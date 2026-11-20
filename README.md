@@ -2,6 +2,8 @@
 
 VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. The original stopwatch was touch-tested on the Moto. The Rust service migration is tested in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
 
+**Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
+
 ## Run it on the Mac
 
 | Command | What you get |
