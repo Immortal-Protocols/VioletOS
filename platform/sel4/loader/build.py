@@ -19,11 +19,11 @@ ld = cc.with_name("ld.lld")
 objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
-defines = ["-DROOT_BYTES=0x40000"]
+defines = ["-DNDEBUG", "-DROOT_BYTES=0x40000"]
 sys.path.insert(0,str(app))
 from firmware import prepare
 prepare(out, variant, Path(stock_path).parent)
-sources = [here/"root.S", app/"root.c", app/"ui.c", app/"touch.c", app/"watchdog.c",
+sources = [here/"root.S", app/"root.c", app/"events.c", app/"ui.c", app/"touch.c", app/"watchdog.c",
            app/"spi.c", app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), out/"firmware.S", here/"strings.c"]
 root_objects = []
 for source in sources:
@@ -39,7 +39,7 @@ if not rustc:
 run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib",
      "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
 root_objects.append("services.a")
-(out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) *(.data*) *(.bss*) } /DISCARD/ : { *(.ARM.exidx*) } }")
+(out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
 assert (out/"root.bin").stat().st_size < 0x3e000

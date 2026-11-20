@@ -21,13 +21,13 @@ For either seL4 target, install Android NDK **28.2.13676358** for its ARM cross-
 
 ## How the layers fit together
 
-Read from the top down. The **Moto and QEMU columns share the purple upper layers**. The UI and drivers live together in one C program, the first user task started by seL4. The kernel controls which physical memory and device registers that task can access. Once mapped, the task can draw pixels and talk to the controller directly. The desktop simulator has its own event loop and UI implementation.
+Read from the top down. The **Moto and QEMU columns share the purple upper layers**. The first task creates a UI task and a touch task with separate address spaces and capability tables. The UI gets the display and a call endpoint. Only the touch task gets SPI, pin, clock and watchdog mappings. Once mapped, the tasks can draw pixels and talk to the controller directly. The desktop simulator has its own event loop and UI implementation.
 
 ```mermaid
 flowchart TB
     future["Planned · persistent storage, Wi-Fi, power management"]:::plan
     ui["VioletOS stopwatch · ui.c<br/>screen layout, elapsed time, tap handling"]:::ours
-    task["First user task · root.c, touch.c, spi.c, watchdog.c<br/>map the display, initialize touch, exchange reports, service watchdog"]:::ours
+    task["Bootstrap · root.c creates isolated tasks<br/>UI requests decoded events from the touch endpoint"]:::ours
     kernel["Upstream seL4 17.0.0 + VioletOS board configuration<br/>capabilities, address spaces, scheduling, interrupts"]:::mixed
     future -.- ui
     ui --> task --> kernel
@@ -67,10 +67,10 @@ flowchart TB
 
 | If you want to change… | Start here | Where it runs |
 | --- | --- | --- |
-| A button, stopwatch timing or framebuffer drawing | [ui.c](platform/sel4/stopwatch/ui.c). Both UI implementations use the [bitmap font](src/glyphs.h). | Moto and QEMU user task |
-| How the first task obtains device mappings | [root.c](platform/sel4/stopwatch/root.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU user task |
+| A button, stopwatch timing or framebuffer drawing | [ui.c](platform/sel4/stopwatch/ui.c). Both UI implementations use the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
+| How the first task obtains device mappings | [root.c](platform/sel4/stopwatch/root.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
 | How a touch becomes a tap | [touch.c](platform/sel4/stopwatch/touch.c) initializes the Novatek controller and decodes contacts. [spi.c](platform/sel4/stopwatch/spi.c) drives each transfer. [spi_mmio.c](platform/sel4/stopwatch/spi_mmio.c) accesses real registers, while [fixture.c](platform/sel4/stopwatch/fixture.c) models them. | Shared driver with one backend per target |
-| Watchdog behavior | [watchdog.c](platform/sel4/stopwatch/watchdog.c) | Moto and QEMU user task |
+| Watchdog behavior | [watchdog.c](platform/sel4/stopwatch/watchdog.c) | Moto and QEMU userspace |
 | Where seL4 comes from and how it boots | [build_sel4.py](tools/build_sel4.py) pins and fetches upstream seL4, applies the [board configuration](platform/sel4/board/) and builds a kernel per target. The [loader](platform/sel4/loader/) prepares memory and transfers control to the kernel. | Build host and early ARM boot |
 | The Moto image layout | [loader/build.py](platform/sel4/loader/build.py) links the payload. [phone_image.py](tools/phone_image.py) reads and packages the Android v2 boot format. | Build host |
 | How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU. [viewer.c](tools/emulator/viewer.c) displays its 720 × 1600 framebuffer and translates mouse events into touch reports. [test.py](platform/sel4/stopwatch/test.py) checks the driver and rendered output. | Mac host |
@@ -89,7 +89,7 @@ make moto
 shasum -a 256 build/sel4/moto/boot.img
 ```
 
-The rebuilt handset image has SHA-256 `19377b26ea4c304b612599baf7d09ad9a19cc7371e8432a2dddb98a8bc44188d`. On the unlocked test handset, this image booted from slot B, displayed **TOUCH READY** and accepted taps to open and start the stopwatch. Android occupied slot A. QEMU exercises the same touch protocol with synthetic firmware and modeled registers. Physical panel initialization, electrical behavior and bootloader slot selection still require a handset.
+The previous single-task handset baseline has SHA-256 `19377b26ea4c304b612599baf7d09ad9a19cc7371e8432a2dddb98a8bc44188d`. On the unlocked test handset, the baseline image booted from slot B, displayed **TOUCH READY** and accepted taps to open and start the stopwatch. Android occupied slot A. QEMU exercises the same touch protocol with synthetic firmware and modeled registers. Physical panel initialization, electrical behavior and bootloader slot selection still require a handset.
 
 Persistent disk storage, Wi-Fi and power management are planned. The current guest keeps stopwatch state in RAM. The [Rust isolation experiment](spikes/sel4-isolation/) explores separating services. The [handset bring-up log](spikes/sel4-ellis/) records the hardware trials. The [original architecture deck](docs/VioletOS-architecture.pdf) documents the earlier Linux prototype.
 

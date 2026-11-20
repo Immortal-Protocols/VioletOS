@@ -2,7 +2,6 @@
 #include "spi.h"
 #include "firmware.h"
 extern const uint8_t touch_firmware[];
-static volatile uint32_t *uart,*test;
 static unsigned page_base, uploaded[sizeof(parts)/sizeof(*parts)], crc_fields;
 static bool ready, identified;
 enum { NORMAL, DELAY, DROP_BEFORE, DROP_AFTER, STUCK, SETUP, RESET1, RESET2 };
@@ -11,10 +10,12 @@ static unsigned cmd,cfg0,cfg1,cfg2,pad,tx_words,rx_pos,rx_len,start,latency;
 static bool active, suppress;
 static uint8_t fifo[32];
 
+#define uart ((volatile uint32_t *)0x09003000)
+#define test ((volatile uint32_t *)0x09005000)
 void touch_map(void) {
-    uart=map_device(0x09000000,0x09003000,12);
-    test=map_device(0x49000000,0x09005000,12);
-    watchdog_attach(test);
+    map_device(0x09000000,0x09003000,12);
+    map_device(0x49000000,0x09005000,12);
+    
 }
 bool spi_clock_start(void) { return true; }
 

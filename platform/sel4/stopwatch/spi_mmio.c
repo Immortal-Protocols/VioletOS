@@ -1,14 +1,18 @@
 // MT6765 SPI3, chip select 0. Use programmed I/O with bounded transfers.
 #include "spi.h"
-static volatile uint32_t *top,*infra,*pad,*gpio,*spi;
 #define REG(base,offset) ((base)[(offset)/4])
+#define top ((volatile uint32_t *)0x09000000)
+#define infra ((volatile uint32_t *)0x09001000)
+#define pad ((volatile uint32_t *)0x09004000)
+#define gpio ((volatile uint32_t *)0x09002000)
+#define spi ((volatile uint32_t *)0x09003000)
 void touch_map(void) {
-    top=map_device(0x10000000,0x09000000,12);
-    infra=map_device(0x10001000,0x09001000,12);
-    pad=map_device(0x10002000,0x09004000,12);
-    gpio=map_device(0x10005000,0x09002000,12);
-    watchdog_attach(map_device(0x10007000,0x09005000,12));
-    spi=map_device(0x11013000,0x09003000,12);
+    map_device(0x10000000,0x09000000,12);
+    map_device(0x10001000,0x09001000,12);
+    map_device(0x10002000,0x09004000,12);
+    map_device(0x10005000,0x09002000,12);
+    map_device(0x10007000,0x09005000,12);
+    map_device(0x11013000,0x09003000,12);
 }
 bool spi_clock_start(void) {
     // Use the 26 MHz oscillator for SPI and ungate only SPI3.

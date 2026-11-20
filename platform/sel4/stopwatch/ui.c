@@ -1,4 +1,4 @@
-#include "platform.h"
+#include "tasks.h"
 #include "../../../src/glyphs.h"
 // Bootloader scanout pitch inferred from the physical flash 3 photograph.
 enum { scanout_width = 720, scanout_height = 1600 };
@@ -48,29 +48,26 @@ struct watch_state { uint32_t tenths, remainder; bool running; };
 extern void watch_toggle(struct watch_state *);
 extern void watch_reset(struct watch_state *);
 extern bool watch_advance(struct watch_state *, unsigned, unsigned);
-void stopwatch(void) {
-    uint32_t freq;
+void clock_init(void) {
+    unsigned freq;
     __asm__ volatile("mrc p15,0,%0,c14,c0,0":"=r"(freq));
     ticks_per_ms=freq/1000;
-    // Reserve the low-address device mappings before allocating the display.
-    extern void touch_map(void);
-    touch_map();
-    for(unsigned offset=0;offset<sizeof(*pixels)*scanout_width*scanout_height;offset+=65536)
-        map_device(0x79450000+offset,0x08000000+offset,16);
+}
+void stopwatch(void) {
+    clock_init();
     draw(false,false,0,"STARTING TOUCH");
-    const char *status=touch_init();
+    const char *status=touch_status();
     bool ready=status==0,watch=false,held=false;
     if(ready) status="TOUCH READY";
     struct watch_state state={0};
     draw(watch,state.running,0,status);
     unsigned previous=ticks();
     for(;;) {
-        watchdog_progress();
         unsigned now=ticks(), delta=now-previous;
         previous=now;
         if(watch_advance(&state,delta,ticks_per_ms*100) && watch) digits(state.tenths);
         unsigned x=0,y=0; bool down=false;
-        if(ready && touch_sample(&x,&y,&down)) {
+        if(touch_event(&x,&y,&down) && ready) {
             if(down && !held && x>=42 && x<678) {
                 if(y>=824 && y<1024) {
                     if(watch) watch_toggle(&state); else watch=true;
