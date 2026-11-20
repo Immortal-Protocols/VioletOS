@@ -34,9 +34,11 @@ static void digits(unsigned tenths) {
     s[0]+=(min/10); s[1]+=min%10; s[3]+=(sec%60)/10; s[4]+=sec%10; s[6]+=tenths%10;
     rect(14,139,170,29,bg); label(14,139,s,4,accent);
 }
+static const char *disk_status="";
 static void draw(bool watch,bool running,unsigned tenth,const char *status) {
     rect(0,0,240,400,bg);
     label(14,20,"VIOLET OS",1,accent); label(14,32,status,1,ink);
+    label(14,43,disk_status,1,ink);
     if(watch) {
         label(14,68,"STOPWATCH",3,ink); digits(tenth);
         button(206,running?"PAUSE":"START"); button(266,"RESET"); button(335,"HOME");
@@ -60,7 +62,9 @@ void stopwatch(void) {
     bool ready=status==0,watch=false,held=false;
     if(ready) status="TOUCH READY";
     struct watch_state state={0};
-    draw(watch,state.running,0,status);
+    bool disk=checkpoint(false,&state.tenths);
+    disk_status=disk?"DISK READY":"RAM ONLY";
+    draw(watch,state.running,state.tenths,status);
     unsigned previous=ticks();
     for(;;) {
         unsigned now=ticks(), delta=now-previous;
@@ -69,11 +73,20 @@ void stopwatch(void) {
         unsigned x=0,y=0; bool down=false;
         if(touch_event(&x,&y,&down) && ready) {
             if(down && !held && x>=42 && x<678) {
+                bool save=false;
                 if(y>=824 && y<1024) {
-                    if(watch) watch_toggle(&state); else watch=true;
+                    if(watch) {
+                        watch_toggle(&state);
+                        save=!state.running;
+                    } else watch=true;
                 } else if(watch && y>=1064 && y<1264) {
                     watch_reset(&state);
+                    save=true;
                 } else if(watch && y>=1340 && y<1540) watch=false;
+                if(save && disk && !checkpoint(true,&state.tenths)) {
+                    disk=false;
+                    disk_status="DISK ERROR";
+                }
                 draw(watch,state.running,state.tenths,status);
             }
             held=down;

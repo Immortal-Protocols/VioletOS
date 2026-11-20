@@ -7,13 +7,21 @@ parser=argparse.ArgumentParser()
 parser.add_argument("--watchdog-enabled", action="store_true")
 modes = ["normal","delayed","drop-before","drop-after","stuck","setup","reset1","reset2"]
 parser.add_argument("--spi", choices=modes, default="normal")
+parser.add_argument("--disk",type=Path)
+parser.add_argument("--checkpoint",choices=["save","restore","reset"])
+parser.add_argument("--expect",type=int, default=0)
+parser.add_argument("--probe",choices=["touch","storage","dma"])
 args=parser.parse_args()
 enabled=args.watchdog_enabled
 repo=Path(__file__).resolve().parents[3]
 sys.path.insert(0,str(repo/"tools"))
 from run import IMAGE, machine
 out=IMAGE
-cmd=machine(watchdog=enabled, scenario=modes.index(args.spi))+["-serial","pty","-qmp","stdio"]
+image=IMAGE/"isolation-test" if args.probe else IMAGE
+cmd=machine(image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
+if args.probe:
+    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000}[args.probe]
+    cmd+=["-device",f"loader,addr=0x49300000,data={address},data-len=4"]
 p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
 try:
     while True:
@@ -35,6 +43,15 @@ try:
             if "return" in msg: return msg["return"]
             if "error" in msg: raise RuntimeError(msg)
     request("qmp_capabilities",{})
+    if args.probe:
+        filename=image/"fault.raw"
+        for _ in range(60):
+            request("pmemsave",dict(val=0x49300004,size=4,filename=str(filename)))
+            if struct.unpack("<I",filename.read_bytes())[0]==address: break
+            time.sleep(.05)
+        else: raise AssertionError(f"missing UI VM fault at {address:#x}")
+        print(f"seL4 denied UI access to {args.probe} at {address:#x}")
+        sys.exit(0)
     serial=os.open(port,os.O_RDWR|os.O_NOCTTY);tty.setraw(serial)
     digits=[tuple(map(int,x.split(','))) for x in re.findall(r'\{([\d, ]+)\}',(repo/'src/glyphs.h').read_text())[:10]]
     def snapshot():
@@ -58,6 +75,19 @@ try:
         time.sleep(.18)
         os.write(serial,bytes(6));time.sleep(.18)
     time.sleep(1)
+    if args.checkpoint:
+        tap(920)
+        assert value()==args.expect, ("restored value",value(),args.expect)
+        if args.checkpoint=="save":
+            tap(920); time.sleep(.5); tap(920)
+            saved=value()
+            time.sleep(.25)
+            assert saved>0 and value()==saved
+            print("Checkpoint",saved)
+        elif args.checkpoint=="reset":
+            tap(1140)
+            assert value()==0
+        sys.exit(0)
     if args.spi in ("stuck","reset1","reset2"):
         # Decode the actual status line through the same bitmap font as the UI.
         text=(repo/"src/glyphs.h").read_text()

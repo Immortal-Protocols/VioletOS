@@ -74,6 +74,7 @@ static void new_task(struct task *t,void (*entry)(void)) {
     t->thread=create(ram,seL4_TCBObject);
     ensure_table(t,BASE);
     for(unsigned va=BASE;va<(unsigned)writable_start;va+=PAGE) {
+        if(next_slot>=boot->empty.end) stop();
         seL4_CPtr frame=boot->userImageFrames.start+(va-BASE)/PAGE;
         check(seL4_CNode_Copy(seL4_CapInitThreadCNode,next_slot,32,seL4_CapInitThreadCNode,frame,32,seL4_AllRights));
         check(seL4_ARM_Page_Map(next_slot++,t->pd,va,seL4_CapRights_new(0,0,1,0),seL4_ARM_Default_VMAttributes));
@@ -93,6 +94,26 @@ static void endpoint(struct task *t,unsigned slot,seL4_CPtr ep,bool server) {
     seL4_CapRights_t rights=seL4_CapRights_new(!server,0,server,!server);
     check(seL4_CNode_Copy(t->caps,slot,CAP_BITS,seL4_CapInitThreadCNode,ep,32,rights));
 }
+#ifdef VIOLET_TEST_ISOLATION
+// Run one load with the UI's actual page directory and capability table.
+static void read_probe(volatile unsigned *address) {
+    (void)*address;
+    stop();
+}
+static void check_isolation(volatile unsigned *report) {
+    seL4_CPtr faults=create(ram,seL4_EndpointObject);
+    endpoint(&ui,3,faults,false);
+    unsigned guard=seL4_CNode_CapData_new(0,32-CAP_BITS).words[0];
+    check(seL4_TCB_SetSpace(ui.thread,3,ui.caps,guard,ui.pd,0));
+    unsigned address=report[0];
+    seL4_UserContext regs={.pc=(unsigned)read_probe,.sp=STACK_TOP,.r0=address};
+    check(seL4_TCB_WriteRegisters(ui.thread,1,0,sizeof(regs)/sizeof(unsigned),&regs));
+    seL4_MessageInfo_t fault=seL4_Recv(faults,0);
+    if(seL4_MessageInfo_get_label(fault)==seL4_Fault_VMFault && seL4_GetMR(1)==address)
+        report[1]=address;
+    stop();
+}
+#endif
 void root_main(seL4_BootInfo *bi) {
     boot=bi;
     seL4_SetIPCBuffer(bi->ipcBuffer);
@@ -112,9 +133,27 @@ void root_main(seL4_BootInfo *bi) {
     endpoint(&ui,TOUCH_EP,ep,false);
     mapping=&touch;
     touch_map();
+#ifdef VIOLET_QEMU
+    static struct task storage;
+    new_task(&storage,storage_task);
+    seL4_CPtr disk=create(ram,seL4_EndpointObject);
+    endpoint(&storage,STORAGE_EP,disk,true);
+    endpoint(&ui,STORAGE_EP,disk,false);
+    mapping=&storage;
+    map_device(0x0a000000,0x0a000000,12);
+    map_device(0x49200000,0x0b000000,12);
+    check(seL4_TCB_Resume(storage.thread));
+#endif
+#ifdef VIOLET_TEST_ISOLATION
+    mapping=&bootstrap;
+    volatile unsigned *report=map_device(0x49300000,0x09100000,12);
+#endif
     mapping=&ui;
     for(unsigned offset=0;offset<720*1600*4;offset+=65536)
         map_device(0x79450000+offset,0x08000000+offset,16);
+#ifdef VIOLET_TEST_ISOLATION
+    check_isolation(report);
+#endif
     check(seL4_TCB_Resume(touch.thread));
     check(seL4_TCB_Resume(ui.thread));
     seL4_TCB_Suspend(seL4_CapInitThreadTCB);

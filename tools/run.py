@@ -10,10 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGE = ROOT / "build/sel4/qemu"
 RAM_SIZE = 1024**3
 
-def machine(image=IMAGE, watchdog=False, scenario=0):
+def machine(image=IMAGE, watchdog=False, scenario=0, disk=None):
     cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
            "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", "1", "-display", "none",
            "-monitor", "none", "-nic", "none", "-no-reboot"]
+    if disk is not None:
+        cmd += ["-global", "virtio-mmio.force-legacy=false",
+                "-drive", f"if=none,id=violetdisk,format=raw,file={str(disk).replace(',', ',,')}",
+                "-device", "virtio-blk-device,drive=violetdisk,bus=virtio-mmio-bus.0"]
     for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
                                   ("entry.bin", "0x44000000", ",cpu-num=0")]:
         cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
@@ -35,7 +39,13 @@ def main(viewer):
         ram = Path(tmp)/"guest.ram"
         with ram.open("wb") as stream:
             stream.truncate(RAM_SIZE)
-        cmd = machine() + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
+        disk = IMAGE / "stopwatch.disk"
+        try:
+            with disk.open("xb") as stream:
+                stream.truncate(1024**2)
+        except FileExistsError:
+            pass
+        cmd = machine(disk=disk) + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
                            "-machine", "memory-backend=ram", "-serial", "stdio"]
         guest = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
         try:

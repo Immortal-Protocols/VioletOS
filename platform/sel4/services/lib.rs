@@ -11,3 +11,10 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 mod spi;
 #[cfg(target_os="none")]
 mod touch;
+
+#[cfg(any(violet_qemu,test))]
+mod journal;
+#[cfg(violet_qemu)]
+mod block;
+#[cfg(violet_qemu)]
+mod storage;
