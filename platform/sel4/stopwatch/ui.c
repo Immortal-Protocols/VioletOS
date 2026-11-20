@@ -44,6 +44,10 @@ static void draw(bool watch,bool running,unsigned tenth,const char *status) {
         label(14,76,"VIOLET",5,ink); button(206,"STOPWATCH");
     }
 }
+struct watch_state { uint32_t tenths, remainder; bool running; };
+extern void watch_toggle(struct watch_state *);
+extern void watch_reset(struct watch_state *);
+extern bool watch_advance(struct watch_state *, unsigned, unsigned);
 void stopwatch(void) {
     uint32_t freq;
     __asm__ volatile("mrc p15,0,%0,c14,c0,0":"=r"(freq));
@@ -55,31 +59,25 @@ void stopwatch(void) {
         map_device(0x79450000+offset,0x08000000+offset,16);
     draw(false,false,0,"STARTING TOUCH");
     const char *status=touch_init();
-    bool ready=status==0,watch=false,running=false,held=false;
+    bool ready=status==0,watch=false,held=false;
     if(ready) status="TOUCH READY";
-    draw(watch,running,0,status);
-    unsigned tenths=0, leftover=0, previous=ticks();
+    struct watch_state state={0};
+    draw(watch,state.running,0,status);
+    unsigned previous=ticks();
     for(;;) {
         watchdog_progress();
         unsigned now=ticks(), delta=now-previous;
         previous=now;
-        if(running) {
-            leftover+=delta;
-            unsigned interval=ticks_per_ms*100;
-            if(leftover>=interval) {
-                tenths+=leftover/interval; leftover%=interval;
-                if(watch) digits(tenths);
-            }
-        }
+        if(watch_advance(&state,delta,ticks_per_ms*100) && watch) digits(state.tenths);
         unsigned x=0,y=0; bool down=false;
         if(ready && touch_sample(&x,&y,&down)) {
             if(down && !held && x>=42 && x<678) {
                 if(y>=824 && y<1024) {
-                    if(watch) running=!running; else watch=true;
+                    if(watch) watch_toggle(&state); else watch=true;
                 } else if(watch && y>=1064 && y<1264) {
-                    running=false; tenths=0; leftover=0;
+                    watch_reset(&state);
                 } else if(watch && y>=1340 && y<1540) watch=false;
-                draw(watch,running,tenths,status);
+                draw(watch,state.running,state.tenths,status);
             }
             held=down;
         }

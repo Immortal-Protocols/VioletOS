@@ -1,6 +1,6 @@
 """Link the VioletOS first task and package it with the target kernel."""
 from pathlib import Path
-import sys, subprocess, struct, shlex, hashlib
+import sys, subprocess, struct, shlex, hashlib, os, shutil
 
 here = Path(__file__).resolve().parent
 repo = here.parents[2]
@@ -30,6 +30,15 @@ for source in sources:
     obj = source.name+".o"
     run(common + incs + defines + ["-I",out,"-std=gnu11","-c",source,"-o",obj])
     root_objects.append(obj)
+rustc = os.environ.get("RUSTC") or shutil.which("rustc")
+if not rustc:
+    local = repo/"build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc"
+    if not local.exists():
+        sys.exit("Install Rust and run rustup target add armv7a-none-eabi")
+    rustc = local
+run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib",
+     "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
+root_objects.append("services.a")
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) *(.data*) *(.bss*) } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
