@@ -1,0 +1,59 @@
+#!/bin/sh
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# The stock kernel has no devtmpfs. Populate device nodes in RAM.
+mount -t tmpfs tmpfs /dev
+mdev -s
+if [ -c /dev/kmsg ]; then
+    exec >/dev/kmsg 2>&1
+fi
+echo "VioletOS 4C1: XT2163DL init"
+/bin/sh /bin/touch-log &
+for module in mtk_tpd_mmi nt36xxx_mtk_mmi; do
+    if ! insmod "/vendor/lib/modules/$module.ko"; then
+        echo "VioletOS: could not load $module"
+        echo "$module" >> /tmp/touch-module-errors
+    fi
+done
+
+# The touch probe can finish after insmod returns. Without devtmpfs, the
+# framebuffer program can only open late event nodes after a second coldplug.
+(
+    /bin/busybox mkdir -p /dev/input
+    while :; do
+        mdev -s
+        for event in /sys/class/input/event*; do
+            if [ -r "$event/device/name" ]; then
+                read -r name < "$event/device/name"
+                node="/dev/input/${event##*/}"
+                if [ ! -c "$node" ] && IFS=: read -r major minor < "$event/dev"; then
+                    /bin/busybox mknod "$node" c "$major" "$minor"
+                fi
+                if [ "$name" = NVTCapacitiveTouchScreen ] && [ -c "$node" ]; then
+                    echo "VioletOS: Novatek event node ready"
+                    exit 0
+                fi
+            fi
+        done
+        sleep 2
+    done
+) &
+
+while :; do
+    mdev -s
+    if [ -c /dev/fb0 ] || [ -c /dev/graphics/fb0 ]; then
+        blank=/sys/class/graphics/fb0/blank
+        if [ -w "$blank" ]; then echo 0 > "$blank"; fi
+        light=/sys/class/leds/lcd-backlight
+        if [ -r "$light/max_brightness" ] && [ -w "$light/brightness" ]; then
+            read -r maximum < "$light/max_brightness"
+            read -r current < "$light/brightness"
+            if [ "$current" = 0 ] && [ "$maximum" -gt 1 ]; then
+                echo $((maximum / 2)) > "$light/brightness"
+            fi
+        fi
+        /bin/violet --pan-display --touch-status
+    fi
+    sleep 1
+done

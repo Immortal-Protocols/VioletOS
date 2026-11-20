@@ -1,0 +1,33 @@
+#!/bin/sh
+# Send only touchscreen diagnostics over a USB serial port.
+set -e
+bb=/bin/busybox
+$bb mkdir -p /config
+mount -t configfs configfs /config
+g=/config/usb_gadget/violet
+$bb mkdir "$g"
+cd "$g"
+echo 0x1d6b > idVendor
+echo 0x0104 > idProduct
+$bb mkdir -p strings/0x409 configs/c.1/strings/0x409 functions/acm.gs0
+echo VioletOS > strings/0x409/manufacturer
+echo "VioletOS touch diagnostics" > strings/0x409/product
+echo VioletEllis > strings/0x409/serialnumber
+echo Diagnostics > configs/c.1/strings/0x409/configuration
+$bb ln -s "$g/functions/acm.gs0" configs/c.1/acm.gs0
+while :; do
+    for controller in /sys/class/udc/*; do
+        if [ -e "$controller" ] && echo "${controller##*/}" > UDC; then break 2; fi
+    done
+    sleep 1
+done
+while [ ! -c /dev/ttyGS0 ]; do mdev -s; sleep 1; done
+while :; do
+    (
+        echo "VIOLET TOUCH BEGIN"
+        $bb dmesg -s 2097152 | $bb grep -Ei 'novatek|nvt_|firmware|mtk.tpd|touchpanel|touchscreen' | $bb tail -160
+        $bb grep -Ei 'novatek|nvt|touch|tpd' /proc/interrupts
+        echo "VIOLET TOUCH END"
+    ) > /dev/ttyGS0 || :
+    sleep 3
+done
