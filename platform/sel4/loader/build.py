@@ -1,6 +1,6 @@
 """Link the VioletOS first task and package it with the target kernel."""
 from pathlib import Path
-import sys, subprocess, struct, shlex, hashlib
+import sys, subprocess, struct, shlex, hashlib, os, shutil
 
 here = Path(__file__).resolve().parent
 repo = here.parents[2]
@@ -12,6 +12,11 @@ def run(cmd):
     subprocess.run(cmd, cwd=out, check=True)
 
 abi = out/"kernel"
+probe = os.environ.get("VIOLET_TEST_ISOLATION") == "1" and variant=="qemu"
+if probe:
+    out=out/"isolation-test"
+    out.mkdir(exist_ok=True)
+    shutil.copyfile(out.parent/"handoff.dtb",out/"handoff.dtb")
 line = next(s for s in subprocess.check_output(["ninja","-C",abi,"-t","commands","sel4"],text=True).splitlines() if " -c " in s and s.endswith("/sel4_bootinfo.c"))
 args = shlex.split(line)
 cc = Path(args[0])
@@ -19,18 +24,30 @@ ld = cc.with_name("ld.lld")
 objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
-defines = ["-DROOT_BYTES=0x40000"]
+defines = ["-DNDEBUG", "-DROOT_BYTES=0x40000"]
+if probe: defines.append("-DVIOLET_TEST_ISOLATION")
+if variant=="qemu": defines.append("-DVIOLET_QEMU")
 sys.path.insert(0,str(app))
 from firmware import prepare
 prepare(out, variant, Path(stock_path).parent)
-sources = [here/"root.S", app/"root.c", app/"ui.c", app/"touch.c", app/"watchdog.c",
-           app/"spi.c", app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), out/"firmware.S", here/"strings.c"]
+sources = [here/"root.S", app/"root.c", app/"events.c", app/"storage_ipc.c", app/"ui.c", app/"watchdog.c",
+           app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), here/"strings.c"]
 root_objects = []
 for source in sources:
     obj = source.name+".o"
     run(common + incs + defines + ["-I",out,"-std=gnu11","-c",source,"-o",obj])
     root_objects.append(obj)
-(out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) *(.data*) *(.bss*) } /DISCARD/ : { *(.ARM.exidx*) } }")
+rustc = os.environ.get("RUSTC") or shutil.which("rustc")
+if not rustc:
+    local = repo/"build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc"
+    if not local.exists():
+        sys.exit("Install Rust and run rustup target add armv7a-none-eabi")
+    rustc = local
+os.environ["VIOLET_FIRMWARE_RS"] = str(out/"firmware.rs")
+run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib", *(["--cfg","violet_qemu"] if variant=="qemu" else []),
+     "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
+root_objects.append("services.a")
+(out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
 assert (out/"root.bin").stat().st_size < 0x3e000

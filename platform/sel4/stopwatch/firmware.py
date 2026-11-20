@@ -28,4 +28,7 @@ def prepare(out, variant, stock_dir):
             assert offset+size<=len(data) and addr+size<=0x30000
     rows=',\n'.join('{'+','.join(map(hex,p))+'}' for p in parts)
     (out/'firmware.h').write_text('static const struct { unsigned addr,offset,size,crc; } parts[]={\n'+rows+'\n};\n')
-    (out/'firmware.S').write_text('.section .rodata.firmware,"a"\n.global touch_firmware\ntouch_firmware: .incbin "'+str(fw)+'"\n')
+    import json
+    (out/'firmware.rs').write_text(
+        f"#[no_mangle] static touch_firmware: [u8;{fw.stat().st_size}] = *include_bytes!({json.dumps(str(fw))});\n"
+        + "const PARTS: &[(usize,usize,usize,u32)] = &[" + ",".join(map(str,parts)) + "];\n")

@@ -1,4 +1,4 @@
-#include "platform.h"
+#include "tasks.h"
 #include "../../../src/glyphs.h"
 // Bootloader scanout pitch inferred from the physical flash 3 photograph.
 enum { scanout_width = 720, scanout_height = 1600 };
@@ -34,9 +34,11 @@ static void digits(unsigned tenths) {
     s[0]+=(min/10); s[1]+=min%10; s[3]+=(sec%60)/10; s[4]+=sec%10; s[6]+=tenths%10;
     rect(14,139,170,29,bg); label(14,139,s,4,accent);
 }
+static const char *disk_status="";
 static void draw(bool watch,bool running,unsigned tenth,const char *status) {
     rect(0,0,240,400,bg);
     label(14,20,"VIOLET OS",1,accent); label(14,32,status,1,ink);
+    label(14,43,disk_status,1,ink);
     if(watch) {
         label(14,68,"STOPWATCH",3,ink); digits(tenth);
         button(206,running?"PAUSE":"START"); button(266,"RESET"); button(335,"HOME");
@@ -44,42 +46,48 @@ static void draw(bool watch,bool running,unsigned tenth,const char *status) {
         label(14,76,"VIOLET",5,ink); button(206,"STOPWATCH");
     }
 }
-void stopwatch(void) {
-    uint32_t freq;
+struct watch_state { uint32_t tenths, remainder; bool running; };
+extern void watch_toggle(struct watch_state *);
+extern void watch_reset(struct watch_state *);
+extern bool watch_advance(struct watch_state *, unsigned, unsigned);
+void clock_init(void) {
+    unsigned freq;
     __asm__ volatile("mrc p15,0,%0,c14,c0,0":"=r"(freq));
     ticks_per_ms=freq/1000;
-    // Reserve the low-address device mappings before allocating the display.
-    extern void touch_map(void);
-    touch_map();
-    for(unsigned offset=0;offset<sizeof(*pixels)*scanout_width*scanout_height;offset+=65536)
-        map_device(0x79450000+offset,0x08000000+offset,16);
+}
+void stopwatch(void) {
+    clock_init();
     draw(false,false,0,"STARTING TOUCH");
-    const char *status=touch_init();
-    bool ready=status==0,watch=false,running=false,held=false;
+    const char *status=touch_status();
+    bool ready=status==0,watch=false,held=false;
     if(ready) status="TOUCH READY";
-    draw(watch,running,0,status);
-    unsigned tenths=0, leftover=0, previous=ticks();
+    struct watch_state state={0};
+    bool disk=checkpoint(false,&state.tenths);
+    disk_status=disk?"DISK READY":"RAM ONLY";
+    draw(watch,state.running,state.tenths,status);
+    unsigned previous=ticks();
     for(;;) {
-        watchdog_progress();
         unsigned now=ticks(), delta=now-previous;
         previous=now;
-        if(running) {
-            leftover+=delta;
-            unsigned interval=ticks_per_ms*100;
-            if(leftover>=interval) {
-                tenths+=leftover/interval; leftover%=interval;
-                if(watch) digits(tenths);
-            }
-        }
+        if(watch_advance(&state,delta,ticks_per_ms*100) && watch) digits(state.tenths);
         unsigned x=0,y=0; bool down=false;
-        if(ready && touch_sample(&x,&y,&down)) {
+        if(touch_event(&x,&y,&down) && ready) {
             if(down && !held && x>=42 && x<678) {
+                bool save=false;
                 if(y>=824 && y<1024) {
-                    if(watch) running=!running; else watch=true;
+                    if(watch) {
+                        watch_toggle(&state);
+                        save=!state.running;
+                    } else watch=true;
                 } else if(watch && y>=1064 && y<1264) {
-                    running=false; tenths=0; leftover=0;
+                    watch_reset(&state);
+                    save=true;
                 } else if(watch && y>=1340 && y<1540) watch=false;
-                draw(watch,running,tenths,status);
+                if(save && disk && !checkpoint(true,&state.tenths)) {
+                    disk=false;
+                    disk_status="DISK ERROR";
+                }
+                draw(watch,state.running,state.tenths,status);
             }
             held=down;
         }

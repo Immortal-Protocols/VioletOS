@@ -34,3 +34,12 @@ build/simulator: src/screen.c src/screen.h src/glyphs.h src/simulator.c
 	$(CC) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) src/screen.c src/simulator.c -o $@ $(shell sdl2-config --libs)
 sim: build/simulator
 	./build/simulator
+
+.PHONY: test-storage test-isolation
+test-storage: qemu-image
+	$(PYTHON) platform/sel4/stopwatch/test_storage.py
+test-isolation: setup
+	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu
+	@set -e; for region in touch storage dma; do \
+	  $(PYTHON) platform/sel4/stopwatch/test.py --probe $$region; \
+	done
