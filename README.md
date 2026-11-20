@@ -69,7 +69,7 @@ flowchart TB
 | --- | --- | --- |
 | A button, stopwatch timing or framebuffer drawing | [ui.c](platform/sel4/stopwatch/ui.c). Both UI implementations use the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
 | How the first task obtains device mappings | [root.c](platform/sel4/stopwatch/root.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
-| How a touch becomes a tap | [touch.c](platform/sel4/stopwatch/touch.c) initializes the Novatek controller and decodes contacts. [spi.c](platform/sel4/stopwatch/spi.c) drives each transfer. [spi_mmio.c](platform/sel4/stopwatch/spi_mmio.c) accesses real registers, while [fixture.c](platform/sel4/stopwatch/fixture.c) models them. | Shared driver with one backend per target |
+| How a touch becomes a tap | [touch.rs](platform/sel4/services/touch.rs) initializes the Novatek controller and decodes contacts. [spi.rs](platform/sel4/services/spi.rs) drives each transfer. [spi_mmio.c](platform/sel4/stopwatch/spi_mmio.c) accesses real registers, while [fixture.c](platform/sel4/stopwatch/fixture.c) models them. | Shared driver with one backend per target |
 | Watchdog behavior | [watchdog.c](platform/sel4/stopwatch/watchdog.c) | Moto and QEMU userspace |
 | Where seL4 comes from and how it boots | [build_sel4.py](tools/build_sel4.py) pins and fetches upstream seL4, applies the [board configuration](platform/sel4/board/) and builds a kernel per target. The [loader](platform/sel4/loader/) prepares memory and transfers control to the kernel. | Build host and early ARM boot |
 | The Moto image layout | [loader/build.py](platform/sel4/loader/build.py) links the payload. [phone_image.py](tools/phone_image.py) reads and packages the Android v2 boot format. | Build host |

@@ -23,8 +23,8 @@ defines = ["-DNDEBUG", "-DROOT_BYTES=0x40000"]
 sys.path.insert(0,str(app))
 from firmware import prepare
 prepare(out, variant, Path(stock_path).parent)
-sources = [here/"root.S", app/"root.c", app/"events.c", app/"ui.c", app/"touch.c", app/"watchdog.c",
-           app/"spi.c", app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), out/"firmware.S", here/"strings.c"]
+sources = [here/"root.S", app/"root.c", app/"events.c", app/"ui.c", app/"watchdog.c",
+           app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), here/"strings.c"]
 root_objects = []
 for source in sources:
     obj = source.name+".o"
@@ -36,6 +36,7 @@ if not rustc:
     if not local.exists():
         sys.exit("Install Rust and run rustup target add armv7a-none-eabi")
     rustc = local
+os.environ["VIOLET_FIRMWARE_RS"] = str(out/"firmware.rs")
 run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib",
      "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
 root_objects.append("services.a")

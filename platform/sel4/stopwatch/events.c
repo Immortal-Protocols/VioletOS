@@ -8,18 +8,19 @@ static seL4_MessageInfo_t message(unsigned words) {
 void touch_task(void) {
     clock_init();
     watchdog_attach((void *)0x09005000);
-    const char *error = touch_init();
+    char error[STATUS_BYTES];
+    touch_initialize(error);
     for (;;) {
         seL4_Recv(TOUCH_EP, NULL);
         watchdog_progress();
         if (seL4_GetMR(0) == STATUS) {
             unsigned i = 0;
-            for (; error && error[i] && i < STATUS_BYTES-1; ++i) seL4_SetMR(i,error[i]);
+            for (; error[i] && i < STATUS_BYTES-1; ++i) seL4_SetMR(i,error[i]);
             seL4_SetMR(i,0);
             seL4_Reply(message(i+1));
         } else {
             unsigned x=0,y=0; bool down=false;
-            bool valid = !error && touch_sample(&x,&y,&down);
+            bool valid = !error[0] && touch_sample(&x,&y,&down);
             seL4_SetMR(0, valid | ((unsigned)down << 1));
             seL4_SetMR(1,x);
             seL4_SetMR(2,y);

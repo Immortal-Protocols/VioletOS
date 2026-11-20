@@ -6,3 +6,8 @@ mod stopwatch;
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop { core::hint::spin_loop() }
 }
+
+#[cfg(target_os="none")]
+mod spi;
+#[cfg(target_os="none")]
+mod touch;
