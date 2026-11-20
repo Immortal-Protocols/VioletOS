@@ -1,6 +1,6 @@
 # VioletOS
 
-VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. The original stopwatch was touch-tested on the Moto. The Rust service migration is tested in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
+VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. The Rust stopwatch and touch driver have been tested on the Moto and in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -25,57 +25,11 @@ For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Androi
 
 ## How the layers fit together
 
-Read from the top down. The **Moto and QEMU columns share the purple upper layers**. The first task gives the UI, touch driver and QEMU storage service separate address spaces and capability tables. The UI can draw into the framebuffer and call its service endpoints. On the Moto, the touch task owns the SPI, pin, clock and watchdog mappings. On QEMU, only the storage task maps the disk controller and its transfer buffer. The desktop simulator has its own event loop and UI implementation.
+This slide from the original design review shows the proposed stack. Its Linux label describes the Moto at the time of the proposal. Slot B now boots seL4.
 
-```mermaid
-flowchart TB
-    future["Planned · handset disk, Wi-Fi, power management"]:::plan
-    ui["UI task · ui.c and stopwatch.rs<br/>C renderer, Rust elapsed time and transitions"]:::ours
-    task["Bootstrap · root.c creates isolated tasks<br/>UI requests decoded events from the touch endpoint"]:::ours
-    kernel["Upstream seL4 17.0.0 + VioletOS board configuration<br/>capabilities, address spaces, scheduling, interrupts"]:::mixed
-    future -.- ui
-    touch["Touch task · touch.rs and spi.rs<br/>firmware, transfer recovery, decoded finger events"]:::ours
-    store["QEMU storage task · storage.rs and journal.rs<br/>load and save the paused stopwatch time"]:::ours
-    ui -->|touch endpoint| touch
-    ui -->|checkpoint endpoint| store
-    task --> kernel
-    ui --- kernel
-    touch --- kernel
-    store --- kernel
+![Proposed architecture with the shared UI above Rust services and Microkit and seL4, followed by the Mac simulator, QEMU and Moto G Pure targets.](docs/proposed-violetos-stack.png)
 
-    subgraph moto["Moto G Pure · XT2163DL"]
-        mdrv["VioletOS · spi_mmio.c<br/>user task accesses MediaTek SPI registers"]:::ours
-        mboot["Motorola bootloader + VioletOS loader<br/>factory device tree and existing panel scanout"]:::mixed
-        mhw["MediaTek SoC · physical framebuffer<br/>DJN panel + Novatek controller and vendor firmware"]:::external
-        mdrv --> mhw
-        mboot --> mhw
-    end
-    subgraph emu["QEMU · ARM guest on the Mac"]
-        edrv["VioletOS · fixture.c<br/>user task models controller registers and firmware transfers"]:::ours
-        eq["QEMU virtual CPU, timer, interrupt controller and RAM"]:::external
-        view["VioletOS host viewer + SDL2<br/>reads guest pixels, sends mouse reports over virtual serial"]:::mixed
-        block["Rust block driver · block.rs<br/>virtio disk backed by a local file"]:::ours
-        block --> eq
-        edrv --> eq
-        eq <--> view
-    end
-    subgraph sim["Native simulator · Mac"]
-        sui["VioletOS · screen.c<br/>clock, stopwatch and system screens"]:::ours
-        shost["VioletOS · simulator.c + SDL2<br/>host window, mouse and time"]:::mixed
-        sui --> shost
-    end
-    kernel --- mboot
-    kernel --- eq
-    touch --> mdrv
-    touch --> edrv
-    store --> block
-    classDef ours fill:#eee5ff,stroke:#7952a3,color:#201529
-    classDef mixed fill:#e3f1f1,stroke:#518481,color:#162c2b
-    classDef external fill:#eef0f4,stroke:#747d8d,color:#1c2430
-    classDef plan fill:#fff,stroke:#7952a3,stroke-dasharray:5 4,color:#432a54
-```
-
-**Purple** is code in this repository. **Teal** combines our integration with upstream or vendor components. **Gray** is external. **Dashed** marks future work. The loader runs at boot and hands control to seL4. This board configuration, the loader, the drivers and the stopwatch have no end-to-end formal verification claim.
+**What runs today.** The Moto and QEMU use the same Rust stopwatch and touch protocol. VioletOS boot code sets up the UI and touch driver as separate seL4 tasks. QEMU also runs a storage task that saves the paused time to disk. The Moto keeps that time in RAM. The Mac simulator remains a native SDL application with its own UI. Microkit is used in the isolation experiment.
 
 ## Where to change the code
 
@@ -115,7 +69,7 @@ shasum -a 256 build/sel4/moto/boot.img
 
 The previous single-task handset baseline has SHA-256 `19377b26ea4c304b612599baf7d09ad9a19cc7371e8432a2dddb98a8bc44188d`. On the unlocked test handset, the baseline image booted from slot B, displayed **TOUCH READY** and accepted taps to open and start the stopwatch. Android occupied slot A. QEMU exercises the same touch protocol with synthetic firmware and modeled registers. Physical panel initialization, electrical behavior and bootloader slot selection still require a handset.
 
-The Rust handset image has been built. Physical validation of the new driver and task split is pending. The Moto keeps stopwatch state in RAM until a handset storage driver and a dedicated storage region are available. Wi-Fi and power management are also planned. The [Rust isolation experiment](spikes/sel4-isolation/) explores separating services. The [handset bring-up log](spikes/sel4-ellis/) records the hardware trials. The [original architecture deck](docs/VioletOS-architecture.pdf) documents the earlier Linux prototype.
+In one slot B trial, the Rust handset image displayed **TOUCH READY** and **RAM ONLY**. Physical taps opened the stopwatch, started it, paused it and reset it to zero. The Moto keeps stopwatch state in RAM until a handset storage driver and a dedicated storage region are available. Wi-Fi and power management are also planned. The [Rust isolation experiment](spikes/sel4-isolation/) explores separating services. The [handset bring-up log](spikes/sel4-ellis/) records the hardware trials. The [original architecture deck](docs/VioletOS-architecture.pdf) documents the earlier Linux prototype.
 
 ### Rust toolchain
 
