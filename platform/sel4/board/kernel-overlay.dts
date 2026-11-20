@@ -1,0 +1,15 @@
+/ {
+    chosen {
+        seL4,kernel-devices = &gic, &{/timer};
+    };
+};
+
+// Initial compile target only. The live Linux report describes continuous system
+// RAM here. Firmware reservations begin later. The loader must still protect
+// its own code, kernel payload, initial task and boot-time DTB from overlap.
+&{/memory} {
+    reg = <0x0 0x40000000 0x0 0x04000000>;
+};
+
+// Only the boot CPU's redistributor is mapped in this single-core port.
+&gic { compatible = "violet,ellis-boot-gic", "arm,gic-v3"; };

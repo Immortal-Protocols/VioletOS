@@ -1,22 +1,60 @@
-"""Launch a fresh machine with software translation on any QEMU host."""
+"""Launch the seL4 QEMU target with an SDL view of guest display memory."""
 from pathlib import Path
-import argparse
+import sys
+import signal
 import subprocess
+import tempfile
+import time
 
-build = Path(__file__).resolve().parents[1] / "build"
-parser = argparse.ArgumentParser()
-parser.add_argument("--headless", action="store_true", help="serial logs only")
-args = parser.parse_args()
-command = ["qemu-system-aarch64", "-machine", "virt,accel=tcg", "-cpu", "cortex-a53",
-           "-m", "128M", "-smp", "1", "-kernel", str(build/"Image"),
-           "-initrd", str(build/"violet-aarch64.cpio.gz"),
-           "-append", "console=ttyAMA0 loglevel=4 rdinit=/init",
-           "-device", "virtio-gpu-pci,xres=480,yres=800",
-           "-device", "virtio-tablet-pci", "-nic", "none", "-serial", "stdio",
-           "-monitor", "none", "-no-reboot"]
-if args.headless:
-    command += ["-display", "none"]
-try:
-    raise SystemExit(subprocess.call(command))
-except KeyboardInterrupt:
-    pass
+ROOT = Path(__file__).resolve().parents[1]
+IMAGE = ROOT / "build/sel4/qemu"
+RAM_SIZE = 1024**3
+
+def machine(image=IMAGE, watchdog=False, scenario=0):
+    cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
+           "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", "1", "-display", "none",
+           "-monitor", "none", "-nic", "none", "-no-reboot"]
+    for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
+                                  ("entry.bin", "0x44000000", ",cpu-num=0")]:
+        cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
+    for address, value in [("0x49000000", int(watchdog)), ("0x49000010", scenario)]:
+        cmd += ["-device", f"loader,addr={address},data={value},data-len=4"]
+    return cmd
+
+def finish(process):
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+def main(viewer):
+    with tempfile.TemporaryDirectory(prefix="violet-qemu-") as tmp:
+        ram = Path(tmp)/"guest.ram"
+        with ram.open("wb") as stream:
+            stream.truncate(RAM_SIZE)
+        cmd = machine() + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
+                           "-machine", "memory-backend=ram", "-serial", "stdio"]
+        guest = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        try:
+            window = subprocess.Popen([viewer, ram], stdout=guest.stdin)
+            try:
+                while window.poll() is None and guest.poll() is None:
+                    time.sleep(.05)
+                if guest.poll() is not None:
+                    raise SystemExit(f"QEMU exited while the window was open (status {guest.returncode})")
+                return window.returncode
+            finally:
+                finish(window)
+        finally:
+            guest.stdin.close()
+            finish(guest)
+
+if __name__=="__main__":
+    signal.signal(signal.SIGTERM, lambda *_: exit(0))
+    try:
+        raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else ROOT/"build/sel4/viewer"))
+    except KeyboardInterrupt:
+        pass

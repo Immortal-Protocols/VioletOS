@@ -1,0 +1,38 @@
+// QEMU virt boot CPU, timer and GICv3 addresses. The loader validates the
+// synthetic handoff below using the same bounds checks as on Ellis.
+/dts-v1/;
+/ {
+    compatible = "linux,dummy-virt";
+    #address-cells = <2>;
+    #size-cells = <2>;
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        cpu@0 { device_type = "cpu"; compatible = "arm,cortex-a53"; reg = <0>; };
+    };
+    gic: interrupt-controller@8000000 {
+        compatible = "arm,gic-v3";
+        interrupt-controller;
+        #interrupt-cells = <3>;
+        interrupt-parent = <&gic>;
+        interrupts = <1 9 4>;
+        reg = <0 0x08000000 0 0x10000 0 0x080a0000 0 0xf60000>;
+    };
+    timer {
+        compatible = "arm,armv8-timer";
+        interrupt-parent = <&gic>;
+        interrupts = <1 13 8 1 14 8 1 11 8 1 10 8>;
+        clock-frequency = <13000000>;
+    };
+    memory { device_type = "memory"; reg = <0 0x40000000 0 0xc0000000>; };
+    chosen {
+        linux,initrd-start = <0x51b00000>;
+        atag,videolfb = [00 00 45 79 00 00 00 00 01 00 00 00 12 17 00 00 00 00 fb 00], "mipi_mot_vid_djn_nt36525b_a_hdp_652";
+    };
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        mblock-16-framebuffer { reg = <0 0x79450000 0 0xfb0000>; };
+    };
+};
