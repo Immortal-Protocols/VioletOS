@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="note_page" size="0x1000" />
+    <memory_region name="packet_page" size="0x1000" />
+    <protection_domain name="Notes" priority="110">
+        <program_image path="notes.elf" />
+        <map mr="note_page" vaddr="0x40000000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="Network" priority="100">
+        <program_image path="network.elf" />
+        <map mr="packet_page" vaddr="0x41000000" perms="rw" />
+    </protection_domain>
+</system>
