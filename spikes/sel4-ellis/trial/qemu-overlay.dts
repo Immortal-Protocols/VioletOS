@@ -1,2 +1,0 @@
-// QEMU virt has the same GIC interface at different physical addresses.
-&gic { reg = <0 0x08000000 0 0x10000 0 0x080a0000 0 0xf60000>; };

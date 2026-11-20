@@ -1,21 +1,17 @@
-"""Build one diagnostic using a measured Ellis kernel or its QEMU GIC fixture."""
+"""Link the VioletOS first task and package it with the target kernel."""
 from pathlib import Path
 import sys, subprocess, struct, shlex, hashlib
 
 here = Path(__file__).resolve().parent
 repo = here.parents[2]
-build = repo / "build/spike2"
-variant = sys.argv[1]
-watch = sys.argv[2:] == ["--stopwatch"]
+build = repo / "build/sel4"
+variant, stock_path = sys.argv[1:]
 app = here.parent / "stopwatch"
-if variant not in ("measured", "fixture"):
-    raise ValueError("choose measured or fixture")
-out = build / (("stopwatch-" if watch else "trial-") + variant)
-out.mkdir(exist_ok=True)
+out = build / variant
 def run(cmd):
     subprocess.run(cmd, cwd=out, check=True)
 
-abi = build / "kernel-measured"
+abi = out/"kernel"
 line = next(s for s in subprocess.check_output(["ninja","-C",abi,"-t","commands","sel4"],text=True).splitlines() if " -c " in s and s.endswith("/sel4_bootinfo.c"))
 args = shlex.split(line)
 cc = Path(args[0])
@@ -23,14 +19,12 @@ ld = cc.with_name("ld.lld")
 objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
-defines = ["-DROOT_BYTES=0x40000"] if watch else ["-DROOT_BYTES=0x4000"]
-sources = [here/"root.S", here/"root.c"]
-if watch:
-    sys.path.insert(0,str(app))
-    from firmware import prepare
-    prepare(repo,out)
-    sources = [here/"root.S", app/"root.c", app/"ui.c", app/"touch.c", app/"watchdog.c",
-               app/"spi.c", app/("fixture.c" if variant=="fixture" else "spi_mmio.c"), out/"firmware.S", here/"strings.c"]
+defines = ["-DROOT_BYTES=0x40000"]
+sys.path.insert(0,str(app))
+from firmware import prepare
+prepare(out, variant, Path(stock_path).parent)
+sources = [here/"root.S", app/"root.c", app/"ui.c", app/"touch.c", app/"watchdog.c",
+           app/"spi.c", app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), out/"firmware.S", here/"strings.c"]
 root_objects = []
 for source in sources:
     obj = source.name+".o"
@@ -39,8 +33,8 @@ for source in sources:
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) *(.data*) *(.bss*) } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
-assert (out/"root.bin").stat().st_size < (0x3e000 if watch else 8192)
-elf = (build/(("watch-kernel-" if watch else "kernel-")+variant)/"kernel.elf").read_bytes()
+assert (out/"root.bin").stat().st_size < 0x3e000
+elf = (abi/"kernel.elf").read_bytes()
 assert elf[:6] == b"\x7fELF\x01\x01" and struct.unpack_from("<I",elf,24)[0] == 0xe0000000
 phoff, = struct.unpack_from("<I",elf,28)
 size,count = struct.unpack_from("<HH",elf,42)
@@ -66,13 +60,13 @@ run([ld,"--gc-sections","-T",here/"loader.ld",*objects,"-o","loader.elf"])
 run([objcopy,"-O","binary","loader.elf","zImage"])
 z=(out/"zImage").read_bytes()
 assert struct.unpack_from("<3I",z,36)==(0x016f2818,0,len(z))
-if variant=="fixture":
+if variant=="qemu":
     run(common+["-DIMAGE_BYTES="+str(len(z)),"-c",here/"qemu-entry.S","-o","qemu-entry.o"])
     run([objcopy,"-O","binary","-j",".text","qemu-entry.o","entry.bin"])
-if variant=="measured":
+if variant=="moto":
     sys.path.insert(0,str(repo/"tools"))
     from phone_image import rebuild_v2
-    stock=next((repo/"build/xt2163dl").glob("*/stock/boot.img")).read_bytes()
+    stock=Path(stock_path).read_bytes()
     assert hashlib.sha256(stock).hexdigest()=="36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a"
     image=rebuild_v2(stock,kernel=z)
     (out/"boot.img").write_bytes(image)

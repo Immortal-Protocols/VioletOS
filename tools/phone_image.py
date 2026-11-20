@@ -1,15 +1,7 @@
 """Rebuild Android boot images locally, including a stock v2 round-trip check."""
-import argparse
 import hashlib
 import struct
-from pathlib import Path
 
-PAGE = 4096
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def aligned(size):
-    return ((size + PAGE - 1) // PAGE) * PAGE
 
 
 # Size fields in Android boot_img_hdr_v2, in on-disk section order.
@@ -71,37 +63,17 @@ def rebuild_v2(stock, replacement=None, *, kernel=None):
     return bytes(rebuilt)
 
 
-def repack(stock, ramdisk):
-    if stock[:8] == b"ANDROID!" and len(stock) >= 44 and struct.unpack_from("<I", stock, 40)[0] == 2:
-        return rebuild_v2(stock, ramdisk)
-    if len(stock) < PAGE or stock[:8] != b"ANDROID!":
-        raise ValueError("Expected a raw Android boot.img")
-    kernel_size, old_size, _, header_size = struct.unpack_from("<4I", stock, 8)
-    version, = struct.unpack_from("<I", stock, 40)
-    if (version, header_size) not in {(3, 1580), (4, 1584)}:
-        raise ValueError("Unsupported Android boot header version or size")
-    offset = PAGE + aligned(kernel_size)
-    if not kernel_size or not old_size or offset + old_size > len(stock):
-        raise ValueError("Invalid kernel or stock ramdisk extent")
-    hdr = bytearray(stock[:PAGE])
-    struct.pack_into("<I", hdr, 12, len(ramdisk))
-    if version == 4:
-        struct.pack_into("<I", hdr, 1580, 0)
-    return bytes(hdr) + stock[PAGE:offset] + ramdisk.ljust(aligned(len(ramdisk)), b"\0")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stock", type=Path, help="boot.img from the exact XT2163DL installed build")
-    parser.add_argument("output", type=Path, help="new output file (must not already exist)")
-    parser.add_argument("--stock-roundtrip", action="store_true",
-                        help="reassemble v2 factory components and retain the original trailer after byte comparison")
-    args = parser.parse_args()
-    stock = args.stock.read_bytes()
-    if args.stock_roundtrip:
-        data = rebuild_v2(stock)
-    else:
-        data = repack(stock, (ROOT / "build/violet-armv7.cpio.gz").read_bytes())
-    with args.output.open("xb") as output:
-        output.write(data)
-    print(f"Created {args.output} ({len(data):,} bytes)")
+def factory_dtb(stock):
+    """Extract the single MT6765 base tree from the pinned Motorola image."""
+    if hashlib.sha256(stock).hexdigest() != "36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a":
+        raise ValueError("expected the XT2163DL S3RHS32.20-42-13-2-3-2 factory boot image")
+    page, version = struct.unpack_from("<II", stock, 36)
+    start = page
+    for field in (8, 16, 24, 1632):
+        size, = struct.unpack_from("<I", stock, field)
+        start += (size + page - 1) // page * page
+    magic, total, _, entry_size, count, entries = struct.unpack_from(">6I", stock, start)
+    assert version == 2 and magic == 0xd7b7ab1e and count == 1 and entry_size == 32
+    size, offset = struct.unpack_from(">II", stock, start + entries)
+    assert offset + size <= total and struct.unpack_from(">II", stock, start + offset) == (0xd00dfeed, size)
+    return stock[start + offset:start + offset + size]

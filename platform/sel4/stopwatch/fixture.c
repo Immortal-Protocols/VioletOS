@@ -26,6 +26,7 @@ static void contact(uint8_t *data) {
         if (count==6) {
             for (unsigned j=0;j<6;j++) current[j]=pending[j];
             count=0;
+            break; // Deliver down and up on separate guest polls, even for a fast click.
         }
     }
     for (unsigned j=0;j<6;j++) data[j]=current[j];

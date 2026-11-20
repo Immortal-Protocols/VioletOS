@@ -1,5 +1,6 @@
 """Boot the seL4 fixture and read each stopwatch digit from the framebuffer."""
 from pathlib import Path
+import sys
 import argparse
 import os, subprocess, time, json, struct, re, tty
 parser=argparse.ArgumentParser()
@@ -9,17 +10,10 @@ parser.add_argument("--spi", choices=modes, default="normal")
 args=parser.parse_args()
 enabled=args.watchdog_enabled
 repo=Path(__file__).resolve().parents[3]
-out=repo/"build/spike2/stopwatch-fixture"
-dt=out/"handoff.dtb"
-dt.write_bytes((out.parent/"factory-base.dtb").read_bytes())
-for path,hexdata in re.findall(r"^DT (\S+)\n((?: [\da-f ]+\n)+)",(out.parent/"live-board.txt").read_text(),re.M):
-    node,prop=path.rsplit("/",1)
-    subprocess.run(["fdtput","-p","-t","bx",dt,node,prop,*hexdata.split()],check=True)
-cmd=["qemu-system-arm","-machine","virt,gic-version=3,virtualization=on","-cpu","max","-m","1G","-display","none","-serial","pty","-qmp","stdio","-monitor","none","-no-reboot"]
-for name,addr,pc in [("zImage","0x45000000",""),("handoff.dtb","0x47880000",""),("entry.bin","0x44000000",",cpu-num=0")]:
-    cmd+=["-device",f"loader,file={out/name},addr={addr},force-raw=on{pc}"]
-cmd+=["-device",f"loader,addr=0x49000000,data={int(enabled)},data-len=4"]
-cmd+=["-device",f"loader,addr=0x49000010,data={modes.index(args.spi)},data-len=4"]
+sys.path.insert(0,str(repo/"tools"))
+from run import IMAGE, machine
+out=IMAGE
+cmd=machine(watchdog=enabled, scenario=modes.index(args.spi))+["-serial","pty","-qmp","stdio"]
 p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
 try:
     while True:

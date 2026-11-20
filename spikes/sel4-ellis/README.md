@@ -1,5 +1,7 @@
 # Spike 2 · seL4 on the Moto G Pure XT2163DL
 
+Historical bring-up log. Paths and commands below refer to the spike as it ran. See the [current build and architecture guide](../../README.md) for the maintained targets.
+
 The comparison target is the Linux slot B build on this handset: a visible clock, opening Stopwatch with a physical tap, and advancing digits after Start. A Linux display and a registered input node alone were insufficient during the original bring-up.
 
 ## Mac-side board build

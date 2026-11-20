@@ -1,4 +1,4 @@
-# Compile-only Ellis kernel based on the factory device description.
+# Ellis platform for the handset and its QEMU test configuration.
 declare_platform(ellis KernelPlatformEllis PLAT_ELLIS KernelArchARM)
 if(KernelPlatformEllis)
     declare_seL4_arch(aarch32)
