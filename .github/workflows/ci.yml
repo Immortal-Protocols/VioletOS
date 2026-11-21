@@ -61,5 +61,7 @@ jobs:
         run: make build/simulator build/sel4/VioletOS.app/Contents/MacOS/viewer build/moto-debug build/moto-package
       - name: Test touch, storage and isolation
         run: make test-emulator test-storage test-isolation
-      - name: Test lifecycle, updates, Wi-Fi and power
-        run: make test-stack test-apps test-wifi test-power
+      - name: Test lifecycle and package updates
+        run: make test-stack test-apps
+      - name: Test Wi-Fi and power
+        run: make test-wifi test-power
