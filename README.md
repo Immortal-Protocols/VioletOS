@@ -31,7 +31,7 @@ For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Androi
 
 ## Continuous integration
 
-[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds seL4 and runs the headless QEMU suites for touch, isolation, storage, app lifecycle, updates, Wi-Fi and power. The macOS job compiles the SDL simulator, emulator viewer and both USB clients.
+[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the seL4 image and tests the stopwatch logic. The macOS job compiles the SDL simulator, emulator viewer and both USB clients, then runs the headless QEMU suites for touch, isolation, storage, app lifecycle, updates, Wi-Fi and power.
 
 The Moto image and Moto supervisor tests require local factory files. Physical USB and Wi-Fi tests run on the handset. The public HTTPS endpoint test is available separately as `make test-wifi-live`.
 
