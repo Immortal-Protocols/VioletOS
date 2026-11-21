@@ -133,11 +133,24 @@ try:
                         if time.monotonic()>deadline:raise AssertionError((expected,status()))
                         time.sleep(.05)
                 else:assert status()==(1,3,0),status()
-                time.sleep(.5)
+                def wait_for_label(y, expected):
+                    deadline = time.monotonic() + 5
+                    while True:
+                        actual = read_label(y, len(expected), 0xffeeeaf8)
+                        if actual == expected:
+                            return
+                        if time.monotonic() >= deadline:
+                            raise AssertionError((expected, actual))
+                        time.sleep(.05)
+
+                # The catalog status advances before the replacement processes
+                # and touchscreen are ready to accept input.
+                wait_for_label(32, "TOUCH READY")
+                wait_for_label(104, "VIRTUAL RADIO ONLINE")
                 tap(1140)
-                check_label(104,"VIRTUAL RADIO OFF",0xffeeeaf8)
+                wait_for_label(104, "VIRTUAL RADIO OFF")
                 tap(1140)
-                check_label(104,"VIRTUAL RADIO ONLINE",0xffeeeaf8)
+                wait_for_label(104, "VIRTUAL RADIO ONLINE")
                 print("Guest service package transaction:",args.library,status())
                 sys.exit(0)
             library()
