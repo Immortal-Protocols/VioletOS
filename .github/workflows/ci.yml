@@ -1,0 +1,57 @@
+name: Build and test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qemu:
+    name: seL4 build and QEMU tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler ninja-build python3-venv qemu-system-arm
+          ndk_version=28.2.13676358
+          if [[ ! -f "$ANDROID_HOME/ndk/$ndk_version/source.properties" ]]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
+          fi
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
+          rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi
+          rustup override set 1.91.1
+      - name: Build the QEMU image and test stopwatch logic
+        run: |
+          make qemu-image
+          rustc --edition=2021 --test apps/stopwatch/state.rs -o build/state-tests
+          build/state-tests
+      - name: Test touch, storage and isolation
+        run: make test-emulator test-storage test-isolation
+      - name: Test lifecycle, updates, Wi-Fi and power
+        run: make test-stack test-apps test-wifi test-power
+
+  mac:
+    name: macOS simulator and developer tools
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install SDL and libusb
+        run: brew install sdl2 libusb pkgconf
+      - name: Build simulator, emulator viewer and USB clients
+        run: make build/simulator build/sel4/VioletOS.app/Contents/MacOS/viewer build/moto-debug build/moto-package
