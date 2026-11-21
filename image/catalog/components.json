@@ -1,0 +1,49 @@
+[
+  {
+    "id": 1,
+    "name": "launcher",
+    "required": true
+  },
+  {
+    "id": 2,
+    "name": "stopwatch",
+    "required": false,
+    "title": "STOPWATCH"
+  },
+  {
+    "id": 3,
+    "name": "runtime",
+    "required": true
+  },
+  {
+    "id": 4,
+    "name": "touch",
+    "required": true
+  },
+  {
+    "id": 5,
+    "name": "display",
+    "required": true
+  },
+  {
+    "id": 6,
+    "name": "storage",
+    "required": false
+  },
+  {
+    "id": 7,
+    "name": "radio",
+    "required": false
+  },
+  {
+    "id": 8,
+    "name": "power",
+    "required": false
+  },
+  {
+    "id": 10,
+    "name": "wifi",
+    "required": false,
+    "title": "WI-FI SETUP"
+  }
+]

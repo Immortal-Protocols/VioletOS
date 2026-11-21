@@ -1,3 +1,111 @@
 # Moto G Pure
 
 The XT2163DL target boots seL4 on the physical handset and drives its display and touchscreen. The tested Rust build opened, started, paused and reset the stopwatch on slot B. Run `make moto` using the [factory inputs documented in the main README](../../README.md#handset-build-and-validation) to produce a local boot image.
+
+The handset runs the shared supervisor, Runtime, launcher, stopwatch, display and catalog manager. The touch process owns the MT6765 SPI3, pin, clock and watchdog registers. The earlier RAM-only image passed the physical Start → Home → Stopwatch check.
+
+## Handset storage
+
+The storage image includes the same checkpoint and private-file implementation as QEMU. The [Moto driver](emmc.rs) uses MSDC0 to read or write one 512-byte eMMC sector and waits for the card to finish programming. If the inherited card cache is enabled, Flush also issues the eMMC cache-flush command. The [mount check](storage_volume.rs) verifies both GPT checksums, the exact factory boot B bounds (sectors 2,000,896 through 2,066,431), the Android boot header, and a VioletOS volume marker.
+
+The image builder puts the marker 16 MiB into boot B and initializes the following 1 MiB for VioletOS. Files and checkpoints survive a normal reboot; reinstalling this complete image initializes the volume again. A failed mount leaves applications in RAM-only mode with a diagnostic on Home when available.
+
+For hardware acceptance, check for **DISK READY**, then start and pause Stopwatch. Record the displayed time, reboot B without reflashing, and reopen Stopwatch to compare the restored time.
+
+## Handset power and Wi-Fi bring-up
+
+The Power package owns the MT6765 PMIC wrapper. It checks the MT6357 chip identity, requests a battery ADC conversion and reports millivolts. Screen blanking keeps touch running. The confirmed Off action requests shutdown by releasing the PMIC power-hold bit. Verify the voltage, tap-to-wake and shutdown on the handset. The QEMU power test exercises the virtual power backend.
+
+## Round one on slot B
+
+The Moto radio remains idle at Home. **Scan Wi-Fi** starts the first hardware access by the radio service and the passive scan. Home remains usable while Radio works. The test listens on 2.4 GHz channels 1–11. A completed scan displays the first visible network name, a hidden-network result or an empty result. The UUID HTTPS test requires association and an IP connection.
+
+The loader selects the Ellis antenna profile from the bootloader’s device and radio identifiers. It checks the RAM layout and uses the factory secure-monitor interface for the 4 MiB connectivity window and separate 3 MiB DMA pool. Unknown profiles or conflicting memory protections stop the scan. The Radio process reads the factory firmware bundle from a separate read-only mapping. The connectivity processor must return its ROM-start signature before the driver sends the MCU patch over BTIF or submits WLAN commands over AXI.
+
+The driver checks each firmware configuration acknowledgement, waits for WLAN readiness and sends the firmware a passive scan request with no probe requests. A completed scan requires a matching scan sequence, firmware completion state and all eleven channels. The network name comes from a received beacon or probe response. After sampling, the driver stops DMA and requests domain and regulator cleanup.
+
+## Reading the result
+
+With USB connected, run `make moto-debug` on the Mac. The read-only reader reports firmware bytes staged, regulator acknowledgements, chip ID, ROM mailbox, scan stage and result, received frame count, completed channels, first SSID and cleanup status. Home shows the result as well. The launcher’s private `radio-probe` file holds the last returned status.
+
+| Diagnostic | Meaning |
+| --- | --- |
+| 2–10 | Initial power state, power controller, regulator, clock, chip identity or bus protection |
+| 12–16 | ROM version, EMI remap, ROM-start timeout, memory permissions or antenna profile |
+| Stage 20, 26–30 | BTIF query, patch transfer, framing switch, antenna configuration, calibration or WLAN power-on |
+| Errors 21–25 | BTIF transmit or receive timeout, invalid frame, unexpected reply or patch header |
+| Errors 31–36 | Controller ownership, idle state, DMA ring setup, transmit or receive descriptor |
+| Stage 37–40 | WLAN firmware upload, firmware start, WLAN readiness and passive scan |
+| Errors 37–42 | Upload rejection, start rejection, readiness or scan timeout, or missing firmware reply |
+| Result 43 | Firmware completed the requested scan |
+| Cleanup 44 | DMA did not acknowledge idle. The driver retains power and the reserved memory. |
+
+Run `make test-moto-radio` for the factory-firmware tests, memory-protection tests and register-level driver fixtures, including timeout and rejection paths. `make test-moto-ui` checks the handset application catalog in QEMU with virtual peripherals. Physical radio startup, scan results and USB enumeration remain handset measurements.
+
+The full slot B image initializes the 1 MiB VioletOS volume inside it. Flashing this image clears saved VioletOS files and stopwatch times. The previously tested battery image is the recovery image for this round.
+
+During handset startup the loader draws a white band before relocating seL4. An amber square on the band means the relocated kernel copy completed. Green blocks above the band mark supervisor progress, from left to right: initial framebuffer mapping, core processes prepared, service workers wired, and Launcher started. The first normal screen replaces these marks. The loader reloads the inherited watchdog during bounded memory copies and leaves its reset policy in place.
+
+`make test-moto-ui` boots the Moto loader, supervisor and catalog with QEMU’s interrupt controller and synthetic board handoff. It checks the four supervisor stages in guest memory. A separate run checks interactive stopwatch behavior with QEMU peripherals. Physical USB enumeration and reception of Wi-Fi beacons require handset evidence.
+
+The November 20 handset trials did not produce a USB Wi-Fi result. The first image (`2d15ea03f183`) reached a visible white band and fell back to Android A. The second (`34f8a2b6b01b`) showed a white band and a green streak, followed by apparent restarts. The observed marks did not identify a specific supervisor stage. Neither trial establishes that the Wi-Fi chip received a scan command.
+
+
+Three dedicated sectors after the VioletOS volume hold an image marker and alternating boot records. The loader checks the live GPT and both volume markers before writing. Each stage must flush and read back successfully. On the next VioletOS boot, **LAST** and a digit show the last committed stage. USB reports the same value as `previous_boot_stage`. Zero means a fresh history. 4294967295 means the loader could not read or update it. Android on A does not need to mount the VioletOS volume.
+
+| Last stage | What finished |
+| --- | --- |
+| 1 | Loader opened the validated history area |
+| 2 | Firmware handoff and memory-policy check finished |
+| 3 | Loader prepared the jump to seL4 |
+| 4 | seL4 ran the supervisor, which mapped the eMMC controller |
+| 5 | Supervisor finished wiring the processes |
+| 6 | Storage process opened the volume |
+
+The first five stages precede the storage process taking ownership of eMMC. A reset before the first durable update cannot record a new stage. The record identifies the last completed write and has no reset-cause information.
+
+On the XT2163DL, slot B image `6b1784307ba4` reached Home with the Stopwatch button visible and Wi-Fi left idle. This build uses a 720-pixel pitch for the boot diagnostics, a dedicated 32 KiB storage stack, and startup that allows Home to draw while touch and storage initialize. The Mac USB diagnostic reader did not receive a reply during the Home check. Wi-Fi scanning was not exercised in this trial.
+
+Slot B installer image `07a0a5c68ed0` includes USB package transfer, two persistent catalog banks, and the Wi-Fi memory-policy diagnostic. Fastboot confirmed the 19,459 KiB write to `boot_b` and slot B selection on the XT2163DL. The embedded Radio payload checksum is `d0b9b77e`; the 24,608-byte R2 update has payload checksum `300e82e3`. Those are the expected values for the Mac installer status before and after updating. The full-image flash alone establishes neither update activation nor checkpoint persistence. See the [package transfer procedure](../../system/package-manager/README.md#moto-developer-packages).
+
+On installer build `07a0a5c68ed0`, the handset displayed `USB 5 LINK 99`. The Mac detected the connection and repeatedly rejected the initial device descriptor because it read 111 for endpoint zero's maximum packet size. The compiled descriptor specifies 64. Build `fd5dd9d066ca` acknowledges the incoming setup packet, waits for the receive-ready bit to clear, and then writes the reply into the shared FIFO. This ordering follows Motorola's [endpoint-zero driver](https://github.com/MotorolaMobilityLLC/kernel-mtk/blob/MMI-S3RHS32.20-42-10-4-11/drivers/misc/mediatek/usb20/musb_gadget_ep0.c). The Moto Home and stopwatch tests passed under QEMU. USB enumeration requires a physical handset test.
+
+The XT2163DL enumerated as **VioletOS Diagnostics** at 12 Mbps on macOS with build `fd5dd9d066ca`. Over USB, `moto-package status` reported factory Radio `031a79f6`, bank 0, and an empty inbox. `moto-debug` reported generation 1, touch ready, disk ready and zero recorded faults. The R2 package prepared for the live update has Radio payload checksum `300e82e3`.
+
+With Stopwatch paused at 2.7 seconds, the Mac sent Radio R2 over the running VioletOS USB connection. The handset reported package ID 7 and 24,608 of 24,608 bytes received. Before on-device install confirmation, the active checksum remained `031a79f6` in factory bank 0.
+
+After the handset install confirmation, the Mac read active Radio checksum `300e82e3` in catalog bank 2 and an empty inbox. The running supervisor reported generation 2, zero recorded faults, and disk ready. This confirms live activation on the handset without another boot-image flash.
+
+After a physical restart through the startup menu, fastboot reported slot B selected. A plain reboot started that same image. At 8.5 seconds into the new boot, USB reported Radio checksum `300e82e3`, catalog bank 2, generation 1, previous boot stage 6, and disk ready. This confirms that the USB-installed Radio persisted across a handset reboot.
+
+After reopening Stopwatch on that boot, the tester read 2.7 seconds, exactly matching the paused value before the USB transfer. The active Radio checksum was verified over USB and the restored time was verified on the handset screen.
+
+**Hands-free Radio update on the XT2163DL.** After one bootstrap flash of developer image `d396cf7bb732`, `tools/moto-reboot-check --install-radio build/sel4/moto/radio-r2.vpk` completed from the Mac. The fresh test volume contained a deliberately seeded 4.1-second checkpoint. USB reported factory Radio `7e81a913` in bank 0, then R2 `300e82e3` in bank 2 after signed activation. The Mac requested a physical reboot. VioletOS returned at generation 1 with previous boot stage 6, R2 in bank 2 and the same 4.1-second checkpoint. Activation, reboot and both checkpoint comparisons ran without handset input.
+
+Signed Radio R3 (`17d7889e`) exposed the loader's Wi-Fi prerequisite values over USB while idle on the XT2163DL. The Mac read RF profile 2 and policy `0x10`: the region 25 readback failed the loader's empty-or-expected mapping check. Firmware bytes staged, channels completed and received frames were all zero. The Wi-Fi hardware had not associated and the UUID request was not issued. Diagnostic boot image `eddc23577c73` also captures the four raw secure-monitor replies for each of regions 25 and 29. This allows the Mac to distinguish unexpected bounds, unexpected permissions and possible firmware error returns.
+
+On the handset, diagnostic image `eddc23577c73` reached VioletOS after reselecting slot B following an initial fallback to Android A. All eight secure-monitor reads (start, end and two permission words for each of regions 25 and 29) returned `0xffffffff`. The original `0x10` classification therefore did not establish an occupied memory range. No Wi-Fi firmware was staged and no scan ran. The source now distinguishes an all-ones read failure from a conflicting region and still stops before configuring either window.
+
+### Runtime Wi-Fi memory interface
+
+In the new Moto baseline, the loader stages the firmware bundle and identifies the antenna profile. Radio requests a fresh memory inspection when it starts, including after a signed Radio-only update. Before a scan it requests preparation through the same supervisor endpoint. Both requests use key `RADIO_MEMORY` (`0x4058`). `GET` reads the windows and `EXECUTE` may prepare empty ones. The value selects automatic (0), primary (1), or offset (2) readback. The supervisor checks the caller's Radio badge and returns the policy status in the result value.
+
+The Ellis AArch32 kernel extension gives the supervisor one board-specific capability in the reserved SMC slot. Its two operations are limited to the connectivity and DMA windows. The offset reader also checks the AP reference window. The supervisor checks the antenna profile and power state before preparation. General secure-monitor calls are unavailable through this interface. This local kernel extension has been exercised in tests and has no formal verification claim.
+
+Use `build/moto-package scan-wifi` from the Mac while Home is visible. `build/moto-debug` reports completed runtime memory checks, the raw window replies and scan results. The QEMU firmware fixture returns unsupported reads. `python3 targets/moto-g-pure/test_boot.py --radio-package build/sel4/moto/radio-r4.vpk` exercises a separately built replacement Radio's startup IPC on the same QEMU kernel, without simulating a successful Wi-Fi scan.
+
+On the physical XT2163DL, slot B baseline `3037d4f95c73` completed one runtime memory inspection at startup. Signed Radio R4 (`239e269d`) activated over USB in catalog bank 2, advanced the supervisor generation to 2, and completed a second inspection without a handset reboot. Sending `scan-wifi` from the Mac triggered the third call (preparation). Radio returned probe status 15 and memory policy `0x42`: primary window reads returned all ones and the alternate reader failed its AP reference-range check. USB reported zero firmware bytes staged, zero channels completed, and no process faults. No network association or UUID request occurred.
+
+### WPA2-Personal and the HTTPS test
+
+The Moto Radio package controls Wi-Fi startup, loads the vendor firmware, scans, authenticates with the selected access point, and runs the WPA2 four-way handshake. It requests the fixed power, memory and entropy operations from the supervisor. Radio owns the IPv4, DHCP, DNS, TCP and TLS clients. The Wi-Fi app displays the UUID returned by the HTTPS endpoint. The current station configuration supports WPA2-Personal with CCMP on the listed non-DFS channels and requires a network that permits association without mandatory protected management frames.
+
+The ABI 3 Moto Radio package uses 128 KiB of private working memory supplied by the supervisor. The matching baseline supports signed Radio-only USB updates. With Home visible, run `tools/moto-wifi-profile` in a private terminal to provision the network for this boot, then run `build/moto-package join-wifi` to scan, join, and fetch the UUID. The provisioner transfers the derived key and Mac time over the developer USB cable. Runtime grants the Wi-Fi app access to the connection and test operations. The supervisor releases the key only to Radio. Use a trusted USB host with this developer image.
+
+`make test-moto-radio` checks firmware command and frame handling and exercises WPA2 with a fixture access point. `make test-moto-ip-live` runs the handset's IP and TLS client on the host with libslirp providing the test Ethernet link.
+
+On the physical XT2163DL, slot B image `4be2ac63c17e` with signed Radio `ca18deb9` completed a passive scan on all 20 configured channels. USB reported three received beacons or probe responses and zero process faults. The run used a Radio-only USB update. Signed Radio `c90eb9e1` then joined the provisioned WPA2 network, obtained a DHCP lease and fetched two distinct UUIDv4 responses over verified HTTPS on the same handset connection. The Mac used USB to request each test and read the result. The profile is held in memory for the current boot.
+
+## USB diagnostics
+
+The current build ships [USB Diagnostics](../../services/usb-diagnostics/README.md) as its own signed-update target. Its service guide covers the Mac clients, live package replacement and recovery tests.
