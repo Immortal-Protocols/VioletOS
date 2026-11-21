@@ -47,7 +47,7 @@ These three design-review slides describe the planned architecture. The componen
 
 ![Proposed VioletOS processes, services, kernel, boot and recovery components across the three environments.](docs/violetos-complete-lifecycle-stack.png)
 
-![One directory and README for each of the 17 architecture boxes.](docs/violetos-folders-layer-cake.png)
+![Component directories, the Moto USB Diagnostics process and the Mac diagnostic tools.](docs/violetos-folders-layer-cake.png)
 
 ![Proposed Subscribe, Get and Execute operations and independent component update rules.](docs/violetos-runtime-contract-updates.png)
 
