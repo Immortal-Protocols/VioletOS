@@ -133,24 +133,26 @@ try:
                         if time.monotonic()>deadline:raise AssertionError((expected,status()))
                         time.sleep(.05)
                 else:assert status()==(1,3,0),status()
-                def wait_for_label(y, expected):
-                    deadline = time.monotonic() + 5
+                def wait_for_label(y, expected, seconds=5):
+                    deadline = time.monotonic() + seconds
                     while True:
                         actual = read_label(y, len(expected), 0xffeeeaf8)
-                        if actual == expected:
-                            return
-                        if time.monotonic() >= deadline:
-                            raise AssertionError((expected, actual))
+                        if actual == expected or time.monotonic() >= deadline:
+                            return actual
                         time.sleep(.05)
 
-                # The catalog status advances before the replacement processes
-                # and touchscreen are ready to accept input.
-                wait_for_label(32, "TOUCH READY")
-                wait_for_label(104, "VIRTUAL RADIO ONLINE")
+                assert wait_for_label(32, "TOUCH READY") == "TOUCH READY"
+                online, offline = "VIRTUAL RADIO ONLINE", "VIRTUAL RADIO OFF"
+                assert wait_for_label(104, online) == online
                 tap(1140)
-                wait_for_label(104, "VIRTUAL RADIO OFF")
+                if args.library == "radio-rollback" and wait_for_label(104, offline, 1) != offline:
+                    # The previous Home frame can remain visible as the restarted
+                    # guest takes over. An early touch can land during that handoff.
+                    if read_label(104, len(online), 0xffeeeaf8) == online:
+                        tap(1140)
+                assert wait_for_label(104, offline) == offline
                 tap(1140)
-                wait_for_label(104, "VIRTUAL RADIO ONLINE")
+                assert wait_for_label(104, online) == online
                 print("Guest service package transaction:",args.library,status())
                 sys.exit(0)
             library()
