@@ -1,6 +1,8 @@
 # Runtime
 
-QEMU apps call the [Rust SDK](sdk.rs). The [Runtime process](process.rs) uses the endpoint badge assigned by seL4 to identify each caller. It controls focus, routes requests to the appropriate service, and lets only the foreground app present pixels or receive touches.
+QEMU apps call the [Rust SDK](sdk.rs). The [Runtime process](process.rs) uses the endpoint badge assigned by seL4 to identify each caller. Its [router](router.rs) controls focus, routes requests to the appropriate service, and lets only the foreground app present pixels or receive touches.
+
+The [Runtime proofs](verify/README.md) check with Kani that, from any reachable state, no app receives another app's touches or service replies, presents while in the background, or reaches another app's storage. CI runs them on every change to `runtime/`.
 
 | App operation | Completion |
 | --- | --- |

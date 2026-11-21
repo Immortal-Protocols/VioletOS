@@ -1,6 +1,7 @@
 //! Shared request cells between Runtime and its service-specific workers.
 //! Release/acquire publishes a complete message across address spaces.
 use crate::protocol::*;
+use crate::router::{present_allowed, storage_route, StorageRoute};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{
@@ -25,6 +26,14 @@ extern "C" {
     fn touch_status() -> *const u8;
     fn touch_event(x: &mut u32, y: &mut u32, down: &mut bool) -> bool;
     fn app_checkpoint(region: u32, save: bool, value: &mut u32) -> bool;
+}
+/// Word in the display lane's page naming the app that may present. Runtime
+/// writes it on every focus or sleep change; the display worker reads it.
+fn presenter_word() -> &'static AtomicU32 {
+    unsafe { &*((BASE + 4096 + 1021 * 4) as *const AtomicU32) }
+}
+pub fn publish_presenter(app: u32) {
+    presenter_word().store(app, Release);
 }
 pub fn queue(lane: u32, index: u32, owner: u32, m: Message) -> bool {
     let c = cell(lane, index);
@@ -86,20 +95,25 @@ fn execute(lane: u32, owner: u32, mut m: Message) -> Message {
             r.key = down as u32;
             r
         }
-        6 if m.key == STATUS => Message::new(STORAGE_DIAGNOSTIC, 0, 0).call(3),
-        6 if m.key == SAVE => {
-            let mut v = m.value;
-            if unsafe { app_checkpoint(region(owner), m.op == EXECUTE, &mut v) } {
-                Message::result(v)
-            } else {
-                Message::error(OFFLINE)
+        6 => match storage_route(owner, &m) {
+            StorageRoute::Diagnostic => Message::new(STORAGE_DIAGNOSTIC, 0, 0).call(3),
+            StorageRoute::Checkpoint(region) => {
+                let mut v = m.value;
+                if unsafe { app_checkpoint(region, m.op == EXECUTE, &mut v) } {
+                    Message::result(v)
+                } else {
+                    Message::error(OFFLINE)
+                }
             }
-        }
-        6 => {
-            m.op = STORAGE_FILE + region(owner);
-            m.call(3)
-        }
-        5 => m.call(4),
+            StorageRoute::File(op) => {
+                m.op = op;
+                m.call(3)
+            }
+            StorageRoute::Reject => Message::error(DENIED),
+        },
+        // A present queued just before a focus change is dropped here.
+        5 if present_allowed(owner, &m, presenter_word().load(Acquire)) => m.call(4),
+        5 => Message::error(DENIED),
         7 => {
             if matches!(m.key, RADIO | PROFILE) && m.op == EXECUTE { m.arg = 0; }
             let reply = m.call(5);

@@ -109,6 +109,7 @@ SECTIONS {
         body = "process::run()"
         if name == "runtime":
             modules["lanes"] = repo / "runtime/lanes.rs"
+            modules["router"] = repo / "runtime/router.rs"
             body = "if identity>=15 {lanes::work(identity-15+4)} else {process::run()}"
         if name == "touch":
             modules.update(

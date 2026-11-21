@@ -1,0 +1,85 @@
+name: Runtime formally verified
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "runtime/**"
+      - "image/packages/build.py"
+      - ".github/workflows/runtime-proofs.yml"
+
+env:
+  KANI_VERSION: "0.68.0"
+  RUST_VERSION: "1.91.1"
+
+jobs:
+  tests:
+    name: Policy tests and Runtime target build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target armv7a-none-eabi
+          rustup default "$RUST_VERSION"
+      - name: Regression scenarios
+        working-directory: runtime/verify
+        run: cargo test --locked
+      - name: Runtime package compiles for the guest
+        # Same crate layout as image/packages/build.py, without linking.
+        run: |
+          mkdir -p build/ci
+          cat > build/ci/runtime.rs <<RS
+          #![no_std]
+          #![allow(dead_code)]
+          #[path="$PWD/runtime/protocol.rs"] mod protocol;
+          #[path="$PWD/runtime/process.rs"] mod process;
+          #[path="$PWD/runtime/lanes.rs"] mod lanes;
+          #[path="$PWD/runtime/router.rs"] mod router;
+          #[panic_handler] fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+          #[no_mangle] pub extern "C" fn component_main(identity: u32) {
+              if identity >= 15 { lanes::work(identity - 15 + 4) } else { process::run() }
+          }
+          RS
+          rustc --edition=2021 --crate-type=staticlib --target=armv7a-none-eabi \
+            -Cpanic=abort -Copt-level=s -Dwarnings build/ci/runtime.rs -o build/ci/runtime.a
+
+  proofs:
+    name: Kani proofs (${{ matrix.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Request proofs are grouped by operation; each group has one proof per app.
+        group: [subscribe, poll, forget, get, execute, other, core]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+            ~/.kani
+          key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+      - name: Install Kani
+        run: |
+          if ! command -v cargo-kani >/dev/null; then
+            cargo install --locked kani-verifier@"$KANI_VERSION"
+          fi
+          cargo kani setup
+      - name: Prove the Runtime policy
+        working-directory: runtime/verify
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          if [ "$GROUP" = core ]; then
+            harnesses="startup_establishes_invariant startup_step_keeps_policy non_apps_are_refused
+                       worker_step_keeps_policy storage_regions_are_private display_shows_only_the_presenter"
+          else
+            harnesses="$GROUP::"
+          fi
+          args=()
+          for h in $harnesses; do args+=(--harness "proofs::$h"); done
+          cargo kani -Z stubbing -j "$(nproc)" --output-format terse "${args[@]}"
