@@ -11,7 +11,8 @@ VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. T
 | `make emulator` | A clickable seL4 window. Open **Stopwatch**, click **Start**, then try **Pause** and **Reset**. Close the window or press Escape to quit. |
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering stopwatch behavior, touch transfer failures, recovery and watchdog handling. The tests read the guest's rendered pixels. |
-| `make test-storage` | Boots five QEMU guests against a disposable disk and verifies recovery from the rendered digits. |
+| `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
+| `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally. Installing it is a separate operation. |
 
@@ -29,7 +30,9 @@ This slide from the original design review shows the proposed stack. Its Linux l
 
 ![Proposed architecture with the shared UI above Rust services and Microkit and seL4, followed by the Mac simulator, QEMU and Moto G Pure targets.](docs/proposed-violetos-stack.png)
 
-**What runs today.** The Moto and QEMU use the same Rust stopwatch and touch protocol. VioletOS boot code sets up the UI and touch driver as separate seL4 tasks. QEMU also runs a storage task that saves the paused time to disk. The Moto keeps that time in RAM. The Mac simulator remains a native SDL application with its own UI. Microkit is used in the isolation experiment.
+**What runs today.** In QEMU, the launcher, stopwatch, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto uses the earlier touch-tested UI and driver with RAM-only stopwatch state. The Mac simulator runs its native SDL UI.
+
+In QEMU, start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance. Reopening it restores the last saved checkpoint. On Home, **Radio** toggles the virtual modem and **Sleep** blanks the display until the next tap. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
 
 ## Proposed components and interfaces
 
@@ -50,26 +53,26 @@ These three design-review slides describe the planned architecture. The componen
 
 | If you want to change… | Start here | Where it runs |
 | --- | --- | --- |
-| A button, stopwatch timing or framebuffer drawing | [ui.c](platform/sel4/stopwatch/ui.c) draws the UI. [stopwatch.rs](platform/sel4/services/stopwatch.rs) owns the state transitions. Both UI implementations use the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
-| How the first task obtains device mappings | [root.c](platform/sel4/stopwatch/root.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
-| How a touch becomes a tap | [touch.rs](platform/sel4/services/touch.rs) initializes the Novatek controller and decodes contacts. [spi.rs](platform/sel4/services/spi.rs) drives each transfer. [spi_mmio.c](platform/sel4/stopwatch/spi_mmio.c) accesses real registers, while [fixture.c](platform/sel4/stopwatch/fixture.c) models them. | Shared driver with one backend per target |
-| How touch events cross address spaces | [events.c](platform/sel4/stopwatch/events.c) handles the request and reply. [root.c](platform/sel4/stopwatch/root.c) grants each task its mappings and endpoint rights. | Moto and QEMU |
-| Durable stopwatch checkpoints | [storage.rs](platform/sel4/services/storage.rs) handles load and save requests, [journal.rs](platform/sel4/services/journal.rs) selects the latest valid record, and [block.rs](platform/sel4/services/block.rs) drives the virtual disk. | QEMU storage task |
+| A button, stopwatch timing or framebuffer drawing | [QEMU app](apps/stopwatch/process.rs) and [handset UI](platform/sel4/stopwatch/ui.c) draw their respective screens. [stopwatch.rs](apps/stopwatch/state.rs) owns the state transitions. Both UI implementations use the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
+| How the first task obtains device mappings | [QEMU supervisor](system/supervisor/qemu.c), [Moto bootstrap](platform/sel4/stopwatch/root.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
+| How a touch becomes a tap | [touch.rs](services/touch/touch.rs) initializes the Novatek controller and decodes contacts. [spi.rs](services/touch/spi.rs) drives each transfer. [spi_mmio.c](targets/moto-g-pure/spi_mmio.c) accesses real registers, while [fixture.c](targets/qemu/fixture.c) models them. | Shared driver with one backend per target |
+| How touch events cross address spaces | [events.c](platform/sel4/stopwatch/events.c) handles the request and reply. The supervisor grants Runtime access to the QEMU touch endpoint. | Moto and QEMU |
+| Durable stopwatch checkpoints | [storage.rs](services/storage/storage.rs) handles load and save requests, [journal.rs](services/storage/journal.rs) selects the latest valid record, and [block.rs](services/storage/block.rs) drives the virtual disk. | QEMU storage task |
 | Watchdog behavior | [watchdog.c](platform/sel4/stopwatch/watchdog.c) | Moto and QEMU userspace |
-| Where seL4 comes from and how it boots | [build_sel4.py](tools/build_sel4.py) pins and fetches upstream seL4, applies the [board configuration](platform/sel4/board/) and builds a kernel per target. The [loader](platform/sel4/loader/) prepares memory and transfers control to the kernel. | Build host and early ARM boot |
+| Where seL4 comes from and how it boots | [Kernel build](kernel/sel4/build.py) pins and fetches upstream seL4, applies the [board configuration](platform/sel4/board/) and builds a kernel per target. The [loader](boot/loader/) prepares memory and transfers control to the kernel. | Build host and early ARM boot |
 | The Moto image layout | [loader/build.py](platform/sel4/loader/build.py) links the payload. [phone_image.py](tools/phone_image.py) reads and packages the Android v2 boot format. | Build host |
 | How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU. [viewer.c](tools/emulator/viewer.c) displays its 720 × 1600 framebuffer and translates mouse events into touch reports. [test.py](platform/sel4/stopwatch/test.py) checks the driver and rendered output. | Mac host |
-| The native simulator | [screen.c](src/screen.c) owns its UI and state. [simulator.c](src/simulator.c) supplies SDL input, display and time. | Native host process |
+| The native simulator | [screen.c](src/screen.c) owns its UI and state. [simulator.c](targets/mac-simulator/simulator.c) supplies SDL input, display and time. | Native host process |
 
-For example, change the **Start** label in `ui.c` and both seL4 targets pick it up. Change `spi_mmio.c` and only the Moto build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
+For example, change the **Start** label in `apps/stopwatch/process.rs` to update the QEMU app. Change `spi_mmio.c` and only the Moto build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
 
 ## Try persistence in QEMU
 
 Open **Stopwatch → Start → Pause** and note the displayed time. Close the emulator, run `make emulator` again, and open **Stopwatch**. The paused time returns. **Reset** saves zero. Closing while the timer runs restores the last saved checkpoint on the next boot.
 
-QEMU uses a dedicated 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest alternates between two 512-byte sectors. Each holds a version marker, generation number, elapsed tenths and CRC. The storage service acknowledges a save after the device flush completes. On startup it chooses the newest valid record. The screen shows **DISK READY** when the service is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails.
+QEMU uses a dedicated 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest allocates two alternating 512-byte sectors per app. Each holds a version marker, generation number, elapsed tenths and CRC. The storage service acknowledges a save after the device flush completes. On startup it chooses the newest valid record. The screen shows **DISK READY** when the service is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails.
 
-The IPC interface currently stores one stopwatch value. A filesystem and physical handset storage are future work. The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
+Runtime identifies the requesting app and selects its private checkpoint. The stopwatch saves elapsed time and the launcher saves its radio preference. A filesystem and physical handset storage are future work. The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
 
 ## Handset build and validation
 

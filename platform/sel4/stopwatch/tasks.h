@@ -12,3 +12,11 @@ bool touch_event(unsigned *x, unsigned *y, bool *down);
 void clock_init(void);
 void storage_task(void);
 bool checkpoint(bool save,unsigned *tenths);
+
+#ifdef VIOLET_COMPONENT
+#define TOUCH_CLIENT_EP 2
+#define STORAGE_CLIENT_EP 3
+#else
+#define TOUCH_CLIENT_EP TOUCH_EP
+#define STORAGE_CLIENT_EP STORAGE_EP
+#endif

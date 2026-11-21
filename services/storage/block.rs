@@ -23,6 +23,7 @@ extern "C" {
 
 pub struct Disk {
     index: u16,
+    pub sectors: usize,
 }
 impl Disk {
     pub fn open() -> Option<Self> {
@@ -69,7 +70,14 @@ impl Disk {
         fence();
         set(0x44, 1);
         set(0x70, 15);
-        Some(Self { index: 0 })
+        Some(Self {
+            index: 0,
+            sectors: if reg(0x104) != 0 {
+                usize::MAX
+            } else {
+                reg(0x100) as usize
+            },
+        })
     }
     fn descriptor(slot: usize, offset: u32, len: u32, flags: u16, next: u16) {
         let p = (DMA + 16 * slot) as *mut u32;
@@ -81,8 +89,8 @@ impl Disk {
         }
     }
     fn request(&mut self, kind: u32, sector: usize, data: &mut Sector) -> Result<(), ()> {
-        // Only sectors zero and one belong to this checkpoint volume.
-        if sector > 1 {
+        // Bound the queue to the two private journals.
+        if sector >= self.sectors.min(4) {
             return Err(());
         }
         let flush = kind == 4;

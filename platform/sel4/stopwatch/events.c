@@ -31,7 +31,7 @@ void touch_task(void) {
 const char *touch_status(void) {
     static char status[STATUS_BYTES];
     seL4_SetMR(0,STATUS);
-    unsigned length=seL4_MessageInfo_get_length(seL4_Call(TOUCH_EP,message(1)));
+    unsigned length=seL4_MessageInfo_get_length(seL4_Call(TOUCH_CLIENT_EP,message(1)));
     if (!length || length>sizeof(status)) return "TOUCH IPC ERROR";
     for (unsigned i=0;i<length;i++) status[i]=seL4_GetMR(i);
     status[length-1]=0;
@@ -39,7 +39,7 @@ const char *touch_status(void) {
 }
 bool touch_event(unsigned *x,unsigned *y,bool *down) {
     seL4_SetMR(0,SAMPLE);
-    if (seL4_MessageInfo_get_length(seL4_Call(TOUCH_EP,message(1)))!=3) return false;
+    if (seL4_MessageInfo_get_length(seL4_Call(TOUCH_CLIENT_EP,message(1)))!=3) return false;
     unsigned flags=seL4_GetMR(0);
     *down=(flags&2)!=0; *x=seL4_GetMR(1); *y=seL4_GetMR(2);
     return flags&1;

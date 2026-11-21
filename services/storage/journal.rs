@@ -1,4 +1,5 @@
-//! One durable stopwatch checkpoint. Each update replaces the older sector.
+//! A pair of sectors holds one app checkpoint. The value field retains its
+//! original stopwatch wire layout. Each update replaces the older sector.
 pub type Sector = [u8; 512];
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Record {

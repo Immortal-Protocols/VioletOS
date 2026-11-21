@@ -31,11 +31,12 @@ sys.path.insert(0,str(app))
 from firmware import prepare
 prepare(out, variant, Path(stock_path).parent)
 sources = [here/"root.S", app/"root.c", app/"events.c", app/"storage_ipc.c", app/"ui.c", app/"watchdog.c",
-           app/("fixture.c" if variant=="qemu" else "spi_mmio.c"), here/"strings.c"]
+           repo/"targets/moto-g-pure/spi_mmio.c", here/"strings.c"]
+if variant=="qemu": sources=[here/"root.S",here/"strings.c"]
 root_objects = []
 for source in sources:
     obj = source.name+".o"
-    run(common + incs + defines + ["-I",out,"-std=gnu11","-c",source,"-o",obj])
+    run(common + incs + defines + ["-I",out,"-I",app,"-std=gnu11","-c",source,"-o",obj])
     root_objects.append(obj)
 rustc = os.environ.get("RUSTC") or shutil.which("rustc")
 if not rustc:
@@ -44,9 +45,26 @@ if not rustc:
         sys.exit("Install Rust and run rustup target add armv7a-none-eabi")
     rustc = local
 os.environ["VIOLET_FIRMWARE_RS"] = str(out/"firmware.rs")
-run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib", *(["--cfg","violet_qemu"] if variant=="qemu" else []),
-     "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
-root_objects.append("services.a")
+if variant=="qemu":
+    sys.path.insert(0,str(repo/"image/packages"))
+    from build import components
+    # Only process-local ABI shims, never the root allocator, enter packages.
+    shims=[]
+    for source in [app/"events.c", app/"storage_ipc.c", app/"watchdog.c", repo/"targets/qemu/fixture.c", here/"strings.c"]:
+        obj=out/("component-"+source.name+".o")
+        run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",app,"-std=gnu11","-c",source,"-o",obj])
+        shims.append(obj)
+    only=os.environ.get("VIOLET_COMPONENT_ONLY")
+    components(repo,out,cc,common,incs,rustc,shims,only)
+    if only: sys.exit(0)
+    (out/"catalog.S").write_text('.section .rodata.catalog,"a"\n.balign 4\n.global builtin_catalog,builtin_catalog_end\nbuiltin_catalog: .incbin "catalog.bin"\nbuiltin_catalog_end:\n.balign 4\n.global recovery_manager\nrecovery_manager: .incbin "packages/package_manager.vpk"\n')
+    run(common+["-c",out/"catalog.S","-o","catalog.o"])
+    run(common+incs+defines+["-I",app,"-std=gnu11","-c",repo/"system/supervisor/qemu.c","-o","supervisor.o"])
+    root_objects=["root.S.o","supervisor.o","strings.c.o","catalog.o"]
+else:
+    run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib",
+         "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
+    root_objects.append("services.a")
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
@@ -69,11 +87,11 @@ fdt = build/"dtc-1.7.2/libfdt"
 ndk = cc.parent.parent/"sysroot/usr/include"
 headers = ["-I"+str(fdt),"-isystem",ndk/"arm-linux-androideabi","-isystem",ndk]
 objects = []
-for source in [here/"loader.S", here/"loader.c", here/"strings.c", out/"payload.S"]+[fdt/(n+".c") for n in ("fdt","fdt_ro","fdt_check","fdt_addresses")]:
+for source in [repo/"boot/loader/loader.S", repo/"boot/loader/loader.c", here/"strings.c", out/"payload.S"]+[fdt/(n+".c") for n in ("fdt","fdt_ro","fdt_check","fdt_addresses")]:
     obj = source.name+".o"
     run(common+defines+headers+["-c",source,"-o",obj])
     objects.append(obj)
-run([ld,"--gc-sections","-T",here/"loader.ld",*objects,"-o","loader.elf"])
+run([ld,"--gc-sections","-T",repo/"boot/loader/loader.ld",*objects,"-o","loader.elf"])
 run([objcopy,"-O","binary","loader.elf","zImage"])
 z=(out/"zImage").read_bytes()
 assert struct.unpack_from("<3I",z,36)==(0x016f2818,0,len(z))

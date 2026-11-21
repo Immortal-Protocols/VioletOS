@@ -1,6 +1,7 @@
 """Boot the seL4 fixture and read each stopwatch digit from the framebuffer."""
 from pathlib import Path
 import sys
+import tempfile
 import argparse
 import os, subprocess, time, json, struct, re, tty
 parser=argparse.ArgumentParser()
@@ -10,17 +11,23 @@ parser.add_argument("--spi", choices=modes, default="normal")
 parser.add_argument("--disk",type=Path)
 parser.add_argument("--checkpoint",choices=["save","restore","reset"])
 parser.add_argument("--expect",type=int, default=0)
-parser.add_argument("--probe",choices=["touch","storage","dma"])
+parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer"])
+parser.add_argument("--stack",choices=["lifecycle","removed","recovered","save-radio","restore-radio"])
+parser.add_argument("--state-dir",type=Path)
+parser.add_argument("--fault-id",type=int,default=7)
 args=parser.parse_args()
 enabled=args.watchdog_enabled
 repo=Path(__file__).resolve().parents[3]
 sys.path.insert(0,str(repo/"tools"))
 from run import IMAGE, machine
-out=IMAGE
+scratch=tempfile.TemporaryDirectory()
+out=Path(scratch.name)
 image=IMAGE/"isolation-test" if args.probe else IMAGE
-cmd=machine(image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
+from manage import launch_catalogs
+catalogs=launch_catalogs(args.state_dir) if args.state_dir else (None,None)
+cmd=machine(catalogs=catalogs,image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
 if args.probe:
-    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000}[args.probe]
+    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000,"scanout":0x08000000,"peer":0x06100000}[args.probe]
     cmd+=["-device",f"loader,addr=0x49300000,data={address},data-len=4"]
 p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
 try:
@@ -44,7 +51,7 @@ try:
             if "error" in msg: raise RuntimeError(msg)
     request("qmp_capabilities",{})
     if args.probe:
-        filename=image/"fault.raw"
+        filename=out/"fault.raw"
         for _ in range(60):
             request("pmemsave",dict(val=0x49300004,size=4,filename=str(filename)))
             if struct.unpack("<I",filename.read_bytes())[0]==address: break
@@ -69,12 +76,66 @@ try:
             if cols not in digits: return None
             result+=str(digits.index(cols))
         return int(result[:2])*600+int(result[2:4])*10+int(result[4])
-    def tap(y):
-        x=360
+    def tap(y,x=360):
         os.write(serial,bytes([9,x>>4,y>>4,((x&15)<<4)|(y&15),1,1]))
         time.sleep(.18)
         os.write(serial,bytes(6));time.sleep(.18)
     time.sleep(1)
+    if args.stack:
+        def words(address,count=1):
+            path=out/"status.raw"
+            request("pmemsave",dict(val=address,size=4*count,filename=str(path)))
+            return struct.unpack("<"+"I"*count,path.read_bytes())
+        if args.stack in ("save-radio","restore-radio"):
+            if args.stack=="save-radio": tap(1140)
+            assert words(0x49001004)==(1,), "launcher preference was lost"
+            tap(920)
+            assert value()==args.expect, "launcher changed stopwatch storage"
+            sys.exit(0)
+        if args.stack=="recovered":
+            if args.fault_id==2:
+                tap(920)  # The stopwatch loads on demand.
+            for _ in range(80):
+                if words(0x49300008,3)==(2,2,args.fault_id): break
+                time.sleep(.05)
+            else: raise AssertionError(("failed recovery",words(0x49300008,3)))
+            time.sleep(.3)
+            from manage import acknowledge_rollback
+            acknowledge_rollback(args.state_dir,catalogs[0].stem,2)
+            if args.fault_id!=7:
+                tap(920)
+                assert value()==0
+                tap(920)
+                assert value()>0
+                print("Recovered and started stopwatch after fault in component",args.fault_id)
+                sys.exit(0)
+        if args.stack=="removed":
+            home=snapshot()
+            tap(920)
+            assert snapshot()==home and value() is None
+        else:
+            tap(1140)
+            assert words(0x49001004)==(1,), "radio did not disable"
+            tap(1140)
+            assert words(0x49001004)==(0,), "radio did not reenable"
+            tap(1420)
+            assert words(0x49002004)==(1,) and len(set(snapshot()[::4]))==1, "display did not sleep"
+            tap(920)
+            assert words(0x49002004)==(0,) and value() is None, "first touch must wake only"
+            tap(920)
+            assert value()==0, "stopwatch did not launch"
+            tap(920)
+            running=value()
+            tap(1420)
+            assert value() is None, "Home did not switch apps"
+            tap(920)
+            assert value()>running, "background stopwatch did not advance"
+            tap(100,530)
+            assert value() is None, "quit did not return Home"
+            tap(920)
+            assert value()==0, "relaunch retained private state"
+        print("QEMU guest passed:",args.stack)
+        sys.exit(0)
     if args.checkpoint:
         tap(920)
         assert value()==args.expect, ("restored value",value(),args.expect)

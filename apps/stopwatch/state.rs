@@ -3,9 +3,9 @@
 #[repr(C)]
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct Watch {
-    tenths: u32,
+    pub tenths: u32,
     remainder: u32,
-    running: bool,
+    pub running: bool,
 }
 
 #[no_mangle]

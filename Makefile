@@ -29,9 +29,9 @@ test-emulator: qemu-image
 	@set -e; for mode in normal delayed drop-before drop-after stuck setup reset1 reset2; do \
 	  $(PYTHON) platform/sel4/stopwatch/test.py --spi $$mode --watchdog-enabled; \
 	done
-build/simulator: src/screen.c src/screen.h src/glyphs.h src/simulator.c
+build/simulator: src/screen.c src/screen.h src/glyphs.h targets/mac-simulator/simulator.c
 	mkdir -p $(@D)
-	$(CC) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) src/screen.c src/simulator.c -o $@ $(shell sdl2-config --libs)
+	$(CC) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) -Isrc src/screen.c targets/mac-simulator/simulator.c -o $@ $(shell sdl2-config --libs)
 sim: build/simulator
 	./build/simulator
 
@@ -40,6 +40,13 @@ test-storage: qemu-image
 	$(PYTHON) platform/sel4/stopwatch/test_storage.py
 test-isolation: setup
 	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu
-	@set -e; for region in touch storage dma; do \
+	@set -e; for region in touch storage dma scanout peer; do \
 	  $(PYTHON) platform/sel4/stopwatch/test.py --probe $$region; \
 	done
+
+.PHONY: test-stack component
+test-stack: qemu-image
+	$(PYTHON) targets/qemu/test_packages.py
+component: setup
+	@test -n "$(NAME)" || (echo "Set NAME to the component name"; exit 1)
+	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py qemu

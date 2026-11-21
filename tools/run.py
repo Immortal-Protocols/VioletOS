@@ -8,9 +8,12 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = ROOT / "build/sel4/qemu"
+sys.path.insert(0,str(ROOT/"system/package-manager"))
+from manage import launch_catalogs, acknowledge_rollback
+
 RAM_SIZE = 1024**3
 
-def machine(image=IMAGE, watchdog=False, scenario=0, disk=None):
+def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None)):
     cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
            "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", "1", "-display", "none",
            "-monitor", "none", "-nic", "none", "-no-reboot"]
@@ -21,7 +24,11 @@ def machine(image=IMAGE, watchdog=False, scenario=0, disk=None):
     for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
                                   ("entry.bin", "0x44000000", ",cpu-num=0")]:
         cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
-    for address, value in [("0x49000000", int(watchdog)), ("0x49000010", scenario)]:
+    for address,path in zip(("0x49400000","0x49500000"),catalogs):
+        if path:
+            if path.stat().st_size>1024**2:raise ValueError("catalog exceeds boot window")
+            cmd+=["-device",f"loader,file={str(path).replace(',', ',,')},addr={address},force-raw=on"]
+    for address, value in [("0x49001000",1),("0x49002000",85),("0x49000000", int(watchdog)), ("0x49000010", scenario)]:
         cmd += ["-device", f"loader,addr={address},data={value},data-len=4"]
     return cmd
 
@@ -45,13 +52,26 @@ def main(viewer):
                 stream.truncate(1024**2)
         except FileExistsError:
             pass
-        cmd = machine(disk=disk) + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
+        state_dir=IMAGE/"installed"
+        catalogs=launch_catalogs(state_dir)
+        selected=catalogs[0]
+        last_source=1
+        cmd = machine(disk=disk,catalogs=catalogs) + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
                            "-machine", "memory-backend=ram", "-serial", "stdio"]
         guest = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
         try:
             window = subprocess.Popen([viewer, ram], stdout=guest.stdin)
             try:
                 while window.poll() is None and guest.poll() is None:
+                    if selected:
+                        with ram.open("rb") as mem:
+                            mem.seek(0x09300008)
+                            generation=int.from_bytes(mem.read(4),"little")
+                            source=int.from_bytes(mem.read(4),"little")
+                        if generation and source!=last_source and source in (0,2):
+                            acknowledge_rollback(state_dir,selected.stem,source)
+                            selected=catalogs[1] if source==2 else None
+                            last_source=source
                     time.sleep(.05)
                 if guest.poll() is not None:
                     raise SystemExit(f"QEMU exited while the window was open (status {guest.returncode})")

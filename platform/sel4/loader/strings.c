@@ -9,3 +9,4 @@ int strcmp(const char *a,const char *b) { while(*a && *a==*b) { ++a; ++b; } retu
 char *strrchr(const char *s,int c) { const char *found=NULL; do { if (*s==c) found=s; } while(*s++); return (char *)found; }
 void __aeabi_memcpy(void *d,const void *s,size_t n) { memcpy(d,s,n); }
 void __aeabi_memclr(void *d,size_t n) { memset(d,0,n); }
+void __aeabi_memclr8(void *d,size_t n) { memset(d,0,n); }

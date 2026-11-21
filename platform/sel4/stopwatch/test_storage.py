@@ -22,4 +22,7 @@ with tempfile.TemporaryDirectory(prefix="violet-storage-test-") as tmp:
         stream.seek(1023)
         stream.write(bytes([last^1]))
     boot("restore",saved)
-    print(f"Five QEMU boots verified pause at {saved/10:.1f}s, durable reset and torn-sector recovery.")
+    for scenario in ("save-radio","restore-radio"):
+        subprocess.run([sys.executable,Path(__file__).with_name("test.py"),"--disk",disk,
+                        "--stack",scenario,"--expect",str(saved)],check=True,timeout=20)
+    print(f"Seven QEMU boots verified independent app storage, pause at {saved/10:.1f}s, durable reset and torn-sector recovery.")
