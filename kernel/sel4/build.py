@@ -70,6 +70,9 @@ def build_target(target,out):
     src=out/"upstream"
     source(KERNEL,src)
     source(DTC,BUILD/DTC[0])
+    if target=="qemu":
+        bear=("bearssl-0.6","https://bearssl.org/bearssl-0.6.tar.gz","6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14")
+        source(bear,BUILD/bear[0])
     board=PORT/"board"
     plat=src/"src/plat/ellis"
     plat.mkdir(exist_ok=True)
@@ -90,7 +93,7 @@ def build_target(target,out):
     kernel=out/"kernel"
     run("cmake","-GNinja","-S",src,"-B",kernel,"-DCMAKE_TOOLCHAIN_FILE="+str(src/"llvm.cmake"),
         "-DTRIPLE=arm-none-eabi","-DPYTHON3="+str(py),"-DKernelPlatform=ellis",
-        "-DKernelSel4Arch=aarch32","-DKernelIsMCS=OFF","-DKernelPrinting=OFF",
+        "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS=OFF","-DKernelPrinting=OFF",
         "-DKernelDebugBuild=OFF","-DKernelVerificationBuild=OFF","-DKernelArmExportVCNTUser=ON")
     generated=["include/sel4/"+f for f in ["shared_types_gen.h","syscall.h","invocation.h"]]
     generated+=["include/interfaces/sel4_client.h","arch_include/arm/sel4/arch/invocation.h",

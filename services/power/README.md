@@ -1,5 +1,5 @@
 # Power service
 
-The [QEMU power process](process.rs) reads a virtual battery level and records sleep and wake requests. Runtime blanks the display on sleep and consumes the first press to wake. The virtual CPU continues executing while the screen sleeps.
+The QEMU power process exposes battery level, sleep, wake and shutdown to Runtime. Tap **Sleep** on Home to blank the display and pause guest execution. The viewer resumes QEMU on the next press. For shutdown, open **Apps**, tap **Off**, then **Confirm**.
 
-Run `make test-stack` to check both the device state and the framebuffer. Hardware suspend, charging and shutdown require a handset implementation.
+Run `make test-power` to send those controls through the guest UI. It checks the virtual machine’s paused and running states via QMP and waits for the guest process to exit after shutdown.

@@ -9,6 +9,8 @@ import subprocess
 
 
 def components(repo, out, cc, common, incs, rustc, objects, only=None):
+    from package_format import package_abi
+
     app = repo / "platform/sel4/stopwatch"
     dest = out / "packages"
     dest.mkdir(exist_ok=True)
@@ -56,12 +58,31 @@ SECTIONS {
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
     names = [item["name"] for item in manifest]
-    if only is not None and only not in [*names,"package_manager"]:
+    external = os.environ.get("VIOLET_APP_DIR")
+    if external:
+        folder = Path(external).resolve()
+        entry = json.loads((folder / "app.json").read_text())
+        if not 11 <= entry["id"] <= 14 or not re.fullmatch(
+            r"[A-Z0-9 -]{1,16}", entry["title"]
+        ):
+            raise ValueError(
+                "app ID must be 11–14 and title must fit 16 display characters"
+            )
+        name = f"app-{entry['id']}"
+        entry["name"] = name
+        entry["entry"] = folder / "process.rs"
+        scripts[name] = entry["entry"]
+        manifest.append(entry)
+        names.append(name)
+        only = name
+    if only is not None and only not in [*names, "package_manager"]:
         raise ValueError(f"Unknown component: {only}")
     os.environ["VIOLET_WATCH_TITLE"] = next(
         item["title"] for item in manifest if item["name"] == "stopwatch"
     )
-    os.environ["VIOLET_WIFI_TITLE"] = next(item["title"] for item in manifest if item["name"]=="wifi")
+    os.environ["VIOLET_WIFI_TITLE"] = next(
+        item["title"] for item in manifest if item["name"] == "wifi"
+    )
     # Package manager is always loaded from the factory recovery image.
     manifest.append({"id": 9, "name": "package_manager"})
     scripts["package_manager"] = repo / "system/package-manager/process.rs"
@@ -72,13 +93,16 @@ SECTIONS {
         modules = {"protocol": repo / "runtime/protocol.rs"}
         if name in scripts:
             modules["process"] = scripts[name]
-        if name in ("stopwatch", "launcher","wifi"):
+        if name in ("stopwatch", "launcher", "wifi") or "entry" in item:
             modules.update(
                 sdk=repo / "runtime/sdk.rs", drawing=repo / "apps/drawing.rs"
             )
         if name == "stopwatch":
             modules["watch"] = repo / "apps/stopwatch/state.rs"
         body = "process::run()"
+        if name == "runtime":
+            modules["lanes"] = repo / "runtime/lanes.rs"
+            body = "if identity>=15 {lanes::work(identity-15+4)} else {process::run()}"
         if name == "touch":
             modules.update(
                 touch=repo / "services/touch/touch.rs",
@@ -99,7 +123,7 @@ SECTIONS {
                 f"#[path={json.dumps(str(v))}] mod {k};\n" for k, v in modules.items()
             )
             + '#[panic_handler] fn panic(_: &core::panic::PanicInfo)->!{unsafe{core::arch::asm!("udf #1",options(noreturn))}}\n'
-            + '#[no_mangle] pub extern "C" fn component_main(){'
+            + '#[no_mangle] pub extern "C" fn component_main(identity:u32){let _=identity;'
             + body
             + "}\n"
         )
@@ -117,6 +141,14 @@ SECTIONS {
                 lib,
             ]
         )
+        tls_objects = []
+        if name == "radio":
+            import sys
+
+            sys.path.insert(0, str(repo / "services/radio"))
+            from build_tls import build
+
+            tls_objects = build(repo, out, common)
         elf = dest / (name + ".elf")
         run(
             [
@@ -127,6 +159,7 @@ SECTIONS {
                 "--start-group",
                 transport,
                 *objects,
+                *tls_objects,
                 lib,
                 "--end-group",
                 "-o",
@@ -151,8 +184,18 @@ SECTIONS {
                 image[s[3] - 0x100000 : s[3] - 0x100000 + s[5]] = data[
                     s[4] : s[4] + s[5]
                 ]
+        if "entry" in item:
+            image += b"APP1" + item["title"].encode("ascii").ljust(16, b"\0")
+            if len(image) > 65512:
+                raise ValueError("application exceeds 64 KiB package slot")
         header = struct.pack(
-            "<4s5I", b"VPK1", 1, item["id"], code[5], len(image), binascii.crc32(image)
+            "<4s5I",
+            b"VPK1",
+            package_abi(item["id"]),
+            item["id"],
+            code[5],
+            len(image),
+            binascii.crc32(image),
         )
         (dest / (name + ".vpk")).write_bytes(header + image)
     if only:

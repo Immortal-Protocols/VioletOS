@@ -1,5 +1,5 @@
 # Process supervisor
 
-The [QEMU first task](qemu.c) constructs each component's address space, thread and endpoint permissions. It starts the launcher at boot, resumes the stopwatch on Open, and resets the stopwatch's private execution state on Quit.
+The [QEMU first task](qemu.c) constructs address spaces, threads and endpoint permissions. It starts the launcher, Runtime and services, opens apps on demand, and reinitializes private execution state on Quit. Each Runtime worker can contact its assigned service. Only display holds the scanout mapping.
 
-On a managed process fault it suspends the group, revokes its resources and reconnects fresh processes. A fault with a staged catalog selects the previous compatible catalog or falls back to the factory image. After five unsuccessful generations it stops recovery. Run `make test-stack` to exercise replacement failure and check that the recovered launcher and stopwatch work.
+The supervisor receives kernel fault messages and monitors in-flight service calls. Runtime and the foreground app also have progress deadlines. After a fault or a 20-second stall it restarts the managed group and attempts the previous catalog. A failed guest-installed catalog is retired on disk. Repeated failures during startup stop the recovery loop. Run `make test-stack` and `make test-apps` for fault, hang and cold-boot rollback checks.

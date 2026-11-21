@@ -7,7 +7,7 @@ pub struct Record {
     pub tenths: u32,
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in data {
         crc ^= u32::from(b);

@@ -1,5 +1,7 @@
 # Radio service
 
-The launcher controls airplane mode. Wi-Fi Setup uses Runtime to associate with the modeled open network and request a [gateway test](gateway.rs). The radio process owns a virtio network device and a dedicated DMA page. It sends an ARP request for 10.0.2.2 and verifies the reply's sender, destination and operation. A missing response times out.
+Wi-Fi Setup scans the QEMU network profiles, selects one by stable ID and remembers the choice on disk. Set `VIOLET_NETWORKS='["VIOLET LAB","GUEST WIFI"]'` to change the available names. These are virtual open access points sharing one Ethernet uplink. The Moto still needs its own Wi-Fi driver and authentication implementation.
 
-QEMU uses a restricted user-mode network. After the gateway replies, the guest sends a tagged Ethernet request to the emulator peer. The peer fetches the fixed UUID endpoint over HTTPS, validates the response and returns it over the same virtual network. Nearby Wi-Fi discovery, WPA authentication and hardware radio testing require a physical driver.
+**Test Radio** sends an ARP request to the QEMU gateway. It then opens a TCP stream through the emulator’s [relay](../../tools/emulator_endpoint.py). Inside the guest, the [TLS client](tls.c) draws entropy from virtio-rng, checks the certificate chain, hostname and QEMU clock, and fetches the response over HTTP/1.1. The guest accepts a UUIDv4 from the fixed endpoint and shows it on screen. The image ships the ISRG Root X1 trust anchor. Changes to the endpoint’s trust chain can require a radio package update. [Endpoint](https://www.uuidgenerator.net/api/version4)
+
+Run `make test-wifi` for network selection, persistence, link failures, rejection of plaintext, and app switching during a delayed request. Run `make test-wifi-live` for the public endpoint.

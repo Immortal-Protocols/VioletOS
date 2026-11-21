@@ -5,6 +5,12 @@
 .section .text
 .global _start
 _start:
+    // The Moto boot firmware configures the interrupt groups. Reproduce the
+    // nonsecure Group 1 routing for the virtual timer PPI on QEMU virt.
+    ldr r0, =0x080b0080
+    mvn r1, #0
+    str r1, [r0]
+    dsb sy
     ldr r0, =0x45000000
     ldr r1, =0x40008000
     ldr r2, =IMAGE_BYTES

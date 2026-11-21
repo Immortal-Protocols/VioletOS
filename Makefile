@@ -58,3 +58,17 @@ test-wifi: qemu-image
 .PHONY: test-wifi-live
 test-wifi-live: qemu-image
 	$(PYTHON) platform/sel4/stopwatch/test.py --wifi live
+
+.PHONY: app
+app: setup
+	@test -n "$(APP)" || (echo "Set APP to an application directory"; exit 1)
+	VIOLET_APP_DIR="$(abspath $(APP))" $(PYTHON) tools/build_sel4.py qemu
+
+.PHONY: test-apps
+test-apps: qemu-image
+	$(MAKE) app APP=targets/qemu/test-app
+	$(PYTHON) targets/qemu/test_library.py
+
+.PHONY: test-power
+test-power: qemu-image
+	$(PYTHON) targets/qemu/test_power.py

@@ -13,7 +13,7 @@ pub fn run() -> ! {
                     r.arg = regs.add(1).read_volatile() & 1;
                     r
                 }
-                EXECUTE if m.value <= 1 => {
+                EXECUTE if m.value <= 2 => {
                     regs.add(1).write_volatile(m.value);
                     Message::result(m.value)
                 }

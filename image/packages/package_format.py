@@ -6,16 +6,39 @@ import struct
 LIMIT = 1 << 20
 
 
+def package_abi(identity):
+    # Runtime also boots as service workers using the supervisor's mailbox ABI.
+    return 2 if identity == 3 else 1
+
+
 def inspect(blob):
     if len(blob) < 24:
         raise ValueError("truncated package")
     magic, abi, identity, code, size, crc = struct.unpack_from("<4s5I", blob)
-    if magic != b"VPK1" or abi != 1 or not (1 <= identity <= 8 or identity == 10):
+    if (
+        magic != b"VPK1"
+        or abi != package_abi(identity)
+        or not (1 <= identity <= 8 or 10 <= identity <= 14)
+    ):
         raise ValueError("unsupported package or ABI")
     if not 0 < code <= size <= 0x3E000 or code % 4096 or len(blob) != 24 + size:
         raise ValueError("invalid segment sizes")
+    if identity in (3, 7) and size > 0x38000:
+        raise ValueError("package overlaps its process stack")
     if binascii.crc32(blob[24:]) != crc:
         raise ValueError("package checksum mismatch")
+    if identity >= 11:
+        title = blob[-16:].rstrip(b"\0")
+        if (
+            size > 65512
+            or size < code + 20
+            or blob[-20:-16] != b"APP1"
+            or not title
+            or any(
+                chr(ch) not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -" for ch in title
+            )
+        ):
+            raise ValueError("invalid application manifest")
     return identity
 
 

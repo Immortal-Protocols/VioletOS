@@ -21,9 +21,9 @@ with tempfile.TemporaryDirectory() as tmp:
             [sys.executable, MANAGER, "--state-dir", state, *args], check=check
         )
 
-    def guest(scenario,*extra):
+    def guest(scenario, *extra):
         subprocess.run(
-            [sys.executable, GUEST, "--stack", scenario, "--state-dir", state,*extra],
+            [sys.executable, GUEST, "--stack", scenario, "--state-dir", state, *extra],
             check=True,
             timeout=40,
         )
@@ -41,14 +41,21 @@ with tempfile.TemporaryDirectory() as tmp:
     assert (state / "active.json").read_bytes() == active
     # A fault in any replaceable component must leave a usable launcher and
     # working apps. The stopwatch replacement faults on launch, the rest at boot.
-    for component in json.loads((ROOT/"image/catalog/components.json").read_text()):
-        blob=bytearray((OUT/"packages"/(component["name"]+".vpk")).read_bytes())
-        struct.pack_into("<I",blob,24,0xE7F000F0)  # intentional ARM UDF
-        struct.pack_into("<I",blob,20,binascii.crc32(blob[24:]))
+    for component in json.loads((ROOT / "image/catalog/components.json").read_text()):
+        blob = bytearray((OUT / "packages" / (component["name"] + ".vpk")).read_bytes())
+        struct.pack_into("<I", blob, 24, 0xE7F000F0)  # intentional ARM UDF
+        struct.pack_into("<I", blob, 20, binascii.crc32(blob[24:]))
         package.write_bytes(blob)
-        manage("install",package)
-        guest("recovered","--fault-id",str(component["id"]))
+        manage("install", package)
+        guest("recovered", "--fault-id", str(component["id"]))
+    # A runnable but nonresponsive process must also trigger supervised recovery.
+    image = bytearray((OUT / "packages/radio.vpk").read_bytes())
+    struct.pack_into("<I", image, 24, 0xEAFFFFFE)  # deliberate infinite loop at entry
+    struct.pack_into("<I", image, 20, binascii.crc32(image[24:]))
+    package.write_bytes(image)
+    manage("install", package)
+    guest("recovered", "--fault-id", "7")
     guest("lifecycle")
-    manage("uninstall","power")
+    manage("uninstall", "power")
     manage("rollback")
     guest("lifecycle")

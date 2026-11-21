@@ -4,8 +4,17 @@
 //! request header at 256, status at 272 and one sector at 512.
 use crate::journal::Sector;
 use core::ptr::{read_volatile, write_volatile};
+#[cfg(package_volume)]
+const MMIO: usize = 0x0a003000;
+#[cfg(not(package_volume))]
 const MMIO: usize = 0x0a000000;
+#[cfg(package_volume)]
+const DMA: usize = 0x0b003000;
+#[cfg(not(package_volume))]
 const DMA: usize = 0x0b000000;
+#[cfg(package_volume)]
+const PHYS: u32 = 0x49203000;
+#[cfg(not(package_volume))]
 const PHYS: u32 = 0x49200000;
 fn reg(offset: usize) -> u32 {
     unsafe { read_volatile((MMIO + offset) as *const u32) }
@@ -23,6 +32,7 @@ extern "C" {
 
 pub struct Disk {
     index: u16,
+    retired: bool,
     pub sectors: usize,
 }
 impl Disk {
@@ -72,6 +82,7 @@ impl Disk {
         set(0x70, 15);
         Some(Self {
             index: 0,
+            retired: false,
             sectors: if reg(0x104) != 0 {
                 usize::MAX
             } else {
@@ -90,7 +101,7 @@ impl Disk {
     }
     fn request(&mut self, kind: u32, sector: usize, data: &mut Sector) -> Result<(), ()> {
         // Bound the queue to the app journals.
-        if sector >= self.sectors.min(6) {
+        if self.retired || sector >= self.sectors {
             return Err(());
         }
         let flush = kind == 4;
@@ -122,6 +133,7 @@ impl Disk {
         let start = unsafe { ticks() };
         while unsafe { read_volatile((DMA + 162) as *const u16) } != self.index {
             if unsafe { ticks() }.wrapping_sub(start) > unsafe { ticks_per_ms } * 500 {
+                self.retired = true;
                 return Err(());
             }
         }
@@ -143,6 +155,12 @@ impl Disk {
         let mut bytes = [0; 512];
         self.request(0, index, &mut bytes)?;
         Ok(bytes)
+    }
+    pub fn write(&mut self, index: usize, bytes: &mut Sector) -> Result<(), ()> {
+        self.request(1, index, bytes)
+    }
+    pub fn flush(&mut self) -> Result<(), ()> {
+        self.request(4, 0, &mut [0; 512])
     }
     pub fn commit(&mut self, index: usize, bytes: &mut Sector) -> Result<(), ()> {
         self.request(1, index, bytes)?;

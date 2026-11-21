@@ -1,6 +1,6 @@
 # VioletOS
 
-VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. The Rust stopwatch and touch driver have been tested on the Moto and in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
+VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and QEMU. The Rust stopwatch and touch driver have been tested on the Moto and in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -12,6 +12,9 @@ VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. T
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering stopwatch behavior, touch transfer failures, recovery and watchdog handling. The tests read the guest's rendered pixels. |
 | `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
+| `make test-apps` | Installs a separately built fourth app, reads its file after reboot, uninstalls it, and recovers from a stalled service update. |
+| `make test-power` | Verifies guest-driven VM pause, resume and shutdown. |
+| `make test-wifi-live` | Validates the certificate in the guest and reads the live UUID from the framebuffer. |
 | `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
 | `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
@@ -23,7 +26,7 @@ On an Apple Silicon Mac, install the Xcode command-line tools, Python 3, and the
 brew install qemu sdl2 cmake ninja dtc
 ```
 
-For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Android NDK **28.2.13676358** for its ARM cross-compiler. The build looks under `~/Library/Android/sdk/ndk/28.2.13676358`. Set `ANDROID_NDK_HOME` if it lives elsewhere. The first build downloads pinned seL4 and libfdt sources, checks their SHA-256 hashes and installs the Python build dependencies in a local virtual environment. QEMU can build and run without a handset or factory files. The interactive launcher has been tested on this Mac.
+For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Android NDK **28.2.13676358** for its ARM cross-compiler. The build looks under `~/Library/Android/sdk/ndk/28.2.13676358`. Set `ANDROID_NDK_HOME` if it lives elsewhere. The first build downloads pinned seL4, libfdt and QEMU radio TLS sources, checks their SHA-256 hashes and installs the Python build dependencies in a local virtual environment. QEMU can build and run without a handset or factory files. The interactive launcher has been tested on this Mac.
 
 ## How the layers fit together
 
@@ -33,9 +36,9 @@ This slide from the original design review shows the proposed stack. Its Linux l
 
 **What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto uses the earlier touch-tested UI and driver with RAM-only stopwatch state. The Mac simulator runs its native SDL UI.
 
-Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. The guest checks the local gateway and requests the UUID through a host TLS helper. The [setup app](apps/wifi/README.md) uses a modeled open network.
+Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. Choose a virtual access point with **Next Network**. The guest checks the gateway, verifies the HTTPS certificate, and prints the UUID. The Mac relays TCP bytes. [Wi-Fi Setup](apps/wifi/README.md)
 
-In QEMU, start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance. Reopening it restores the last saved checkpoint. On Home, **Radio** toggles the virtual modem and **Sleep** blanks the display until the next tap. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
+In QEMU, start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance. Reopening it restores the last saved checkpoint. On Home, **Radio** toggles the virtual modem and **Sleep** pauses QEMU until the next tap. **Apps → Off → Confirm** shuts the VM down. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
 
 ## Proposed components and interfaces
 
@@ -75,7 +78,7 @@ Open **Stopwatch → Start → Pause** and note the displayed time. Close the em
 
 QEMU uses a dedicated 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest allocates two alternating 512-byte sectors per app. Each holds a version marker, generation number, elapsed tenths and CRC. The storage service acknowledges a save after the device flush completes. On startup it chooses the newest valid record. The screen shows **DISK READY** when the service is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails.
 
-Runtime identifies the requesting app and selects its private checkpoint. The stopwatch saves elapsed time and the launcher saves its radio preference. A filesystem and physical handset storage are future work. The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
+Runtime identifies the requesting app and selects its private checkpoint. The stopwatch saves elapsed time and the launcher saves its radio preference. Apps can also use named files in a private directory. A separate 4 MiB package disk holds the installed catalog and rollback copy. Physical handset storage still needs a driver. The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
 
 ## Handset build and validation
 

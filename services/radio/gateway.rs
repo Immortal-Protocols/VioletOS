@@ -41,7 +41,7 @@ fn queue(index: u32, base: usize, buf: usize, length: u32, receive: bool) -> boo
     set(0x44, 1);
     true
 }
-fn exchange(frame: &[u8; 60], reply: &mut [u8], timeout_ms: u32) -> bool {
+fn exchange(frame: &[u8], reply: &mut [u8], timeout_ms: u32) -> bool {
     if reg(0) != 0x74726976 || reg(4) != 2 || reg(8) != 1 {
         return false;
     }
@@ -72,7 +72,7 @@ fn exchange(frame: &[u8; 60], reply: &mut [u8], timeout_ms: u32) -> bool {
     unsafe {
         core::ptr::copy_nonoverlapping(frame.as_ptr(), (DMA + TX + HEADER) as *mut u8, frame.len());
     }
-    if !queue(0, 0, RX, 1600, true) || !queue(1, 128, TX, (HEADER + 60) as u32, false) {
+    if !queue(0, 0, RX, 1600, true) || !queue(1, 128, TX, (HEADER + frame.len()) as u32, false) {
         return false;
     }
     fence();
@@ -81,6 +81,9 @@ fn exchange(frame: &[u8; 60], reply: &mut [u8], timeout_ms: u32) -> bool {
     set(0x50, 1);
     let start = unsafe { ticks() };
     while unsafe { read_volatile((DMA + 50) as *const u16) } == 0 {
+        unsafe {
+            crate::protocol::delay_ms(1);
+        }
         if unsafe { ticks().wrapping_sub(start) > ticks_per_ms * timeout_ms } {
             return false;
         }
@@ -115,23 +118,53 @@ pub fn probe() -> bool {
         && reply[38..42] == GUEST
 }
 
-pub fn endpoint_uuid() -> Option<[u8; 36]> {
-    const PEER: [u8; 6] = [2, 0x56, 0x49, 0x4f, 0x4c, 0x54];
+const PEER: [u8; 6] = [2, 0x56, 0x49, 0x4f, 0x4c, 0x54];
+fn transfer(op: u8, send: &[u8], recv: &mut [u8]) -> Option<usize> {
     let nonce = unsafe { ticks() }.to_be_bytes();
-    let mut frame = [0u8; 60];
+    let mut frame = [0; 1048];
+    let mut reply = [0; 1048];
     frame[..6].copy_from_slice(&PEER);
     frame[6..12].copy_from_slice(&MAC);
-    frame[12..18].copy_from_slice(b"\x88\xb5GET4");
-    frame[18..22].copy_from_slice(&nonce);
-    let mut reply = [0; 60];
-    if !exchange(&frame, &mut reply, 7000)
+    frame[12..14].copy_from_slice(&[0x88, 0xb5]);
+    frame[14] = op;
+    frame[16..20].copy_from_slice(&nonce);
+    frame[20..22].copy_from_slice(&(send.len().max(recv.len()) as u16).to_be_bytes());
+    frame[24..24 + send.len()].copy_from_slice(send);
+    if !exchange(&frame, &mut reply, 5500)
         || reply[..6] != MAC
         || reply[6..12] != PEER
-        || &reply[12..18] != b"\x88\xb5UUID"
-        || reply[18..22] != nonce
-        || reply[22] != 1
+        || reply[12..14] != [0x88, 0xb5]
+        || reply[14] != op
+        || reply[15] != 1
+        || reply[16..20] != nonce
     {
         return None;
     }
-    reply[23..59].try_into().ok()
+    let n = u16::from_be_bytes([reply[20], reply[21]]) as usize;
+    if n > recv.len() {
+        return None;
+    }
+    recv[..n].copy_from_slice(&reply[24..24 + n]);
+    Some(n)
+}
+#[no_mangle]
+pub unsafe extern "C" fn tunnel_read(_: usize, buf: *mut u8, n: usize) -> i32 {
+    transfer(3, &[], core::slice::from_raw_parts_mut(buf, n.min(1024)))
+        .filter(|n| *n > 0)
+        .map_or(-1, |n| n as i32)
+}
+#[no_mangle]
+pub unsafe extern "C" fn tunnel_write(_: usize, buf: *const u8, n: usize) -> i32 {
+    let n = n.min(1024);
+    transfer(2, core::slice::from_raw_parts(buf, n), &mut []).map_or(-1, |_| n as i32)
+}
+extern "C" {
+    fn guest_https(uuid: *mut u8) -> i32;
+}
+pub fn endpoint_uuid() -> Option<[u8; 36]> {
+    transfer(1, &[], &mut [])?;
+    let mut uuid = [0; 36];
+    let ok = unsafe { guest_https(uuid.as_mut_ptr()) } == 1;
+    transfer(4, &[], &mut []);
+    ok.then_some(uuid)
 }

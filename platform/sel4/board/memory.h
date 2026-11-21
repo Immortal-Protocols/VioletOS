@@ -6,7 +6,7 @@ static seL4_CPtr ram, next_slot;
 static unsigned cursor[CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
 struct task {
     seL4_CPtr pd, caps, thread, ipc;
-    unsigned sections[12], count;
+    unsigned sections[32], count;
 };
 static struct task bootstrap;
 static struct task *mapping;

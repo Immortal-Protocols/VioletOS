@@ -1,60 +1,83 @@
-"""QEMU lab peer for the single HTTPS operation exposed by the radio service."""
+"""Transport for the emulated radio. TCP bytes pass through unchanged; the
+guest performs the TLS handshake, validates the peer and parses HTTP."""
+
 from contextlib import contextmanager
-import re
 import socket
 import struct
-import subprocess
 import threading
 
-URL = "https://www.uuidgenerator.net/api/version4"
-UUID4 = re.compile(rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")
 HOST = bytes.fromhex("0256494f4c54")
 GUEST = bytes.fromhex("525400560001")
 TYPE = bytes.fromhex("88b5")
+PAYLOAD = 1024
+FRAME = 24 + PAYLOAD
 
 
-def fetch_uuid():
-    response = subprocess.run(
-        ["curl", "--disable", "--silent", "--show-error", "--fail",
-         "--max-time", "5", "--max-filesize", "128", "--header", "Cache-Control: no-cache", URL],
-        capture_output=True, check=True, timeout=6,
-    )
-    return response.stdout.strip()
+def connect_endpoint():
+    return socket.create_connection(("www.uuidgenerator.net", 443), timeout=4)
 
 
-def serve(sock, fetch):
+def serve(sock, connect):
+    remote = None
     with sock, sock.makefile("rb") as stream:
         try:
             while header := stream.read(4):
                 if len(header) != 4:
                     return
-                size, = struct.unpack("!I",header)
+                (size,) = struct.unpack("!I", header)
                 if size > 65536:
                     return
                 frame = stream.read(size)
                 if len(frame) != size:
                     return
-                if len(frame)<22 or frame[:18] != HOST + GUEST + TYPE + b"GET4":
+                if size != FRAME or frame[:14] != HOST + GUEST + TYPE:
                     continue
+                command = frame[14]
+                length = int.from_bytes(frame[20:22], "big")
+                if length > PAYLOAD:
+                    continue
+                data = b""
+                ok = False
                 try:
-                    data = fetch()
-                    ok = bool(UUID4.fullmatch(data))
-                except (OSError, subprocess.SubprocessError):
-                    data, ok = b"", False
-                reply = GUEST + HOST + TYPE + b"UUID" + frame[18:22] + bytes([ok]) + (data if ok else b"")
-                reply = reply.ljust(60, b"\0")
-                sock.sendall(struct.pack("!I",len(reply)) + reply)
+                    if command in (1, 4):
+                        if remote:
+                            remote.close()
+                            remote = None
+                        if command == 1:
+                            remote = connect()
+                    elif command == 2 and remote:
+                        remote.sendall(frame[24 : 24 + length])
+                    elif command == 3 and remote:
+                        data = remote.recv(length)
+                    else:
+                        raise OSError("inactive connection")
+                    ok = True
+                except OSError:
+                    if remote:
+                        remote.close()
+                        remote = None
+                reply = bytearray(FRAME)
+                reply[:14] = GUEST + HOST + TYPE
+                reply[14] = command
+                reply[15] = int(ok)
+                reply[16:20] = frame[16:20]
+                reply[20:22] = len(data).to_bytes(2, "big")
+                reply[24 : 24 + len(data)] = data
+                sock.sendall(struct.pack("!I", FRAME) + reply)
         except OSError:
-            return
+            pass
+        finally:
+            if remote:
+                remote.close()
 
 
 @contextmanager
-def endpoint_peer(fetch=fetch_uuid):
+def endpoint_peer(connect=connect_endpoint):
     host, guest = socket.socketpair()
-    thread = threading.Thread(target=serve, args=(host,fetch), daemon=True)
+    thread = threading.Thread(target=serve, args=(host, connect), daemon=True)
     thread.start()
     try:
         yield guest.fileno()
     finally:
         guest.close()
-        thread.join(timeout=7)
+        thread.join(timeout=6)

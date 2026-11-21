@@ -1,4 +1,6 @@
 use crate::{drawing::*, protocol::*, sdk::*};
+#[path = "library.rs"]
+mod library;
 pub fn run() -> ! {
     acquire_surface();
     let status = request(GET, STATUS, 0);
@@ -12,13 +14,24 @@ pub fn run() -> ! {
     if preference.op == OK && radio_events.is_some() {
         request(EXECUTE, RADIO, (preference.value == 0) as u32);
     }
+    let mut radio_state = Message::error(OFFLINE);
+    let mut battery = 0;
     let mut visible = false;
     let mut redraw = true;
     loop {
         let active = request(GET, FOCUS, 0).value == LAUNCHER;
         if active {
-            for stream in [&radio_events, &power_events].into_iter().flatten() {
-                if stream.poll().op == OK {
+            if let Some(stream) = &radio_events {
+                let r = stream.poll();
+                if r.op == OK {
+                    radio_state = r;
+                    redraw = true;
+                }
+            }
+            if let Some(stream) = &power_events {
+                let r = stream.poll();
+                if r.op == OK {
+                    battery = r.value.min(100);
                     redraw = true;
                 }
             }
@@ -26,7 +39,9 @@ pub fn run() -> ! {
         if active && (!visible || redraw) {
             header(&status.text(), status.arg != 0);
             label(14, 62, b"VIOLET", 4, INK);
-            let radio = request(GET, RADIO, 0);
+            rect(157, 53, 70, 32, PANEL);
+            label(163, 65, b"APPS", 2, INK);
+            let radio = radio_state;
             label(
                 14,
                 104,
@@ -40,7 +55,7 @@ pub fn run() -> ! {
                 1,
                 INK,
             );
-            let battery = request(GET, POWER, 0).value.min(100);
+
             let mut percent = *b"BATTERY 000";
             percent[8] += (battery / 100) as u8;
             percent[9] += ((battery / 10) % 10) as u8;
@@ -75,6 +90,10 @@ pub fn run() -> ! {
         let e = touch.poll();
         if active && e.op == OK && (42..678).contains(&e.value) {
             match e.arg {
+                212..340 if e.value >= 471 => {
+                    library::open();
+                    redraw = true;
+                }
                 584..784 if wifi.value == WIFI => {
                     request(EXECUTE, OPEN, WIFI);
                 }

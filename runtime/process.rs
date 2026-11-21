@@ -1,13 +1,4 @@
 use crate::protocol::*;
-extern "C" {
-    fn touch_status() -> *const u8;
-    fn touch_event(x: &mut u32, y: &mut u32, down: &mut bool) -> bool;
-    fn app_checkpoint(region: u32, save: bool, value: &mut u32) -> bool;
-}
-const PACKAGE_MANAGER: u32 = 8;
-const DISPLAY_SLOT: u32 = 4;
-const RADIO_SLOT: u32 = 5;
-const POWER_SLOT: u32 = 6;
 const LIFECYCLE: u32 = 7;
 #[derive(Default, Clone, Copy)]
 struct Stream {
@@ -17,9 +8,27 @@ struct Stream {
 #[derive(Default, Clone, Copy)]
 struct Client {
     serial: u32,
-    ticket: u32,
-    result: Message,
+    jobs: [Job; 7],
     streams: [Stream; 3],
+}
+#[derive(Default, Clone, Copy)]
+struct Job {
+    ticket: u32,
+    lane: u32,
+    result: Message,
+}
+fn service(key: u32) -> u32 {
+    match key {
+        SAVE | FILE_LIST..=FILE_DELETE => 6,
+        PRESENT => 5,
+        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST => 7,
+        POWER => 8,
+        CATALOG | INBOX | INSTALL | REMOVE => 9,
+        _ => 0,
+    }
+}
+fn job_slot(key: u32) -> usize {
+    service(key).saturating_sub(3) as usize
 }
 const STREAM_KEYS: [u32; 3] = [CONTACT, RADIO, POWER];
 fn ticket(c: &mut Client) -> u32 {
@@ -32,49 +41,58 @@ struct Runtime {
     held: bool,
     asleep: bool,
     ready: Message,
-    clients: [Client; 3],
+    clients: [Client; 15],
 }
 impl Runtime {
     fn contact(&mut self, who: u32) -> Message {
         if who != self.focus {
             return Message::error(EMPTY);
         }
-        let (mut x, mut y, mut down) = (0, 0, false);
-        if !unsafe { touch_event(&mut x, &mut y, &mut down) } {
+        let event = crate::lanes::sample(4, 16, who, Message::new(GET, CONTACT, 0));
+        if event.op != OK {
             return Message::error(EMPTY);
         }
+        let down = event.key != 0;
         let pressed = down && !self.held;
         self.held = down;
         if !pressed {
             return Message::error(EMPTY);
         }
         if self.asleep {
-            Message::new(EXECUTE, POWER, 0).call(POWER_SLOT);
+            crate::lanes::take(8, 0);
+            crate::lanes::queue(8, 0, who, Message::new(EXECUTE, POWER, 0));
             self.asleep = false;
             return Message::error(EMPTY);
         }
-        let mut r = Message::result(x);
-        r.arg = y;
-        r
+        event
+    }
+    fn forward(&mut self, who: u32, lane: u32, m: Message) -> Message {
+        if !crate::lanes::queue(lane, who, who, m) {
+            return Message::error(OFFLINE);
+        }
+        self.clients[who as usize].jobs[(lane - 3) as usize].lane = lane;
+        Message::error(BUSY)
     }
     fn dispatch(&mut self, who: u32, m: Message) -> Message {
         let component = match m.key {
-            RADIO | NETWORK | RADIO_TEST => 7,
+            RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN => 7,
             POWER => 8,
-            SAVE => 6,
+            SAVE | FILE_LIST..=FILE_DELETE => 6,
             _ => 0,
         };
         if component != 0 && self.inventory & (1 << component) == 0 {
             return Message::error(OFFLINE);
         }
         match (m.op, m.key) {
+            (GET, WHOAMI) => Message::result(who),
             (GET, STATUS) => self.ready,
             (GET, FOCUS) => Message::result(if self.asleep { 0 } else { self.focus }),
             (GET, SURFACE) => Message::result(0x06000000),
-            (GET, CATALOG) if who == LAUNCHER => m.call(PACKAGE_MANAGER),
+            (GET, CATALOG | INBOX) | (EXECUTE, INSTALL | REMOVE) if who == LAUNCHER => {
+                self.forward(who, 9, m)
+            }
             (EXECUTE, OPEN)
-                if (who == LAUNCHER && matches!(m.value, WATCH | WIFI))
-                    || (matches!(who, WATCH | WIFI) && m.value == LAUNCHER) =>
+                if (who == LAUNCHER && is_app(m.value)) || (is_app(who) && m.value == LAUNCHER) =>
             {
                 let r = m.call(LIFECYCLE);
                 if r.op == OK {
@@ -82,81 +100,71 @@ impl Runtime {
                 }
                 r
             }
-            (EXECUTE, QUIT) if who == WATCH => {
-                let r = m.call(LIFECYCLE);
+            (EXECUTE, QUIT) if who != LAUNCHER => {
+                let r = Message::new(EXECUTE, QUIT, who).call(LIFECYCLE);
                 if r.op == OK {
                     self.focus = LAUNCHER;
-                    self.clients[1] = Client::default();
+                    let client = &mut self.clients[who as usize];
+                    client.streams = [Stream::default(); 3];
+                    for job in &mut client.jobs {
+                        job.ticket = 0;
+                    }
                 }
                 r
             }
-            (GET | EXECUTE, SAVE) => {
-                let mut value = m.value;
-                let region = match who {
-                    WATCH => 0,
-                    LAUNCHER => 1,
-                    WIFI => 2,
-                    _ => return Message::error(DENIED),
-                };
-                if unsafe { app_checkpoint(region, m.op == EXECUTE, &mut value) } {
-                    Message::result(value)
-                } else {
-                    Message::error(OFFLINE)
-                }
-            }
+            (GET, FILE_LIST | FILE_READ)
+            | (EXECUTE, FILE_WRITE | FILE_TRUNCATE | FILE_DELETE)
+            | (GET | EXECUTE, SAVE) => self.forward(who, 6, m),
             (EXECUTE, PRESENT) if who == self.focus && !self.asleep => {
                 let mut req = Message::new(EXECUTE, PRESENT, who);
                 req.arg = m.value;
-                req.call(DISPLAY_SLOT)
+                self.forward(who, 5, req)
             }
-            (GET | EXECUTE, NETWORK) | (EXECUTE, RADIO_TEST) if who == WIFI => m.call(RADIO_SLOT),
-            (GET, RADIO) => m.call(RADIO_SLOT),
-            (EXECUTE, RADIO) if who == LAUNCHER => m.call(RADIO_SLOT),
-            (GET, POWER) => m.call(POWER_SLOT),
-            (EXECUTE, POWER) if who == LAUNCHER && m.value <= 1 => {
-                let r = m.call(POWER_SLOT);
-                if r.op == OK && m.value == 1 {
-                    Message::new(EXECUTE, POWER, 1).call(DISPLAY_SLOT);
-                    self.asleep = true;
-                }
-                r
+            (GET | EXECUTE, NETWORK | PROFILE) | (EXECUTE, RADIO_TEST) if who == WIFI => {
+                self.forward(who, 7, m)
+            }
+            (GET, SCAN) if who == WIFI => self.forward(who, 7, m),
+            (GET, RADIO) => self.forward(who, 7, m),
+            (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
+            (GET, POWER) => self.forward(who, 8, m),
+            (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
+                self.asleep = m.value == 1;
+                self.forward(who, 8, m)
             }
             _ => Message::error(DENIED),
         }
     }
 }
 pub fn run() -> ! {
-    let mut status = Message::result(0);
-    let ptr = unsafe { touch_status() };
-    if ptr.is_null() {
-        status.put_text(b"TOUCH READY");
-    } else {
-        let mut bytes = [0; 40];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = unsafe { *ptr.add(i) };
-            if *b == 0 {
-                break;
-            }
-        }
-        status.put_text(&bytes);
-    }
-    let inventory = Message::new(GET, INVENTORY, 0).call(PACKAGE_MANAGER).value;
-    status.arg = (inventory & (1 << 6) != 0 && unsafe { app_checkpoint(0, false, &mut 0) }) as u32;
+    let mut status = crate::lanes::initialize(4, LAUNCHER, Message::new(GET, STATUS, 0));
+    let inventory = crate::lanes::initialize(9, LAUNCHER, Message::new(GET, INVENTORY, 0)).value;
+    status.arg = (inventory & (1 << 6) != 0
+        && crate::lanes::initialize(6, WATCH, Message::new(GET, SAVE, 0)).op == OK)
+        as u32;
     let mut rt = Runtime {
         inventory,
         focus: LAUNCHER,
         held: false,
         asleep: false,
         ready: status,
-        clients: [Client::default(); 3],
+        clients: [Client::default(); 15],
     };
     loop {
         let (who, m) = Message::receive(SERVER);
-        if !matches!(who, LAUNCHER | WATCH | WIFI) {
+        if !is_app(who) {
             Message::error(DENIED).reply();
             continue;
         }
-        let i = if who == WIFI { 2 } else { (who - 1) as usize };
+        unsafe {
+            let health = 0x07400ff4 as *mut u32;
+            let now = ticks();
+            health.write_volatile(now);
+            if health.add(1).read_volatile() != rt.focus || who == rt.focus {
+                health.add(1).write_volatile(rt.focus);
+                health.add(2).write_volatile(now);
+            }
+        }
+        let i = who as usize;
         let c = &mut rt.clients[i];
         match m.op {
             SUBSCRIBE if STREAM_KEYS.contains(&m.key) => {
@@ -183,7 +191,12 @@ pub fn run() -> ! {
                     rt.contact(who).reply();
                     continue;
                 }
-                let state = rt.dispatch(who, Message::new(GET, key, 0));
+                let state = crate::lanes::sample(
+                    if key == RADIO { 7 } else { 8 },
+                    16 + who,
+                    who,
+                    Message::new(GET, key, 0),
+                );
                 let stream = &mut rt.clients[i].streams[index];
                 if state.op != OK {
                     state.reply();
@@ -194,23 +207,42 @@ pub fn run() -> ! {
                     state.reply();
                 }
             }
-            POLL | FORGET if m.value != 0 && m.value == c.ticket => {
-                c.ticket = 0;
+            POLL | FORGET if m.value != 0 => {
+                let Some(job) = c.jobs.iter_mut().find(|j| j.ticket == m.value) else {
+                    Message::error(INVALID).reply();
+                    continue;
+                };
+                if job.lane != 0 {
+                    if let Some(r) = crate::lanes::take(job.lane, who) {
+                        job.result = r;
+                        job.lane = 0;
+                    } else if m.op == POLL {
+                        Message::error(BUSY).reply();
+                        continue;
+                    }
+                }
+                job.ticket = 0;
                 if m.op == POLL {
-                    c.result.reply()
+                    job.result.reply();
                 } else {
-                    Message::result(0).reply()
+                    Message::result(0).reply();
                 }
             }
-            GET | EXECUTE if c.ticket == 0 => {
+            GET | EXECUTE => {
+                let slot = job_slot(m.key);
+                let job = &mut c.jobs[slot];
+                if job.ticket != 0 || (job.lane != 0 && crate::lanes::take(job.lane, who).is_none())
+                {
+                    Message::error(BUSY).reply();
+                    continue;
+                }
+                job.lane = 0;
                 let id = ticket(c);
-                c.ticket = id;
-                // Acknowledge acceptance before issuing the downstream operation.
+                c.jobs[slot].ticket = id;
                 Message::result(id).reply();
-                let result = rt.dispatch(who, m);
-                rt.clients[i].result = result;
+                let r = rt.dispatch(who, m);
+                rt.clients[i].jobs[slot].result = r;
             }
-            GET | EXECUTE => Message::error(BUSY).reply(),
             _ => Message::error(INVALID).reply(),
         }
     }

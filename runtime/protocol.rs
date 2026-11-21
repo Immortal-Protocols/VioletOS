@@ -90,6 +90,33 @@ pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {
 pub const INVENTORY: u32 = 11;
 pub const SURFACE: u32 = 12;
 
+pub const APP_LAST: u32 = 14;
+pub fn is_app(id: u32) -> bool {
+    matches!(id, LAUNCHER | WATCH | WIFI..=APP_LAST)
+}
+pub const INBOX: u32 = 16;
+pub const INSTALL: u32 = 17;
+pub const REMOVE: u32 = 18;
+pub const WHOAMI: u32 = 15;
 pub const WIFI: u32 = 10;
 pub const NETWORK: u32 = 13;
 pub const RADIO_TEST: u32 = 14;
+
+pub const FILE_LIST: u32 = 21;
+pub const FILE_READ: u32 = 22;
+pub const FILE_WRITE: u32 = 23;
+pub const FILE_TRUNCATE: u32 = 24;
+pub const FILE_DELETE: u32 = 25;
+pub const STORAGE_FILE: u32 = 0x200;
+pub fn region(who: u32) -> u32 {
+    match who {
+        WATCH => 0,
+        LAUNCHER => 1,
+        WIFI..=APP_LAST => who - 8,
+        _ => u32::MAX,
+    }
+}
+
+pub const SCAN: u32 = 26;
+
+pub const PROFILE: u32 = 27;

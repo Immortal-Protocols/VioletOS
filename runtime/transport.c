@@ -4,11 +4,12 @@
 seL4_IPCBuffer *__sel4_ipc_buffer;
 char __sel4_print_error;
 enum { WORDS = 14 };
-extern void component_main(void);
-__attribute__((section(".entry"), noreturn)) void process_entry(void) {
+extern void component_main(unsigned);
+__attribute__((section(".entry"), noreturn)) void
+process_entry(unsigned identity) {
   seL4_SetIPCBuffer((void *)IPC_BUFFER);
   clock_init();
-  component_main();
+  component_main(identity);
   for (;;)
     seL4_Yield();
 }
@@ -47,3 +48,6 @@ void delay_ms(unsigned ms) {
   while (ticks() - start < ms * ticks_per_ms)
     seL4_Yield();
 }
+
+void worker_signal(unsigned cap) { seL4_Signal(cap); }
+void worker_wait(unsigned cap) { seL4_Wait(cap, 0); }

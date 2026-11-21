@@ -24,7 +24,7 @@ ld = cc.with_name("ld.lld")
 objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
-defines = ["-DNDEBUG", "-DROOT_BYTES=0x40000"]
+defines = ["-DNDEBUG", "-DROOT_BYTES=0x80000" if variant=="qemu" else "-DROOT_BYTES=0x40000"]
 if probe: defines.append("-DVIOLET_TEST_ISOLATION")
 if variant=="qemu": defines.append("-DVIOLET_QEMU")
 sys.path.insert(0,str(app))
@@ -56,11 +56,12 @@ if variant=="qemu":
         shims.append(obj)
     only=os.environ.get("VIOLET_COMPONENT_ONLY")
     components(repo,out,cc,common,incs,rustc,shims,only)
-    if only: sys.exit(0)
+    if only or os.environ.get("VIOLET_APP_DIR"): sys.exit(0)
     (out/"catalog.S").write_text('.section .rodata.catalog,"a"\n.balign 4\n.global builtin_catalog,builtin_catalog_end\nbuiltin_catalog: .incbin "catalog.bin"\nbuiltin_catalog_end:\n.balign 4\n.global recovery_manager\nrecovery_manager: .incbin "packages/package_manager.vpk"\n')
     run(common+["-c",out/"catalog.S","-o","catalog.o"])
     run(common+incs+defines+["-I",app,"-std=gnu11","-c",repo/"system/supervisor/qemu.c","-o","supervisor.o"])
-    root_objects=["root.S.o","supervisor.o","strings.c.o","catalog.o"]
+    run([rustc,"--edition=2021","--target=armv7a-none-eabi","--crate-type=staticlib","--cfg","package_volume","-Cpanic=abort","-Copt-level=s",repo/"system/package-manager/volume.rs","-o","volume.a"])
+    root_objects=["root.S.o","supervisor.o","volume.a","strings.c.o","catalog.o"]
 else:
     run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib",
          "-Cpanic=abort", "-Copt-level=s", app.parent/"services/lib.rs", "-o", "services.a"])
@@ -68,7 +69,7 @@ else:
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
-assert (out/"root.bin").stat().st_size < 0x3e000
+assert (out/"root.bin").stat().st_size < (0x7e000 if variant=="qemu" else 0x3e000)
 elf = (abi/"kernel.elf").read_bytes()
 assert elf[:6] == b"\x7fELF\x01\x01" and struct.unpack_from("<I",elf,24)[0] == 0xe0000000
 phoff, = struct.unpack_from("<I",elf,28)

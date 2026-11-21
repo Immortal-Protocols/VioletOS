@@ -9,7 +9,7 @@ pub fn run() -> ! {
             }
             return Message::result(0);
         }
-        if m.op != EXECUTE || m.key != PRESENT || !matches!(m.value, LAUNCHER | WATCH | WIFI) {
+        if m.op != EXECUTE || m.key != PRESENT || !is_app(m.value) {
             return Message::error(INVALID);
         }
         let first = (m.arg >> 16) as usize;
