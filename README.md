@@ -33,7 +33,7 @@ This slide from the original design review shows the proposed stack. Its Linux l
 
 **What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto uses the earlier touch-tested UI and driver with RAM-only stopwatch state. The Mac simulator runs its native SDL UI.
 
-Open **Wi-Fi Setup → Connect → Test Radio** to send a packet to the private QEMU gateway. **Gateway Replied** confirms a round trip. The [setup app](apps/wifi/README.md) uses a modeled open network.
+Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. The guest checks the local gateway and requests the UUID through a host TLS helper. The [setup app](apps/wifi/README.md) uses a modeled open network.
 
 In QEMU, start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance. Reopening it restores the last saved checkpoint. On Home, **Radio** toggles the virtual modem and **Sleep** blanks the display until the next tap. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
 

@@ -30,7 +30,15 @@ pub fn run() -> ! {
                 Message::result(m.value)
             }
             (EXECUTE, RADIO_TEST) if online && associated => {
-                Message::result(gateway::probe() as u32)
+                if !gateway::probe() {
+                    Message::result(0)
+                } else if let Some(uuid) = gateway::endpoint_uuid() {
+                    let mut response = Message::result(1);
+                    response.put_text(&uuid);
+                    response
+                } else {
+                    Message::result(2)
+                }
             }
             _ => Message::error(OFFLINE),
         }

@@ -54,3 +54,7 @@ component: setup
 .PHONY: test-wifi
 test-wifi: qemu-image
 	$(PYTHON) targets/qemu/test_wifi.py
+
+.PHONY: test-wifi-live
+test-wifi-live: qemu-image
+	$(PYTHON) platform/sel4/stopwatch/test.py --wifi live

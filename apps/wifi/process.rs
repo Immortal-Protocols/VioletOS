@@ -7,6 +7,7 @@ pub fn run() -> ! {
     let mut remember = saved.op == OK && saved.value == 1;
     let mut visible = false;
     let mut redraw = true;
+    let mut uuid = [0u8; 40];
     let mut result: &[u8] = b"";
     loop {
         let active = request(GET, FOCUS, 0).value == WIFI;
@@ -35,9 +36,11 @@ pub fn run() -> ! {
                 1,
                 INK,
             );
-            label(14, 154, result, 1, ACCENT);
+            label(14, 141, result, 1, ACCENT);
+            label(14, 152, &uuid[..18], 2, INK);
+            label(14, 168, &uuid[18..36], 2, INK);
             button(
-                182,
+                186,
                 if state.value == 1 {
                     b"DISCONNECT"
                 } else {
@@ -53,7 +56,8 @@ pub fn run() -> ! {
         let e = touch.poll();
         if active && e.op == OK && (42..678).contains(&e.value) {
             match e.arg {
-                728..928 => {
+                744..944 => {
+                    uuid.fill(0);
                     let s = request(GET, NETWORK, 0);
                     let r = request(EXECUTE, NETWORK, (s.value == 0) as u32);
                     result = if r.op != OK {
@@ -69,9 +73,14 @@ pub fn run() -> ! {
                     redraw = true;
                 }
                 980..1180 => {
+                    rect(14, 140, 223, 44, BG);
+                    label(14, 141, b"TESTING HTTPS", 1, ACCENT);
+                    present(140, 184);
                     let r = request(EXECUTE, RADIO_TEST, 0);
+                    uuid = r.text();
                     result = match (r.op, r.value) {
-                        (OK, 1) => b"GATEWAY REPLIED",
+                        (OK, 1) => b"UUID FROM HTTPS",
+                        (OK, 2) => b"HTTPS TEST FAILED",
                         (OK, 0) => b"NO GATEWAY REPLY",
                         _ => b"CONNECT FIRST",
                     };
@@ -79,6 +88,7 @@ pub fn run() -> ! {
                 }
                 1256..1456 => {
                     request(EXECUTE, OPEN, LAUNCHER);
+                    uuid.fill(0);
                     result = b"";
                 }
                 _ => {}

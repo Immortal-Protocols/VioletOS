@@ -13,7 +13,7 @@ parser.add_argument("--checkpoint",choices=["save","restore","reset"])
 parser.add_argument("--expect",type=int, default=0)
 parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer","radio","radio-dma"])
 parser.add_argument("--stack",choices=["lifecycle","removed","recovered","save-radio","restore-radio"])
-parser.add_argument("--wifi",choices=["exercise","save","restore"])
+parser.add_argument("--wifi",choices=["exercise","save","restore","live"])
 parser.add_argument("--state-dir",type=Path)
 parser.add_argument("--fault-id",type=int,default=7)
 args=parser.parse_args()
@@ -26,11 +26,23 @@ out=Path(scratch.name)
 image=IMAGE/"isolation-test" if args.probe else IMAGE
 from manage import launch_catalogs
 catalogs=launch_catalogs(args.state_dir) if args.state_dir else (None,None)
-cmd=machine(catalogs=catalogs,image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
+from contextlib import ExitStack
+from emulator_endpoint import endpoint_peer,fetch_uuid
+resources=ExitStack()
+responses=[]
+def endpoint_response():
+    if args.wifi=="live":
+        data=fetch_uuid()
+    else:
+        data=b"12345678-abcd-4abc-8def-0123456789ab" if len(responses)<2 else b"invalid"
+    responses.append(data)
+    return data
+peer=resources.enter_context(endpoint_peer(endpoint_response)) if args.wifi else None
+cmd=machine(peer=peer,catalogs=catalogs,image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
 if args.probe:
     address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000,"scanout":0x08000000,"peer":0x06100000,"radio":0x09001000,"radio-dma":0x09002000}[args.probe]
     cmd+=["-device",f"loader,addr=0x49300000,data={address},data-len=4"]
-p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+p=subprocess.Popen(cmd,pass_fds=(peer,) if peer is not None else (),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
 try:
     while True:
         line=p.stdout.readline()
@@ -86,12 +98,15 @@ try:
         font=(repo/"src/glyphs.h").read_text()
         alphabet=re.search(r'alphabet\[\] = "([^"]+)"',font)[1]
         glyphs=[tuple(map(int,x.split(','))) for x in re.findall(r'\{([\d, ]+)\}',font)]
-        def check_label(y,expected,color):
+        def read_label(y,length,color,scale=1):
             frame=snapshot()
             actual=""
-            for n in range(len(expected)):
-                cols=tuple(sum((pixel(frame,(14+n*6+x)*3,(y+j)*4)==color)<<j for j in range(7)) for x in range(5))
+            for n in range(length):
+                cols=tuple(sum((pixel(frame,(14+(n*6+x)*scale)*3,(y+j*scale)*4)==color)<<j for j in range(7)) for x in range(5))
                 actual+=alphabet[glyphs.index(cols)] if cols in glyphs else "?"
+            return actual
+        def check_label(y,expected,color):
+            actual=read_label(y,len(expected),color)
             assert actual==expected,(expected,actual)
         ink,accent=0xffeeeaf8,0xffd1b0fe
         tap(680)
@@ -100,27 +115,38 @@ try:
             sys.exit(0)
         check_label(130,"DISCONNECTED",ink)
         tap(1080)
-        check_label(154,"CONNECT FIRST",accent)
+        check_label(141,"CONNECT FIRST",accent)
         tap(820)
         check_label(130,"CONNECTED",ink)
         if args.wifi=="save": sys.exit(0)
-        for _ in range(2):
+        for n in range(1 if args.wifi=="live" else 2):
             tap(1080)
-            time.sleep(.6)
-            check_label(154,"GATEWAY REPLIED",accent)
+            for _ in range(75):
+                if read_label(141,13,accent)=="UUID FROM HTT": break
+                time.sleep(.1)
+            check_label(141,"UUID FROM HTTPS",accent)
+            assert len(responses)==n+1, "one HTTPS request per tap"
+            displayed=read_label(152,18,ink,2)+read_label(168,18,ink,2)
+            assert displayed==responses[-1].decode("ascii"),displayed
+            if args.wifi=="live":
+                print("Live endpoint UUID decoded from the QEMU screen:",responses[-1].decode("ascii"))
+                sys.exit(0)
+        tap(1080)
+        check_label(141,"HTTPS TEST FAILED",accent)
+        assert read_label(152,18,ink,2)+read_label(168,18,ink,2)==" "*36
         request("set_link",dict(name="wifi",up=False))
         tap(1080)
         time.sleep(.7)
-        check_label(154,"NO GATEWAY REPLY",accent)
+        check_label(141,"NO GATEWAY REPLY",accent)
         request("set_link",dict(name="wifi",up=True))
         tap(820)
         check_label(130,"DISCONNECTED",ink)
         tap(1340);tap(1140);tap(680)
         check_label(130,"RADIO OFF",ink)
         tap(820)
-        check_label(154,"CHECK RADIO ON HOME",accent)
+        check_label(141,"CHECK RADIO ON HOME",accent)
         tap(1340);tap(1140)  # Restore the saved radio setting before reboot.
-        print("QEMU Wi-Fi setup, two gateway replies, disconnect and radio-off verified.")
+        print("QEMU Wi-Fi setup, two displayed UUIDs, invalid response, link failure, disconnect and radio-off verified.")
         sys.exit(0)
     if args.stack:
         def words(address,count=1):
@@ -227,4 +253,4 @@ try:
     assert mode==int(enabled) and reload==(0x1971 if enabled else 0)
     print(f"Watchdog register fixture verified (enabled={enabled}).")
 finally:
-    p.kill();p.wait()
+    p.kill();p.wait();resources.close()

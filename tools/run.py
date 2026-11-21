@@ -1,6 +1,7 @@
 """Launch the seL4 QEMU target with an SDL view of guest display memory."""
 from pathlib import Path
 import sys
+from emulator_endpoint import endpoint_peer
 import signal
 import subprocess
 import tempfile
@@ -13,12 +14,18 @@ from manage import launch_catalogs, acknowledge_rollback
 
 RAM_SIZE = 1024**3
 
-def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None)):
+def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None),peer=None):
+    network="guestport" if peer is not None else "wifi"
     cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
            "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", "1", "-display", "none",
            "-monitor", "none", "-global","virtio-mmio.force-legacy=false",
            "-netdev","user,id=wifi,restrict=on","-device",
-           "virtio-net-device,netdev=wifi,bus=virtio-mmio-bus.8,mac=52:54:00:56:00:01", "-no-reboot"]
+           f"virtio-net-device,netdev={network},bus=virtio-mmio-bus.8,mac=52:54:00:56:00:01", "-no-reboot"]
+    if peer is not None:
+        cmd+=["-netdev","hubport,id=guestport,hubid=0",
+              "-netdev","hubport,id=routerport,hubid=0,netdev=wifi",
+              "-netdev",f"socket,id=httpspeer,fd={peer}",
+              "-netdev","hubport,id=httpsport,hubid=0,netdev=httpspeer"]
     if disk is not None:
         cmd += [
                 "-drive", f"if=none,id=violetdisk,format=raw,file={str(disk).replace(',', ',,')}",
@@ -44,7 +51,7 @@ def finish(process):
         process.wait()
 
 def main(viewer):
-    with tempfile.TemporaryDirectory(prefix="violet-qemu-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="violet-qemu-") as tmp, endpoint_peer() as peer:
         ram = Path(tmp)/"guest.ram"
         with ram.open("wb") as stream:
             stream.truncate(RAM_SIZE)
@@ -58,9 +65,9 @@ def main(viewer):
         catalogs=launch_catalogs(state_dir)
         selected=catalogs[0]
         last_source=1
-        cmd = machine(disk=disk,catalogs=catalogs) + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
+        cmd = machine(disk=disk,catalogs=catalogs,peer=peer) + ["-object", f"memory-backend-file,id=ram,size=1G,mem-path={ram},share=on",
                            "-machine", "memory-backend=ram", "-serial", "stdio"]
-        guest = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        guest = subprocess.Popen(cmd,pass_fds=(peer,), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
         try:
             window = subprocess.Popen([viewer, ram], stdout=guest.stdin)
             try:

@@ -41,7 +41,7 @@ fn queue(index: u32, base: usize, buf: usize, length: u32, receive: bool) -> boo
     set(0x44, 1);
     true
 }
-pub fn probe() -> bool {
+fn exchange(frame: &[u8; 60], reply: &mut [u8], timeout_ms: u32) -> bool {
     if reg(0) != 0x74726976 || reg(4) != 2 || reg(8) != 1 {
         return false;
     }
@@ -69,13 +69,6 @@ pub fn probe() -> bool {
     unsafe {
         core::ptr::write_bytes(DMA as *mut u8, 0, 4096);
     }
-    let mut frame = [0u8; 60];
-    frame[..6].fill(255);
-    frame[6..12].copy_from_slice(&MAC);
-    frame[12..22].copy_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
-    frame[22..28].copy_from_slice(&MAC);
-    frame[28..32].copy_from_slice(&GUEST);
-    frame[38..42].copy_from_slice(&GATEWAY);
     unsafe {
         core::ptr::copy_nonoverlapping(frame.as_ptr(), (DMA + TX + HEADER) as *mut u8, frame.len());
     }
@@ -88,22 +81,57 @@ pub fn probe() -> bool {
     set(0x50, 1);
     let start = unsafe { ticks() };
     while unsafe { read_volatile((DMA + 50) as *const u16) } == 0 {
-        if unsafe { ticks().wrapping_sub(start) > ticks_per_ms * 500 } {
+        if unsafe { ticks().wrapping_sub(start) > ticks_per_ms * timeout_ms } {
             return false;
         }
     }
     fence();
     let len = unsafe { read_volatile((DMA + 56) as *const u32) };
-    if len < (HEADER + 42) as u32 {
+    if len < (HEADER + reply.len()) as u32 {
         return false;
     }
-    let mut reply = [0; 42];
+
     for (i, b) in reply.iter_mut().enumerate() {
         *b = unsafe { read_volatile((DMA + RX + HEADER + i) as *const u8) };
+    }
+    true
+}
+pub fn probe() -> bool {
+    let mut frame = [0u8; 60];
+    frame[..6].fill(255);
+    frame[6..12].copy_from_slice(&MAC);
+    frame[12..22].copy_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
+    frame[22..28].copy_from_slice(&MAC);
+    frame[28..32].copy_from_slice(&GUEST);
+    frame[38..42].copy_from_slice(&GATEWAY);
+    let mut reply = [0; 42];
+    if !exchange(&frame, &mut reply, 500) {
+        return false;
     }
     reply[..6] == MAC
         && reply[12..22] == [8, 6, 0, 1, 8, 0, 6, 4, 0, 2]
         && reply[28..32] == GATEWAY
         && reply[32..38] == MAC
         && reply[38..42] == GUEST
+}
+
+pub fn endpoint_uuid() -> Option<[u8; 36]> {
+    const PEER: [u8; 6] = [2, 0x56, 0x49, 0x4f, 0x4c, 0x54];
+    let nonce = unsafe { ticks() }.to_be_bytes();
+    let mut frame = [0u8; 60];
+    frame[..6].copy_from_slice(&PEER);
+    frame[6..12].copy_from_slice(&MAC);
+    frame[12..18].copy_from_slice(b"\x88\xb5GET4");
+    frame[18..22].copy_from_slice(&nonce);
+    let mut reply = [0; 60];
+    if !exchange(&frame, &mut reply, 7000)
+        || reply[..6] != MAC
+        || reply[6..12] != PEER
+        || &reply[12..18] != b"\x88\xb5UUID"
+        || reply[18..22] != nonce
+        || reply[22] != 1
+    {
+        return None;
+    }
+    reply[23..59].try_into().ok()
 }
