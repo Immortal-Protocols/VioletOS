@@ -133,6 +133,12 @@ try:
                         if time.monotonic()>deadline:raise AssertionError((expected,status()))
                         time.sleep(.05)
                 else:assert status()==(1,3,0),status()
+                if args.library == "radio-rollback":
+                    # Observe the in-place rollback before stopping this guest.
+                    # The next scenario cold-boots the same disk and exercises
+                    # Radio through the UI with a fresh virtual UART.
+                    print("Guest service package transaction:", args.library, status())
+                    sys.exit(0)
                 time.sleep(.5)
                 tap(1140)
                 check_label(104,"VIRTUAL RADIO OFF",0xffeeeaf8)

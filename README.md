@@ -29,6 +29,12 @@ brew install qemu sdl2 cmake ninja dtc
 
 For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Android NDK **28.2.13676358** for its ARM cross-compiler. The build looks under `~/Library/Android/sdk/ndk/28.2.13676358`. Set `ANDROID_NDK_HOME` if it lives elsewhere. The first build downloads pinned seL4, libfdt and QEMU radio TLS sources, checks their SHA-256 hashes and installs the Python build dependencies in a local virtual environment. QEMU can build and run without a handset or factory files. The interactive launcher has been tested on this Mac.
 
+## Continuous integration
+
+[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the seL4 image and tests the stopwatch logic. The macOS job compiles the SDL simulator, emulator viewer and both USB clients, then runs the headless QEMU suites for touch, isolation, storage, app lifecycle, updates, Wi-Fi and power.
+
+The Moto image and Moto supervisor tests require local factory files. Physical USB and Wi-Fi tests run on the handset. The public HTTPS endpoint test is available separately as `make test-wifi-live`.
+
 ## How the layers fit together
 
 The layer cake shows the services above seL4 and the three environments below. USB Diagnostics runs on the Moto and serves developer tools connected from a Mac.

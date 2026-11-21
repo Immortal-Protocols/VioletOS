@@ -6,4 +6,5 @@ ply==3.11
 pyfdt==0.3
 PyYAML==6.0.3
 six==1.17.0
+typing_extensions==4.16.0
 setuptools<81
