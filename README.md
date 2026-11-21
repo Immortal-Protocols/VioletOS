@@ -18,7 +18,7 @@ VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and 
 | `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
 | `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
-| `make moto-debug` | Read handset status over USB. See [USB diagnostics](targets/moto-g-pure/README.md#usb-diagnostics). |
+| `make moto-debug` | Read handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally. Installing it is a separate operation. |
 
 On an Apple Silicon Mac, install the Xcode command-line tools, Python 3, and the Homebrew packages below. The simulator needs only the host C toolchain, Make and SDL2.
@@ -31,11 +31,11 @@ For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Androi
 
 ## How the layers fit together
 
-This slide from the original design review shows the proposed stack. Its Linux label describes the Moto at the time of the proposal. Slot B now boots seL4.
+The layer cake shows the services above seL4 and the three environments below. USB Diagnostics runs on the Moto and serves developer tools connected from a Mac.
 
 ![Proposed architecture with the shared UI above Rust services and Microkit and seL4, followed by the Mac simulator, QEMU and Moto G Pure targets.](docs/proposed-violetos-stack.png)
 
-**What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto has run the shared launcher, Runtime and stopwatch with physical touch, including switching Home and reopening a running timer. The next image adds the storage service and a handset eMMC backend. The Mac simulator runs its native SDL UI.
+**What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto has run the shared launcher, Runtime and stopwatch with physical touch, including switching Home and reopening a running timer. The handset has also persisted stopwatch data across a reboot and fetched a UUID over Wi-Fi. The Mac simulator runs its native SDL UI.
 
 Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. Choose a virtual access point with **Next Network**. The guest checks the gateway, verifies the HTTPS certificate, and prints the UUID. The Mac relays TCP bytes. [Wi-Fi Setup](apps/wifi/README.md)
 
@@ -52,7 +52,7 @@ These three design-review slides describe the planned architecture. The componen
 ![Proposed Subscribe, Get and Execute operations and independent component update rules.](docs/violetos-runtime-contract-updates.png)
 
 - **Image and apps** — [App packages](image/packages/README.md), [Built-in app catalog](image/catalog/README.md), [Launcher](apps/launcher/README.md), [Stopwatch](apps/stopwatch/README.md).
-- **Runtime and services** — [Runtime](runtime/README.md), [Touch service](services/touch/README.md), [Display service](services/display/README.md), [Storage service](services/storage/README.md), [Radio service](services/radio/README.md), [Power service](services/power/README.md).
+- **Runtime and services** — [Runtime](runtime/README.md), [Touch service](services/touch/README.md), [Display service](services/display/README.md), [Storage service](services/storage/README.md), [Radio service](services/radio/README.md), [Power service](services/power/README.md), [USB Diagnostics](services/usb-diagnostics/README.md).
 - **Kernel, boot and recovery** — [seL4 kernel](kernel/sel4/README.md), [Bootloader](boot/loader/README.md), [Process supervisor](system/supervisor/README.md), [Package manager](system/package-manager/README.md).
 - **Targets** — [Mac simulator](targets/mac-simulator/README.md), [QEMU emulator](targets/qemu/README.md), [Moto G Pure](targets/moto-g-pure/README.md).
 

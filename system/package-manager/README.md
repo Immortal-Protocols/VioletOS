@@ -30,3 +30,5 @@ tools/moto-reboot-check --install-radio build/sel4/moto/radio-r2.vpk
 Supply a different board-specific Radio VPK from the one already running. The command records the saved stopwatch value, signs the exact package, transfers it over USB, requests activation, and checks for the new checksum and catalog bank. It then reboots the handset and checks the active Radio and saved stopwatch again. Leave USB connected throughout.
 
 The Moto build creates a local P-256 signing key at `build/sel4/moto/developer-signing.pem`. Keep it private and retain it to authorize future Radio builds. The boot image embeds the public key. A newly generated key requires a matching boot image. The supervisor verifies the signature over the entire staged VPK and restricts remote activation to Radio. Local confirmation in Apps is still available for other components.
+
+On the Moto baseline with package 21, [USB Diagnostics](../../services/usb-diagnostics/README.md) also accepts a signed replacement for itself. The supervisor runs the replacement as a trial and waits for confirmation over the new USB connection before persisting the catalog.

@@ -105,3 +105,7 @@ The ABI 3 Moto Radio package uses 128 KiB of private working memory supplied by 
 `make test-moto-radio` checks firmware command and frame handling and exercises WPA2 with a fixture access point. `make test-moto-ip-live` runs the handset's IP and TLS client on the host with libslirp providing the test Ethernet link.
 
 On the physical XT2163DL, slot B image `4be2ac63c17e` with signed Radio `ca18deb9` completed a passive scan on all 20 configured channels. USB reported three received beacons or probe responses and zero process faults. The run used a Radio-only USB update. Signed Radio `c90eb9e1` then joined the provisioned WPA2 network, obtained a DHCP lease and fetched two distinct UUIDv4 responses over verified HTTPS on the same handset connection. The Mac used USB to request each test and read the result. The profile is held in memory for the current boot.
+
+## USB diagnostics
+
+The current build ships [USB Diagnostics](../../services/usb-diagnostics/README.md) as its own signed-update target. Its service guide covers the Mac clients, live package replacement and recovery tests.

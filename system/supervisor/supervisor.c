@@ -71,13 +71,17 @@ static bool valid_package(const struct package *p, unsigned limit) {
 #ifdef VIOLET_MOTO
   if (p->id==RADIO && p->abi==3) abi_ok=true;
 #endif
+  bool allowed_id = p->id < COUNT;
+#ifdef VIOLET_MOTO
+  allowed_id |= p->id == USB_DIAG;
+#endif
   if (p->magic != 0x314b5056 ||
       !abi_ok || !p->id || p->id == PACKAGES ||
-      p->id >= COUNT || !p->code || p->code % PAGE || p->size < p->code ||
+      !allowed_id || !p->code || p->code % PAGE || p->size < p->code ||
       p->size > limit - sizeof(*p) ||
       p->size > ((p->id == RADIO || p->id == RUNTIME) ? 0x38000 : 0x3e000))
     return false;
-  if (p->id >= 11) {
+  if (p->id >= 11 && p->id < COUNT) {
     if (p->size > 65512 || p->size < p->code + 20 ||
         memcmp(p->bytes + p->size - 20, "APP1", 4))
       return false;
@@ -98,9 +102,9 @@ static bool valid_package(const struct package *p, unsigned limit) {
 }
 static bool parse(const struct archive *a, unsigned limit) {
   if (a->magic != 0x31544356 || limit < 16 || a->size > limit - 16 ||
-      a->count >= COUNT || crc32(a->bytes, a->size) != a->crc)
+      a->count > COUNT || crc32(a->bytes, a->size) != a->crc)
     return false;
-  const struct package *found[COUNT] = {0};
+  const struct package *found[TOTAL] = {0};
   unsigned pos = 0;
   for (unsigned i = 0; i < a->count; i++) {
     if (a->size - pos < sizeof(struct package))
@@ -124,6 +128,10 @@ static bool parse(const struct archive *a, unsigned limit) {
       return false;
   for (unsigned i = 1; i < COUNT; i++)
     procs[i].package = found[i];
+#ifdef VIOLET_MOTO
+  // Older installed catalogs inherit Diagnostics from the factory catalog.
+  if (found[USB_DIAG]) procs[USB_DIAG].package = found[USB_DIAG];
+#endif
   return true;
 }
 static void grant(struct task *t, unsigned slot, seL4_CPtr ep, unsigned badge,
@@ -321,7 +329,15 @@ static struct device_page devices[] = {
 static unsigned handset_report[6];
 static unsigned uploaded, upload_size, upload_crc;
 static seL4_CPtr catalog_candidate_frame;
-static const struct package *usb_image;
+static const struct package *factory_usb;
+static bool usb_factory_only;
+static unsigned usb_trial_bytes, usb_trial_generation;
+enum usb_failure { USB_HEALTHY, USB_FAULT, USB_TIMEOUT, USB_DEPENDENCY_FAULT };
+static enum usb_failure usb_last_failure;
+// Kept in the read-only image so virtual-board tests can shorten the trial.
+static const volatile unsigned usb_trial_timeout_ms = 45000;
+static unsigned long long usb_deadline;
+static unsigned long long ticks64(void);
 #endif
 extern unsigned volume_load(void *destination);
 extern bool volume_commit(const void *data, unsigned length, unsigned active);
@@ -338,10 +354,10 @@ static unsigned profile_length, profile_transaction, profile_epoch;
 static unsigned long long profile_ticks;
 static bool profile_pending, profile_ready;
 static unsigned join_job;
-static unsigned char radio_signature[72];
-static bool signature_started, radio_authorized;
-static bool signed_radio(unsigned size) {
-  if (!upload_size || uploaded != upload_size || inbox->id != RADIO ||
+static unsigned char package_signature[72];
+static bool signature_started, package_authorized;
+static bool signed_update(unsigned size) {
+  if (!upload_size || uploaded != upload_size || (inbox->id != RADIO && inbox->id != USB_DIAG) ||
       !valid_package(inbox, uploaded)) return false;
   unsigned char digest[32];
   br_sha256_context hash;
@@ -350,7 +366,7 @@ static bool signed_radio(unsigned size) {
   br_sha256_out(&hash, digest);
   br_ec_public_key pk = {BR_EC_secp256r1, developer_key, sizeof(developer_key)};
   return br_ecdsa_i31_vrfy_asn1(&br_ec_prime_i31, digest, sizeof(digest), &pk,
-                                radio_signature, size);
+                                package_signature, size);
 }
 #endif
 static bool valid_inbox(void) {
@@ -364,6 +380,8 @@ static const char *title(const struct package *p) {
   static const char names[][16] = {"",      "LAUNCHER", "STOPWATCH",  "RUNTIME",
                                    "TOUCH", "DISPLAY",  "STORAGE",    "RADIO",
                                    "POWER", "",         "WI-FI SETUP"};
+  static const char diag_name[16] = "USB DIAGNOSTICS";
+  if (p->id == USB_DIAG) return diag_name;
   return p->id >= 11 ? (const char *)p->bytes + p->size - 16 : names[p->id];
 }
 static void reply_title(const struct package *p) {
@@ -379,7 +397,12 @@ static bool update_catalog(unsigned id, bool remove) {
   // Each physical device is wired to a process on this board.
   if (remove && id >= STORAGE && id <= POWER) return false;
 #endif
-  if (!id || id >= COUNT || id == PACKAGES)
+  bool known = id > 0 && id < COUNT && id != PACKAGES;
+#ifdef VIOLET_MOTO
+  if (usb_trial_bytes && id != USB_DIAG) return false;
+  if (id == USB_DIAG) known = !remove && usb_trial_bytes && usb_trial_generation == generation;
+#endif
+  if (!known)
     return false;
   if (remove && (!procs[id].package || id == LAUNCHER || id == RUNTIME ||
                  id == TOUCH || id == DISPLAY))
@@ -387,7 +410,8 @@ static bool update_catalog(unsigned id, bool remove) {
   if (!remove && (!valid_inbox() || inbox->id != id))
     return false;
   unsigned count = 0, length = 0;
-  for (unsigned i = 1; i < COUNT; i++) {
+  for (unsigned i = 1; i < TOTAL; i++) {
+    if (i >= COUNT && i != USB_DIAG) continue;
     const struct package *p = i == id ? (remove ? 0 : inbox) : procs[i].package;
     if (!p || i == PACKAGES)
       continue;
@@ -482,7 +506,8 @@ static void wire(void) {
     source = 3;
 #else
   report = handset_report;
-  usb_image = procs[RADIO].package; // Recovery USB always uses the built-in binary.
+  factory_usb = procs[USB_DIAG].package;
+  check(!factory_usb);
   local_catalog = device(0,0x43c00000,0x0d000000,20);
   new_catalog = device(0,0x43d00000,0x0d100000,20);
   catalog_candidate_frame = next_slot-1;
@@ -494,7 +519,7 @@ static void wire(void) {
                           seL4_ARM_Default_VMAttributes|seL4_ARM_ExecuteNever));
   inbox = (const void *)0x0d200000;
   upload_size = uploaded = 0;
-  radio_authorized = signature_started = false;
+  package_authorized = signature_started = false;
 #endif
   report[3] = source;
   __sync_synchronize();
@@ -532,7 +557,19 @@ static void wire(void) {
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode,copy_catalog,32,seL4_CapInitThreadCNode,
                         catalog_candidate_frame,32,seL4_CanRead));
   check(seL4_ARM_Page_Map(copy_catalog,procs[STORAGE].task.pd,0x0d100000,seL4_CanRead,seL4_ARM_ExecuteNever));
-  procs[USB_DIAG].package = usb_image;
+  if (usb_factory_only) procs[USB_DIAG].package = factory_usb;
+  if (usb_trial_bytes) {
+    // The scratch section survives group teardown. The inbox does not.
+    memcpy((void *)inbox, new_catalog, usb_trial_bytes);
+    uploaded = upload_size = usb_trial_bytes;
+    if (inbox->id == USB_DIAG && valid_inbox()) {
+      procs[USB_DIAG].package = inbox;
+      usb_trial_generation = generation;
+      usb_deadline = ticks64() + (unsigned long long)ticks_per_ms * usb_trial_timeout_ms;
+    } else {
+      usb_trial_bytes = 0;
+    }
+  }
   prepare_process(USB_DIAG);
   grant(&procs[USB_DIAG].task,7,life,USB_TRANSFER_BADGE,false);
   grant(&procs[USB_DIAG].task,6,procs[POWER].ep,USB_DIAG,false);
@@ -895,6 +932,13 @@ void root_main(seL4_BootInfo *bi) {
       seL4_MessageInfo_t msg = seL4_Recv(life, &badge);
 #else
       seL4_MessageInfo_t msg = seL4_NBRecv(life, &badge);
+#ifdef VIOLET_MOTO
+      if (usb_trial_bytes && ticks64() >= usb_deadline) {
+        usb_last_failure = USB_TIMEOUT;
+        usb_trial_bytes = 0;
+        break;
+      }
+#endif
       if (!badge) {
 #ifdef VIOLET_MOTO
         volatile unsigned *diag = (void *)0x09202000;
@@ -929,11 +973,14 @@ void root_main(seL4_BootInfo *bi) {
 #endif
 #ifdef VIOLET_MOTO
         if (badge == 16 + USB_DIAG) {
+          if (usb_trial_bytes) { usb_last_failure = USB_FAULT; usb_trial_bytes = 0; break; }
+          if (procs[USB_DIAG].package != factory_usb) { usb_factory_only = true; break; }
           check(seL4_TCB_Suspend(procs[USB_DIAG].task.thread));
           continue;
         }
 #endif
 #ifdef VIOLET_MOTO
+        if (usb_trial_bytes) { usb_last_failure = USB_DEPENDENCY_FAULT; usb_trial_bytes = 0; break; }
         if (source == 3) {
           // Freeze clients before taking the controller back from Storage.
           for (unsigned id=1; id<TOTAL; ++id)
@@ -966,7 +1013,24 @@ void root_main(seL4_BootInfo *bi) {
 #ifdef VIOLET_MOTO
       if (badge == USB_TRANSFER_BADGE && op == EXECUTE && seL4_MessageInfo_get_length(msg)==14) {
         unsigned n=seL4_GetMR(3), ok=0;
-        if (key == 0x6a || key == 0x6b) {
+        if (key == 0x6d) {
+          seL4_SetMR(0,0);
+          seL4_SetMR(2,procs[USB_DIAG].package->crc);
+          seL4_SetMR(3,usb_trial_bytes ? generation : 0);
+          seL4_SetMR(4,usb_last_failure);
+          seL4_Reply(seL4_MessageInfo_new(0,0,0,5));
+          continue;
+        } else if (key == 0x6e && usb_trial_bytes && val == usb_trial_generation) {
+          if (update_catalog(USB_DIAG,false)) {
+            usb_factory_only = false;
+            usb_last_failure = USB_HEALTHY;
+            usb_trial_bytes = 0;
+            break;
+          }
+        } else if (usb_trial_bytes && key != 0x63) {
+          // A candidate can report health; privileged controls resume after confirmation.
+          ok = 0;
+        } else if (key == 0x6a || key == 0x6b) {
           unsigned words[9];
           for (unsigned i = 0; i < 9; ++i) words[i] = seL4_GetMR(4+i);
           if (key == 0x6a && val && n && n <= 32) {
@@ -992,22 +1056,27 @@ void root_main(seL4_BootInfo *bi) {
         } else if (key == 0x66 || key == 0x67) {
           unsigned words[10];
           for (unsigned i=0; i<10; i++) words[i]=seL4_GetMR(4+i);
-          radio_authorized = false;
+          package_authorized = false;
           if (key == 0x66) {
-            signature_started = valid_inbox() && inbox->id == RADIO && n == 40;
-            if (signature_started) memcpy(radio_signature, words, 40);
+            signature_started = valid_inbox() && (inbox->id == RADIO || inbox->id == USB_DIAG) && n == 40;
+            if (signature_started) memcpy(package_signature, words, 40);
             ok = signature_started;
           } else {
-            if (signature_started && n && n <= sizeof(radio_signature)-40) {
-              memcpy(radio_signature+40, words, n);
-              radio_authorized = signed_radio(40+n);
+            if (signature_started && n && n <= sizeof(package_signature)-40) {
+              memcpy(package_signature+40, words, n);
+              package_authorized = signed_update(40+n);
             }
             signature_started = false;
-            ok = radio_authorized;
+            ok = package_authorized;
           }
         } else if (key == 0x68) {
-          if (radio_authorized) {
-            radio_authorized = false;
+          if (package_authorized) {
+            package_authorized = false;
+            if (inbox->id == USB_DIAG) {
+              usb_trial_bytes = uploaded;
+              memcpy(new_catalog,inbox,usb_trial_bytes);
+              break;
+            }
             if (update_catalog(RADIO, false)) break;
           }
         } else if (key == 0x64) {
@@ -1042,7 +1111,7 @@ void root_main(seL4_BootInfo *bi) {
           ((volatile unsigned *)LANE_BASE)[980]=val;
           ((volatile unsigned *)LANE_BASE)[981]=n;ok=1;
         } else if(key==0x60) { // New upload invalidates every previous partial package.
-          radio_authorized = signature_started = false;
+          package_authorized = signature_started = false;
           uploaded=upload_size=0;
           if(val>=sizeof(*inbox) && val<=sizeof(*inbox)+0x3e000) {
             upload_size=val;upload_crc=n;ok=1;
@@ -1152,7 +1221,7 @@ void root_main(seL4_BootInfo *bi) {
       } else
 #endif
       if (badge == PACKAGES && op == EXECUTE && (key == 17 || key == 18)) {
-        if (update_catalog(val, key == 18))
+        if (val != USB_DIAG && update_catalog(val, key == 18))
           break;
       } else if (badge == PACKAGES && op == GET && key == 16) {
         error = 0;

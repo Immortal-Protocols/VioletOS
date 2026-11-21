@@ -18,7 +18,7 @@ def inspect(blob):
     if (
         magic != b"VPK1"
         or (abi != package_abi(identity) and (identity, abi) != (7, 3))
-        or not (1 <= identity <= 8 or 10 <= identity <= 14)
+        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity == 21)
     ):
         raise ValueError("unsupported package or ABI")
     if not 0 < code <= size <= 0x3E000 or code % 4096 or len(blob) != 24 + size:
@@ -27,7 +27,7 @@ def inspect(blob):
         raise ValueError("package overlaps its process stack")
     if binascii.crc32(blob[24:]) != crc:
         raise ValueError("package checksum mismatch")
-    if identity >= 11:
+    if 11 <= identity <= 14:
         title = blob[-16:].rstrip(b"\0")
         if (
             size > 65512

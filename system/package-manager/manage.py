@@ -91,6 +91,8 @@ def stage(directory, factory, action, argument):
             if action == "install":
                 data = Path(argument).read_bytes()
                 identity = inspect(data)
+                if identity == 21:
+                    raise ValueError("USB Diagnostics requires the Moto target")
                 packages[identity] = data
             else:
                 item = NAMES[argument]

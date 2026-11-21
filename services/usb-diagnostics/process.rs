@@ -214,8 +214,8 @@ pub fn run() -> ! {
             continue;
         }
         if tx != 0 {
-            if let Some(action) = action_after_status.take() {
-                Message::new(EXECUTE, action, 0).call(7);
+            if let Some((action, token)) = action_after_status.take() {
+                Message::new(EXECUTE, action, token).call(7);
             }
             if let Some(a) = address.take() {
                 put(0, a);
@@ -282,6 +282,18 @@ pub fn run() -> ! {
                     put_half(CSR, 0x60);
                 }
             }
+            (0xc0, 0x6d, 0, 0) if configuration == 1 && (len == 12 || len == 16) => {
+                let r = Message::new(EXECUTE, 0x6d, 0).call(7);
+                let mut health = *b"VUD1............";
+                health[4..8].copy_from_slice(&r.value.to_le_bytes());
+                health[8..12].copy_from_slice(&r.arg.to_le_bytes());
+                health[12..16].copy_from_slice(&r.data[..4]);
+                if r.op == OK { send(&health, len); } else { put_half(CSR, 0x60); }
+            }
+            (0x40, 0x6e, lo, hi) if configuration == 1 && len == 0 => {
+                action_after_status = Some((0x6e, u32::from(lo) | (u32::from(hi) << 16)));
+                put_half(CSR, 0x48);
+            }
             (0x40,0x6c,lo,hi) if configuration==1 && len==0 => {
                 let token=u32::from(lo)|(u32::from(hi)<<16);
                 let r=Message::new(EXECUTE,0x6c,token).call(7);
@@ -299,7 +311,7 @@ pub fn run() -> ! {
                 put_half(CSR, if reply.op == OK { 0x48 } else { 0x60 });
             }
             (0x40, action @ (0x65 | 0x68), 0, 0) if configuration == 1 && len == 0 => {
-                action_after_status = Some(u32::from(action));
+                action_after_status = Some((u32::from(action), 0));
                 put_half(CSR, 0x48);
             }
             (0xc0, 0x62, 0, 0) if configuration==1 => send(&package_status(),len),

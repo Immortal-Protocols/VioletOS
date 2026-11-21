@@ -43,6 +43,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
     board = repo / "targets" / ("moto-g-pure" if target == "moto" else "qemu")
     if target == "moto":
         scripts["radio"] = board / "radio.rs"
+        scripts["usb-diagnostics"] = repo / "services/usb-diagnostics/process.rs"
     script = dest / "component.ld"
     script.write_text("""ENTRY(process_entry)
 SECTIONS {
@@ -61,6 +62,8 @@ SECTIONS {
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
     titles = {item["name"]: item.get("title") for item in manifest}
+    if target == "moto":
+        manifest.append({"id": 21, "name": "usb-diagnostics", "required": True})
     if selected is not None:
         manifest = [item for item in manifest if item["name"] in selected]
     names = [item["name"] for item in manifest]
@@ -104,9 +107,6 @@ SECTIONS {
         if name == "stopwatch":
             modules["watch"] = repo / "apps/stopwatch/state.rs"
         body = "process::run()"
-        if name == "radio" and target == "moto":
-            modules["usb_debug"] = board / "usb_debug.rs"
-            body = "if identity == 21 { usb_debug::run() } else { process::run() }"
         if name == "runtime":
             modules["lanes"] = repo / "runtime/lanes.rs"
             body = "if identity>=15 {lanes::work(identity-15+4)} else {process::run()}"

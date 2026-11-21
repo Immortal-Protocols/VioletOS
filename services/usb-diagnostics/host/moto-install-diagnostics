@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Install signed USB Diagnostics and confirm the replacement from the Mac."""
+import argparse
+import json
+from pathlib import Path
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "image/packages"))
+from package_format import inspect
+
+
+def run(tool, *args):
+    return subprocess.check_output([ROOT / "build" / tool, *args],
+                                   stderr=subprocess.PIPE, text=True, timeout=40).strip()
+
+
+def health():
+    response = run("moto-package", "diagnostics-status")
+    match = re.fullmatch(r"Diagnostics CRC ([0-9a-f]{8}), trial (\d+)", response)
+    if not match:
+        raise ValueError(response)
+    return int(match[1], 16), int(match[2])
+
+
+def install(package):
+    data = package.read_bytes()
+    if inspect(data) != 21:
+        raise ValueError("Expected a Moto USB Diagnostics VPK (ID 21)")
+    crc, = struct.unpack_from("<I", data, 20)
+    previous, trial = health()
+    if trial:
+        raise ValueError("Another Diagnostics trial is active")
+    if crc == previous:
+        print(f"Diagnostics {crc:08x} is already active.")
+        return
+    with tempfile.TemporaryDirectory() as scratch:
+        sig = Path(scratch) / "signature"
+        subprocess.run(["openssl", "dgst", "-sha256", "-sign",
+                        ROOT / "build/sel4/moto/developer-signing.pem", "-out", sig, package], check=True)
+        print(run("moto-package", package), flush=True)
+        run("moto-package", "activate-diagnostics", sig)
+    deadline = time.monotonic() + 65
+    confirmation_sent = False
+    while time.monotonic() < deadline:
+        try:
+            current, generation = health()
+            if current == crc:
+                if generation:
+                    snapshot = json.loads(run("moto-debug"))
+                    if snapshot.get("generation") == generation and snapshot.get("runtime_ready"):
+                        # Re-enumeration can interrupt the host transfer after delivery.
+                        confirmation_sent = True
+                        run("moto-package", "confirm-diagnostics", str(generation))
+                elif confirmation_sent:
+                    print(f"Diagnostics {crc:08x} committed and reachable over USB.")
+                    return
+        except (ValueError, subprocess.SubprocessError):
+            pass  # USB re-enumerates during group restarts.
+        time.sleep(0.5)
+    current, trial = health()
+    if current == previous and not trial:
+        raise RuntimeError("Diagnostics trial failed; previous service is reachable over USB")
+    raise RuntimeError("Diagnostics installation could not be verified")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("package", type=Path)
+    try:
+        install(parser.parse_args().package)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise SystemExit(str(exc))

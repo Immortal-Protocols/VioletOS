@@ -51,7 +51,7 @@ static int stage(libusb_device_handle *h,const char *file) {
     printf("Staged package CRC %08x.\n",word(bytes+20));
     return 0;
 }
-static int activate_radio(libusb_device_handle *h, const char *signature) {
+static int activate_signed(libusb_device_handle *h, const char *signature) {
     FILE *file = fopen(signature, "rb");
     if (!file) { perror(signature); return 1; }
     unsigned char der[73];
@@ -67,8 +67,11 @@ static int activate_radio(libusb_device_handle *h, const char *signature) {
     return transfer(h,0x40,0x68,0,NULL,0);
 }
 int main(int argc,char **argv) {
-    int activate = argc==3 && !strcmp(argv[1],"activate-radio");
-    if((argc!=2 && !activate) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | FILE.vpk | activate-radio SIGNATURE\n",stderr);return 2;}
+    int radio = argc == 3 && !strcmp(argv[1], "activate-radio");
+    int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
+    int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
+    int activate = radio || diagnostics;
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -90,7 +93,23 @@ int main(int argc,char **argv) {
     if(chosen){
         unsigned char b[24];
         if (activate) {
-            rc = activate_radio(chosen, argv[2]);
+            if (!status(chosen,b) && word(b+16) == (radio ? 7u : 21u))
+                rc = activate_signed(chosen, argv[2]);
+        } else if (!strcmp(argv[1], "diagnostics-status")) {
+            rc = transfer(chosen, 0xc0, 0x6d, 0, b, 12) || memcmp(b,"VUD1",4);
+            if (!rc) printf("Diagnostics CRC %08x, trial %u\n", word(b+4), word(b+8));
+        } else if (!strcmp(argv[1], "diagnostics-recovery")) {
+            rc = transfer(chosen, 0xc0, 0x6d, 0, b, 16) || memcmp(b,"VUD1",4);
+            if (!rc) {
+                const char *reasons[] = {"none", "Diagnostics fault", "confirmation timeout", "dependency fault"};
+                uint32_t reason = word(b+12);
+                printf("Last trial failure: %s\n", reason < 4 ? reasons[reason] : "unknown");
+            }
+        } else if (confirm) {
+            char *end = NULL;
+            unsigned long token = strtoul(argv[2], &end, 10);
+            if (token && token <= UINT32_MAX && end && !*end)
+                rc = transfer(chosen, 0x40, 0x6e, (uint32_t)token, NULL, 0);
         } else if (!strcmp(argv[1],"provision-wpa2")) {
             unsigned char payload[73];
             // nonce (4), SSID length (1), padded SSID (32), PMK (32), UTC seconds (4).

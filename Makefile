@@ -73,6 +73,12 @@ test-apps: qemu-image
 test-power: qemu-image
 	$(PYTHON) targets/qemu/test_power.py
 
+.PHONY: test-moto-diagnostics
+test-moto-diagnostics: moto qemu-image
+	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial confirm
+	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial fault
+	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial timeout
+
 .PHONY: test-moto-ui
 test-moto-ui: moto qemu-image
 	$(PYTHON) targets/moto-g-pure/test_boot.py
@@ -83,7 +89,7 @@ test-moto-ui: moto qemu-image
 moto-debug: build/moto-debug
 	@$<
 
-build/moto-debug: tools/moto_debug.c
+build/moto-debug: services/usb-diagnostics/host/moto_debug.c
 	@mkdir -p build
 	$(CC) -Wall -Wextra -Werror -std=c11 $< $$(pkg-config --cflags --libs libusb-1.0) -o $@
 
@@ -103,7 +109,7 @@ test-moto-radio: moto
 test-moto-ip-live: moto
 	$(PYTHON) targets/moto-g-pure/test_ip_live.py
 
-build/moto-package: tools/moto_package.c
+build/moto-package: services/usb-diagnostics/host/moto_package.c
 	@mkdir -p build
 	$(CC) -Wall -Wextra -Werror -std=c11 $< $$(pkg-config --cflags --libs libusb-1.0) -o $@
 
