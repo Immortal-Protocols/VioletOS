@@ -1,5 +1,9 @@
 # VioletOS
 
+[![Runtime formally verified](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/runtime-proofs.yml/badge.svg?branch=main)](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/runtime-proofs.yml)
+
+The badge shows the latest [Runtime proofs](runtime/verify/README.md) run on `main`: whether Kani still proves that apps cannot receive each other's touches or service data, present while in the background, or reach each other's storage.
+
 VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and QEMU. The Rust stopwatch and touch driver have been tested on the Moto and in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
