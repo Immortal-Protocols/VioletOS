@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 
-guest = Path(__file__).resolve().parents[2] / "platform/sel4/stopwatch/test.py"
+guest = Path(__file__).resolve().parents[2] / "targets/qemu/test_guest.py"
 with tempfile.TemporaryDirectory() as temp:
     disk = Path(temp) / "wifi.disk"
     disk.write_bytes(bytes(1024**2))

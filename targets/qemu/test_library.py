@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-guest = ROOT / "platform/sel4/stopwatch/test.py"
+guest = ROOT / "targets/qemu/test_guest.py"
 with tempfile.TemporaryDirectory() as tmp:
     disk = Path(tmp) / "app.disk"
     disk.write_bytes(bytes(1024**2))

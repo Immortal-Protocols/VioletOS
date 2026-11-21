@@ -61,14 +61,14 @@ These three design-review slides describe the planned architecture. The componen
 | If you want to change… | Start here | Where it runs |
 | --- | --- | --- |
 | A button, stopwatch timing or framebuffer drawing | [Shared stopwatch app](apps/stopwatch/process.rs) draws the screen on both targets. [stopwatch.rs](apps/stopwatch/state.rs) owns the state transitions. The renderer uses the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
-| How the first task obtains device mappings | [Shared supervisor](system/supervisor/supervisor.c), [Moto register map](targets/moto-g-pure/spi_mmio.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
+| How the first task obtains device mappings | [Shared supervisor](system/supervisor/supervisor.c), [Moto register map](targets/moto-g-pure/spi_mmio.c) and [platform.h](platform/sel4/include/platform.h) | Moto and QEMU userspace |
 | How a touch becomes a tap | [touch.rs](services/touch/touch.rs) initializes the Novatek controller and decodes contacts. [spi.rs](services/touch/spi.rs) drives each transfer. [spi_mmio.c](targets/moto-g-pure/spi_mmio.c) accesses real registers, while [fixture.c](targets/qemu/fixture.c) models them. | Shared driver with one backend per target |
-| How touch events cross address spaces | [events.c](platform/sel4/stopwatch/events.c) handles the request and reply. The supervisor grants Runtime access to the QEMU touch endpoint. | Moto and QEMU |
+| How touch events cross address spaces | [events.c](services/touch/events.c) handles the request and reply. The supervisor grants Runtime access to the QEMU touch endpoint. | Moto and QEMU |
 | Durable stopwatch checkpoints | [storage.rs](services/storage/storage.rs) handles load and save requests, [journal.rs](services/storage/journal.rs) selects the latest valid record, and [block.rs](services/storage/block.rs) drives the virtual disk. | QEMU storage task |
-| Watchdog behavior | [watchdog.c](platform/sel4/stopwatch/watchdog.c) | Moto and QEMU userspace |
+| Watchdog behavior | [watchdog.c](platform/sel4/board/watchdog.c) | Moto and QEMU userspace |
 | Where seL4 comes from and how it boots | [Kernel build](kernel/sel4/build.py) pins and fetches upstream seL4, applies the [board configuration](platform/sel4/board/) and builds a kernel per target. The [loader](boot/loader/) prepares memory and transfers control to the kernel. | Build host and early ARM boot |
 | The Moto image layout | [loader/build.py](platform/sel4/loader/build.py) links the payload. [phone_image.py](tools/phone_image.py) reads and packages the Android v2 boot format. | Build host |
-| How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU. [viewer.c](tools/emulator/viewer.c) displays its 720 × 1600 framebuffer and translates mouse events into touch reports. [test.py](platform/sel4/stopwatch/test.py) checks the driver and rendered output. | Mac host |
+| How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU. [viewer.c](tools/emulator/viewer.c) displays its 720 × 1600 framebuffer and translates mouse events into touch reports. [test_guest.py](targets/qemu/test_guest.py) checks the driver and rendered output. | Mac host |
 | The native simulator | [screen.c](src/screen.c) owns its UI and state. [simulator.c](targets/mac-simulator/simulator.c) supplies SDL input, display and time. | Native host process |
 
 For example, change the **Start** label in `apps/stopwatch/process.rs` to update both seL4 targets. Change `spi_mmio.c` and only the Moto build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
@@ -98,6 +98,6 @@ In one slot B trial, the Rust handset image displayed **TOUCH READY** and **RAM 
 
 ### Rust toolchain
 
-The stopwatch state machine builds with Rust 1.91.1 and the `armv7a-none-eabi` target. Install the target with `rustup target add armv7a-none-eabi` and put `rustc` on PATH (or set `RUSTC`). Run its host tests with `rustc --edition=2021 --test platform/sel4/services/lib.rs -o build/state-tests && build/state-tests`.
+The stopwatch state machine builds with Rust 1.91.1 and the `armv7a-none-eabi` target. Install the target with `rustup target add armv7a-none-eabi` and put `rustc` on PATH (or set `RUSTC`). Run its host tests with `rustc --edition=2021 --test apps/stopwatch/state.rs -o build/state-tests && build/state-tests`.
 
 On the development Mac a single warm QEMU image build took 0.98 s before this port and 1.50 s afterward. The QEMU payload grew from 239,912 to 240,488 bytes. Android boot-image padding kept the Moto package at 12,109,824 bytes. These measurements concern the state-machine port alone.

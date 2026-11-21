@@ -6,7 +6,7 @@ here = Path(__file__).resolve().parent
 repo = here.parents[2]
 build = repo / "build/sel4"
 variant, stock_path = sys.argv[1:]
-app = here.parent / "stopwatch"
+platform_include = here.parent / "include"
 out = build / variant
 def run(cmd):
     subprocess.run(cmd, cwd=out, check=True)
@@ -27,13 +27,13 @@ incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" 
 defines = ["-DNDEBUG", "-DROOT_BYTES=0x80000"]
 if probe: defines.append("-DVIOLET_TEST_ISOLATION")
 defines.append("-DVIOLET_QEMU" if variant=="qemu" else "-DVIOLET_MOTO")
-sys.path.insert(0,str(app))
+sys.path.insert(0,str(repo / "services/touch"))
 from firmware import prepare
 prepare(out, variant, Path(stock_path).parent)
 sources = [here/"root.S", here/"strings.c"]
 for source in sources:
     obj = source.name+".o"
-    run(common + incs + defines + ["-I",out,"-I",app,"-std=gnu11","-c",source,"-o",obj])
+    run(common + incs + defines + ["-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
 rustc = os.environ.get("RUSTC") or shutil.which("rustc")
 if not rustc:
     local = repo/"build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc"
@@ -47,9 +47,9 @@ from build import components
 # Only process-local ABI shims, never the root allocator, enter packages.
 board_spi = repo/("targets/qemu/fixture.c" if variant=="qemu" else "targets/moto-g-pure/spi_mmio.c")
 shims=[]
-for source in [app/"events.c", app/"storage_ipc.c", app/"watchdog.c", board_spi, here/"strings.c"]:
+for source in [repo/"services/touch/events.c", repo/"services/storage/storage_ipc.c", here.parent/"board/watchdog.c", board_spi, here/"strings.c"]:
     obj=out/("component-"+source.name+".o")
-    run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",app,"-std=gnu11","-c",source,"-o",obj])
+    run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
     shims.append(obj)
 only=os.environ.get("VIOLET_COMPONENT_ONLY")
 selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi"}
@@ -80,13 +80,13 @@ if variant == "moto":
     from build_tls import build as build_crypto
     signing_objects = [build_crypto(repo, out, common)[1]]
     incs += ["-I", build / "bearssl-0.6/inc", "-I", repo / "services/radio/freestanding"]
-run(common+incs+defines+["-I",out,"-I",app,"-std=gnu11","-c",repo/"system/supervisor/supervisor.c","-o","supervisor.o"])
+run(common+incs+defines+["-I",out,"-I",platform_include,"-std=gnu11","-c",repo/"system/supervisor/supervisor.c","-o","supervisor.o"])
 root_objects=["root.S.o","supervisor.o","strings.c.o","catalog.o"]
 if variant=="qemu":
     run([rustc,"--edition=2021","--target=armv7a-none-eabi","--crate-type=staticlib","--cfg","package_volume","-Cpanic=abort","-Copt-level=s",repo/"system/package-manager/volume.rs","-o","volume.a"])
     root_objects.insert(2,"volume.a")
 else:
-    run(common+incs+defines+["-I",app,"-c",board_spi,"-o","board-map.o"])
+    run(common+incs+defines+["-I",platform_include,"-c",board_spi,"-o","board-map.o"])
     root_objects.append("board-map.o")
     for name, flags in [("loader-history.a", ["--cfg", "loader_trace", "--cfg", "package_catalog"]), ("root-history.a", ["--cfg", "package_catalog"])]:
         run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib",

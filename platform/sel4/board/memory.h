@@ -1,5 +1,5 @@
 #pragma once
-#include "../stopwatch/tasks.h"
+#include "../include/tasks.h"
 // Bootstrap allocator shared by the handset and QEMU supervisors.
 static seL4_BootInfo *boot;
 static seL4_CPtr ram, next_slot;

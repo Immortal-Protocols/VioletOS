@@ -11,7 +11,7 @@ import subprocess
 def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=None, storage_backend=None, target="qemu"):
     from package_format import package_abi
 
-    app = repo / "platform/sel4/stopwatch"
+    platform_include = repo / "platform/sel4/include"
     dest = out / "packages"
     dest.mkdir(exist_ok=True)
 
@@ -57,7 +57,7 @@ SECTIONS {
     run(
         common
         + incs
-        + ["-DNDEBUG", "-I", app, "-c", repo / "runtime/transport.c", "-o", transport]
+        + ["-DNDEBUG", "-I", platform_include, "-c", repo / "runtime/transport.c", "-o", transport]
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
     titles = {item["name"]: item.get("title") for item in manifest}

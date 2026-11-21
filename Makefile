@@ -27,7 +27,7 @@ emulator: qemu-image $(VIEWER)
 	$(PYTHON) tools/run.py $(VIEWER)
 test-emulator: qemu-image
 	@set -e; for mode in normal delayed drop-before drop-after stuck setup reset1 reset2; do \
-	  $(PYTHON) platform/sel4/stopwatch/test.py --spi $$mode --watchdog-enabled; \
+	  $(PYTHON) targets/qemu/test_guest.py --spi $$mode --watchdog-enabled; \
 	done
 build/simulator: src/screen.c src/screen.h src/glyphs.h targets/mac-simulator/simulator.c
 	mkdir -p $(@D)
@@ -37,11 +37,11 @@ sim: build/simulator
 
 .PHONY: test-storage test-isolation
 test-storage: qemu-image
-	$(PYTHON) platform/sel4/stopwatch/test_storage.py
+	$(PYTHON) targets/qemu/test_storage.py
 test-isolation: setup
 	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu
 	@set -e; for region in touch storage dma scanout peer radio radio-dma; do \
-	  $(PYTHON) platform/sel4/stopwatch/test.py --probe $$region; \
+	  $(PYTHON) targets/qemu/test_guest.py --probe $$region; \
 	done
 
 .PHONY: test-stack component
@@ -57,7 +57,7 @@ test-wifi: qemu-image
 
 .PHONY: test-wifi-live
 test-wifi-live: qemu-image
-	$(PYTHON) platform/sel4/stopwatch/test.py --wifi live
+	$(PYTHON) targets/qemu/test_guest.py --wifi live
 
 .PHONY: app
 app: setup

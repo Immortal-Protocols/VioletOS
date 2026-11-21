@@ -11,7 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "build/sel4/qemu"
 MANAGER = ROOT / "system/package-manager/manage.py"
-GUEST = ROOT / "platform/sel4/stopwatch/test.py"
+GUEST = ROOT / "targets/qemu/test_guest.py"
 
 with tempfile.TemporaryDirectory() as tmp:
     state = Path(tmp)

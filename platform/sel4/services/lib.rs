@@ -1,6 +1,4 @@
 #![cfg_attr(not(test), no_std)]
-#[path="../../../apps/stopwatch/state.rs"]
-mod stopwatch;
 
 #[cfg(not(test))]
 #[panic_handler]

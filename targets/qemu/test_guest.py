@@ -19,7 +19,7 @@ parser.add_argument("--state-dir",type=Path)
 parser.add_argument("--fault-id",type=int,default=7)
 args=parser.parse_args()
 enabled=args.watchdog_enabled
-repo=Path(__file__).resolve().parents[3]
+repo=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(repo/"tools"))
 from run import IMAGE, machine
 scratch=tempfile.TemporaryDirectory()

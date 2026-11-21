@@ -27,5 +27,5 @@ with TemporaryDirectory() as tmp:
     digest = hashlib.sha256(catalog).hexdigest()
     (directory / (digest + ".bin")).write_bytes(catalog)
     (directory / "active.json").write_text(json.dumps({"current": digest, "previous": None}))
-    subprocess.run([sys.executable, root / "platform/sel4/stopwatch/test.py",
+    subprocess.run([sys.executable, root / "targets/qemu/test_guest.py",
                     "--stack", "handset-ui", "--state-dir", directory], check=True, timeout=30)
