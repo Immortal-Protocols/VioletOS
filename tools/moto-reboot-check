@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Reboot the connected developer Moto and compare its persistent Radio and stopwatch."""
+import argparse
+import json
+import re
+import subprocess
+import time
+import tempfile
+import struct
+from pathlib import Path
+
+BUILD = Path(__file__).resolve().parents[1] / "build"
+
+
+def read(*command, timeout=30):
+    return subprocess.check_output(
+        [BUILD / command[0], *command[1:]], stderr=subprocess.PIPE, text=True, timeout=timeout
+    ).strip()
+
+
+def snapshot():
+    status = read("moto-package", "status")
+    radio = re.match(r"Radio CRC ([0-9a-f]{8}), catalog bank ([0-2]),", status)
+    if not radio:
+        raise ValueError(status)
+    return radio.groups(), read("moto-package", "stopwatch")
+
+
+def install_radio(package, before):
+    data = package.read_bytes()
+    if len(data) < 24 or data[:4] != b"VPK1" or struct.unpack_from("<I", data, 8)[0] != 7:
+        raise SystemExit("Expected a Moto Radio VPK")
+    expected = f"{struct.unpack_from('<I', data, 20)[0]:08x}"
+    if expected == before[0][0]:
+        raise SystemExit("Choose a Radio package different from the active build")
+    with tempfile.TemporaryDirectory() as directory:
+        sig = Path(directory) / "radio.sig"
+        subprocess.run(["openssl", "dgst", "-sha256", "-sign", BUILD/"sel4/moto/developer-signing.pem",
+                        "-out", sig, package], check=True)
+        print(read("moto-package", package, timeout=30 + len(data) // 500), flush=True)
+        read("moto-package", "activate-radio", sig)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            active = snapshot()
+        except (ValueError, subprocess.SubprocessError):
+            time.sleep(1)
+            continue
+        if active[0][0] == expected and active[0][1] in ("1", "2") and active[0][1] != before[0][1]:
+            if active[1] != before[1]:
+                raise SystemExit("Stopwatch changed during Radio installation")
+            return active
+        time.sleep(1)
+    raise SystemExit("Radio activation was not confirmed")
+
+
+def run(package=None):
+    before = snapshot()
+    if package:
+        print("Before install:", *before, flush=True)
+        before = install_radio(package, before)
+    boot = json.loads(read("moto-debug"))
+    print("Before reboot:", *before, flush=True)
+    print(read("moto-package", "reboot"), flush=True)
+    start = time.monotonic()
+    while time.monotonic() - start < 90:
+        try:
+            new = json.loads(read("moto-debug"))
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            # A managed-process restart leaves the board counter advancing.
+            # Allow one second of timing slack when distinguishing a fresh boot.
+            if (new["disk_ready"] and new["generation"] == 1
+                    and new["previous_boot_stage"] == 6
+                    and new["counter_ms"] + 1000 < boot["counter_ms"] + elapsed_ms):
+                after = snapshot()
+                print("After reboot:", *after)
+                if after != before:
+                    raise SystemExit("Radio or stopwatch changed across reboot")
+                print("Physical reboot verified; Radio and stopwatch match.")
+                return
+        except (subprocess.SubprocessError, ValueError):
+            pass
+        time.sleep(1)
+    raise SystemExit("Could not verify a new VioletOS boot over USB within 90 seconds")
+
+
+if __name__ == "__main__":
+    try:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--install-radio", type=Path, help="sign, stage and activate a different Moto Radio before reboot")
+        run(parser.parse_args().install_radio)
+    except subprocess.CalledProcessError as error:
+        raise SystemExit((error.stderr or "").strip() or str(error))

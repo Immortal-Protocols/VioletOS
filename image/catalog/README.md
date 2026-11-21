@@ -1,3 +1,5 @@
 # Built-in app catalog
 
-The proposed catalog maps app identities to packages in the boot image. Runtime would use it to list available apps and locate the executable requested by the launcher. Check the catalog at image assembly time for duplicate identities and missing packages.
+[components.json](components.json) identifies the launcher, stopwatch, Wi-Fi Setup, Runtime and five services. The factory image embeds their validated packages. Staged catalogs can replace components and omit optional ones.
+
+The guest package manager exposes the available stopwatch entry to the launcher through Runtime. Removing the stopwatch removes its launch button on the next boot. Run `make test-stack` to check removal and reinstallation.

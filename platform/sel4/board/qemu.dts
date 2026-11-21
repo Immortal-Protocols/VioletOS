@@ -22,7 +22,7 @@
         compatible = "arm,armv8-timer";
         interrupt-parent = <&gic>;
         interrupts = <1 13 8 1 14 8 1 11 8 1 10 8>;
-        clock-frequency = <13000000>;
+        clock-frequency = <62500000>;
     };
     memory { device_type = "memory"; reg = <0 0x40000000 0 0xc0000000>; };
     chosen {
