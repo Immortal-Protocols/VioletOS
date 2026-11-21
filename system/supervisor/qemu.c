@@ -26,6 +26,7 @@ enum {
   RADIO,
   POWER,
   PACKAGES,
+  WIFI,
   COUNT
 };
 enum { GET = 2, EXECUTE = 3, OPEN = 4, QUIT = 10, INVENTORY = 11 };
@@ -67,8 +68,8 @@ static bool parse(const struct archive *a, unsigned limit) {
       return false;
     const struct package *p = (const void *)(a->bytes + pos);
     if (p->magic != 0x314b5056 || p->abi != 1 || p->id < 1 ||
-        p->id >= PACKAGES || found[p->id] || !p->code || p->code % PAGE ||
-        p->size < p->code || p->size > 0x3e000 ||
+        (p->id == PACKAGES || p->id >= COUNT) || found[p->id] || !p->code ||
+        p->code % PAGE || p->size < p->code || p->size > 0x3e000 ||
         p->size > a->size - pos - sizeof(*p) ||
         crc32(p->bytes, p->size) != p->crc)
       return false;
@@ -83,7 +84,7 @@ static bool parse(const struct archive *a, unsigned limit) {
     if ((i == LAUNCHER || i == RUNTIME || i == TOUCH || i == DISPLAY) &&
         !found[i])
       return false;
-  for (unsigned i = 1; i < PACKAGES; i++)
+  for (unsigned i = 1; i < COUNT; i++)
     procs[i].package = found[i];
   return true;
 }
@@ -221,9 +222,10 @@ struct device_page {
   seL4_CPtr frame;
 };
 static struct device_page devices[] = {
-    {TOUCH, 0x09000000, 0x09003000, 0}, {STORAGE, 0x0a000000, 0x0a000000, 0},
-    {TOUCH, 0x49000000, 0x09005000, 0}, {RADIO, 0x49001000, 0x09000000, 0},
-    {POWER, 0x49002000, 0x09000000, 0}, {STORAGE, 0x49200000, 0x0b000000, 0}};
+    {TOUCH, 0x09000000, 0x09003000, 0},   {STORAGE, 0x0a000000, 0x0a000000, 0},
+    {RADIO, 0x0a001000, 0x09001000, 0},   {TOUCH, 0x49000000, 0x09005000, 0},
+    {RADIO, 0x49001000, 0x09000000, 0},   {POWER, 0x49002000, 0x09000000, 0},
+    {STORAGE, 0x49200000, 0x0b000000, 0}, {RADIO, 0x49201000, 0x09002000, 0}};
 static void wire(void) {
   build_group();
   // Device untypeds must be consumed in ascending physical address order.
@@ -249,13 +251,13 @@ static void wire(void) {
     if (!procs[id].package)
       continue;
     prepare_process(id);
-    if (id >= RUNTIME) {
+    if (id >= RUNTIME && id != WIFI) {
       procs[id].ep = create(ram, seL4_EndpointObject);
       grant(&procs[id].task, id == STORAGE ? 2 : 1, procs[id].ep, 0, true);
     }
   }
-  for (unsigned id = 1; id <= 2; id++)
-    if (procs[id].package)
+  for (unsigned id = 1; id < COUNT; id++)
+    if ((id == LAUNCHER || id == WATCH || id == WIFI) && procs[id].package)
       grant(&procs[id].task, 1, procs[RUNTIME].ep, id, false);
   static const unsigned service_slots[COUNT] = {
       [TOUCH] = 2, [STORAGE] = 3, [DISPLAY] = 4, [RADIO] = 5, [POWER] = 6};
@@ -278,6 +280,8 @@ static void wire(void) {
   }
   surface(LAUNCHER);
   surface(WATCH);
+  if (procs[WIFI].package)
+    surface(WIFI);
   for (unsigned off = 0; off < 720 * 1600 * 4; off += 65536)
     device(DISPLAY, 0x79450000 + off, 0x08000000 + off, 16);
 }
@@ -304,7 +308,7 @@ void root_main(seL4_BootInfo *bi) {
                                   sizeof(regs) / 4, &regs));
 #else
     for (unsigned i = RUNTIME; i < COUNT; i++)
-      if (procs[i].package)
+      if (i != WIFI && procs[i].package)
         start(i);
     start(LAUNCHER);
 #endif
@@ -331,12 +335,13 @@ void root_main(seL4_BootInfo *bi) {
         seL4_SetMR(i, 0);
       if (badge == PACKAGES && op == GET && key == INVENTORY) {
         error = 0;
-        for (unsigned id = 1; id < PACKAGES; id++)
-          if (procs[id].package)
+        for (unsigned id = 1; id < COUNT; id++)
+          if (id != PACKAGES && procs[id].package)
             result |= 1u << id;
       } else if (badge == RUNTIME && seL4_MessageInfo_get_length(msg) == 14) {
         if (op == EXECUTE && key == OPEN &&
-            (val == LAUNCHER || (val == WATCH && procs[WATCH].package))) {
+            (val == LAUNCHER ||
+             ((val == WATCH || val == WIFI) && procs[val].package))) {
           start(val);
           error = 0;
         } else if (op == EXECUTE && key == QUIT) {

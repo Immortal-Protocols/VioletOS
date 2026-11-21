@@ -10,7 +10,7 @@ def inspect(blob):
     if len(blob) < 24:
         raise ValueError("truncated package")
     magic, abi, identity, code, size, crc = struct.unpack_from("<4s5I", blob)
-    if magic != b"VPK1" or abi != 1 or not 1 <= identity <= 8:
+    if magic != b"VPK1" or abi != 1 or not (1 <= identity <= 8 or identity == 10):
         raise ValueError("unsupported package or ABI")
     if not 0 < code <= size <= 0x3E000 or code % 4096 or len(blob) != 24 + size:
         raise ValueError("invalid segment sizes")

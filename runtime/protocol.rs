@@ -89,3 +89,7 @@ pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {
 
 pub const INVENTORY: u32 = 11;
 pub const SURFACE: u32 = 12;
+
+pub const WIFI: u32 = 10;
+pub const NETWORK: u32 = 13;
+pub const RADIO_TEST: u32 = 14;

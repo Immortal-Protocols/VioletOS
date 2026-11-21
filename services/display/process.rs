@@ -1,5 +1,5 @@
 use crate::protocol::*;
-// Two 240x400 app-owned drawing surfaces. Only display has scanout access.
+// Private 240x400 app-owned drawing surfaces. Only display has scanout access.
 // The argument identifies a dirty band, allowing a digit update to skip the rest.
 pub fn run() -> ! {
     serve(|m| {
@@ -9,7 +9,7 @@ pub fn run() -> ! {
             }
             return Message::result(0);
         }
-        if m.op != EXECUTE || m.key != PRESENT || !(1..=2).contains(&m.value) {
+        if m.op != EXECUTE || m.key != PRESENT || !matches!(m.value, LAUNCHER | WATCH | WIFI) {
             return Message::error(INVALID);
         }
         let first = (m.arg >> 16) as usize;

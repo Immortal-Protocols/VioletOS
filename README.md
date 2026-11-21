@@ -12,6 +12,7 @@ VioletOS is a seL4 smartphone prototype for the Moto G Pure XT2163DL and QEMU. T
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering stopwatch behavior, touch transfer failures, recovery and watchdog handling. The tests read the guest's rendered pixels. |
 | `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
+| `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
 | `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally. Installing it is a separate operation. |
@@ -30,7 +31,9 @@ This slide from the original design review shows the proposed stack. Its Linux l
 
 ![Proposed architecture with the shared UI above Rust services and Microkit and seL4, followed by the Mac simulator, QEMU and Moto G Pure targets.](docs/proposed-violetos-stack.png)
 
-**What runs today.** In QEMU, the launcher, stopwatch, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto uses the earlier touch-tested UI and driver with RAM-only stopwatch state. The Mac simulator runs its native SDL UI.
+**What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto uses the earlier touch-tested UI and driver with RAM-only stopwatch state. The Mac simulator runs its native SDL UI.
+
+Open **Wi-Fi Setup → Connect → Test Radio** to send a packet to the private QEMU gateway. **Gateway Replied** confirms a round trip. The [setup app](apps/wifi/README.md) uses a modeled open network.
 
 In QEMU, start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance. Reopening it restores the last saved checkpoint. On Home, **Radio** toggles the virtual modem and **Sleep** blanks the display until the next tap. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
 

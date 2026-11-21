@@ -13,4 +13,4 @@ python3 system/package-manager/manage.py uninstall stopwatch
 make emulator
 ```
 
-Close the emulator before staging the next change. Use `rollback` to undo the last transaction, or `install build/sel4/qemu/packages/stopwatch.vpk` to restore the stopwatch. The package format targets the eight declared component identities. Package inputs and the host are trusted. Checksums detect corruption and provide no publisher authentication.
+Close the emulator before staging the next change. Use `rollback` to undo the last transaction, or `install build/sel4/qemu/packages/stopwatch.vpk` to restore the stopwatch. The package format targets the declared component identities. Package inputs and the host are trusted. Checksums detect corruption and provide no publisher authentication.

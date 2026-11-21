@@ -39,5 +39,11 @@
     "id": 8,
     "name": "power",
     "required": false
+  },
+  {
+    "id": 10,
+    "name": "wifi",
+    "required": false,
+    "title": "WI-FI SETUP"
   }
 ]

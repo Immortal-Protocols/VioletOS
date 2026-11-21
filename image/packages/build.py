@@ -31,6 +31,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None):
     os.environ["VIOLET_GLYPHS_RS"] = str(out / "glyphs.rs")
     scripts = {
         "launcher": repo / "apps/launcher/process.rs",
+        "wifi": repo / "apps/wifi/process.rs",
         "stopwatch": repo / "apps/stopwatch/process.rs",
         "runtime": repo / "runtime/process.rs",
         "display": repo / "services/display/process.rs",
@@ -60,6 +61,7 @@ SECTIONS {
     os.environ["VIOLET_WATCH_TITLE"] = next(
         item["title"] for item in manifest if item["name"] == "stopwatch"
     )
+    os.environ["VIOLET_WIFI_TITLE"] = next(item["title"] for item in manifest if item["name"]=="wifi")
     # Package manager is always loaded from the factory recovery image.
     manifest.append({"id": 9, "name": "package_manager"})
     scripts["package_manager"] = repo / "system/package-manager/process.rs"
@@ -70,7 +72,7 @@ SECTIONS {
         modules = {"protocol": repo / "runtime/protocol.rs"}
         if name in scripts:
             modules["process"] = scripts[name]
-        if name in ("stopwatch", "launcher"):
+        if name in ("stopwatch", "launcher","wifi"):
             modules.update(
                 sdk=repo / "runtime/sdk.rs", drawing=repo / "apps/drawing.rs"
             )

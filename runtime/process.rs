@@ -32,7 +32,7 @@ struct Runtime {
     held: bool,
     asleep: bool,
     ready: Message,
-    clients: [Client; 2],
+    clients: [Client; 3],
 }
 impl Runtime {
     fn contact(&mut self, who: u32) -> Message {
@@ -59,7 +59,7 @@ impl Runtime {
     }
     fn dispatch(&mut self, who: u32, m: Message) -> Message {
         let component = match m.key {
-            RADIO => 7,
+            RADIO | NETWORK | RADIO_TEST => 7,
             POWER => 8,
             SAVE => 6,
             _ => 0,
@@ -73,8 +73,8 @@ impl Runtime {
             (GET, SURFACE) => Message::result(0x06000000),
             (GET, CATALOG) if who == LAUNCHER => m.call(PACKAGE_MANAGER),
             (EXECUTE, OPEN)
-                if (who == LAUNCHER && m.value == WATCH)
-                    || (who == WATCH && m.value == LAUNCHER) =>
+                if (who == LAUNCHER && matches!(m.value, WATCH | WIFI))
+                    || (matches!(who, WATCH | WIFI) && m.value == LAUNCHER) =>
             {
                 let r = m.call(LIFECYCLE);
                 if r.op == OK {
@@ -92,8 +92,13 @@ impl Runtime {
             }
             (GET | EXECUTE, SAVE) => {
                 let mut value = m.value;
-                if unsafe { app_checkpoint((who == LAUNCHER) as u32, m.op == EXECUTE, &mut value) }
-                {
+                let region = match who {
+                    WATCH => 0,
+                    LAUNCHER => 1,
+                    WIFI => 2,
+                    _ => return Message::error(DENIED),
+                };
+                if unsafe { app_checkpoint(region, m.op == EXECUTE, &mut value) } {
                     Message::result(value)
                 } else {
                     Message::error(OFFLINE)
@@ -104,6 +109,7 @@ impl Runtime {
                 req.arg = m.value;
                 req.call(DISPLAY_SLOT)
             }
+            (GET | EXECUTE, NETWORK) | (EXECUTE, RADIO_TEST) if who == WIFI => m.call(RADIO_SLOT),
             (GET, RADIO) => m.call(RADIO_SLOT),
             (EXECUTE, RADIO) if who == LAUNCHER => m.call(RADIO_SLOT),
             (GET, POWER) => m.call(POWER_SLOT),
@@ -142,15 +148,15 @@ pub fn run() -> ! {
         held: false,
         asleep: false,
         ready: status,
-        clients: [Client::default(); 2],
+        clients: [Client::default(); 3],
     };
     loop {
         let (who, m) = Message::receive(SERVER);
-        if !(LAUNCHER..=WATCH).contains(&who) {
+        if !matches!(who, LAUNCHER | WATCH | WIFI) {
             Message::error(DENIED).reply();
             continue;
         }
-        let i = (who - 1) as usize;
+        let i = if who == WIFI { 2 } else { (who - 1) as usize };
         let c = &mut rt.clients[i];
         match m.op {
             SUBSCRIBE if STREAM_KEYS.contains(&m.key) => {

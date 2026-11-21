@@ -2,6 +2,7 @@ use crate::{drawing::*, protocol::*, sdk::*};
 pub fn run() -> ! {
     acquire_surface();
     let status = request(GET, STATUS, 0);
+    let wifi = request(GET, CATALOG, WIFI);
     let catalog = request(GET, CATALOG, 0);
     let touch = submit(SUBSCRIBE, CONTACT, 0).unwrap_or_else(|_| panic!());
     let radio_events = submit(SUBSCRIBE, RADIO, 0).ok();
@@ -24,11 +25,11 @@ pub fn run() -> ! {
         }
         if active && (!visible || redraw) {
             header(&status.text(), status.arg != 0);
-            label(14, 76, b"VIOLET", 5, INK);
+            label(14, 62, b"VIOLET", 4, INK);
             let radio = request(GET, RADIO, 0);
             label(
                 14,
-                134,
+                104,
                 if radio.op != OK {
                     b"NO RADIO"
                 } else if radio.value != 0 {
@@ -46,7 +47,7 @@ pub fn run() -> ! {
             percent[10] += (battery % 10) as u8;
             label(
                 14,
-                148,
+                116,
                 if power_events.is_some() {
                     &percent
                 } else {
@@ -55,6 +56,9 @@ pub fn run() -> ! {
                 1,
                 INK,
             );
+            if wifi.value == WIFI {
+                button(146, &wifi.text());
+            }
             if catalog.value != 0 {
                 button(206, &catalog.text());
             }
@@ -71,6 +75,9 @@ pub fn run() -> ! {
         let e = touch.poll();
         if active && e.op == OK && (42..678).contains(&e.value) {
             match e.arg {
+                584..784 if wifi.value == WIFI => {
+                    request(EXECUTE, OPEN, WIFI);
+                }
                 824..1024 if catalog.value != 0 => {
                     request(EXECUTE, OPEN, catalog.value);
                 }

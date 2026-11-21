@@ -16,9 +16,11 @@ RAM_SIZE = 1024**3
 def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None)):
     cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
            "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", "1", "-display", "none",
-           "-monitor", "none", "-nic", "none", "-no-reboot"]
+           "-monitor", "none", "-global","virtio-mmio.force-legacy=false",
+           "-netdev","user,id=wifi,restrict=on","-device",
+           "virtio-net-device,netdev=wifi,bus=virtio-mmio-bus.8,mac=52:54:00:56:00:01", "-no-reboot"]
     if disk is not None:
-        cmd += ["-global", "virtio-mmio.force-legacy=false",
+        cmd += [
                 "-drive", f"if=none,id=violetdisk,format=raw,file={str(disk).replace(',', ',,')}",
                 "-device", "virtio-blk-device,drive=violetdisk,bus=virtio-mmio-bus.0"]
     for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),

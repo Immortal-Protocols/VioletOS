@@ -1,5 +1,5 @@
 # Radio service
 
-The [QEMU radio process](process.rs) reads a virtual carrier register and controls an airplane-mode register. Runtime exposes state queries and subscriptions and authorizes the launcher to toggle the radio. Run `make test-stack` to toggle it in both directions and verify the guest device state.
+The launcher controls airplane mode. Wi-Fi Setup uses Runtime to associate with the modeled open network and request a [gateway test](gateway.rs). The radio process owns a virtio network device and a dedicated DMA page. It sends an ARP request for 10.0.2.2 and verifies the reply's sender, destination and operation. A missing response times out.
 
-Cellular data, calls, Wi-Fi and a physical modem driver remain future work.
+QEMU uses a restricted user-mode network. A passing test establishes local guest-to-gateway connectivity. Nearby Wi-Fi discovery, WPA authentication and hardware radio testing require a physical driver.

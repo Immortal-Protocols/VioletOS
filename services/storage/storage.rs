@@ -1,5 +1,5 @@
 //! One private durable value per installed app. Sectors 0 and 1 retain the
-//! original stopwatch journal layout. The launcher owns sectors 2 and 3.
+//! original stopwatch journal layout. Launcher uses sectors 2–3 and Wi-Fi Setup uses 4–5.
 use crate::{
     block::Disk,
     journal::{recover, Record},
@@ -14,7 +14,7 @@ extern "C" {
 pub extern "C" fn storage_task() {
     unsafe { clock_init() };
     let mut disk = Disk::open();
-    let mut records = [None; 2];
+    let mut records = [None; 3];
     if let Some(device) = disk.as_mut() {
         for (index, record) in records.iter_mut().enumerate() {
             if index * 2 + 1 >= device.sectors {

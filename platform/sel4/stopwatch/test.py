@@ -11,8 +11,9 @@ parser.add_argument("--spi", choices=modes, default="normal")
 parser.add_argument("--disk",type=Path)
 parser.add_argument("--checkpoint",choices=["save","restore","reset"])
 parser.add_argument("--expect",type=int, default=0)
-parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer"])
+parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer","radio","radio-dma"])
 parser.add_argument("--stack",choices=["lifecycle","removed","recovered","save-radio","restore-radio"])
+parser.add_argument("--wifi",choices=["exercise","save","restore"])
 parser.add_argument("--state-dir",type=Path)
 parser.add_argument("--fault-id",type=int,default=7)
 args=parser.parse_args()
@@ -27,7 +28,7 @@ from manage import launch_catalogs
 catalogs=launch_catalogs(args.state_dir) if args.state_dir else (None,None)
 cmd=machine(catalogs=catalogs,image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
 if args.probe:
-    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000,"scanout":0x08000000,"peer":0x06100000}[args.probe]
+    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000,"scanout":0x08000000,"peer":0x06100000,"radio":0x09001000,"radio-dma":0x09002000}[args.probe]
     cmd+=["-device",f"loader,addr=0x49300000,data={address},data-len=4"]
 p=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
 try:
@@ -81,6 +82,46 @@ try:
         time.sleep(.18)
         os.write(serial,bytes(6));time.sleep(.18)
     time.sleep(1)
+    if args.wifi:
+        font=(repo/"src/glyphs.h").read_text()
+        alphabet=re.search(r'alphabet\[\] = "([^"]+)"',font)[1]
+        glyphs=[tuple(map(int,x.split(','))) for x in re.findall(r'\{([\d, ]+)\}',font)]
+        def check_label(y,expected,color):
+            frame=snapshot()
+            actual=""
+            for n in range(len(expected)):
+                cols=tuple(sum((pixel(frame,(14+n*6+x)*3,(y+j)*4)==color)<<j for j in range(7)) for x in range(5))
+                actual+=alphabet[glyphs.index(cols)] if cols in glyphs else "?"
+            assert actual==expected,(expected,actual)
+        ink,accent=0xffeeeaf8,0xffd1b0fe
+        tap(680)
+        if args.wifi=="restore":
+            check_label(130,"CONNECTED",ink)
+            sys.exit(0)
+        check_label(130,"DISCONNECTED",ink)
+        tap(1080)
+        check_label(154,"CONNECT FIRST",accent)
+        tap(820)
+        check_label(130,"CONNECTED",ink)
+        if args.wifi=="save": sys.exit(0)
+        for _ in range(2):
+            tap(1080)
+            time.sleep(.6)
+            check_label(154,"GATEWAY REPLIED",accent)
+        request("set_link",dict(name="wifi",up=False))
+        tap(1080)
+        time.sleep(.7)
+        check_label(154,"NO GATEWAY REPLY",accent)
+        request("set_link",dict(name="wifi",up=True))
+        tap(820)
+        check_label(130,"DISCONNECTED",ink)
+        tap(1340);tap(1140);tap(680)
+        check_label(130,"RADIO OFF",ink)
+        tap(820)
+        check_label(154,"CHECK RADIO ON HOME",accent)
+        tap(1340);tap(1140)  # Restore the saved radio setting before reboot.
+        print("QEMU Wi-Fi setup, two gateway replies, disconnect and radio-off verified.")
+        sys.exit(0)
     if args.stack:
         def words(address,count=1):
             path=out/"status.raw"
@@ -93,8 +134,8 @@ try:
             assert value()==args.expect, "launcher changed stopwatch storage"
             sys.exit(0)
         if args.stack=="recovered":
-            if args.fault_id==2:
-                tap(920)  # The stopwatch loads on demand.
+            if args.fault_id in (2,10):
+                tap(680 if args.fault_id==10 else 920)  # The stopwatch loads on demand.
             for _ in range(80):
                 if words(0x49300008,3)==(2,2,args.fault_id): break
                 time.sleep(.05)

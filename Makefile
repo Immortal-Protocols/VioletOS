@@ -40,7 +40,7 @@ test-storage: qemu-image
 	$(PYTHON) platform/sel4/stopwatch/test_storage.py
 test-isolation: setup
 	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu
-	@set -e; for region in touch storage dma scanout peer; do \
+	@set -e; for region in touch storage dma scanout peer radio radio-dma; do \
 	  $(PYTHON) platform/sel4/stopwatch/test.py --probe $$region; \
 	done
 
@@ -50,3 +50,7 @@ test-stack: qemu-image
 component: setup
 	@test -n "$(NAME)" || (echo "Set NAME to the component name"; exit 1)
 	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py qemu
+
+.PHONY: test-wifi
+test-wifi: qemu-image
+	$(PYTHON) targets/qemu/test_wifi.py

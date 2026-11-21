@@ -89,8 +89,8 @@ impl Disk {
         }
     }
     fn request(&mut self, kind: u32, sector: usize, data: &mut Sector) -> Result<(), ()> {
-        // Bound the queue to the two private journals.
-        if sector >= self.sectors.min(4) {
+        // Bound the queue to the app journals.
+        if sector >= self.sectors.min(6) {
             return Err(());
         }
         let flush = kind == 4;
