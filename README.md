@@ -31,6 +31,21 @@ This slide from the original design review shows the proposed stack. Its Linux l
 
 **What runs today.** The Moto and QEMU use the same Rust stopwatch and touch protocol. VioletOS boot code sets up the UI and touch driver as separate seL4 tasks. QEMU also runs a storage task that saves the paused time to disk. The Moto keeps that time in RAM. The Mac simulator remains a native SDL application with its own UI. Microkit is used in the isolation experiment.
 
+## Proposed components and interfaces
+
+These three design-review slides describe the planned architecture. The component READMEs below identify current implementations and proposed behavior.
+
+![Proposed VioletOS processes, services, kernel, boot and recovery components across the three environments.](docs/violetos-complete-lifecycle-stack.png)
+
+![One directory and README for each of the 17 architecture boxes.](docs/violetos-folders-layer-cake.png)
+
+![Proposed Subscribe, Get and Execute operations and independent component update rules.](docs/violetos-runtime-contract-updates.png)
+
+- **Image and apps** — [App packages](image/packages/README.md), [Built-in app catalog](image/catalog/README.md), [Launcher](apps/launcher/README.md), [Stopwatch](apps/stopwatch/README.md).
+- **Runtime and services** — [Runtime](runtime/README.md), [Touch service](services/touch/README.md), [Display service](services/display/README.md), [Storage service](services/storage/README.md), [Radio service](services/radio/README.md), [Power service](services/power/README.md).
+- **Kernel, boot and recovery** — [seL4 kernel](kernel/sel4/README.md), [Bootloader](boot/loader/README.md), [Process supervisor](system/supervisor/README.md), [Package manager](system/package-manager/README.md).
+- **Targets** — [Mac simulator](targets/mac-simulator/README.md), [QEMU emulator](targets/qemu/README.md), [Moto G Pure](targets/moto-g-pure/README.md).
+
 ## Where to change the code
 
 | If you want to change… | Start here | Where it runs |
