@@ -7,10 +7,15 @@ if(KernelPlatformEllis)
     set(KernelArmGicV3 ON)
     config_set(KernelARMPlatform ARM_PLAT ellis)
     list(APPEND KernelDTSList "src/plat/ellis/factory-base.dts" "src/plat/ellis/kernel-overlay.dts")
+    # Exercise the handset memory reservations in both supervisors.
+    list(APPEND KernelDTSList "src/plat/ellis/moto-radio-memory.dts")
     # Architectural GIC interrupt ID limit; peripheral routing still needs validation.
     set(violet_timer_hz 13000000)
     if(VioletQemuBoard)
+        config_set(KernelEllisWifiFixture ELLIS_WIFI_FIXTURE ON)
         set(violet_timer_hz 62500000)
+    else()
+        add_sources(DEP "KernelPlatformEllis" ASMFILES src/plat/ellis/wifi/monitor.S)
     endif()
     declare_default_headers(TIMER_FREQUENCY ${violet_timer_hz} MAX_IRQ 1019 NUM_PPI 32
         TIMER drivers/timer/arm_generic.h INTERRUPT_CONTROLLER arch/machine/gic_v3.h)

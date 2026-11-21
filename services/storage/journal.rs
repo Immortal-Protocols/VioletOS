@@ -8,14 +8,16 @@ pub struct Record {
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
+    !crc_update(!0u32, data)
+}
+pub fn crc_update(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc ^= u32::from(b);
         for _ in 0..8 {
             crc = (crc >> 1) ^ ((0u32.wrapping_sub(crc & 1)) & 0xedb88320);
         }
     }
-    !crc
+    crc
 }
 impl Record {
     pub fn encode(self) -> Sector {

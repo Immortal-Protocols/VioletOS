@@ -18,6 +18,7 @@ VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and 
 | `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
 | `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
+| `make moto-debug` | Read handset status over USB. See [USB diagnostics](targets/moto-g-pure/README.md#usb-diagnostics). |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally. Installing it is a separate operation. |
 
 On an Apple Silicon Mac, install the Xcode command-line tools, Python 3, and the Homebrew packages below. The simulator needs only the host C toolchain, Make and SDL2.
@@ -34,7 +35,7 @@ This slide from the original design review shows the proposed stack. Its Linux l
 
 ![Proposed architecture with the shared UI above Rust services and Microkit and seL4, followed by the Mac simulator, QEMU and Moto G Pure targets.](docs/proposed-violetos-stack.png)
 
-**What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto uses the earlier touch-tested UI and driver with RAM-only stopwatch state. The Mac simulator runs its native SDL UI.
+**What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power and catalog manager are separate seL4 processes. The supervisor starts them from packages and grants their memory and communication rights. The Moto has run the shared launcher, Runtime and stopwatch with physical touch, including switching Home and reopening a running timer. The next image adds the storage service and a handset eMMC backend. The Mac simulator runs its native SDL UI.
 
 Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. Choose a virtual access point with **Next Network**. The guest checks the gateway, verifies the HTTPS certificate, and prints the UUID. The Mac relays TCP bytes. [Wi-Fi Setup](apps/wifi/README.md)
 
@@ -59,8 +60,8 @@ These three design-review slides describe the planned architecture. The componen
 
 | If you want to change… | Start here | Where it runs |
 | --- | --- | --- |
-| A button, stopwatch timing or framebuffer drawing | [QEMU app](apps/stopwatch/process.rs) and [handset UI](platform/sel4/stopwatch/ui.c) draw their respective screens. [stopwatch.rs](apps/stopwatch/state.rs) owns the state transitions. Both UI implementations use the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
-| How the first task obtains device mappings | [QEMU supervisor](system/supervisor/qemu.c), [Moto bootstrap](platform/sel4/stopwatch/root.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
+| A button, stopwatch timing or framebuffer drawing | [Shared stopwatch app](apps/stopwatch/process.rs) draws the screen on both targets. [stopwatch.rs](apps/stopwatch/state.rs) owns the state transitions. The renderer uses the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
+| How the first task obtains device mappings | [Shared supervisor](system/supervisor/supervisor.c), [Moto register map](targets/moto-g-pure/spi_mmio.c) and [platform.h](platform/sel4/stopwatch/platform.h) | Moto and QEMU userspace |
 | How a touch becomes a tap | [touch.rs](services/touch/touch.rs) initializes the Novatek controller and decodes contacts. [spi.rs](services/touch/spi.rs) drives each transfer. [spi_mmio.c](targets/moto-g-pure/spi_mmio.c) accesses real registers, while [fixture.c](targets/qemu/fixture.c) models them. | Shared driver with one backend per target |
 | How touch events cross address spaces | [events.c](platform/sel4/stopwatch/events.c) handles the request and reply. The supervisor grants Runtime access to the QEMU touch endpoint. | Moto and QEMU |
 | Durable stopwatch checkpoints | [storage.rs](services/storage/storage.rs) handles load and save requests, [journal.rs](services/storage/journal.rs) selects the latest valid record, and [block.rs](services/storage/block.rs) drives the virtual disk. | QEMU storage task |
@@ -70,7 +71,7 @@ These three design-review slides describe the planned architecture. The componen
 | How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU. [viewer.c](tools/emulator/viewer.c) displays its 720 × 1600 framebuffer and translates mouse events into touch reports. [test.py](platform/sel4/stopwatch/test.py) checks the driver and rendered output. | Mac host |
 | The native simulator | [screen.c](src/screen.c) owns its UI and state. [simulator.c](targets/mac-simulator/simulator.c) supplies SDL input, display and time. | Native host process |
 
-For example, change the **Start** label in `apps/stopwatch/process.rs` to update the QEMU app. Change `spi_mmio.c` and only the Moto build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
+For example, change the **Start** label in `apps/stopwatch/process.rs` to update both seL4 targets. Change `spi_mmio.c` and only the Moto build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
 
 ## Try persistence in QEMU
 
@@ -78,11 +79,11 @@ Open **Stopwatch → Start → Pause** and note the displayed time. Close the em
 
 QEMU uses a dedicated 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest allocates two alternating 512-byte sectors per app. Each holds a version marker, generation number, elapsed tenths and CRC. The storage service acknowledges a save after the device flush completes. On startup it chooses the newest valid record. The screen shows **DISK READY** when the service is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails.
 
-Runtime identifies the requesting app and selects its private checkpoint. The stopwatch saves elapsed time and the launcher saves its radio preference. Apps can also use named files in a private directory. A separate 4 MiB package disk holds the installed catalog and rollback copy. Physical handset storage still needs a driver. The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
+Runtime identifies the requesting app and selects its private checkpoint. The stopwatch saves elapsed time and the launcher saves its radio preference. Apps can also use named files in a private directory. A separate 4 MiB package disk holds the installed catalog and rollback copy. The Moto build uses the same file and checkpoint code with an MSDC0 block driver. See the [handset storage layout and validation steps](targets/moto-g-pure/README.md#handset-storage). The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
 
 ## Handset build and validation
 
-The supported handset is **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2** and the DJN NT36525B-A panel. Supply the two local vendor files below. The build checks both against their expected digests.
+The supported handset is **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2** and the DJN NT36525B-A panel. Supply the stock boot image and panel firmware below. Next to the stock boot image, create a `wifi/` folder containing the files listed in the [radio firmware manifest](targets/moto-g-pure/wifi_firmware.py), copied from the factory vendor image’s firmware directory. The build verifies each input against its pinned SHA-256 digest.
 
 ```sh
 export VIOLET_STOCK_BOOT=/path/to/exact-factory/boot.img
@@ -93,7 +94,7 @@ shasum -a 256 build/sel4/moto/boot.img
 
 The previous single-task handset baseline has SHA-256 `19377b26ea4c304b612599baf7d09ad9a19cc7371e8432a2dddb98a8bc44188d`. On the unlocked test handset, the baseline image booted from slot B, displayed **TOUCH READY** and accepted taps to open and start the stopwatch. Android occupied slot A. QEMU exercises the same touch protocol with synthetic firmware and modeled registers. Physical panel initialization, electrical behavior and bootloader slot selection still require a handset.
 
-In one slot B trial, the Rust handset image displayed **TOUCH READY** and **RAM ONLY**. Physical taps opened the stopwatch, started it, paused it and reset it to zero. The Moto keeps stopwatch state in RAM until a handset storage driver and a dedicated storage region are available. Wi-Fi and power management are also planned. The [Rust isolation experiment](spikes/sel4-isolation/) explores separating services. The [handset bring-up log](spikes/sel4-ellis/) records the hardware trials. The [original architecture deck](docs/VioletOS-architecture.pdf) documents the earlier Linux prototype.
+In one slot B trial, the Rust handset image displayed **TOUCH READY** and **RAM ONLY**. Physical taps opened the stopwatch, started it, paused it and reset it to zero. The storage candidate adds a marked 1 MiB volume inside boot B. Wi-Fi and power management are also planned. The [Rust isolation experiment](spikes/sel4-isolation/) explores separating services. The [handset bring-up log](spikes/sel4-ellis/) records the hardware trials. The [original architecture deck](docs/VioletOS-architecture.pdf) documents the earlier Linux prototype.
 
 ### Rust toolchain
 

@@ -36,6 +36,10 @@ pub struct Disk {
     pub sectors: usize,
 }
 impl Disk {
+    #[cfg(not(package_volume))]
+    pub fn open_checked() -> Result<Self, &'static [u8]> {
+        Self::open().ok_or(b"")
+    }
     pub fn open() -> Option<Self> {
         if reg(0) != 0x74726976 || reg(4) != 2 || reg(8) != 2 {
             return None;

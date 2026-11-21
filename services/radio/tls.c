@@ -1,68 +1,15 @@
-// QEMU provides PL031 wall time and a virtio-rng device. Both the certificate
-// verifier and the TLS record layer execute inside the isolated radio process.
+// TLS, certificate validation and UUID parsing run in Radio on the guest.
 #include "isrg_x1.h"
 #include <bearssl.h>
 #include <string.h>
+extern int radio_entropy(unsigned char seed[32]);
+extern unsigned radio_unix_time(void);
 extern int tunnel_read(void *, unsigned char *, size_t);
 extern int tunnel_write(void *, const unsigned char *, size_t);
-extern unsigned ticks(void), ticks_per_ms;
 static br_ssl_client_context client;
 static br_x509_minimal_context verifier;
 static unsigned char buffer[BR_SSL_BUFSIZE_MONO];
 static unsigned char headers[16384];
-static volatile unsigned *const rng = (void *)0x09003000;
-static volatile unsigned *const dma = (void *)0x09005000;
-#define REG(o) rng[(o) / 4]
-static int entropy(unsigned char seed[32]) {
-  if (REG(0) != 0x74726976 || REG(4) != 2 || REG(8) != 4)
-    return 0;
-  REG(0x70) = 0;
-  if (REG(0x70))
-    return 0;
-  REG(0x70) = 1;
-  REG(0x70) = 3;
-  REG(0x14) = 1;
-  if (!(REG(0x10) & 1))
-    return 0;
-  REG(0x24) = 1;
-  REG(0x20) = 1;
-  REG(0x24) = 0;
-  REG(0x20) = 0;
-  REG(0x70) = 11;
-  if (!(REG(0x70) & 8))
-    return 0;
-  REG(0x30) = 0;
-  if (REG(0x34) < 2 || REG(0x44))
-    return 0;
-  memset((void *)dma, 0, 512);
-  const unsigned phys = 0x49202000;
-  dma[0] = phys + 256;
-  dma[2] = 32;
-  dma[3] = 2;
-  dma[8] = 1 << 16;
-  REG(0x38) = 2;
-  REG(0x80) = phys;
-  REG(0x84) = 0;
-  REG(0x90) = phys + 32;
-  REG(0x94) = 0;
-  REG(0xa0) = phys + 48;
-  REG(0xa4) = 0;
-  __asm__ volatile("dmb sy" ::: "memory");
-  REG(0x44) = 1;
-  REG(0x70) = 15;
-  REG(0x50) = 0;
-  unsigned start = ticks();
-  while (!(dma[12] >> 16)) {
-    if (ticks() - start > ticks_per_ms * 1000)
-      return 0;
-  }
-  __asm__ volatile("dmb sy" ::: "memory");
-  if (dma[14] != 32)
-    return 0;
-  memcpy(seed, (const void *)(dma + 64), 32);
-  memset((void *)(dma + 64), 0, 32);
-  return 1;
-}
 static int hex(unsigned char c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
          (c >= 'A' && c <= 'F');
@@ -168,14 +115,15 @@ int guest_https(unsigned char uuid[36]) {
   static const uint16_t suites[] = {BR_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
                                     BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256};
   unsigned char seed[32];
-  if (!entropy(seed))
+  if (!radio_entropy(seed))
     return 0;
   br_ssl_client_init_full(&client, &verifier, TAs, TAs_NUM);
   static const char *protocols[] = {"http/1.1"};
   br_ssl_engine_set_protocol_names(&client.eng, protocols, 1);
   br_ssl_engine_set_versions(&client.eng, BR_TLS12, BR_TLS12);
   br_ssl_engine_set_suites(&client.eng, suites, 2);
-  unsigned now = *(volatile unsigned *)0x09004000;
+  unsigned now = radio_unix_time();
+  if (!now) return 0;
   br_x509_minimal_set_time(&verifier, 719528 + now / 86400, now % 86400);
   br_ssl_engine_inject_entropy(&client.eng, seed, sizeof(seed));
   memset(seed, 0, sizeof(seed));

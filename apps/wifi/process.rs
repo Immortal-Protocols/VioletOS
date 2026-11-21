@@ -1,4 +1,4 @@
-//! Setup for the QEMU lab access point. Runtime owns the radio endpoint.
+//! Wi-Fi setup for networks reported by the board Radio service. Runtime owns the radio endpoint.
 use crate::{drawing::*, protocol::*, sdk::*};
 pub fn run() -> ! {
     acquire_surface();
@@ -51,9 +51,9 @@ pub fn run() -> ! {
                 selected = request(GET, SCAN, index);
             }
             rect(0, 0, 240, 400, BG);
-            label(14, 18, b"QEMU NETWORK", 1, ACCENT);
+            label(14, 18, b"NETWORK", 1, ACCENT);
             label(14, 40, b"WI-FI SETUP", 3, INK);
-            label(14, 84, b"OPEN LAB NETWORK", 1, ACCENT);
+            label(14, 84, b"NETWORK NAME", 1, ACCENT);
             let title = selected.text();
             label(
                 14,

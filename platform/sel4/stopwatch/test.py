@@ -12,7 +12,7 @@ parser.add_argument("--disk",type=Path)
 parser.add_argument("--checkpoint",choices=["save","restore","reset"])
 parser.add_argument("--expect",type=int, default=0)
 parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer","radio","radio-dma"])
-parser.add_argument("--stack",choices=["lifecycle","removed","recovered","save-radio","restore-radio"])
+parser.add_argument("--stack",choices=["handset-ui","lifecycle","removed","recovered","save-radio","restore-radio"])
 parser.add_argument("--library",choices=["install","open","remove","absent","radio-install","radio-rollback","radio-reboot","install-second"])
 parser.add_argument("--wifi",choices=["exercise","save","restore","live","async"])
 parser.add_argument("--state-dir",type=Path)
@@ -230,6 +230,19 @@ try:
             path=out/"status.raw"
             request("pmemsave",dict(val=address,size=4*count,filename=str(path)))
             return struct.unpack("<"+"I"*count,path.read_bytes())
+        if args.stack=="handset-ui":
+            assert words(0x4930000c)==(1,), "handset catalog did not activate"
+            tap(920)
+            assert value()==0, "launcher failed to open stopwatch"
+            tap(920)
+            before=value()
+            assert before is not None and before>0
+            tap(1420)
+            assert value() is None, "Home did not regain focus"
+            tap(920)
+            assert value()>before, "stopwatch lost elapsed time while in background"
+            print("Handset app catalog passed Start, Home and reopen with running time.")
+            sys.exit(0)
         if args.stack in ("save-radio","restore-radio"):
             if args.stack=="save-radio": tap(1140)
             assert words(0x49001004)==(1,), "launcher preference was lost"

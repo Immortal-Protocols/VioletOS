@@ -7,6 +7,14 @@ use crate::{
     block::Disk,
     journal::{recover, Record},
 };
+#[cfg(package_catalog)]
+mod catalog {
+    use crate::block::PackageDisk as Disk;
+    mod volume { include!(env!("VIOLET_CATALOG_VOLUME_RS")); }
+    pub fn commit(length: u32, bank: u32) -> u32 {
+        unsafe { volume::commit_bank(0x0d100000 as *const u8, length as usize, bank) }
+    }
+}
 extern "C" {
     fn storage_reply(ok: bool, value: u32);
     fn clock_init();
@@ -15,9 +23,13 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn storage_task() {
     unsafe { clock_init() };
-    let mut disk = Disk::open();
+    let opened = Disk::open_checked();
+    let diagnostic = opened.as_ref().err().copied().unwrap_or(b"");
+    let mut disk = opened.ok();
     let mut records = [None; 7];
     if let Some(device) = disk.as_mut() {
+        #[cfg(boot_trace)]
+        let _ = device.boot_record(6);
         for (index, record) in records.iter_mut().enumerate() {
             if index * 2 + 1 >= device.sectors {
                 break;
@@ -36,6 +48,24 @@ pub extern "C" fn storage_task() {
     }
     loop {
         let (badge, m) = Message::receive(2);
+        #[cfg(package_catalog)]
+        if m.op == 0x56464c53 && badge == 0 {
+            let flushed = disk.as_mut().is_some_and(|device| device.flush().is_ok());
+            (if flushed { Message::result(0) } else { Message::error(OFFLINE) }).reply();
+            continue;
+        }
+        #[cfg(package_catalog)]
+        if m.op == 0x56434d54 && badge == 0 {
+            let bank = catalog::commit(m.value, m.arg);
+            (if bank != 0 { Message::result(bank) } else { Message::error(OFFLINE) }).reply();
+            continue;
+        }
+        if m.op == STORAGE_DIAGNOSTIC && badge == 3 {
+            let mut r = Message::result(0);
+            r.put_text(diagnostic);
+            r.reply();
+            continue;
+        }
         if (STORAGE_FILE..STORAGE_FILE + 7).contains(&m.op) {
             let response = if badge != 3 {
                 Message::error(DENIED)

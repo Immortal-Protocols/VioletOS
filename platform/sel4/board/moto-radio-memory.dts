@@ -1,0 +1,10 @@
+// The dedicated 3 MiB packet DMA pool follows the firmware at 0x42400000.
+// MT6765 connectivity EMI uses a 16 MiB-aligned, 4 MiB window.
+// The loader checks this entire physical RAM span against live reservations.
+// Two MiB from 0x43c00000 hold the supervisor catalog and transaction workspace.
+// The last two MiB hold the immutable, build-verified firmware bundle.
+&{/memory} {
+    reg = <0x0 0x40000000 0x0 0x01000000
+           0x0 0x41300000 0x0 0x00d00000
+           0x0 0x42700000 0x0 0x01500000>;
+};

@@ -86,6 +86,7 @@ fn execute(lane: u32, owner: u32, mut m: Message) -> Message {
             r.key = down as u32;
             r
         }
+        6 if m.key == STATUS => Message::new(STORAGE_DIAGNOSTIC, 0, 0).call(3),
         6 if m.key == SAVE => {
             let mut v = m.value;
             if unsafe { app_checkpoint(region(owner), m.op == EXECUTE, &mut v) } {
@@ -99,7 +100,27 @@ fn execute(lane: u32, owner: u32, mut m: Message) -> Message {
             m.call(3)
         }
         5 => m.call(4),
-        7 => m.call(5),
+        7 => {
+            if matches!(m.key, RADIO | PROFILE) && m.op == EXECUTE { m.arg = 0; }
+            let reply = m.call(5);
+            if reply.arg == RADIO_RELEASE_POWER {
+                let cleanup=Message::new(EXECUTE,RADIO_RAILS,0).call(6);
+                if cleanup.op!=OK {return cleanup;}
+                return Message::result(reply.value);
+            }
+            let needs_rails = m.op == EXECUTE &&
+                ((m.key == RADIO && m.value == 1) || (m.key == PROFILE && m.value != 0));
+            if reply.op != RADIO_PREPARE_POWER || !needs_rails {
+                return reply;
+            }
+            let rails = Message::new(EXECUTE,RADIO_RAILS,1).call(6);
+            m.arg = if rails.op == OK {1} else {2};
+            let result = m.call(5);
+            if result.arg == RADIO_RETAIN_POWER {return result;}
+            let cleanup = Message::new(EXECUTE,RADIO_RAILS,0).call(6);
+            if cleanup.op != OK { return cleanup; }
+            result
+        }
         8 => {
             if m.op == EXECUTE && m.value == 1 {
                 let blank = Message::new(EXECUTE, POWER, 1).call(4);

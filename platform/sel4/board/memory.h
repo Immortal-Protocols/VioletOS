@@ -25,7 +25,7 @@ static void ensure_table(struct task *task,unsigned va) {
     check(seL4_ARM_PageTable_Map(create(ram,seL4_ARM_PageTableObject),task->pd,va,0));
     task->sections[task->count++]=section;
 }
-void *map_device(uint32_t pa,uint32_t va,unsigned bits) {
+static void *map_device_rights(uint32_t pa,uint32_t va,unsigned bits,seL4_CapRights_t rights) {
     static const unsigned widths[]={24,20,16,12};
     static const unsigned types[]={seL4_ARM_SuperSectionObject,seL4_ARM_SectionObject,seL4_ARM_LargePageObject,seL4_ARM_SmallPageObject};
     unsigned size=1u<<bits;
@@ -44,8 +44,12 @@ void *map_device(uint32_t pa,uint32_t va,unsigned bits) {
         seL4_CPtr cap=create(boot->untyped.start+i,bits==20?types[1]:bits==16?types[2]:types[3]);
         cursor[i]+=size;
         seL4_ARM_Page_GetAddress_t a=seL4_ARM_Page_GetAddress(cap);
-        if(a.error || a.paddr!=pa || seL4_ARM_Page_Map(cap,mapping->pd,va,seL4_AllRights,seL4_ARM_ExecuteNever)) stop();
+        if(a.error || a.paddr!=pa || seL4_ARM_Page_Map(cap,mapping->pd,va,rights,seL4_ARM_ExecuteNever)) stop();
         return (void *)va;
     }
     stop(); return 0;
+}
+
+void *map_device(uint32_t pa,uint32_t va,unsigned bits) {
+    return map_device_rights(pa,va,bits,seL4_AllRights);
 }

@@ -86,6 +86,12 @@ impl Runtime {
         match (m.op, m.key) {
             (GET, WHOAMI) => Message::result(who),
             (GET, STATUS) => self.ready,
+            (GET, 0x4057) if who == LAUNCHER => unsafe {
+                let cell=(0x07400000 as *const u32).add(980);
+                let mut r=Message::result(cell.read_volatile());
+                r.arg=cell.add(1).read_volatile();
+                r.key=cell.add(2).read_volatile(); r
+            },
             (GET, FOCUS) => Message::result(if self.asleep { 0 } else { self.focus }),
             (GET, SURFACE) => Message::result(0x06000000),
             (GET, CATALOG | INBOX) | (EXECUTE, INSTALL | REMOVE) if who == LAUNCHER => {
@@ -135,12 +141,72 @@ impl Runtime {
         }
     }
 }
+const BOOT_SLOT: u32 = 31; // App stream slots end at 30.
+struct Startup {
+    touch_pending: bool,
+    disk_pending: bool,
+    disk_reason_pending: bool,
+    disk_reason: Option<Message>,
+}
+impl Startup {
+    fn begin(inventory: u32) -> Self {
+        let touch_pending = crate::lanes::queue(4, BOOT_SLOT, LAUNCHER, Message::new(GET, STATUS, 0));
+        let disk_pending = inventory & (1 << 6) != 0
+            && crate::lanes::queue(6, BOOT_SLOT, WATCH, Message::new(GET, SAVE, 0));
+        Self { touch_pending, disk_pending, disk_reason_pending: false, disk_reason: None }
+    }
+    fn update(&mut self, status: &mut Message) {
+        if status.key == 0 { return; }
+        if self.touch_pending {
+            if let Some(r) = crate::lanes::take(4, BOOT_SLOT) {
+                status.put_text(&r.text());
+                self.touch_pending = false;
+            }
+        }
+        if self.disk_pending {
+            if let Some(r) = crate::lanes::take(6, BOOT_SLOT) {
+                status.arg = (r.op == OK) as u32;
+                self.disk_pending = false;
+                if r.op != OK {
+                    self.disk_reason_pending = crate::lanes::queue(6, BOOT_SLOT, WATCH, Message::new(GET, STATUS, 0));
+                }
+            }
+        }
+        if self.disk_reason_pending {
+            if let Some(r) = crate::lanes::take(6, BOOT_SLOT) {
+                self.disk_reason = Some(r);
+                self.disk_reason_pending = false;
+            }
+        }
+        if self.touch_pending || self.disk_pending || self.disk_reason_pending { return; }
+        if let Some(r) = self.disk_reason {
+            if status.text().starts_with(b"TOUCH READY") && r.op == OK && r.text()[0] != 0 {
+                status.put_text(&r.text());
+            }
+        }
+        status.key = 0;
+        publish_status(status);
+    }
+}
+fn publish_status(status: &Message) {
+    // Publish boot diagnostics in the unused tail of the supervisor health page.
+    // Only the supervisor copies this narrow record to the USB process.
+    unsafe {
+        let boot_status = 0x07400f80 as *mut u32;
+        for (i, chunk) in status.text().chunks_exact(4).enumerate() {
+            boot_status.add(i + 2).write_volatile(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        boot_status.add(1).write_volatile(status.arg);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        boot_status.write_volatile(1);
+    }
+}
 pub fn run() -> ! {
-    let mut status = crate::lanes::initialize(4, LAUNCHER, Message::new(GET, STATUS, 0));
     let inventory = crate::lanes::initialize(9, LAUNCHER, Message::new(GET, INVENTORY, 0)).value;
-    status.arg = (inventory & (1 << 6) != 0
-        && crate::lanes::initialize(6, WATCH, Message::new(GET, SAVE, 0)).op == OK)
-        as u32;
+    let mut startup = Startup::begin(inventory);
+    let mut status = Message::result(0);
+    status.key = 1;
+    status.put_text(b"STARTING SERVICES");
     let mut rt = Runtime {
         inventory,
         focus: LAUNCHER,
@@ -151,6 +217,7 @@ pub fn run() -> ! {
     };
     loop {
         let (who, m) = Message::receive(SERVER);
+        startup.update(&mut rt.ready);
         if !is_app(who) {
             Message::error(DENIED).reply();
             continue;

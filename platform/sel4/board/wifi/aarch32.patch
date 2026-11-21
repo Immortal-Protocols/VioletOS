@@ -1,0 +1,119 @@
+--- a/include/arch/arm/arch/32/mode/object/structures.bf
++++ b/include/arch/arm/arch/32/mode/object/structures.bf
+@@ -147,6 +147,13 @@
+ #endif
+ 
+ -- NB: odd numbers are arch caps (see isArchCap())
++#ifdef CONFIG_PLAT_ELLIS
++block ellis_wifi_cap {
++    padding 32
++    padding 24
++    field capType 8
++}
++#endif
+ tagged_union cap capType {
+     mask 4 0xe
+     mask 8 0x0e
+@@ -182,6 +189,9 @@
+     tag sched_control_cap   0x5e
+ #endif
+ 
++#ifdef CONFIG_PLAT_ELLIS
++    tag ellis_wifi_cap      0x4f
++#endif
+     -- 8-bit tag arch caps
+ #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+     tag vcpu_cap            0x0f
+--- a/include/arch/arm/arch/32/mode/object/structures.h
++++ b/include/arch/arm/arch/32/mode/object/structures.h
+@@ -286,6 +286,9 @@
+     case cap_asid_pool_cap:
+         return seL4_ASIDPoolBits;
+ 
++#ifdef CONFIG_PLAT_ELLIS
++    case cap_ellis_wifi_cap:
++#endif
+     case cap_asid_control_cap:
+         return 0;
+ 
+@@ -331,6 +334,9 @@
+     case cap_asid_pool_cap:
+         return true;
+ 
++#ifdef CONFIG_PLAT_ELLIS
++    case cap_ellis_wifi_cap:
++#endif
+     case cap_asid_control_cap:
+         return false;
+ 
+@@ -375,6 +381,9 @@
+     case cap_asid_pool_cap:
+         return ASID_POOL_PTR(cap_asid_pool_cap_get_capASIDPool(cap));
+ 
++#ifdef CONFIG_PLAT_ELLIS
++    case cap_ellis_wifi_cap:
++#endif
+     case cap_asid_control_cap:
+         return NULL;
+ 
+--- a/src/arch/arm/kernel/boot.c
++++ b/src/arch/arm/kernel/boot.c
+@@ -457,6 +457,9 @@
+ 
+     /* initialise the IRQ states and provide the IRQ control cap */
+     init_irqs(root_cnode_cap);
++#ifdef CONFIG_PLAT_ELLIS
++    write_slot(SLOT_PTR(pptr_of_cap(root_cnode_cap), seL4_CapSMC), cap_ellis_wifi_cap_new());
++#endif
+ 
+ #ifdef CONFIG_ARM_SMMU
+     /* initialise the SMMU and provide the SMMU control caps*/
+--- a/src/arch/arm/32/object/objecttype.c
++++ b/src/arch/arm/32/object/objecttype.c
+@@ -15,6 +15,10 @@
+ #include <arch/machine/tlb.h>
+ #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+ #include <arch/object/vcpu.h>
++#endif
++
++#ifdef CONFIG_PLAT_ELLIS
++#include <arch/object/ellis_wifi/invoke.h>
+ #endif
+ 
+ bool_t Arch_isFrameType(word_t type)
+@@ -74,6 +78,12 @@
+         ret.status = EXCEPTION_NONE;
+         return ret;
+ 
++#ifdef CONFIG_PLAT_ELLIS
++    case cap_ellis_wifi_cap:
++        ret.cap = cap_null_cap_new();
++        ret.status = EXCEPTION_NONE;
++        return ret;
++#endif
+     case cap_asid_control_cap:
+     case cap_asid_pool_cap:
+         ret.cap = cap;
+@@ -292,6 +302,10 @@
+         }
+         break;
+ 
++#ifdef CONFIG_PLAT_ELLIS
++    case cap_ellis_wifi_cap:
++        return cap_get_capType(cap_b) == cap_ellis_wifi_cap;
++#endif
+     case cap_asid_control_cap:
+         if (cap_get_capType(cap_b) == cap_asid_control_cap) {
+             return true;
+@@ -582,6 +596,11 @@
+                                   cte_t *slot, cap_t cap,
+                                   bool_t call, word_t *buffer)
+ {
++#ifdef CONFIG_PLAT_ELLIS
++    if (cap_get_capType(cap) == cap_ellis_wifi_cap) {
++        return ellisWifiInvocation(invLabel, length, call);
++    }
++#endif
+     /* The C parser cannot handle a switch statement with only a default
+      * case. So we need to do some gymnastics to remove the switch if
+      * there are no other cases */

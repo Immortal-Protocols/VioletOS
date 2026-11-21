@@ -78,6 +78,16 @@ pub const SAVE: u32 = 5;
 pub const PRESENT: u32 = 6;
 pub const RADIO: u32 = 7;
 pub const POWER: u32 = 8;
+// GET reply flags. Diagnostic radio status has no on/off control.
+// Internal service-to-worker handshake. Apps cannot dispatch this selector.
+pub const RADIO_RAILS: u32 = 0x4051;
+// Moto Radio -> supervisor. GET inspects, EXECUTE prepares the two fixed windows.
+pub const RADIO_MEMORY: u32 = 0x4058;
+pub const RADIO_PREPARE_POWER: u32 = 0x4052;
+pub const RADIO_RELEASE_POWER:u32=0x405f;
+pub const RADIO_RETAIN_POWER:u32=0x4053;
+pub const RADIO_DIAGNOSTIC: u32 = 1 << 31;
+pub const POWER_MILLIVOLTS: u32 = 1 << 31;
 pub const CATALOG: u32 = 9;
 pub const QUIT: u32 = 10;
 pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {
@@ -120,3 +130,5 @@ pub fn region(who: u32) -> u32 {
 pub const SCAN: u32 = 26;
 
 pub const PROFILE: u32 = 27;
+
+pub const STORAGE_DIAGNOSTIC: u32 = 0x300;

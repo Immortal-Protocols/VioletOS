@@ -1,24 +1,15 @@
-// QEMU battery fixture: charge is host supplied, display sleep is guest controlled.
-use crate::protocol::*;
+use crate::{power_backend, protocol::*};
 pub fn run() -> ! {
-    let regs = 0x09000000 as *mut u32;
-    serve(|m| {
-        if m.key != POWER {
-            return Message::error(INVALID);
-        }
-        unsafe {
-            match m.op {
-                GET => {
-                    let mut r = Message::result(regs.read_volatile().min(100));
-                    r.arg = regs.add(1).read_volatile() & 1;
-                    r
-                }
-                EXECUTE if m.value <= 2 => {
-                    regs.add(1).write_volatile(m.value);
-                    Message::result(m.value)
-                }
-                _ => Message::error(INVALID),
-            }
-        }
-    })
+    loop {
+        let (caller,m) = Message::receive(SERVER);
+        let reply = match (caller,m.key,m.op) {
+            #[cfg(moto_board)]
+            (21,0x4057,EXECUTE) => power_backend::usb_supply(),
+            (7,RADIO_RAILS,EXECUTE) if m.value <= 1 => power_backend::radio_rails(m.value != 0),
+            (3,POWER,GET) => power_backend::read(),
+            (3,POWER,EXECUTE) if m.value <= 2 => power_backend::command(m.value),
+            _ => Message::error(DENIED),
+        };
+        reply.reply();
+    }
 }

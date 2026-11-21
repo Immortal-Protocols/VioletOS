@@ -8,7 +8,7 @@ import struct
 import subprocess
 
 
-def components(repo, out, cc, common, incs, rustc, objects, only=None):
+def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=None, storage_backend=None, target="qemu"):
     from package_format import package_abi
 
     app = repo / "platform/sel4/stopwatch"
@@ -40,6 +40,9 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None):
         "radio": repo / "services/radio/process.rs",
         "power": repo / "services/power/process.rs",
     }
+    board = repo / "targets" / ("moto-g-pure" if target == "moto" else "qemu")
+    if target == "moto":
+        scripts["radio"] = board / "radio.rs"
     script = dest / "component.ld"
     script.write_text("""ENTRY(process_entry)
 SECTIONS {
@@ -57,8 +60,11 @@ SECTIONS {
         + ["-DNDEBUG", "-I", app, "-c", repo / "runtime/transport.c", "-o", transport]
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
+    titles = {item["name"]: item.get("title") for item in manifest}
+    if selected is not None:
+        manifest = [item for item in manifest if item["name"] in selected]
     names = [item["name"] for item in manifest]
-    external = os.environ.get("VIOLET_APP_DIR")
+    external = os.environ.get("VIOLET_APP_DIR") if selected is None else None
     if external:
         folder = Path(external).resolve()
         entry = json.loads((folder / "app.json").read_text())
@@ -77,12 +83,8 @@ SECTIONS {
         only = name
     if only is not None and only not in [*names, "package_manager"]:
         raise ValueError(f"Unknown component: {only}")
-    os.environ["VIOLET_WATCH_TITLE"] = next(
-        item["title"] for item in manifest if item["name"] == "stopwatch"
-    )
-    os.environ["VIOLET_WIFI_TITLE"] = next(
-        item["title"] for item in manifest if item["name"] == "wifi"
-    )
+    os.environ["VIOLET_WATCH_TITLE"] = titles["stopwatch"]
+    os.environ["VIOLET_WIFI_TITLE"] = titles["wifi"]
     # Package manager is always loaded from the factory recovery image.
     manifest.append({"id": 9, "name": "package_manager"})
     scripts["package_manager"] = repo / "system/package-manager/process.rs"
@@ -91,6 +93,8 @@ SECTIONS {
         if only and name != only:
             continue
         modules = {"protocol": repo / "runtime/protocol.rs"}
+        if name == "power":
+            modules["power_backend"] = board / "power.rs"
         if name in scripts:
             modules["process"] = scripts[name]
         if name in ("stopwatch", "launcher", "wifi") or "entry" in item:
@@ -100,6 +104,9 @@ SECTIONS {
         if name == "stopwatch":
             modules["watch"] = repo / "apps/stopwatch/state.rs"
         body = "process::run()"
+        if name == "radio" and target == "moto":
+            modules["usb_debug"] = board / "usb_debug.rs"
+            body = "if identity == 21 { usb_debug::run() } else { process::run() }"
         if name == "runtime":
             modules["lanes"] = repo / "runtime/lanes.rs"
             body = "if identity>=15 {lanes::work(identity-15+4)} else {process::run()}"
@@ -112,7 +119,7 @@ SECTIONS {
         if name == "storage":
             modules.update(
                 storage=repo / "services/storage/storage.rs",
-                block=repo / "services/storage/block.rs",
+                block=storage_backend or repo / "services/storage/block.rs",
                 journal=repo / "services/storage/journal.rs",
             )
             body = "storage::storage_task()"
@@ -136,26 +143,49 @@ SECTIONS {
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
                 "-Copt-level=s",
+                *(["--cfg", "moto_board"] if target=="moto" and name=="power" else []),
+                *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,
                 "-o",
                 lib,
             ]
         )
         tls_objects = []
-        if name == "radio":
+        if name == "radio" and target == "qemu":
             import sys
 
             sys.path.insert(0, str(repo / "services/radio"))
             from build_tls import build
 
             tls_objects = build(repo, out, common)
+            platform_tls = dest / "tls-platform.o"
+            run([*common, "-I", repo / "services/radio/freestanding", "-c",
+                 board / "tls_platform.c", "-o", platform_tls])
+            tls_objects.append(platform_tls)
+        if name == "radio" and target == "moto":
+            import sys
+            sys.path.insert(0, str(board))
+            from build_supplicant import objects as supplicant_objects
+            from build_ip import objects as ip_objects
+            sys.path.insert(0, str(repo / "services/radio"))
+            from build_tls import build
+            tls_objects.extend(supplicant_objects(repo, out, common))
+            tls_objects.extend(ip_objects(repo, out, common))
+            tls_objects.extend(build(repo, out, common))
+        moto_radio = target == "moto" and name == "radio"
+        link_script = script
+        if moto_radio:
+            # ABI 3 has 128 KiB of zeroed private RAM outside the package/stack.
+            link_script = dest / "radio.ld"
+            link_script.write_text(script.read_text().replace(".bss (NOLOAD)", ". = 0x02800000; .bss (NOLOAD)")
+                                   + "\nASSERT(SIZEOF(.bss) <= 0x20000, \"Radio private RAM exceeded\")\n")
         elf = dest / (name + ".elf")
         run(
             [
                 cc.with_name("ld.lld"),
                 "--gc-sections",
                 "-T",
-                script,
+                link_script,
                 "--start-group",
                 transport,
                 *objects,
@@ -177,6 +207,8 @@ SECTIONS {
         allocated = [s for s in sections if s[2] & 2 and s[5]]
         code = next(s for s in allocated if strings[s[0] :].split(b"\0")[0] == b".text")
         assert code[3] == 0x100000 and code[5] % 4096 == 0
+        if moto_radio:
+            allocated = [s for s in allocated if not (s[1] == 8 and s[3] == 0x02800000)]
         end = max(s[3] + s[5] for s in allocated)
         image = bytearray(end - 0x100000)
         for s in allocated:
@@ -191,7 +223,7 @@ SECTIONS {
         header = struct.pack(
             "<4s5I",
             b"VPK1",
-            package_abi(item["id"]),
+            3 if moto_radio else package_abi(item["id"]),
             item["id"],
             code[5],
             len(image),

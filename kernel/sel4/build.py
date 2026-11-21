@@ -70,15 +70,33 @@ def build_target(target,out):
     src=out/"upstream"
     source(KERNEL,src)
     source(DTC,BUILD/DTC[0])
-    if target=="qemu":
-        bear=("bearssl-0.6","https://bearssl.org/bearssl-0.6.tar.gz","6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14")
-        source(bear,BUILD/bear[0])
+    bear=("bearssl-0.6","https://bearssl.org/bearssl-0.6.tar.gz","6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14")
+    source(bear,BUILD/bear[0])
+    if target == "moto":
+        supplicant = ("wpa_supplicant-2.11", "https://w1.fi/releases/wpa_supplicant-2.11.tar.gz",
+                      "912ea06f74e30a8e36fbb68064d6cdff218d8d591db0fc5d75dee6c81ac7fc0a")
+        source(supplicant, BUILD/supplicant[0])
+        lwip = ("lwip-STABLE-2_2_1_RELEASE", "https://codeload.github.com/lwip-tcpip/lwip/tar.gz/refs/tags/STABLE-2_2_1_RELEASE",
+                "ce0b7461c0ad9602c376f0bf07c5eb7253b48c7bf66f011c6bf3e2a96731c539")
+        source(lwip, BUILD/lwip[0])
     board=PORT/"board"
     plat=src/"src/plat/ellis"
     plat.mkdir(exist_ok=True)
     run(py,board/"gic-single-core.py",src)
-    for name in ["config.cmake","kernel-overlay.dts"]:
+    for name in ["config.cmake","kernel-overlay.dts","moto-radio-memory.dts"]:
         update(plat/name,(board/name).read_bytes())
+    wifi = plat / "wifi"
+    wifi.mkdir(exist_ok=True)
+    update(wifi/"monitor.S", (board/"wifi/monitor.S").read_bytes())
+    includes = src / "include/arch/arm/arch/object/ellis_wifi"
+    includes.mkdir(exist_ok=True)
+    for name in ("windows.h", "invoke.h"):
+        update(includes/name, (board/"wifi"/name).read_bytes())
+    patch = board / "wifi/aarch32.patch"
+    # Idempotent for both a clean pinned source and an already-patched build.
+    if subprocess.run(["git", "apply", "--reverse", "--check", patch], cwd=src,
+                      stderr=subprocess.DEVNULL).returncode:
+        subprocess.run(["git", "apply", patch], cwd=src, check=True)
     constants=Path("sel4/plat/api/constants.h")
     headers=src/"libsel4/sel4_plat_include"
     (headers/"ellis"/constants).parent.mkdir(parents=True,exist_ok=True)

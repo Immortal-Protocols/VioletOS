@@ -17,7 +17,7 @@ def inspect(blob):
     magic, abi, identity, code, size, crc = struct.unpack_from("<4s5I", blob)
     if (
         magic != b"VPK1"
-        or abi != package_abi(identity)
+        or (abi != package_abi(identity) and (identity, abi) != (7, 3))
         or not (1 <= identity <= 8 or 10 <= identity <= 14)
     ):
         raise ValueError("unsupported package or ABI")

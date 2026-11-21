@@ -49,6 +49,8 @@ halt:
     wfe
     b halt
 
+
+
 // Executed from staging RAM. All literals must travel with this block.
 .balign 16
 .global trampoline, trampoline_end
@@ -62,6 +64,19 @@ copy_kernel:
     str r3, [r1], #4
     subs r2, r2, #4
     bne copy_kernel
+#ifdef VIOLET_MOTO
+    // Amber square on the white band: the relocated kernel copy completed.
+    ldr r0, =0x79466800         // framebuffer + 32 rows * 720 pixels * 4
+    ldr r1, =0xffffae32
+    mov r2, #16
+1:  mov r3, #24
+2:  str r1, [r0], #4
+    subs r3, r3, #1
+    bne 2b
+    add r0, r0, #2784          // next row after 24 pixels
+    subs r2, r2, #1
+    bne 1b
+#endif
     dsb sy
     mov r0, #0
     mcr p15, 0, r0, c7, c5, 0

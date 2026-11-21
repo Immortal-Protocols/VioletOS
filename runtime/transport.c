@@ -31,6 +31,13 @@ unsigned ipc_receive(unsigned ep, unsigned *words) {
   read_words(words, seL4_Recv(ep, &badge));
   return badge;
 }
+unsigned ipc_try_receive(unsigned ep,unsigned *words) {
+  unsigned badge=0;
+  seL4_MessageInfo_t tag=seL4_NBRecv(ep,&badge);
+  if (seL4_MessageInfo_get_length(tag)!=WORDS) return 0;
+  read_words(words,tag);
+  return 1;
+}
 void ipc_reply(unsigned *words) { seL4_Reply(send_words(words)); }
 unsigned ticks_per_ms;
 uint32_t ticks(void) {
