@@ -119,17 +119,29 @@ def main():
     fastboot("set_active", "b")
     log("Slot B selected; rebooting")
     fastboot("reboot")
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        snapshot = violet()
-        if snapshot and snapshot.get("runtime_ready"):
-            keys = ("generation", "disk_ready", "startup_status", "previous_boot_stage")
-            log("VioletOS answered: " + json.dumps({k: snapshot.get(k) for k in keys}))
-            return
-        if in_android():
+    # A first boot can fall back to Android (for example after a warm reset with
+    # the Wi-Fi domain powered). Reselect B from fastboot once before giving up.
+    for attempt in range(2):
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            snapshot = violet()
+            if snapshot and snapshot.get("runtime_ready"):
+                keys = ("generation", "disk_ready", "startup_status", "previous_boot_stage")
+                log("VioletOS answered: " + json.dumps({k: snapshot.get(k) for k in keys}))
+                return
+            if in_android():
+                break
+            time.sleep(1)
+        else:
+            raise SystemExit("VioletOS did not answer over USB after the flash")
+        if attempt:
             raise SystemExit("The handset started Android on A instead of VioletOS")
-        time.sleep(1)
-    raise SystemExit("VioletOS did not answer over USB after the flash")
+        log("Android on A answered; reselecting slot B from fastboot")
+        ok("adb", "reboot", "bootloader")
+        if not wait_for(("fastboot",), 60):
+            raise SystemExit("Fastboot did not appear after leaving Android")
+        fastboot("set_active", "b")
+        fastboot("reboot")
 
 
 if __name__ == "__main__":

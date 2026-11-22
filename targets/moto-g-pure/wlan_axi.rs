@@ -1,7 +1,7 @@
 //! Polled Connac AXI transport. Only the dedicated, uncached Moto DMA pool
 //! supplies descriptor and payload addresses. One command can be in flight.
 use super::radio_io::{barrier, byte, expired, now, put, rd, wr};
-use super::{passive_scan, wlan_download};
+use super::{passive_scan, softap, wlan_download};
 use wlan_download::Transport;
 const DMA: usize = 0x09c00000;
 const PA: u32 = 0x42400000;
@@ -43,6 +43,15 @@ pub struct Axi {
     basic_rate: u8,
     pairwise_ready: bool,
     sequence: u8,
+    /// Access-point role: configuration, and 0 idle / 1 authenticated / 2 associated client.
+    pub ap: softap::Config,
+    pub ap_mode: bool,
+    pub client_state: u8,
+    pub mgmt_frames: u32,
+    pub new_client: bool,
+    /// Hosting telemetry: every frame and every management frame seen on rings 2/3.
+    pub rx_frames: u32,
+    pub rx_mgmt: u32,
 }
 impl Axi {
     pub const fn new() -> Self {
@@ -59,6 +68,13 @@ impl Axi {
             basic_rate: 0,
             pairwise_ready: false,
             sequence: 0,
+            ap: softap::Config::empty(),
+            ap_mode: false,
+            client_state: 0,
+            mgmt_frames: 0,
+            new_client: false,
+            rx_frames: 0,
+            rx_mgmt: 0,
         }
     }
     fn init(&mut self) -> Result<(), u32> {
@@ -264,6 +280,17 @@ impl Axi {
         Err(45)
     }
     fn channel(&mut self, channel: u8, token: u8, abort: bool) -> Result<(), u32> {
+        self.channel_for(0, channel, token, abort, 0, 3000)
+    }
+    fn channel_for(
+        &mut self,
+        bss: u8,
+        channel: u8,
+        token: u8,
+        abort: bool,
+        kind: u8,
+        interval: u32,
+    ) -> Result<(), u32> {
         let band = match channel {
             1..=11 => 1,
             36 | 40 | 44 | 48 | 149 | 153 | 157 | 161 | 165 => 2,
@@ -271,20 +298,26 @@ impl Axi {
         };
         self.sequence = self.sequence.wrapping_add(1);
         let mut body = [0; 24];
+        body[0] = bss;
         body[1] = token;
         body[2] = abort as u8;
         body[3] = channel;
         body[5] = band;
+        body[9] = kind; // CH_REQ_TYPE_JOIN or CH_REQ_TYPE_GO_START_BSS
         body[10] = 4; // firmware selects radio band
-        body[12..16].copy_from_slice(&3000u32.to_le_bytes());
+        body[12..16].copy_from_slice(&interval.to_le_bytes());
         self.normal_command(0x1c, self.sequence, true, &body)?;
         if abort {
             return Ok(());
         }
         let start = now();
-        while !expired(start, 1000) {
+        while !expired(start, if kind == 0 { 1000 } else { 3000 }) {
             let Some(n) = self.take(3)? else { continue };
             let packet = &self.rx[..n];
+            if n >= 32 {
+                super::radio_io::trace(6, u32::from_le_bytes(packet[16..20].try_into().unwrap()));
+                super::radio_io::trace(7, u32::from_le_bytes(packet[28..32].try_into().unwrap()));
+            }
             if n < 44 || packet[2..4] != [0, 224] || packet[18..21] != [0, 224, 16] {
                 continue;
             }
@@ -294,7 +327,7 @@ impl Axi {
                 continue;
             }
             let grant = &packet[28..];
-            if grant[0] == 0
+            if grant[0] == bss
                 && grant[1] == token
                 && grant[2] == 0
                 && grant[3] == channel
@@ -302,7 +335,7 @@ impl Axi {
                 && grant[9] == 0
             {
                 // Two timed exchanges follow. Reject a grant too short for both.
-                if u32::from_le_bytes(grant[12..16].try_into().unwrap()) < 1600 {
+                if kind == 0 && u32::from_le_bytes(grant[12..16].try_into().unwrap()) < 1600 {
                     return Err(46);
                 }
                 return Ok(());
@@ -389,12 +422,15 @@ impl Axi {
         }
         let mut ethernet = [0; 1550];
         ethernet[..6].copy_from_slice(&self.peer);
-        ethernet[6..12].copy_from_slice(&self.station);
+        ethernet[6..12].copy_from_slice(if self.ap_mode { &self.ap.bssid } else { &self.station });
         ethernet[12..14].copy_from_slice(&[0x88, 0x8e]);
         ethernet[14..14 + data.len()].copy_from_slice(data);
         self.transmit_ethernet(&ethernet[..14 + data.len()], self.pairwise_ready)
     }
     pub fn send_ip(&mut self, ethernet: &[u8]) -> Result<(), u32> {
+        if self.ap_mode {
+            return self.ap_send_ip(ethernet);
+        }
         if !self.pairwise_ready
             || ethernet.len() < 14
             || ethernet.len() > 1518
@@ -411,7 +447,7 @@ impl Axi {
         p[..2].copy_from_slice(&(n as u16).to_le_bytes());
         // Long descriptor, Ethernet II header translation, pairwise WTBL entry.
         p[2..6].copy_from_slice(&[8, 0x84, 1, 0x90]);
-        p[7] = 2;
+        p[7] = 2 | if self.ap_mode { softap::OWN_MAC << 2 } else { 0 };
         if !protected {
             p[11] = 0x80;
             p[26] = self.basic_rate;
@@ -421,6 +457,9 @@ impl Axi {
         self.send(1, &p[..n])
     }
     pub fn poll_data(&mut self, out: &mut [u8], eapol: &mut [u8]) -> Result<(usize, usize), u32> {
+        if self.ap_mode {
+            return self.ap_poll(out, eapol);
+        }
         for ring in [2, 3] {
             let Some(n) = self.take(ring)? else { continue };
             let p = &self.rx[..n];
@@ -482,17 +521,191 @@ impl Axi {
         let mut body = [0; 64];
         body[..3].copy_from_slice(&[1, pair as u8, pair as u8]);
         body[4..10].copy_from_slice(&self.peer);
+        if self.ap_mode {
+            body[3] = 1; // authenticator
+            body[10] = softap::BSS;
+        }
         body[11..15].copy_from_slice(&[4, id, 16, if pair { 1 } else { 2 }]);
         body[16..32].copy_from_slice(key);
         body[48..48 + counter.len()].copy_from_slice(counter);
         self.set(7, &body)?;
         if pair {
-            self.peer_event(0x24, self.peer)?;
+            if self.ap_mode {
+                // As with the station record, the key event layout differs for a client
+                // of our BSS; data flow after the handshake is the real confirmation.
+                let confirmed = self.peer_event(0x24, self.peer).is_ok();
+                super::radio_io::trace(4, 0x4b45_0000 | confirmed as u32);
+            } else {
+                self.peer_event(0x24, self.peer)?;
+            }
             self.pairwise_ready = true;
         }
         Ok(())
     }
 
+
+    /// Start beaconing as an access point. Mirrors gen4m p2pFuncStartGO:
+    /// channel grant, activate the P2P-network BSS, BSS info, beacon, PM BSS created.
+    pub fn start_ap(&mut self, ssid: &[u8], channel: u8, wpa2: bool) -> Result<(), u32> {
+        if ssid.is_empty() || ssid.len() > 32 {
+            return Err(56);
+        }
+        let mut bssid = self.station;
+        bssid[0] = (bssid[0] | 2) & !1;
+        bssid[5] ^= 1;
+        self.ap = softap::Config { ssid: [0; 32], ssid_len: ssid.len(), bssid, channel, wpa2 };
+        self.ap.ssid[..ssid.len()].copy_from_slice(ssid);
+        self.ap_mode = true;
+        self.client_state = 0;
+        self.pairwise_ready = false;
+        // gen4m activates the role BSS when the interface is created, before any channel request.
+        let mut activate = [softap::BSS, 1, 1, softap::OWN_MAC, 0, 0, 0, 0, 0, 0, softap::GROUP_WTBL, 0];
+        activate[4..10].copy_from_slice(&bssid);
+        self.set(0x11, &activate).map_err(|_| 57u32)?;
+        // The grant is advisory here: with no station BSS active the firmware may
+        // simply adopt the BSS channel from the RLM parameters below.
+        let token = self.sequence.wrapping_add(1);
+        let granted = self.channel_for(softap::BSS, channel, token, false, 3, 5000).is_ok();
+        super::radio_io::trace(4, 0x4150_0000 | granted as u32);
+        let mut filter = [0; 68];
+        filter[0] = 0x09;
+        self.set(0x0a, &filter)?;
+        let info = self.ap.bss_info();
+        self.set(0x12, &info).map_err(|_| 57u32)?;
+        let mut beacon = [0; 256];
+        let n = self.ap.beacon_template(&mut beacon);
+        self.set(0x18, &beacon[..n]).map_err(|_| 58u32)?;
+        let created = self.ap.pm_created();
+        self.set(0x15, &created).map_err(|_| 58u32)?;
+        Ok(())
+    }
+    pub fn peer_address(&self) -> [u8; 6] {
+        self.peer
+    }
+    fn ap_mgmt(&mut self, frame: &[u8], wlan: u8) -> Result<(), u32> {
+        let n = frame.len();
+        let mut tx = [0; 32 + 256];
+        tx[..2].copy_from_slice(&((32 + n) as u16).to_le_bytes());
+        tx[2] = 12;
+        tx[3] = 0x84; // MCU management queue 1
+        tx[4] = wlan;
+        tx[5] = 0xcc; // long descriptor, native 802.11, 24-byte MAC header
+        tx[7] = 2 | (softap::OWN_MAC << 2);
+        tx[8] = frame[0] >> 4;
+        tx[11] = 0x80;
+        tx[12..14].copy_from_slice(&(7u16 << 11).to_le_bytes());
+        tx[26] = 0; // 1 Mbit/s CCK
+        tx[32..32 + n].copy_from_slice(frame);
+        self.send(1, &tx[..32 + n])
+    }
+    fn ap_manage(&mut self, request: softap::Request) -> Result<(), u32> {
+        let mut out = [0; 256];
+        match request {
+            softap::Request::Probe(to) => {
+                let n = self.ap.probe_response(&to, &mut out);
+                self.ap_mgmt(&out[..n], 0)?;
+            }
+            softap::Request::Auth(from) => {
+                // One phone at a time; a new authentication replaces the previous client.
+                self.peer = from;
+                self.client_state = 1;
+                self.pairwise_ready = false;
+                let record = softap::client_record(&from, 0, 0, 0, false);
+                self.set(0x13, &record)?;
+                let n = self.ap.auth_response(&from, &mut out);
+                self.ap_mgmt(&out[..n], softap::CLIENT_WTBL)?;
+            }
+            softap::Request::Assoc { from, reassoc, listen, rsn } => {
+                if from != self.peer || self.client_state == 0 || rsn != self.ap.wpa2 {
+                    return Ok(());
+                }
+                let n = self.ap.assoc_response(&from, reassoc, 1, &mut out);
+                self.ap_mgmt(&out[..n], softap::CLIENT_WTBL)?;
+                let record = softap::client_record(&from, 1, listen, 2, true);
+                self.set(0x13, &record)?;
+                // The station-record event confirms activation for an AP's own peer;
+                // for a client of our BSS its layout differs, so treat it as advisory.
+                let confirmed = self.peer_event(12, from).is_ok();
+                super::radio_io::trace(4, 0x4153_0000 | confirmed as u32);
+                self.client_state = 2;
+                self.new_client = true;
+                self.basic_rate = 0;
+                // Open networks carry data immediately; WPA2 waits for the 4-way handshake.
+                self.pairwise_ready = !self.ap.wpa2;
+            }
+            softap::Request::Leave(from) => {
+                if from == self.peer {
+                    self.client_state = 0;
+                    self.pairwise_ready = false;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn ap_send_ip(&mut self, ethernet: &[u8]) -> Result<(), u32> {
+        if self.client_state != 2 || !self.pairwise_ready {
+            return Ok(()); // no phone associated: drop, as a real link would
+        }
+        if ethernet.len() < 14
+            || ethernet.len() > 1518
+            || ethernet[6..12] != self.ap.bssid
+            || !matches!(&ethernet[12..14], [8, 0] | [8, 6])
+        {
+            return Err(54);
+        }
+        // Only one phone is associated: deliver broadcasts to it as unicast so the
+        // pairwise key and per-station rate table apply.
+        let mut frame = [0; 1518];
+        frame[..ethernet.len()].copy_from_slice(ethernet);
+        if frame[0] & 1 != 0 {
+            frame[..6].copy_from_slice(&self.peer);
+        }
+        if frame[..6] != self.peer {
+            return Ok(());
+        }
+        self.transmit_ethernet(&frame[..ethernet.len()], self.ap.wpa2)
+    }
+    /// Service management frames and return the next data frame (Ethernet) or EAPOL body.
+    pub fn ap_poll(&mut self, out: &mut [u8], eapol: &mut [u8]) -> Result<(usize, usize), u32> {
+        for ring in [2, 3] {
+            let Some(n) = self.take(ring)? else { continue };
+            self.rx_frames = self.rx_frames.wrapping_add(1);
+            super::radio_io::trace(6, self.rx_frames | (ring as u32) << 28);
+            if let Some(f) = passive_scan::management_frame(&self.rx[..n]) {
+                let kind = f[0];
+                self.rx_mgmt = self.rx_mgmt.wrapping_add(1);
+                super::radio_io::trace(7, u32::from(kind) << 24 | u32::from(f[4]) << 16 | u32::from(f[9]) << 8 | u32::from(f[15]));
+                if let Some(request) = softap::classify(f, &self.ap) {
+                    self.mgmt_frames = self.mgmt_frames.wrapping_add(1);
+                    super::radio_io::trace(5, u32::from(kind) << 24 | self.mgmt_frames);
+                    self.ap_manage(request)?;
+                }
+                continue;
+            }
+            let p = &self.rx[..n];
+            if self.client_state != 2 {
+                continue;
+            }
+            if let Some(frame) = super::station::eapol(p, &self.ap.bssid, &self.peer) {
+                if frame.len() <= eapol.len() {
+                    eapol[..frame.len()].copy_from_slice(frame);
+                    return Ok((0, frame.len()));
+                }
+            }
+            if let Some(len) = softap::ethernet(p, &self.ap, &self.peer, out) {
+                if out[12..14] == [0x88, 0x8e] {
+                    // Trim link-layer padding: the MIC covers exactly the EAPOL frame.
+                    let body = &out[14..len];
+                    let declared = body.get(2..4).map_or(0, |b| 4 + u16::from_be_bytes([b[0], b[1]]) as usize);
+                    let size = declared.min(body.len()).min(eapol.len());
+                    eapol[..size].copy_from_slice(&body[..size]);
+                    return Ok((0, size));
+                }
+                return Ok((len, 0));
+            }
+        }
+        Ok((0, 0))
+    }
     pub fn associate(&mut self, ap: &passive_scan::AccessPoint) -> Result<u16, u32> {
         if !ap.wpa2_psk_ccmp || ap.rate_count == 0 {
             return Err(49);
@@ -506,12 +719,9 @@ impl Axi {
         self.channel(ap.channel, token, true)?;
         result
     }
-    pub fn scan(
-        &mut self,
-        image: &[u8],
-        result: &mut passive_scan::Results,
-        stage: fn(u32),
-    ) -> Result<(), u32> {
+    /// Upload and start the WLAN firmware, then read the station address.
+    /// Returns the last command sequence number used.
+    pub fn boot(&mut self, image: &[u8], stage: fn(u32)) -> Result<u8, u32> {
         stage(31);
         self.init()?;
         let mut seq = 0;
@@ -534,9 +744,19 @@ impl Axi {
         }
         wr(GLO, rd(GLO) & !(1 << 9));
         stage(40);
-        let mut activate = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0];
         seq = seq.wrapping_add(2);
         self.station = self.station_address(seq)?;
+        self.sequence = seq;
+        Ok(seq)
+    }
+    pub fn scan(
+        &mut self,
+        image: &[u8],
+        result: &mut passive_scan::Results,
+        stage: fn(u32),
+    ) -> Result<(), u32> {
+        let mut seq = self.boot(image, stage)?;
+        let mut activate = [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0];
         activate[4..10].copy_from_slice(&self.station);
         seq = seq.wrapping_add(1);
         self.normal_command(0x11, seq, true, &activate)?;

@@ -46,7 +46,13 @@ pub fn open() {
             if event.op == OK && (42..678).contains(&event.value) {
                 match event.arg / 4 {
                     86..136 => {
-                        selection = (selection + 1) % ids.len();
+                        // Skip slots with nothing installed so every page shows a component.
+                        for _ in 0..ids.len() {
+                            selection = (selection + 1) % ids.len();
+                            if request(GET, CATALOG, ids[selection]).value != 0 {
+                                break;
+                            }
+                        }
                         break;
                     }
                     139..189 if is_app(item.value) => {

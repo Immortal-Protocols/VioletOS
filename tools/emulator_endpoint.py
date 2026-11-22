@@ -13,8 +13,15 @@ PAYLOAD = 1024
 FRAME = 24 + PAYLOAD
 
 
-def connect_endpoint():
-    return socket.create_connection(("www.uuidgenerator.net", 443), timeout=4)
+# Hosts the guest may name in a connect command. TLS and certificate checks
+# stay in the guest; the relay only refuses other destinations.
+ENDPOINTS = {"www.uuidgenerator.net", "wttr.in"}
+
+
+def connect_endpoint(host="www.uuidgenerator.net"):
+    if host not in ENDPOINTS:
+        raise OSError(f"endpoint {host!r} is not allowed")
+    return socket.create_connection((host, 443), timeout=4)
 
 
 def serve(sock, connect):
@@ -44,7 +51,8 @@ def serve(sock, connect):
                             remote.close()
                             remote = None
                         if command == 1:
-                            remote = connect()
+                            host = frame[24 : 24 + length].decode("ascii", "replace")
+                            remote = connect(host) if host else connect()
                     elif command == 2 and remote:
                         remote.sendall(frame[24 : 24 + length])
                     elif command == 3 and remote:

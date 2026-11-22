@@ -119,3 +119,23 @@ Each VioletOS boot still uses one slot B retry because VioletOS does not mark th
 ## USB diagnostics
 
 The current build ships [USB Diagnostics](../../services/usb-diagnostics/README.md) as its own signed-update target. Its service guide covers the Mac clients, live package replacement and recovery tests.
+
+## Phone relay access point
+
+Radio can host a Wi-Fi network for a phone running the [companion relay](../../companion/ios/README.md) and reach the internet over the phone's cellular data. Run `services/usb-diagnostics/host/moto-relay` from the Mac. It provisions a one-boot profile named `VioletRelay-XXXX` (WPA2-PSK) or, with `--open`, `VioletRelayOpen-XXXX`. It writes the SSID, passphrase and SOCKS password to `build/relay-pairing.json`, then asks Radio to host the network. A join request whose network name starts with `VioletRelay` hosts that network instead of joining one.
+
+- **Access point.** [softap.rs](softap.rs) holds the gen4m access-point commands, following Motorola's driver: activate BSS 1 as a P2P-network BSS with own-MAC slot 1, request the channel, set the BSS information in AP mode, send the beacon template, and report the BSS as created.
+- **Joining.** Radio answers probe, authentication and association frames itself, and admits one phone at a time.
+- **WPA2.** [ap_wpa.c](ap_wpa.c) runs the 4-way handshake as the authenticator, using hostap's PTK, MIC and AES-wrap code.
+- **IP.** [client.c](ip/client.c) serves `192.168.77.0/24`. It leases `192.168.77.2` with no router or DNS option, so the phone keeps cellular as its default route. Broadcasts go to the phone as unicast frames.
+- **Relay.** The HTTPS test connects through SOCKS5 to the phone on port 1081, sends the hostname for the phone to resolve, and keeps TLS end to end on VioletOS.
+- **Staying up.** The access point runs from Radio's event loop and outlives individual requests. If the phone leaves or re-associates, Radio drops only the IP state. While the network is up, every `moto-package join-wifi` repeats the HTTPS test.
+
+Two supporting changes:
+- **Radio's stack.** Radio now runs on a separate eight-page stack at `0x02600000`, as Storage does, so its package may use the full `0x3e000`-byte image window. Runtime keeps the `0x38000` limit.
+- **Reboot.** The supervisor powers down the connectivity domain before a USB-requested reboot. Without that, a warm reset while hosting made slot B fail until the bootloader fell back to Android.
+
+On November 22, 2026, the XT2163DL on slot B hosted the network and an iPhone 18 Pro Max (iOS 27.2) joined it. The Mac drove both devices with no hands on either.
+- **Open network.** The phone joined `VioletRelayOpen-9034` and took the `192.168.77.2` lease. VioletOS fetched UUID `4b95ac2c-…` over verified HTTPS. The companion counted one connection, 4,044 bytes down and 454 up, leaving on its cellular interface `pdp_ip0`.
+- **WPA2.** The phone joined `VioletRelay-9FE8`, completed the 4-way handshake and took the lease. VioletOS fetched `415d7130-…`, and ten further requests over the same session all succeeded. Each fresh TCP, SOCKS5, TLS and HTTPS exchange took 0.8–2.7 s, typically 1.1 s, as timed from the Mac including USB polling.
+- **Not yet covered:** throughput measured from VioletOS, the phone locked or in the background, and a profile that persists across reboots.

@@ -1,0 +1,35 @@
+name: VioletProbe
+options:
+  bundleIdPrefix: com.immortal.violet
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  DEVELOPMENT_TEAM: 3UGCLFLDJ6
+  CODE_SIGN_STYLE: Automatic
+targets:
+  VioletProbe:
+    type: application
+    platform: iOS
+    sources: [App]
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchScreen: {}
+        CFBundleDisplayName: Violet Probe
+  VioletProbeUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: VioletProbe
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+      TEST_TARGET_NAME: VioletProbe
+schemes:
+  VioletProbe:
+    build:
+      targets:
+        VioletProbe: all
+        VioletProbeUITests: [test]
+    test:
+      targets: [VioletProbeUITests]

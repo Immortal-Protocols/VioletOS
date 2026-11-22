@@ -1,0 +1,46 @@
+name: VioletRelay
+options:
+  bundleIdPrefix: com.immortal.violet
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  DEVELOPMENT_TEAM: 3UGCLFLDJ6
+  CODE_SIGN_STYLE: Automatic
+  SWIFT_VERSION: "5.0"
+targets:
+  VioletRelay:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.immortal.violet.relay
+      CODE_SIGN_ENTITLEMENTS: App/VioletRelay.entitlements
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchScreen: {}
+        CFBundleDisplayName: Violet Relay
+        NSLocalNetworkUsageDescription: >-
+          Violet Relay accepts SOCKS5 connections from your VioletOS phone over
+          Wi-Fi and forwards them over this iPhone's cellular data.
+        NSBonjourServices: [_violetrelay._tcp]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+  VioletRelayUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: VioletRelay
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.immortal.violet.relay.uitests
+      GENERATE_INFOPLIST_FILE: YES
+      TEST_TARGET_NAME: VioletRelay
+schemes:
+  VioletRelay:
+    build:
+      targets:
+        VioletRelay: all
+        VioletRelayUITests: [test]
+    test:
+      targets: [VioletRelayUITests]

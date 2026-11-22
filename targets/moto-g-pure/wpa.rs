@@ -127,6 +127,75 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
 }
 
 extern "C" {
+    fn station_net_host(mac: *const u8, wait_ms: u32) -> i32;
+    fn station_net_relay_password(p: *const u8, n: u32);
+    fn station_net_leased() -> i32;
+}
+pub fn leased() -> bool {
+    unsafe { station_net_leased() != 0 }
+}
+/// Drop the hosted IP network but keep the access point running.
+pub unsafe fn close_net() {
+    station_net_close();
+    LINK_ERROR = false;
+}
+extern "C" {
+    fn ap_wpa_start(radio: *mut core::ffi::c_void, aa: *const u8, spa: *const u8, pmk: *const u8) -> i32;
+    fn ap_wpa_rx(frame: *const u8, n: usize) -> i32;
+    fn ap_wpa_poll() -> i32;
+    fn ap_wpa_done() -> i32;
+    fn ap_wpa_report() -> u32;
+}
+pub fn handshake_report() -> u32 {
+    unsafe { ap_wpa_report() }
+}
+/// Drive the access point's 4-way handshake with the associated phone.
+/// A failed handshake waits for the phone to associate again.
+pub fn authenticator_step(axi: &mut Axi, pmk: &[u8; 32], eapol: &[u8]) -> Result<(), u32> {
+    unsafe {
+        if core::mem::take(&mut axi.new_client) {
+            let (aa, spa) = (axi.ap.bssid, axi.peer_address());
+            ap_wpa_start((axi as *mut Axi).cast(), aa.as_ptr(), spa.as_ptr(), pmk.as_ptr());
+        }
+        let rc = if eapol.is_empty() { ap_wpa_poll() } else { ap_wpa_rx(eapol.as_ptr(), eapol.len()) };
+        if rc < 0 {
+            axi.client_state = 0;
+        }
+    }
+    Ok(())
+}
+pub fn authenticated() -> bool {
+    unsafe { ap_wpa_done() != 0 }
+}
+/// Read the provisioned pairwise master key for `ssid` from the supervisor.
+pub fn profile_key(ssid: &[u8]) -> Option<[u8; 32]> {
+    let mut q = Message::new(GET, 0x405d, ssid.len() as u32);
+    q.put_text(ssid);
+    let mut profile = q.call(7);
+    if profile.op != OK {
+        return None;
+    }
+    let key = profile.data[..32].try_into().ok();
+    for byte in &mut profile.data {
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    key
+}
+/// Serve the phone's network on the access point and wait for its DHCP lease.
+/// The SOCKS password is the hex form of the first eight PMK bytes.
+pub unsafe fn host_ip(dev: *mut Axi, pmk: &[u8; 32]) -> bool {
+    DEVICE = dev;
+    LINK_ERROR = false;
+    let mut password = [0u8; 16];
+    for (i, b) in pmk[..8].iter().enumerate() {
+        password[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
+        password[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+    }
+    station_net_relay_password(password.as_ptr(), 16);
+    let mac = (*dev).ap.bssid;
+    station_net_host(mac.as_ptr(), 0) != 0 && !LINK_ERROR
+}
+extern "C" {
     fn station_net_close();
     fn station_net_join(mac: *const u8) -> i32;
     fn station_net_poll();
@@ -150,6 +219,10 @@ unsafe extern "C" fn radio_l2_recv(p: *mut u8, n: usize) -> i32 {
     let mut key = [0; 1536];
     match (*DEVICE).poll_data(slice::from_raw_parts_mut(p, n), &mut key) {
         Ok((size, 0)) => size as i32,
+        Ok((_, size)) if (*DEVICE).ap_mode => {
+            ap_wpa_rx(key.as_ptr(), size);
+            0
+        }
         Ok((_, size)) if station_wpa_rx(key.as_ptr(), size) >= 0 => 0,
         _ => {
             LINK_ERROR = true;
@@ -182,6 +255,17 @@ pub unsafe fn poll() -> bool {
     station_wpa_poll();
     station_net_poll();
     !LINK_ERROR
+}
+extern "C" {
+    fn station_net_text(host: *const u8, path: *const u8, out: *mut u8, cap: u32) -> i32;
+}
+/// One line of weather for `CITIES[city]`, cleaned to the bitmap font. Returns its length.
+pub unsafe fn weather(city: usize, out: &mut [u8; 40]) -> usize {
+    let mut path = [0; 64];
+    if crate::protocol::weather_path(city, &mut path).is_none() {
+        return 0;
+    }
+    station_net_text(b"wttr.in\0".as_ptr(), path.as_ptr(), out.as_mut_ptr(), 40).max(0) as usize
 }
 pub unsafe fn uuid(out: &mut [u8; 36]) -> bool {
     station_net_uuid(out.as_mut_ptr()) == 1
