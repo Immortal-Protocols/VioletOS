@@ -38,10 +38,15 @@ impl Ticket {
     }
 }
 pub fn request(op: u32, key: u32, value: u32) -> Message {
-    match submit(op, key, value) {
-        Ok(t) => t.wait(),
-        Err(e) => Message::error(e),
+    request_with(op, key, value, 0)
+}
+/// As `request`, with the operation's argument word (for example a tone's pitch and length).
+pub fn request_with(op: u32, key: u32, value: u32, arg: u32) -> Message {
+    let r = Message::new(op, key, value).with_arg(arg).call(SERVER);
+    if r.op != OK {
+        return Message::error(r.op);
     }
+    Ticket(r.value).wait()
 }
 
 pub fn file(key: u32, name: &[u8], offset: u32, data: &[u8]) -> Message {

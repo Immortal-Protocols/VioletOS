@@ -64,4 +64,4 @@ jobs:
       - name: Test lifecycle and package updates
         run: make test-stack test-apps
       - name: Test Wi-Fi and power
-        run: make test-wifi test-power
+        run: make test-wifi test-power test-audio

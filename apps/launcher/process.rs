@@ -11,6 +11,8 @@ pub fn run() -> ! {
     let touch = submit(SUBSCRIBE, CONTACT, 0).unwrap_or_else(|_| panic!());
     let radio_events = submit(SUBSCRIBE, RADIO, 0).ok();
     let power_events = submit(SUBSCRIBE, POWER, 0).ok();
+    let volume_events = submit(SUBSCRIBE, VOLUME, 0).ok();
+    let mut volume_state = Message::error(OFFLINE);
     let mut radio_state = Message::error(OFFLINE);
     let mut power_state = Message::error(OFFLINE);
     let mut previous = Message::error(EMPTY);
@@ -60,6 +62,13 @@ pub fn run() -> ! {
                     redraw = true;
                 }
             }
+            if let Some(stream) = &volume_events {
+                let r = stream.poll();
+                if r.op == OK {
+                    volume_state = r;
+                    redraw = true;
+                }
+            }
             if let Some(stream) = &power_events {
                 let r = stream.poll();
                 if r.op == OK {
@@ -79,6 +88,16 @@ pub fn run() -> ! {
         if active && (!visible || redraw) {
             header(&status.text(), status.arg != 0);
             label(14, 62, b"VIOLET", 4, INK);
+            if volume_state.op == OK {
+                // The side buttons work on every screen; Home shows where sound goes.
+                let mut text = *b"VOL 00 SPK";
+                text[4] += (volume_state.value.min(99) / 10) as u8;
+                text[5] += (volume_state.value % 10) as u8;
+                if volume_state.arg & AUDIO_HEADPHONES != 0 {
+                    text[7..].copy_from_slice(b"HP ");
+                }
+                label(166, 20, &text, 1, ACCENT);
+            }
             rect(157, 53, 70, 32, PANEL);
             label(163, 65, b"APPS", 2, INK);
             let radio = radio_state;

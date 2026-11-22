@@ -349,6 +349,26 @@ pub fn run() -> ! {
             (0xc0, 0x53, 0, 0) => send(&radio_snapshot(), len),
             (0xc0, 0x52, 0, 0) => send(&runtime_snapshot(), len),
             (0xc0, 0x51, 0, 0) => send(&snapshot(), len),
+            // Audio status page, 16 words per request selected by the index.
+            (0xc0, 0x4f, 0, page) if page < 4 => {
+                let mut out = [0; 64];
+                let src = (0x09203000 + usize::from(page) * 64) as *const u32;
+                for (i, dest) in out.chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { src.add(i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
+            // A developer audio request for Audio to act on: command in the high byte.
+            (0x40, 0x4e, lo, hi) if configuration == 1 && len == 0 => {
+                let request = 0x09204000 as *mut u32;
+                unsafe {
+                    request.add(1).write_volatile(u32::from(lo) | (u32::from(hi) << 16));
+                    let serial = request.read_volatile().wrapping_add(1);
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    request.write_volatile(serial);
+                }
+                put_half(CSR, 0x48);
+            }
             _ => put_half(CSR, 0x40 | 0x20),
         }
     }

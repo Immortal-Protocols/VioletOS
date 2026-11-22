@@ -9,7 +9,7 @@ struct Stream {
 struct Client {
     serial: u32,
     jobs: [Job; 7],
-    streams: [Stream; 3],
+    streams: [Stream; STREAMS],
 }
 #[derive(Default, Clone, Copy)]
 struct Job {
@@ -30,7 +30,22 @@ fn service(key: u32) -> u32 {
 fn job_slot(key: u32) -> usize {
     service(key).saturating_sub(3) as usize
 }
-const STREAM_KEYS: [u32; 3] = [CONTACT, RADIO, POWER];
+const STREAMS: usize = 5;
+const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK];
+/// The component whose inventory bit gates a key.
+fn component(key: u32) -> u32 {
+    match key {
+        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
+        POWER => 8,
+        SAVE | FILE_LIST..=FILE_DELETE => 6,
+        VOLUME | PLAYBACK => AUDIO_COMPONENT,
+        _ => 0,
+    }
+}
+/// Audio answers between polls of its hardware, so Runtime calls it directly.
+fn audio(m: Message) -> Message {
+    Message::new(m.op, m.key, m.value).with_arg(m.arg).call(AUDIO_SLOT)
+}
 fn ticket(c: &mut Client) -> u32 {
     c.serial = c.serial.wrapping_add(1).max(1);
     c.serial
@@ -74,12 +89,7 @@ impl Runtime {
         Message::error(BUSY)
     }
     fn dispatch(&mut self, who: u32, m: Message) -> Message {
-        let component = match m.key {
-            RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
-            POWER => 8,
-            SAVE | FILE_LIST..=FILE_DELETE => 6,
-            _ => 0,
-        };
+        let component = component(m.key);
         if component != 0 && self.inventory & (1 << component) == 0 {
             return Message::error(OFFLINE);
         }
@@ -111,7 +121,7 @@ impl Runtime {
                 if r.op == OK {
                     self.focus = LAUNCHER;
                     let client = &mut self.clients[who as usize];
-                    client.streams = [Stream::default(); 3];
+                    client.streams = [Stream::default(); STREAMS];
                     for job in &mut client.jobs {
                         job.ticket = 0;
                     }
@@ -137,6 +147,9 @@ impl Runtime {
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
             (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
             (GET, POWER) => self.forward(who, 8, m),
+            (GET, VOLUME | PLAYBACK) => audio(m),
+            // Volume is shared. Only the app on screen may change it or make sound.
+            (EXECUTE, VOLUME | PLAYBACK) if who == self.focus && !self.asleep => audio(m),
             (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
                 self.asleep = m.value == 1;
                 self.forward(who, 8, m)
@@ -240,7 +253,7 @@ pub fn run() -> ! {
         match m.op {
             SUBSCRIBE if STREAM_KEYS.contains(&m.key) => {
                 let index = STREAM_KEYS.iter().position(|&key| key == m.key).unwrap();
-                if m.key != CONTACT && rt.inventory & (1 << m.key) == 0 {
+                if m.key != CONTACT && rt.inventory & (1 << component(m.key)) == 0 {
                     Message::error(OFFLINE).reply();
                 } else {
                     if c.streams[index].id == 0 {
@@ -262,12 +275,16 @@ pub fn run() -> ! {
                     rt.contact(who).reply();
                     continue;
                 }
-                let state = crate::lanes::sample(
-                    if key == RADIO { 7 } else { 8 },
-                    16 + who,
-                    who,
-                    Message::new(GET, key, 0),
-                );
+                let state = if matches!(key, VOLUME | PLAYBACK) {
+                    audio(Message::new(GET, key, 0))
+                } else {
+                    crate::lanes::sample(
+                        if key == RADIO { 7 } else { 8 },
+                        16 + who,
+                        who,
+                        Message::new(GET, key, 0),
+                    )
+                };
                 let stream = &mut rt.clients[i].streams[index];
                 if state.op != OK {
                     state.reply();

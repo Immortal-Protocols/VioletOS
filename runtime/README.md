@@ -4,8 +4,10 @@ QEMU apps call the [Rust SDK](sdk.rs). The [Runtime process](process.rs) uses th
 
 | App operation | Completion |
 | --- | --- |
-| Subscribe to contact, radio or power | Poll a persistent ticket until canceled. Contact reports new presses. Radio and power report their initial state and the latest observed change. |
+| Subscribe to contact, radio, power, volume or playback | Poll a persistent ticket until canceled. Contact reports new presses. The others report their initial state and the latest observed change. |
 | Get a surface, checkpoint or device state | Poll a single-use ticket for the value or error. Each app can hold one outstanding request per service plus one local request. |
 | Execute an operation | Acceptance returns a ticket. Await completion or discard the result. Independent workers wait for service replies. A pending radio request leaves display, touch, storage and app switching available. |
 
 The version-one [wire format](protocol.rs) uses 14 ARM words. An app can write its own mapped surface between calls. Present requests name the changed rows.
+
+Volume and playback go to the [Audio service](../services/audio/README.md). Runtime calls it directly, because Audio answers between hardware polls and never waits on a device. Any app may read them; only the app on screen may change the volume or play a sound.

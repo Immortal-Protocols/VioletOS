@@ -42,9 +42,29 @@ def in_fastboot():
     return bool(result and result.stdout.strip())
 
 
-def in_android():
+def moto_serial():
+    """The adb serial of a Moto G Pure in Android, ignoring any other attached phone."""
     result = ok("adb", "devices", timeout=10)
-    return bool(result and any(line.endswith("\tdevice") for line in result.stdout.splitlines()))
+    if not result:
+        return None
+    for line in result.stdout.splitlines():
+        if not line.endswith("\tdevice"):
+            continue
+        serial = line.split("\t")[0]
+        product = ok("adb", "-s", serial, "shell", "getprop", "ro.product.device", timeout=10)
+        if product and product.stdout.strip() == "ellis":
+            return serial
+    return None
+
+
+def in_android():
+    return moto_serial() is not None
+
+
+def adb_bootloader():
+    serial = moto_serial()
+    if serial:
+        ok("adb", "-s", serial, "reboot", "bootloader")
 
 
 def state():
@@ -86,7 +106,7 @@ def to_fastboot(fallback_reboots):
             now = wait_for({"fastboot", "android"}, 50)
     if now == "android":
         log("Android answered; requesting the bootloader with adb")
-        ok("adb", "reboot", "bootloader")
+        adb_bootloader()
         now = wait_for({"fastboot"}, 60)
     if now != "fastboot":
         raise SystemExit("The handset did not reach fastboot")
@@ -137,7 +157,7 @@ def main():
         if attempt:
             raise SystemExit("The handset started Android on A instead of VioletOS")
         log("Android on A answered; reselecting slot B from fastboot")
-        ok("adb", "reboot", "bootloader")
+        adb_bootloader()
         if not wait_for(("fastboot",), 60):
             raise SystemExit("Fastboot did not appear after leaving Android")
         fastboot("set_active", "b")
