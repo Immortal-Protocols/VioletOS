@@ -278,6 +278,11 @@ try:
         if args.stack=="recovered":
             if args.fault_id in (2,10):
                 tap(680 if args.fault_id==10 else 920)  # The stopwatch loads on demand.
+            if args.fault_id==14:
+                # Weather loads on demand too: Apps -> NEXT past STOPWATCH and WI-FI -> OPEN.
+                tap(260,560); time.sleep(.3)
+                tap(440); tap(440); time.sleep(.3)
+                tap(650)
             for _ in range(140):
                 if words(0x49300008,3)==(2,2,args.fault_id): break
                 time.sleep(.05)
