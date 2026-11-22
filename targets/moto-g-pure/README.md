@@ -106,6 +106,16 @@ The ABI 3 Moto Radio package uses 128 KiB of private working memory supplied by 
 
 On the physical XT2163DL, slot B image `4be2ac63c17e` with signed Radio `ca18deb9` completed a passive scan on all 20 configured channels. USB reported three received beacons or probe responses and zero process faults. The run used a Radio-only USB update. Signed Radio `c90eb9e1` then joined the provisioned WPA2 network, obtained a DHCP lease and fetched two distinct UUIDv4 responses over verified HTTPS on the same handset connection. The Mac used USB to request each test and read the result. The profile is held in memory for the current boot.
 
+## Hands-free image flashing
+
+`build/moto-package reboot-bootloader` asks the running VioletOS to restart into fastboot. USB Diagnostics acknowledges the request and asks Power to set the MT6357 RTC fast-boot flag, `RTC_PDN1` bit 13, the bit Motorola's `rtc_mark_fast()` sets. Power unlocks the RTC write interface, commits the bit through `RTC_WRTGR`, waits for `RTC_BBPU` to clear its busy bit, and reads the bit back. The supervisor then flushes storage and issues the usual TOPRGU software reset. If the reset does not happen, Diagnostics clears the flag so a later reboot still starts VioletOS. Register addresses come from Motorola's `include/linux/mfd/mt6357/registers.h` and `drivers/misc/mediatek/rtc/mt6357/`.
+
+`services/usb-diagnostics/host/moto-flash [IMAGE]` writes an image to `boot_b`, selects slot B, reboots and waits for VioletOS to answer over USB. When run from VioletOS it sends `reboot-bootloader`, and from Android on A it runs `adb reboot bootloader`. If the running image cannot request fastboot, it reboots VioletOS repeatedly until slot B runs out of retries and the bootloader falls back to Android A. `--fastboot-only` stops in the bootloader without flashing.
+
+On November 21, 2026 the XT2163DL was running an image without the request. `moto-flash` exhausted slot B's retries in six reboots (about 300 s), reached Android A, entered fastboot with adb and flashed image `300e374ef5bb`. On that first boot, USB Diagnostics answered when the handset counter read 221 s. Later boots of the same image answered within 8 s. The cause of the first-boot delay was not determined. From that image, `reboot-bootloader` reached fastboot in 5 s with B current, bootable, and six retries remaining. A full `moto-flash` run from VioletOS reached fastboot at 11.1 s, finished the write and slot selection at 11.9 s, and VioletOS answered at 20.1 s with generation 1, disk ready, and a freshly initialized volume (previous boot stage 0). A following plain `moto-package reboot` returned to VioletOS in 11 s, confirming that the bootloader clears the flag. None of these runs needed handset input.
+
+Each VioletOS boot still uses one slot B retry because VioletOS does not mark the slot successful. `moto-flash` restores the count with `set_active b`.
+
 ## USB diagnostics
 
 The current build ships [USB Diagnostics](../../services/usb-diagnostics/README.md) as its own signed-update target. Its service guide covers the Mac clients, live package replacement and recovery tests.

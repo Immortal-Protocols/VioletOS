@@ -215,7 +215,17 @@ pub fn run() -> ! {
         }
         if tx != 0 {
             if let Some((action, token)) = action_after_status.take() {
-                Message::new(EXECUTE, action, token).call(7);
+                if action == 0x70 {
+                    // Power commits the MT6357 RTC fast-boot flag, then the
+                    // supervisor flushes storage and resets. A failed reset
+                    // returns here, so clear the flag for later reboots.
+                    if Message::new(EXECUTE, 0x4062, 1).call(6).op == OK {
+                        Message::new(EXECUTE, 0x65, 0).call(7);
+                        Message::new(EXECUTE, 0x4062, 0).call(6);
+                    }
+                } else {
+                    Message::new(EXECUTE, action, token).call(7);
+                }
             }
             if let Some(a) = address.take() {
                 put(0, a);
@@ -310,7 +320,7 @@ pub fn run() -> ! {
                 let reply = Message::new(EXECUTE, 0x69, 0).call(7);
                 put_half(CSR, if reply.op == OK { 0x48 } else { 0x60 });
             }
-            (0x40, action @ (0x65 | 0x68), 0, 0) if configuration == 1 && len == 0 => {
+            (0x40, action @ (0x65 | 0x68 | 0x70), 0, 0) if configuration == 1 && len == 0 => {
                 action_after_status = Some((u32::from(action), 0));
                 put_half(CSR, 0x48);
             }

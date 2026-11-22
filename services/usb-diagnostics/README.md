@@ -4,6 +4,8 @@ The Moto supervisor starts [USB Diagnostics](process.rs) as a separate Rust proc
 
 The [host clients](host/) run on the Mac. Build them with `make build/moto-debug build/moto-package`. Run `build/moto-debug` for a JSON snapshot and `build/moto-package diagnostics-status` for the running package checksum and trial generation.
 
+Run `build/moto-package reboot-bootloader` to restart the handset into fastboot, or `host/moto-flash IMAGE` to flash slot B and wait for VioletOS to return. See [hands-free image flashing](../../targets/moto-g-pure/README.md#hands-free-image-flashing).
+
 ## Replace Diagnostics over USB
 
 Build a replacement with `make moto-component NAME=usb-diagnostics`. On a handset running a baseline with package 21, run `tools/moto-install-diagnostics build/sel4/moto/packages/usb-diagnostics.vpk`. The installer signs the VPK using this build's developer key and waits for a status snapshot from the replacement. The supervisor restarts the managed processes for the trial. It commits the catalog only after the Mac confirms the new generation. A candidate fault or a 45-second confirmation timeout restarts the previous catalog. A reboot before confirmation also loads the previous catalog.
