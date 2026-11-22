@@ -182,16 +182,11 @@ pub fn profile_key(ssid: &[u8]) -> Option<[u8; 32]> {
     key
 }
 /// Serve the phone's network on the access point and wait for its DHCP lease.
-/// The SOCKS password is the hex form of the first eight PMK bytes.
-pub unsafe fn host_ip(dev: *mut Axi, pmk: &[u8; 32]) -> bool {
+/// `password` is what the phone's SOCKS relay expects.
+pub unsafe fn host_ip(dev: *mut Axi, password: &[u8]) -> bool {
     DEVICE = dev;
     LINK_ERROR = false;
-    let mut password = [0u8; 16];
-    for (i, b) in pmk[..8].iter().enumerate() {
-        password[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
-        password[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
-    }
-    station_net_relay_password(password.as_ptr(), 16);
+    station_net_relay_password(password.as_ptr(), password.len() as u32);
     let mac = (*dev).ap.bssid;
     station_net_host(mac.as_ptr(), 0) != 0 && !LINK_ERROR
 }
@@ -230,14 +225,41 @@ unsafe extern "C" fn radio_l2_recv(p: *mut u8, n: usize) -> i32 {
         }
     }
 }
+/// Unix time from the phone, kept as (seconds, tick at those seconds). The 32-bit tick
+/// counter wraps every few minutes, so `tick_clock` re-anchors it on every loop pass.
+static mut PHONE_CLOCK: Option<(u32, u32)> = None;
+pub fn tick_clock() {
+    unsafe {
+        if let Some((secs, at)) = PHONE_CLOCK {
+            let per_s = ticks_per_ms * 1000;
+            let whole = radio_io::now().wrapping_sub(at) / per_s;
+            if whole > 0 {
+                PHONE_CLOCK = Some((secs + whole, at.wrapping_add(whole * per_s)));
+            }
+        }
+    }
+}
+extern "C" {
+    fn station_net_phone_time(out: *mut u32) -> i32;
+    static ticks_per_ms: u32;
+}
+/// Ask the phone's relay for the time. Returns true when it answered.
+pub unsafe fn phone_time() -> bool {
+    let mut secs = 0u32;
+    if station_net_phone_time(&mut secs) != 1 || secs < 1_704_067_200 {
+        return false;
+    }
+    PHONE_CLOCK = Some((secs, radio_io::now()));
+    true
+}
 #[no_mangle]
 extern "C" fn radio_unix_time() -> u32 {
     let r = Message::new(GET, 0x405e, 0).call(7);
-    if r.op == OK {
-        r.value
-    } else {
-        0
+    if r.op == OK && r.value != 0 {
+        return r.value;
     }
+    tick_clock();
+    unsafe { PHONE_CLOCK.map_or(0, |(secs, _)| secs) }
 }
 pub unsafe fn join_ip(dev: *mut Axi) -> bool {
     DEVICE = dev;

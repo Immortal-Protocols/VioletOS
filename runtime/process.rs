@@ -21,7 +21,7 @@ fn service(key: u32) -> u32 {
     match key {
         SAVE | FILE_LIST..=FILE_DELETE => 6,
         PRESENT => 5,
-        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | WEATHER => 7,
+        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | WEATHER | RELAY => 7,
         POWER => 8,
         CATALOG | INBOX | INSTALL | REMOVE => 9,
         _ => 0,
@@ -75,7 +75,7 @@ impl Runtime {
     }
     fn dispatch(&mut self, who: u32, m: Message) -> Message {
         let component = match m.key {
-            RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER => 7,
+            RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
             POWER => 8,
             SAVE | FILE_LIST..=FILE_DELETE => 6,
             _ => 0,
@@ -135,6 +135,7 @@ impl Runtime {
             }
             (GET, RADIO) => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
+            (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
             (GET, POWER) => self.forward(who, 8, m),
             (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
                 self.asleep = m.value == 1;

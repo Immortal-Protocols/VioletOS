@@ -28,6 +28,10 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Violet Relay accepts SOCKS5 connections from your VioletOS phone over Wi-Fi and forwards them over this iPhone's cellular data.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UILaunchScreen</key>
