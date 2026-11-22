@@ -13,12 +13,12 @@ from package_format import pack, unpack
 moto = root / "build/sel4/moto"
 qemu = root / "build/sel4/qemu"
 packages = unpack((moto / "catalog.bin").read_bytes())
-assert set(packages) == {1, 2, 3, 4, 5, 6, 7, 8, 10, 14, 21}
+assert set(packages) == {1, 2, 3, 4, 5, 6, 7, 8, 10, 13, 14, 21, 22}
 reference = unpack((qemu / "catalog.bin").read_bytes())
-for identity in (1, 2, 3, 5, 10):
+for identity in (1, 2, 3, 5, 10, 13):
     assert packages[identity] == reference[identity], f"package {identity} differs"
 assert (moto / "packages/package_manager.vpk").read_bytes() == (qemu / "packages/package_manager.vpk").read_bytes()
-for identity in (4, 6, 7, 8):
+for identity in (4, 6, 7, 8, 22):
     assert packages[identity] != reference[identity]
     packages[identity] = reference[identity]
 with TemporaryDirectory() as tmp:

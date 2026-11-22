@@ -18,6 +18,10 @@ impl Message {
             ..Self::default()
         }
     }
+    pub fn with_arg(mut self, arg: u32) -> Self {
+        self.arg = arg;
+        self
+    }
     pub fn result(value: u32) -> Self {
         Self::new(OK, 0, value)
     }
@@ -167,3 +171,39 @@ pub fn weather_path(city: usize, out: &mut [u8; 64]) -> Option<usize> {
 pub const PROFILE: u32 = 27;
 
 pub const STORAGE_DIAGNOSTIC: u32 = 0x300;
+
+// Audio. VOLUME and PLAYBACK can be subscribed to, read with GET and changed
+// with EXECUTE. Runtime forwards them to the Audio process, which also owns the
+// hardware volume buttons and the headphone jack.
+pub const VOLUME: u32 = 29;
+pub const PLAYBACK: u32 = 30;
+/// Audio is component 22, beside USB Diagnostics, so app and service IDs keep their values.
+pub const AUDIO_COMPONENT: u32 = 22;
+/// Runtime's capability slot for the Audio endpoint.
+pub const AUDIO_SLOT: u32 = 2;
+pub const VOLUME_MAX: u32 = 15;
+/// EXECUTE VOLUME values beside an absolute level 0..=VOLUME_MAX.
+pub const VOLUME_UP: u32 = 0x100;
+pub const VOLUME_DOWN: u32 = 0x101;
+/// VOLUME replies: value is the level, arg carries these flags.
+pub const AUDIO_HEADPHONES: u32 = 1 << 0; // A plug is in the jack; output follows it.
+pub const AUDIO_SPEAKER_OUT: u32 = 1 << 1; // The speaker path is available.
+pub const AUDIO_HEADPHONE_OUT: u32 = 1 << 2; // The headphone path is available.
+pub const AUDIO_BUTTONS: u32 = 1 << 3; // Hardware volume buttons are being read.
+pub const AUDIO_JACK: u32 = 1 << 4; // Jack detection is being read.
+/// PLAYBACK: EXECUTE value is a sound (SOUND_STOP stops). For SOUND_TONE, arg is
+/// frequency in hertz in the low 16 bits and duration in milliseconds in the high 16.
+/// Replies carry the sound now playing in value (0 when idle) and, in arg, the
+/// serial of the most recent request in the low 16 bits and its outcome above.
+pub const SOUND_STOP: u32 = 0;
+pub const SOUND_CLICK: u32 = 1;
+pub const SOUND_CHIME: u32 = 2;
+pub const SOUND_ALERT: u32 = 3;
+pub const SOUND_TONE: u32 = 4;
+pub const SOUND_LAST: u32 = SOUND_TONE;
+pub const PLAYBACK_PLAYED: u32 = 1 << 16; // The last request finished playing.
+pub const PLAYBACK_STOPPED: u32 = 2 << 16; // It was stopped or replaced.
+pub const PLAYBACK_NO_OUTPUT: u32 = 3 << 16; // No output path could play it.
+pub const PLAYBACK_OUTCOME: u32 = 3 << 16;
+/// Internal: Audio -> Power, a PMIC register read or masked write on the handset.
+pub const PMIC_ACCESS: u32 = 0x4070;

@@ -211,3 +211,52 @@ pub fn fastboot_mark(enable: bool) -> Message {
         None => Message::error(OFFLINE),
     }
 }
+
+// Audio reaches the PMIC through Power, which serializes every wrapper access.
+// Audio may read and write the MT6357 audio block (AUD_TOP, AUDDEC, AUDENC,
+// ACCDET and ZCD at 0x2080-0x233e) and only the named bits elsewhere: the
+// 26 MHz audio clock buffer, the audio link pad modes and their Schmitt
+// triggers. Everything else, including every regulator, is refused.
+const AUDIO_BLOCK: core::ops::RangeInclusive<u16> = 0x2080..=0x233e;
+const AUDIO_FIELDS: [(u16, u16); 6] = [
+    (0x0024, 0x0000), // TOPSTATUS: read only (power and home key)
+    (0x07ac, 0x2000), // DCXO_CW14 XO_AUDIO_EN_M
+    (0x00b6, 0xffff), // GPIO_MODE2: audio MOSI pads
+    (0x00b8, 0xffff), // GPIO_MODE2_SET
+    (0x00ba, 0xffff), // GPIO_MODE2_CLR
+    (0x002c, 0x0ff0), // SMT_CON1: audio pad Schmitt triggers
+];
+/// GET reads `addr`. EXECUTE writes `arg & 0xffff` under the mask in its high half.
+pub fn audio_pmic(op: u32, addr: u32, arg: u32) -> Message {
+    let Ok(addr) = u16::try_from(addr) else { return Message::error(DENIED) };
+    let allowed = if AUDIO_BLOCK.contains(&addr) && addr & 1 == 0 {
+        0xffff
+    } else if let Some(&(_, mask)) = AUDIO_FIELDS.iter().find(|f| f.0 == addr) {
+        mask
+    } else {
+        return Message::error(DENIED);
+    };
+    if !ready() {
+        return Message::error(OFFLINE);
+    }
+    if op == EXECUTE {
+        let mask = (arg >> 16) as u16;
+        if mask & !allowed != 0 || mask == 0 {
+            return Message::error(DENIED);
+        }
+        let value = arg as u16 & mask;
+        // Set and clear registers act on written ones, so write them directly.
+        let write = if matches!(addr, 0x00b8 | 0x00ba) {
+            Some(value)
+        } else {
+            pmic_read(addr).map(|old| (old & !mask) | value)
+        };
+        if write.and_then(|v| pmic_write(addr, v)).is_none() {
+            return Message::error(OFFLINE);
+        }
+    }
+    match pmic_read(addr) {
+        Some(v) => Message::result(u32::from(v)),
+        None => Message::error(OFFLINE),
+    }
+}

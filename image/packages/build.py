@@ -39,6 +39,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
         "display": repo / "services/display/process.rs",
         "radio": repo / "services/radio/process.rs",
         "power": repo / "services/power/process.rs",
+        "audio": repo / "services/audio/process.rs",
     }
     board = repo / "targets" / ("moto-g-pure" if target == "moto" else "qemu")
     if target == "moto":
@@ -103,6 +104,8 @@ SECTIONS {
         modules = {"protocol": repo / "runtime/protocol.rs"}
         if name == "power":
             modules["power_backend"] = board / "power.rs"
+        if name == "audio":
+            modules["audio_backend"] = board / "audio.rs"
         if name in scripts:
             modules["process"] = scripts[name]
         if name in ("stopwatch", "launcher", "wifi") or "entry" in item:

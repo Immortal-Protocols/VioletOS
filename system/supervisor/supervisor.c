@@ -45,13 +45,14 @@ struct process {
   seL4_CPtr ep, frames[64];
   bool running;
 };
-enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, USB_TRANSFER_BADGE = 14,
-#ifdef VIOLET_MOTO
-       TOTAL = USB_DIAG + 1,
-#else
-       TOTAL = USB_DIAG,
-#endif
-       LANE_BASE = 0x07400000 };
+// Audio follows USB Diagnostics so app and service identities keep their values.
+// QEMU has no USB Diagnostics process; its slot stays empty there.
+enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7,
+       USB_TRANSFER_BADGE = 14, TOTAL = AUDIO + 1, LANE_BASE = 0x07400000,
+       RUNTIME_AUDIO_SLOT = 2, AUDIO_POWER_SLOT = 6,
+       // Badges 16 and up mean faults, so Audio's supervisor requests use an
+       // app identity that never holds the lifecycle endpoint.
+       AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071 };
 static struct process procs[TOTAL];
 static seL4_CPtr life, scratch_slot;
 static volatile unsigned *report;
@@ -71,7 +72,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
 #ifdef VIOLET_MOTO
   if (p->id==RADIO && p->abi==3) abi_ok=true;
 #endif
-  bool allowed_id = p->id < COUNT;
+  bool allowed_id = p->id < COUNT || p->id == AUDIO;
 #ifdef VIOLET_MOTO
   allowed_id |= p->id == USB_DIAG;
 #endif
@@ -132,6 +133,7 @@ static bool parse(const struct archive *a, unsigned limit) {
   // Older installed catalogs inherit Diagnostics from the factory catalog.
   if (found[USB_DIAG]) procs[USB_DIAG].package = found[USB_DIAG];
 #endif
+  procs[AUDIO].package = found[AUDIO];
   return true;
 }
 static void grant(struct task *t, unsigned slot, seL4_CPtr ep, unsigned badge,
@@ -332,7 +334,13 @@ static struct device_page devices[] = {
     {TOUCH, 0x49000000, 0x09005000, 0},   {RADIO, 0x49001000, 0x09000000, 0},
     {POWER, 0x49002000, 0x09000000, 0},   {STORAGE, 0x49200000, 0x0b000000, 0},
     {RADIO, 0x49201000, 0x09002000, 0},   {RADIO, 0x49202000, 0x09005000, 0},
-    {0, 0x49203000, 0x0b003000, 0}};
+    {0, 0x49203000, 0x0b003000, 0},
+    // Emulated sound card: control page, then an eight-page PCM ring.
+    {AUDIO, 0x49204000, 0x09000000, 0}, {AUDIO, 0x49205000, 0x09001000, 0},
+    {AUDIO, 0x49206000, 0x09002000, 0}, {AUDIO, 0x49207000, 0x09003000, 0},
+    {AUDIO, 0x49208000, 0x09004000, 0}, {AUDIO, 0x49209000, 0x09005000, 0},
+    {AUDIO, 0x4920a000, 0x09006000, 0}, {AUDIO, 0x4920b000, 0x09007000, 0},
+    {AUDIO, 0x4920c000, 0x09008000, 0}};
 #else
 static unsigned handset_report[6];
 static unsigned uploaded, upload_size, upload_crc;
@@ -388,8 +396,9 @@ static const char *title(const struct package *p) {
   static const char names[][16] = {"",      "LAUNCHER", "STOPWATCH",  "RUNTIME",
                                    "TOUCH", "DISPLAY",  "STORAGE",    "RADIO",
                                    "POWER", "",         "WI-FI SETUP"};
-  static const char diag_name[16] = "USB DIAGNOSTICS";
+  static const char diag_name[16] = "USB DIAGNOSTICS", audio_name[16] = "AUDIO";
   if (p->id == USB_DIAG) return diag_name;
+  if (p->id == AUDIO) return audio_name;
   return p->id >= 11 ? (const char *)p->bytes + p->size - 16 : names[p->id];
 }
 static void reply_title(const struct package *p) {
@@ -405,7 +414,7 @@ static bool update_catalog(unsigned id, bool remove) {
   // Each physical device is wired to a process on this board.
   if (remove && id >= STORAGE && id <= POWER) return false;
 #endif
-  bool known = id > 0 && id < COUNT && id != PACKAGES;
+  bool known = (id > 0 && id < COUNT && id != PACKAGES) || id == AUDIO;
 #ifdef VIOLET_MOTO
   if (usb_trial_bytes && id != USB_DIAG) return false;
   if (id == USB_DIAG) known = !remove && usb_trial_bytes && usb_trial_generation == generation;
@@ -419,7 +428,7 @@ static bool update_catalog(unsigned id, bool remove) {
     return false;
   unsigned count = 0, length = 0;
   for (unsigned i = 1; i < TOTAL; i++) {
-    if (i >= COUNT && i != USB_DIAG) continue;
+    if (i >= COUNT && i != USB_DIAG && i != AUDIO) continue;
     const struct package *p = i == id ? (remove ? 0 : inbox) : procs[i].package;
     if (!p || i == PACKAGES)
       continue;
@@ -543,6 +552,15 @@ static void wire(void) {
       grant(&procs[id].task, id == STORAGE ? 2 : 1, procs[id].ep, 0, true);
     }
   }
+  if (procs[AUDIO].package) {
+    // Only Runtime calls Audio. On the handset Audio reaches the PMIC through Power.
+    prepare_process(AUDIO);
+    procs[AUDIO].ep = create(ram, seL4_EndpointObject);
+    grant(&procs[AUDIO].task, 1, procs[AUDIO].ep, 0, true);
+    grant(&procs[RUNTIME].task, RUNTIME_AUDIO_SLOT, procs[AUDIO].ep, RUNTIME, false);
+    if (procs[POWER].package)
+      grant(&procs[AUDIO].task, AUDIO_POWER_SLOT, procs[POWER].ep, AUDIO, false);
+  }
   for (unsigned id = 1; id < COUNT; id++)
     if ((id == LAUNCHER || id == WATCH || id >= WIFI) && procs[id].package)
       grant(&procs[id].task, 1, procs[RUNTIME].ep, id, false);
@@ -581,6 +599,16 @@ static void wire(void) {
   prepare_process(USB_DIAG);
   grant(&procs[USB_DIAG].task,7,life,USB_TRANSFER_BADGE,false);
   grant(&procs[USB_DIAG].task,6,procs[POWER].ep,USB_DIAG,false);
+  if (procs[AUDIO].package) {
+    // Audio publishes diagnostics to USB; USB passes developer requests back.
+    unsigned status_frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(status_frame, &procs[AUDIO].task, 0x09203000, seL4_AllRights);
+    map_shared(status_frame, &procs[USB_DIAG].task, 0x09203000, seL4_CanRead);
+    unsigned request_frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(request_frame, &procs[USB_DIAG].task, 0x09204000, seL4_AllRights);
+    map_shared(request_frame, &procs[AUDIO].task, 0x09204000, seL4_CanRead);
+    grant(&procs[AUDIO].task, 7, life, AUDIO_LIFE_BADGE, false);
+  }
   unsigned diagnostic_frame = create(ram, seL4_ARM_SmallPageObject);
   map_lane(diagnostic_frame, &bootstrap, 0x09202000);
   map_shared(diagnostic_frame, &procs[USB_DIAG].task, 0x09202000, seL4_CanRead);
@@ -590,7 +618,7 @@ static void wire(void) {
     map_shared(frame, &procs[id].task, va, seL4_AllRights);
     map_shared(frame, &procs[USB_DIAG].task, va, seL4_CanRead);
   }
-  device(TOUCH, 0x10000000, 0x09000000, 12);
+  board_device(TOUCH, 0x10000000, 0x09000000, 0x09708000); // topckgen: audio clock muxes
   board_device(TOUCH, 0x10001000, 0x09001000, 0x09701000);
   device(TOUCH, 0x10002000, 0x09004000, 12);
   board_device(TOUCH, 0x10005000, 0x09002000, 0x09702000);
@@ -605,9 +633,21 @@ static void wire(void) {
   grant(&procs[RADIO].task, 7, life, RADIO, false);
   board_device(TOUCH, 0x10007000, 0x09005000, 0x09703000);
   device(POWER, 0x1000d000, 0x09000000, 12);
+  if (procs[AUDIO].package) {
+    // Keypad (Volume Down), read-only: Audio cannot reconfigure the scan.
+    mapping = &procs[AUDIO].task;
+    map_device_rights(0x10010000, 0x09000000, 12, seL4_CanRead);
+    map_device(0x11007000, 0x09004000, 12); // I2C0: FS1603 speaker amplifier
+  }
   device(RADIO, 0x1100c000, 0x09010000, 12);
   device(TOUCH, 0x11013000, 0x09003000, 12);
   device(USB_DIAG, 0x11200000, 0x09000000, 12);
+  if (procs[AUDIO].package) {
+    // AFE registers, then its 36 KiB SRAM (the playback buffer).
+    mapping = &procs[AUDIO].task;
+    for (unsigned off = 0; off < 0xa000; off += PAGE)
+      map_device(0x11220000 + off, 0x09010000 + off, 12);
+  }
   board_device(STORAGE, 0x11230000, 0x0a000000, 0x0a000000);
   record_boot_stage(4);
   device(USB_DIAG, 0x11cc0000, 0x09001000, 12);
@@ -897,6 +937,52 @@ restore_config:
   return status;
 }
 #endif
+#ifdef VIOLET_MOTO
+// Audio clocks and pins, from Motorola's ellis kernel: mt6765 clk tables
+// (clk-mt6765.c), AudDrv_Clk_On and the ellis pinctrl overlay. Bits in `want`:
+// 1 audio clocks (infra audio + 26 MHz gates, audio_sel = 26 MHz,
+// aud_intbus_sel = syspll1_d4), 2 headphone link pins (GPIO136/138/139 mode 1),
+// 4 speaker pins (I2S3 on GPIO17-20 mode 6, I2C0 gate). Zero leaves the
+// hardware alone. The survey reports gates, muxes and pin modes either way.
+static void set_field(volatile unsigned *reg, unsigned mask, unsigned value) {
+  write_board(reg, (*reg & ~mask) | value);
+}
+static unsigned audio_platform(unsigned want, bool change, unsigned survey[10]) {
+  volatile unsigned *top = (void *)0x09708000, *infra = (void *)0x09701000,
+                    *gpio = (void *)0x09702000;
+  unsigned done = 0;
+  if (change && (want & 1)) {
+    write_board(infra + 0x8c / 4, 1u << 25);   // ifr_audio
+    write_board(infra + 0xa8 / 4, 1u << 4);    // ifr_audio26m
+    write_board(top + 0x78 / 4, (3u << 24) | (1u << 31)); // audio_sel: clk26m, ungated
+    write_board(top + 0x04 / 4, 1u << 15);
+    write_board(top + 0x88 / 4, 3u | (1u << 7));         // aud_intbus_sel: clear, ungate
+    write_board(top + 0x84 / 4, 1u);                     // syspll1_d4
+    write_board(top + 0x04 / 4, 1u << 16);
+    if (!(infra[0x94 / 4] & (1u << 25)) && !(infra[0xac / 4] & (1u << 4))) done |= 1;
+  }
+  if (change && (want & 2)) {
+    set_field(gpio + 0x410 / 4, 0xff0f, 0x1101);
+    done |= 2;
+  }
+  if (change && (want & 4)) {
+    set_field(gpio + 0x320 / 4, 0xffff0, 0x66660);
+    write_board(infra + 0x84 / 4, 1u << 11);   // ifr_i2c_ap
+    if (!(infra[0x90 / 4] & (1u << 11))) done |= 4;
+  }
+  survey[0] = infra[0x90 / 4];
+  survey[1] = infra[0x94 / 4];
+  survey[2] = infra[0xac / 4];
+  survey[3] = top[0x70 / 4];
+  survey[4] = top[0x80 / 4];
+  survey[5] = gpio[0x320 / 4];
+  survey[6] = gpio[0x3a0 / 4];
+  survey[7] = gpio[0x3b0 / 4];
+  survey[8] = gpio[0x410 / 4];
+  survey[9] = 0x41555031; // "AUP1"
+  return done;
+}
+#endif
 void root_main(seL4_BootInfo *bi) {
   unsigned freq;
   __asm__ volatile("mrc p15,0,%0,c14,c0,0" : "=r"(freq));
@@ -1010,7 +1096,7 @@ void root_main(seL4_BootInfo *bi) {
         if (++faults >= 5)
           stop();
         unsigned failed = badge - 16;
-        report[4] = failed >= FIRST_WORKER ? RUNTIME : failed;
+        report[4] = failed >= FIRST_WORKER && failed < USB_DIAG ? RUNTIME : failed;
 #ifdef VIOLET_QEMU
         if (source == 3 && !volume_reject(volume_bank))
           stop();
@@ -1024,6 +1110,16 @@ void root_main(seL4_BootInfo *bi) {
       unsigned op = seL4_GetMR(0), key = seL4_GetMR(1), val = seL4_GetMR(2),
                result = 0, error = 2;
 #ifdef VIOLET_MOTO
+      if (badge == AUDIO_LIFE_BADGE && key == AUDIO_PLATFORM &&
+          seL4_MessageInfo_get_length(msg) == 14 && (op == GET || (op == EXECUTE && val <= 7))) {
+        unsigned survey[10];
+        result = audio_platform(op == EXECUTE ? val : 0, op == EXECUTE, survey);
+        for (unsigned i = 0; i < 10; i++) seL4_SetMR(4 + i, survey[i]);
+        seL4_SetMR(0, 0);
+        seL4_SetMR(2, result);
+        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 14));
+        continue;
+      }
       if (badge == USB_TRANSFER_BADGE && op == EXECUTE && seL4_MessageInfo_get_length(msg)==14) {
         unsigned n=seL4_GetMR(3), ok=0;
         if (key == 0x6d) {
@@ -1253,6 +1349,8 @@ void root_main(seL4_BootInfo *bi) {
         for (unsigned id = 1; id < COUNT; id++)
           if (id != PACKAGES && procs[id].package)
             result |= 1u << id;
+        if (procs[AUDIO].package)
+          result |= 1u << AUDIO;
       } else if (badge == PACKAGES && op == GET && key == 9 && val < COUNT) {
         error = 0;
         if (procs[val].package && val != PACKAGES) {

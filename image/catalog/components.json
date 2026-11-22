@@ -47,10 +47,22 @@
     "title": "WI-FI SETUP"
   },
   {
+    "id": 13,
+    "name": "sounds",
+    "required": false,
+    "title": "SOUNDS",
+    "entry": "apps/sounds/process.rs"
+  },
+  {
     "id": 14,
     "name": "weather",
     "required": false,
     "title": "WEATHER",
     "entry": "apps/weather/process.rs"
+  },
+  {
+    "id": 22,
+    "name": "audio",
+    "required": false
   }
 ]
