@@ -9,6 +9,8 @@ static int conflicts(uint64_t base, uint64_t size)
     return size > UINT64_MAX - base || (size && base < ram_end && base + size > ram);
 }
 
+// Index into panels[] of the panel the bootloader lit; passed on for touch firmware.
+static unsigned panel_index;
 static int layout_ok(const void *dt)
 {
     uintptr_t addr = (uintptr_t)dt;
@@ -18,9 +20,19 @@ static int layout_ok(const void *dt)
     int chosen = fdt_path_offset(dt, "/chosen"), len;
     const char *video = fdt_getprop(dt, chosen, "atag,videolfb", &len);
     const uint32_t *tag = (const uint32_t *)video;
-    const char panel[] = "mipi_mot_vid_djn_nt36525b_a_hdp_652";
-    if (!video || len < 20 + (int)sizeof(panel) || tag[0] != fb || tag[1] ||
-        tag[2] != 1 || tag[4] != pool || memcmp(video+20, panel, sizeof(panel))) return 0;
+    // XT2163DL units ship with different 720x1600 panels; the stock kernel lists
+    // these five. The bootloader lights any of them into the same framebuffer.
+    static const char *const panels[] = {
+        "mipi_mot_vid_djn_nt36525b_a_hdp_652", "mipi_mot_vid_djn_nt36525b_hdp_652",
+        "mipi_mot_vid_tm_nt36672a_hdp_652", "mipi_mot_vid_tm_hx83112a_hdp_652",
+        "mipi_mot_vid_txd_ili7806s_hdp_652"};
+    if (!video || len < 20 || tag[0] != fb || tag[1] || tag[2] != 1 || tag[4] != pool) return 0;
+    int known = 0;
+    for (unsigned i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
+        size_t n = strlen(panels[i]) + 1;
+        if (len >= 20 + (int)n && !memcmp(video + 20, panels[i], n)) known = 1, panel_index = i;
+    }
+    if (!known) return 0;
     const fdt32_t *start = fdt_getprop(dt, chosen, "linux,initrd-start", &len);
     if (!start || len != 4 || fdt32_to_cpu(*start) < ram_end) return 0;
     int reserved = fdt_path_offset(dt, "/reserved-memory");
@@ -140,6 +152,8 @@ void prepare(const void *dt)
     stage_ram((void *)0x43e00000, (const void *)radio_firmware, length);
     unsigned profile=radio_profile(dt);
     *(volatile unsigned *)0x43fffff8 = profile;
+    // "PAN" tag plus the panel index, so touch can tell a missing value from panel 0.
+    *(volatile unsigned *)0x43fffff0 = 0x50414e00u | panel_index;
     if (previous != UINT32_MAX) record_boot_stage(2);
     *(volatile unsigned *)0x43fffff4 = previous;
     *(volatile unsigned *)0x43dffffc = volume_load((void *)0x43c00000);

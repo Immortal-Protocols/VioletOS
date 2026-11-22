@@ -3,6 +3,18 @@ use core::fmt::{self, Write};
 
 include!(env!("VIOLET_FIRMWARE_RS"));
 
+/// Firmware for the panel the loader found. The loader writes "PAN" plus the index of
+/// the panel in its list to 0x43fffff0, which the supervisor maps read-only at 0x09f00000.
+/// Index 1 is mipi_mot_vid_djn_nt36525b_hdp_652; anything else keeps the default.
+fn firmware() -> (&'static [u8], &'static [(usize, usize, usize, u32)]) {
+    if let Some(alt) = ALT {
+        if unsafe { (0x09ff_fff0 as *const u32).read_volatile() } == 0x5041_4e01 {
+            return alt;
+        }
+    }
+    (&touch_firmware, PARTS)
+}
+
 struct Status<'a> {
     bytes: &'a mut [u8; 40],
     used: usize,
@@ -62,13 +74,14 @@ impl Bus {
     }
     fn upload(&mut self, status: &mut Status) -> Result<(), &'static str> {
         let mut limit = 31;
-        for &(addr, offset, size, _) in PARTS {
+        let (image, parts) = firmware();
+        for &(addr, offset, size, _) in parts {
             let mut i = 0;
             while i < size {
                 let a = addr + i;
                 let mut n = (size - i).min(128 - (a & 127)).min(limit);
                 for attempt in 0..5 {
-                    let data = &touch_firmware[offset + i..offset + i + n];
+                    let data = &image[offset + i..offset + i + n];
                     let phase = match self.put(a, data) {
                         Ok(()) => break,
                         Err(e) => e,
@@ -132,7 +145,7 @@ impl Bus {
             return Err("TOUCH ID FAILED");
         }
         self.reset(2, status)?;
-        for (bank, &(addr, _, size, crc)) in PARTS[..2].iter().enumerate() {
+        for (bank, &(addr, _, size, crc)) in firmware().1[..2].iter().enumerate() {
             let registers = [[0x3f128, 0x3f118, 0x3f100], [0x3f12c, 0x3f130, 0x3f104]][bank];
             let errors = [
                 [

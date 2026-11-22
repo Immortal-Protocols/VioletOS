@@ -629,6 +629,11 @@ static void wire(void) {
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode,policy_cap,32,seL4_CapInitThreadCNode,
                         policy_cap-1,32,seL4_CanRead));
   check(seL4_ARM_Page_Map(policy_cap,bootstrap.pd,0x09f00000,seL4_CanRead,seL4_ARM_ExecuteNever));
+  // Touch reads the loader's panel word at 0x43fffff0 to pick its firmware.
+  unsigned touch_boot=next_slot++;
+  check(seL4_CNode_Copy(seL4_CapInitThreadCNode,touch_boot,32,seL4_CapInitThreadCNode,
+                        policy_cap,32,seL4_CanRead));
+  check(seL4_ARM_Page_Map(touch_boot,procs[TOUCH].task.pd,0x09f00000,seL4_CanRead,seL4_ARM_ExecuteNever));
 #endif
   workers();
 #ifdef VIOLET_MOTO
