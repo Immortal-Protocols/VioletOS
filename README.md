@@ -89,7 +89,7 @@ Runtime identifies the requesting app and selects its private checkpoint. The st
 
 ## Handset build and validation
 
-The supported handset is **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2** and the DJN NT36525B-A panel. Supply the stock boot image and panel firmware below. Next to the stock boot image, create a `wifi/` folder containing the files listed in the [radio firmware manifest](targets/moto-g-pure/wifi_firmware.py), copied from the factory vendor image’s firmware directory. The build verifies each input against its pinned SHA-256 digest.
+The supported handset is **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2**. Units with either DJN NT36525B panel revision (`djn_nt36525b_a` or `djn_nt36525b`) are supported: the loader reads the panel the bootloader lit, and touch uploads the matching firmware. Supply the stock boot image and both panel firmware files below. Next to the stock boot image, create a `wifi/` folder containing the files listed in the [radio firmware manifest](targets/moto-g-pure/wifi_firmware.py), copied from the factory vendor image’s firmware directory. The build verifies each input against its pinned SHA-256 digest.
 
 ```sh
 export VIOLET_STOCK_BOOT=/path/to/exact-factory/boot.img
