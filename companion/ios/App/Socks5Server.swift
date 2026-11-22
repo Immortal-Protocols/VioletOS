@@ -121,6 +121,11 @@ final class RelayServer {
     func checkCredentials(user: String, pass: String) -> Bool {
         user == credentials.user && pass == credentials.pass
     }
+
+    /// Change the relay password (a new pairing). Existing sessions keep running.
+    func setPassword(_ password: String) {
+        queue.async { self.credentials.pass = password }
+    }
 }
 
 /// One SOCKS5 client connection and its cellular upstream.
@@ -248,6 +253,7 @@ final class Socks5Session {
                 self.read(2) { p in
                     let port = UInt16(p[0]) << 8 | UInt16(p[1])
                     guard cmd == 0x01 else { return self.fail(.commandNotSupported, "command \(cmd) not supported") }
+                    if case .name("time.violet", _) = host { return self.sendTime() }
                     self.connect(host: host, port: port)
                 }
             }
@@ -328,6 +334,16 @@ final class Socks5Session {
         case .dns: return .hostUnreachable
         default: return nil
         }
+    }
+
+    /// VioletOS has no clock of its own: "time.violet" answers with the phone's Unix
+    /// time as four big-endian bytes, then closes.
+    private func sendTime() {
+        phase = "time"
+        let now = UInt32(Date().timeIntervalSince1970)
+        let reply: [UInt8] = [0x05, Reply.succeeded.rawValue, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
+                              UInt8(now >> 24), UInt8(now >> 16 & 0xFF), UInt8(now >> 8 & 0xFF), UInt8(now & 0xFF)]
+        write(reply) { self.finish(nil) }
     }
 
     private func successReply(_ up: NWConnection) -> [UInt8] {

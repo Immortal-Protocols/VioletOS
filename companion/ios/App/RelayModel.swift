@@ -20,8 +20,29 @@ enum RelayConfig {
             return fromArgs
         }
         if let env = ProcessInfo.processInfo.environment["VIOLET_PAIRING_SECRET"], !env.isEmpty { return env }
+        if let code = pairingCode { return String(code.suffix(8)) }
         return d.string(forKey: "pairingSecret") ?? "violet-dev"
     }
+
+    /// The 12-character code shown on VioletOS's Phone Internet page: the first four
+    /// characters name the network, the last eight are the relay password.
+    static var pairingCode: String? {
+        get { UserDefaults.standard.string(forKey: "pairingCode") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "pairingCode")
+            // A code replaces any secret set by the Mac tools.
+            if newValue != nil { UserDefaults.standard.removeObject(forKey: "pairingSecret") }
+        }
+    }
+
+    /// Uppercase hex only; spaces and dashes are ignored. Nil unless exactly 12 characters.
+    static func normalizedCode(_ text: String) -> String? {
+        let code = text.uppercased().filter { !" -".contains($0) }
+        guard code.count == 12, code.allSatisfy({ "0123456789ABCDEF".contains($0) }) else { return nil }
+        return code
+    }
+
+    static func ssid(forCode code: String) -> String { "VioletRelayOpen-" + code.prefix(4) }
 
     /// `-joinSSID NAME [-joinPassphrase PASS]` from the launch arguments only (not persisted).
     static var joinRequest: (ssid: String, passphrase: String)? {
@@ -53,6 +74,7 @@ struct RelayStatus: Codable {
     var lastError: String?
     var lastErrorAt: Date?
     var hotspot: String?
+    var background: String?
     var recentErrors: [String] = []
 }
 
@@ -65,6 +87,7 @@ final class RelayModel: ObservableObject {
     private var cellularAvailable = false
     private let cellMonitor = NWPathMonitor(requiredInterfaceType: .cellular)
     private var tick = 0
+    private let keepAlive = KeepAlive()
 
     static var statusURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("status.json")
@@ -79,6 +102,7 @@ final class RelayModel: ObservableObject {
 
     func start() {
         UIApplication.shared.isIdleTimerDisabled = true
+        keepAlive.start()
         cellMonitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor in self?.cellularAvailable = path.status == .satisfied }
         }
@@ -103,6 +127,26 @@ final class RelayModel: ObservableObject {
             Task { @MainActor in self?.refresh() }
         }
         refresh()
+    }
+
+    /// Save a pairing code from VioletOS and join its network. Returns false for a bad code.
+    @discardableResult
+    func pair(code text: String) -> Bool {
+        guard let code = RelayConfig.normalizedCode(text) else {
+            hotspotState = "That code isn't 12 letters and numbers (0-9, A-F)"
+            refresh()
+            return false
+        }
+        RelayConfig.pairingCode = code
+        server.setPassword(String(code.suffix(8)))
+        joinNetwork(ssid: RelayConfig.ssid(forCode: code), passphrase: "")
+        return true
+    }
+
+    /// Rejoin the paired network (for example after VioletOS restarted).
+    func rejoin() {
+        guard let code = RelayConfig.pairingCode else { return }
+        joinNetwork(ssid: RelayConfig.ssid(forCode: code), passphrase: "")
     }
 
     /// Join (and remember) a Wi-Fi network. Empty passphrase = open network.
@@ -151,7 +195,7 @@ final class RelayModel: ObservableObject {
         }
     }
 
-    private func refresh() {
+    func refresh() {
         let snapshot = server.queue.sync { () -> RelayCounters in
             let c = RelayCounters()
             let s = server.counters
@@ -170,7 +214,7 @@ final class RelayModel: ObservableObject {
                              activeConnections: snapshot.activeConnections, totalConnections: snapshot.totalConnections,
                              failedConnections: snapshot.failedConnections, authFailures: snapshot.authFailures,
                              bytesUp: snapshot.bytesUp, bytesDown: snapshot.bytesDown,
-                             lastError: snapshot.lastError, lastErrorAt: snapshot.lastErrorAt, hotspot: hotspotState,
+                             lastError: snapshot.lastError, lastErrorAt: snapshot.lastErrorAt, hotspot: hotspotState, background: keepAlive.state,
                              recentErrors: snapshot.recentErrors)
         tick += 1
         if tick % 4 == 1 { writeStatus() }
