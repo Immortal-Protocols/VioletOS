@@ -256,6 +256,17 @@ pub unsafe fn poll() -> bool {
     station_net_poll();
     !LINK_ERROR
 }
+extern "C" {
+    fn station_net_text(host: *const u8, path: *const u8, out: *mut u8, cap: u32) -> i32;
+}
+/// One line of weather for `CITIES[city]`, cleaned to the bitmap font. Returns its length.
+pub unsafe fn weather(city: usize, out: &mut [u8; 40]) -> usize {
+    let mut path = [0; 64];
+    if crate::protocol::weather_path(city, &mut path).is_none() {
+        return 0;
+    }
+    station_net_text(b"wttr.in\0".as_ptr(), path.as_ptr(), out.as_mut_ptr(), 40).max(0) as usize
+}
 pub unsafe fn uuid(out: &mut [u8; 36]) -> bool {
     station_net_uuid(out.as_mut_ptr()) == 1
 }

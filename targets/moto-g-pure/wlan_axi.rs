@@ -49,6 +49,9 @@ pub struct Axi {
     pub client_state: u8,
     pub mgmt_frames: u32,
     pub new_client: bool,
+    /// Hosting telemetry: every frame and every management frame seen on rings 2/3.
+    pub rx_frames: u32,
+    pub rx_mgmt: u32,
 }
 impl Axi {
     pub const fn new() -> Self {
@@ -70,6 +73,8 @@ impl Axi {
             client_state: 0,
             mgmt_frames: 0,
             new_client: false,
+            rx_frames: 0,
+            rx_mgmt: 0,
         }
     }
     fn init(&mut self) -> Result<(), u32> {
@@ -664,8 +669,12 @@ impl Axi {
     pub fn ap_poll(&mut self, out: &mut [u8], eapol: &mut [u8]) -> Result<(usize, usize), u32> {
         for ring in [2, 3] {
             let Some(n) = self.take(ring)? else { continue };
+            self.rx_frames = self.rx_frames.wrapping_add(1);
+            super::radio_io::trace(6, self.rx_frames | (ring as u32) << 28);
             if let Some(f) = passive_scan::management_frame(&self.rx[..n]) {
                 let kind = f[0];
+                self.rx_mgmt = self.rx_mgmt.wrapping_add(1);
+                super::radio_io::trace(7, u32::from(kind) << 24 | u32::from(f[4]) << 16 | u32::from(f[9]) << 8 | u32::from(f[15]));
                 if let Some(request) = softap::classify(f, &self.ap) {
                     self.mgmt_frames = self.mgmt_frames.wrapping_add(1);
                     super::radio_io::trace(5, u32::from(kind) << 24 | self.mgmt_frames);

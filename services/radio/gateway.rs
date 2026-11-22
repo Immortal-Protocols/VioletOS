@@ -160,6 +160,18 @@ pub unsafe extern "C" fn tunnel_write(_: usize, buf: *const u8, n: usize) -> i32
 }
 extern "C" {
     fn guest_https(uuid: *mut u8) -> i32;
+    fn guest_https_text(host: *const u8, path: *const u8, out: *mut u8, cap: usize) -> i32;
+}
+/// Fetch one line of weather for `city` from wttr.in through the emulator relay.
+/// The connect command names the host; the Mac relay allows only known endpoints.
+pub fn endpoint_weather(city: usize) -> Option<([u8; 40], usize)> {
+    let mut path = [0; 64];
+    crate::protocol::weather_path(city, &mut path)?;
+    transfer(1, b"wttr.in", &mut [])?;
+    let mut text = [0; 40];
+    let n = unsafe { guest_https_text(b"wttr.in\0".as_ptr(), path.as_ptr(), text.as_mut_ptr(), 40) };
+    transfer(4, &[], &mut []);
+    (n > 0).then_some((text, n as usize))
 }
 pub fn endpoint_uuid() -> Option<[u8; 36]> {
     transfer(1, &[], &mut [])?;

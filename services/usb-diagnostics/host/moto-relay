@@ -22,13 +22,27 @@ def main():
     parser.add_argument("--open", action="store_true", help="host an open network")
     parser.add_argument("--details", type=Path, default=BUILD / "relay-pairing.json")
     parser.add_argument("--wait", type=int, default=200, help="seconds to wait for the result")
+    parser.add_argument("--new", action="store_true",
+                        help="make a new network instead of reusing the saved pairing")
     args = parser.parse_args()
-    tag = secrets.token_hex(2).upper()
-    ssid = (f"VioletRelayOpen-{tag}" if args.open else f"VioletRelay-{tag}").encode()
-    passphrase = secrets.token_urlsafe(12)
-    pmk = hashlib.pbkdf2_hmac("sha1", passphrase.encode(), ssid, 4096, 32)
-    details = {"ssid": ssid.decode(), "passphrase": "" if args.open else passphrase,
-               "socks_user": "violet", "socks_password": pmk[:8].hex()}
+    # Reusing the network the phone already saved lets it rejoin without the iOS "Join" prompt.
+    saved = json.loads(args.details.read_text()) if args.details.exists() and not args.new else None
+    if saved and saved["ssid"].startswith("VioletRelayOpen-") == args.open:
+        ssid = saved["ssid"].encode()
+        if saved.get("pmk"):
+            pmk = bytes.fromhex(saved["pmk"])
+        elif saved["passphrase"]:
+            pmk = hashlib.pbkdf2_hmac("sha1", saved["passphrase"].encode(), ssid, 4096, 32)
+        else:  # open network from an older pairing file: only the SOCKS half of the key matters
+            pmk = bytes.fromhex(saved["socks_password"]).ljust(32, b"\0")
+        details = {**saved, "pmk": pmk.hex()}
+    else:
+        tag = secrets.token_hex(2).upper()
+        ssid = (f"VioletRelayOpen-{tag}" if args.open else f"VioletRelay-{tag}").encode()
+        passphrase = secrets.token_urlsafe(12)
+        pmk = hashlib.pbkdf2_hmac("sha1", passphrase.encode(), ssid, 4096, 32)
+        details = {"ssid": ssid.decode(), "passphrase": "" if args.open else passphrase,
+                   "socks_user": "violet", "socks_password": pmk[:8].hex(), "pmk": pmk.hex()}
     args.details.write_text(json.dumps(details, indent=2) + "\n")
     nonce = (secrets.randbelow(0xFFFFFFFE) + 1).to_bytes(4, "little")
     record = nonce + bytes([len(ssid)]) + ssid.ljust(32, b"\0") + pmk + int(time.time()).to_bytes(4, "little")

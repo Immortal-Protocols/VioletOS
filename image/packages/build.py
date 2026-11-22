@@ -62,6 +62,11 @@ SECTIONS {
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
     titles = {item["name"]: item.get("title") for item in manifest}
+    # Built-in library apps (IDs 11–14) name their source; they ship with the APP1 trailer.
+    for item in manifest:
+        if "entry" in item:
+            item["entry"] = repo / item["entry"]
+            scripts[item["name"]] = item["entry"]
     if target == "moto":
         manifest.append({"id": 21, "name": "usb-diagnostics", "required": True})
     if selected is not None:

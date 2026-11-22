@@ -6,6 +6,8 @@
 #   ./run.sh launch                  (re)launch the installed app with devicectl only
 #   JOIN_SSID=Violet JOIN_PASSPHRASE=secret ./run.sh join   join a Wi-Fi network (taps "Join"), then launch
 #   FORGET_SSID=Violet ./run.sh forget                      remove a stored hotspot configuration
+#   ./run.sh rejoin                  rejoin the saved network in build/relay-pairing.json without UI
+#                                    automation; iOS asks nothing for a network it already saved
 #
 # Env: RELAY_SECRET (default violet-dev), DEVICE (devicectl id), XCODE_DEST (xcodebuild udid),
 #      SKIP_BUILD=1 to reuse the last build.
@@ -59,6 +61,12 @@ case "${1:-all}" in
   launch) launch ;;
   status) status ;;
   join)   : "${JOIN_SSID:?set JOIN_SSID}"; SKIP_BUILD=${SKIP_BUILD:-1} build; ui_test; launch; sleep 3; status ;;
+  rejoin) pairing=../../build/relay-pairing.json
+          ssid=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["ssid"])' "$pairing")
+          secret=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["socks_password"])' "$pairing")
+          xcrun devicectl device process launch --device "$DEVICE" --terminate-existing "$BUNDLE" -- \
+            -pairingSecret "$secret" -joinSSID "$ssid" >/dev/null
+          sleep 10; status ;;
   forget) : "${FORGET_SSID:?set FORGET_SSID}"; ui_test; launch ;;
   *) echo "usage: $0 [all|build|grant|launch|status|join|forget]" >&2; exit 2 ;;
 esac

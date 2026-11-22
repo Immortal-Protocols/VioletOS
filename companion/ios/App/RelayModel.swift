@@ -85,8 +85,18 @@ final class RelayModel: ObservableObject {
         cellMonitor.start(queue: .main)
         server.start()
         if let ssid = RelayConfig.forgetSSID, !ssid.isEmpty {
-            NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
-            hotspotState = "removed configuration for \(ssid)"
+            if ssid.hasSuffix("*") {
+                // "VioletRelay*" removes every configuration this app saved with that prefix.
+                let prefix = String(ssid.dropLast())
+                NEHotspotConfigurationManager.shared.getConfiguredSSIDs { [weak self] ssids in
+                    let matches = ssids.filter { $0.hasPrefix(prefix) }
+                    matches.forEach { NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: $0) }
+                    self?.hotspotState = "removed \(matches.count) configurations matching \(ssid)"
+                }
+            } else {
+                NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
+                hotspotState = "removed configuration for \(ssid)"
+            }
         }
         if let join = RelayConfig.joinRequest { joinNetwork(ssid: join.ssid, passphrase: join.passphrase) }
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in

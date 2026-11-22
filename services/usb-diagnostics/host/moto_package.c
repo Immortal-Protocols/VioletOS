@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -122,8 +122,13 @@ int main(int argc,char **argv) {
         } else if (!strcmp(argv[1],"stopwatch")) {
             rc=transfer(chosen,0xc0,0x64,0,b,8) || memcmp(b,"VSW1",4);
             if (!rc) printf("Saved stopwatch: %u.%u seconds\n",word(b+4)/10,word(b+4)%10);
-        } else if (!strcmp(argv[1],"join-wifi")) {
+        } else if (!strcmp(argv[1],"join-wifi") || !strncmp(argv[1],"weather=",8)) {
+            // A weather job sets the token's top bit and carries the city in its low byte.
+            int weather=!strncmp(argv[1],"weather=",8);
             uint32_t token=arc4random_uniform(UINT32_MAX)+1;
+            token&=0x7fffffffu;
+            if (!token) token=1;
+            if (weather) token=0x80000000u|(token&0x7fffff00u)|((uint32_t)atoi(argv[1]+8)&0xff);
             unsigned char result[44];
             if (!transfer(chosen,0x40,0x6c,token,NULL,0)) {
                 time_t until=time(NULL)+(getenv("MOTO_WIFI_WAIT") ? atoi(getenv("MOTO_WIFI_WAIT")) : 85);
@@ -131,7 +136,7 @@ int main(int argc,char **argv) {
                     if(transfer(chosen,0xc0,0x58,0,result,sizeof result)) break;
                     unsigned state=word(result+4);
                     if(word(result)==token && state) {
-                        if(state==1) {printf("Moto HTTPS UUID: %.36s\n",(char *)result+8);rc=0;}
+                        if(state==1) {printf(weather ? "Moto weather: %.36s\n" : "Moto HTTPS UUID: %.36s\n",(char *)result+8);rc=0;}
                         else fprintf(stderr,"Moto Wi-Fi step failed (%u)\n",state);
                         break;
                     }

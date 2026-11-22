@@ -337,11 +337,9 @@ static int socks_connect(const char *host, unsigned port) {
   }
   return rest && read_exact(b, rest);
 }
-static int relay_uuid(unsigned char *out) {
-  abort_connection();
-  failed = 0;
-  eof = 0;
-  request_start = sys_now();
+// Open a TCP stream ready for TLS to host:443. When hosting the phone's network,
+// the stream goes through the phone's SOCKS5 relay and the phone resolves `host`.
+static int relay_open(const char *host) {
   IP4_ADDR(ip_2_ip4(&destination), 192, 168, 77, 2);
   // The companion may still be starting its listener: retry for about 10 s.
   for (int attempt = 0; attempt < 5 && !established; attempt++) {
@@ -358,24 +356,13 @@ static int relay_uuid(unsigned char *out) {
         station_net_poll();
   }
   request_start = sys_now();
-  int ok = established && !failed && socks_connect("www.uuidgenerator.net", 443) &&
-           guest_https(out);
-  abort_connection();
-  return ok;
+  return established && !failed && socks_connect(host, 443);
 }
-int station_net_uuid(unsigned char *out) {
-  if (hosting)
-    return attached && leased ? relay_uuid(out) : 0;
-  if (!attached || !dhcp_supplied_address(&iface))
-    return 0;
-  abort_connection();
-  failed = 0;
-  eof = 0;
-  request_start = sys_now();
+static int station_open(const char *host) {
   static unsigned generation;
   dns_state = ++generation;
   ip_addr_set_zero(&destination);
-  err_t rc = dns_gethostbyname("www.uuidgenerator.net", &destination, resolved,
+  err_t rc = dns_gethostbyname(host, &destination, resolved,
                                (void *)(uintptr_t)dns_state);
   if (rc != ERR_OK && rc != ERR_INPROGRESS)
     return 0;
@@ -394,7 +381,27 @@ int station_net_uuid(unsigned char *out) {
     while (!established && !failed && sys_now() - start < 8000)
       station_net_poll();
   }
-  int ok = established && !failed && guest_https(out);
+  return established && !failed;
+}
+static int open_https(const char *host) {
+  if (hosting ? !(attached && leased) : !(attached && dhcp_supplied_address(&iface)))
+    return 0;
+  abort_connection();
+  failed = 0;
+  eof = 0;
+  request_start = sys_now();
+  return hosting ? relay_open(host) : station_open(host);
+}
+int station_net_uuid(unsigned char *out) {
+  int ok = open_https("www.uuidgenerator.net") && guest_https(out);
   abort_connection();
   return ok;
+}
+extern int guest_https_text(const char *, const char *, unsigned char *, size_t);
+// One short plain-text HTTPS reply (for example a wttr.in weather line).
+int station_net_text(const char *host, const char *path, unsigned char *out,
+                     unsigned cap) {
+  int n = open_https(host) ? guest_https_text(host, path, out, cap) : 0;
+  abort_connection();
+  return n;
 }
