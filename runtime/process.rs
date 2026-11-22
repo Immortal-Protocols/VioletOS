@@ -38,7 +38,7 @@ fn component(key: u32) -> u32 {
         RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
         POWER => 8,
         SAVE | FILE_LIST..=FILE_DELETE => 6,
-        VOLUME | PLAYBACK => AUDIO_COMPONENT,
+        VOLUME | PLAYBACK | MUSIC => AUDIO_COMPONENT,
         _ => 0,
     }
 }
@@ -147,9 +147,9 @@ impl Runtime {
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
             (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
             (GET, POWER) => self.forward(who, 8, m),
-            (GET, VOLUME | PLAYBACK) => audio(m),
+            (GET, VOLUME | PLAYBACK | MUSIC) => audio(m),
             // Volume is shared. Only the app on screen may change it or make sound.
-            (EXECUTE, VOLUME | PLAYBACK) if who == self.focus && !self.asleep => audio(m),
+            (EXECUTE, VOLUME | PLAYBACK | MUSIC) if who == self.focus && !self.asleep => audio(m),
             (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
                 self.asleep = m.value == 1;
                 self.forward(who, 8, m)

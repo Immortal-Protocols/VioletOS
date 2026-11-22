@@ -52,7 +52,7 @@ for source in [repo/"services/touch/events.c", repo/"services/storage/storage_ip
     run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
     shims.append(obj)
 only=os.environ.get("VIOLET_COMPONENT_ONLY")
-selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi","weather","usb-diagnostics","audio","sounds"}
+selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi","weather","usb-diagnostics","audio","sounds","music"}
 storage_backend=repo/"targets/moto-g-pure/emmc.rs" if variant=="moto" else None
 components(repo,out,cc,common,incs,rustc,shims,only,selected,storage_backend,variant)
 if only or (variant=="qemu" and os.environ.get("VIOLET_APP_DIR")): sys.exit(0)

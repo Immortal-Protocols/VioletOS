@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""Provision one WPA2-Personal profile over VioletOS USB, for this boot only."""
+"""Provision one WPA2-Personal profile over VioletOS USB, for this boot only.
+
+Run it in a private terminal to enter the network name and password. The Mac
+keeps only the derived WPA2 key (never the password) in a private file, so
+`moto-wifi-profile --saved` can provision the same network after a reflash
+without asking again. `--forget` deletes that file.
+"""
+import argparse
 import getpass
 import hashlib
+import json
+import os
 import secrets
 import subprocess
 import sys
@@ -9,7 +18,30 @@ import time
 import warnings
 from pathlib import Path
 
+SAVED = Path.home() / "Library/Application Support/VioletOS/wifi-profile.json"
+
+def provision(ssid, pmk):
+    nonce = (secrets.randbelow(0xffffffff) + 1).to_bytes(4, "little")
+    record = nonce + bytes([len(ssid)]) + ssid.ljust(32, b"\0") + pmk + int(time.time()).to_bytes(4, "little")
+    tool = Path(__file__).resolve().parents[3] / "build/moto-package"
+    subprocess.run([tool, "provision-wpa2"], input=record, check=True)
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--saved", action="store_true", help="provision the network saved on this Mac")
+    parser.add_argument("--forget", action="store_true", help="delete the saved network")
+    args = parser.parse_args()
+    if args.forget:
+        SAVED.unlink(missing_ok=True)
+        print("Saved Wi-Fi profile deleted.")
+        return
+    if args.saved:
+        if not SAVED.exists():
+            raise SystemExit("No saved network. Run moto-wifi-profile in a terminal first.")
+        saved = json.loads(SAVED.read_text())
+        provision(bytes.fromhex(saved["ssid"]), bytes.fromhex(saved["pmk"]))
+        print("Saved profile provisioned for this boot.")
+        return
     if not sys.stdin.isatty():
         raise SystemExit("Run from an interactive terminal to enter a Wi-Fi passphrase privately")
     warnings.simplefilter("error", getpass.GetPassWarning)
@@ -20,11 +52,16 @@ def main():
     if not 8 <= len(password) <= 63 or not all(32 <= b <= 126 for b in password):
         raise SystemExit("Use an 8–63 character WPA2 passphrase")
     pmk = hashlib.pbkdf2_hmac("sha1", password, ssid, 4096, 32)
-    nonce = (secrets.randbelow(0xffffffff) + 1).to_bytes(4, "little")
-    record = nonce + bytes([len(ssid)]) + ssid.ljust(32,b"\0") + pmk + int(time.time()).to_bytes(4, "little")
-    tool = Path(__file__).resolve().parents[3] / "build/moto-package"
-    subprocess.run([tool, "provision-wpa2"], input=record, check=True)
-    print("Profile provisioned for this boot.")
+    SAVED.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(SAVED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"ssid": ssid.hex(), "pmk": pmk.hex()}, f)
+    print(f"Derived key saved to {SAVED}. Delete it with --forget.")
+    try:
+        provision(ssid, pmk)
+        print("Profile provisioned for this boot.")
+    except Exception as e:
+        print(f"Saved, but provisioning failed now ({e}). `--saved` will retry once VioletOS shows Home.")
 
 if __name__ == "__main__":
     main()

@@ -47,7 +47,7 @@ def ring():
     base = 4096
     return [struct.unpack_from("<h", card, base + 4 * ((end - n) % size))[0] for n in range(4096, 0, -1)]
 
-until("sound card ready", lambda: word(2) == 0x31445541, 20)
+until("sound card ready", lambda: word(2) == 0x31445541)
 put(1, 0)
 until("default volume", lambda: word(4) == 8)
 time.sleep(1.5)  # Let Home finish starting services.
@@ -58,8 +58,8 @@ hold(3, 0.3); time.sleep(0.2)
 if word(4) != 7: fail("both buttons together must not change volume")
 hold(1, 2.4); until("held button repeats to the top", lambda: word(4) == 15)
 
-# Home -> Apps -> Next (Wi-Fi Setup) -> Next (Sounds) -> Open.
-tap_logical(190, 68); tap_logical(120, 110); tap_logical(120, 110); tap_logical(120, 164)
+# Home -> Apps -> Next (Wi-Fi Setup) -> Next (Music) -> Next (Sounds) -> Open.
+tap_logical(190, 68); tap_logical(120, 110); tap_logical(120, 110); tap_logical(120, 110); tap_logical(120, 164)
 until("Sounds shows the volume bar", lambda: bar(15), 8)
 
 tap_logical(60, 210)  # CHIME

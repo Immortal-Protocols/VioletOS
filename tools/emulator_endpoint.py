@@ -15,7 +15,12 @@ FRAME = 24 + PAYLOAD
 
 # Hosts the guest may name in a connect command. TLS and certificate checks
 # stay in the guest; the relay only refuses other destinations.
-ENDPOINTS = {"www.uuidgenerator.net", "wttr.in"}
+ENDPOINTS = {
+    "www.uuidgenerator.net",
+    "wttr.in",
+    # The music library (runtime/protocol.rs MUSIC_HOST).
+    "agent-39868422bcfa413fa7149c56084664db.apps.chariots.sh",
+}
 
 
 def connect_endpoint(host="www.uuidgenerator.net"):

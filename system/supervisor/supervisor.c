@@ -53,6 +53,9 @@ enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7,
        // Badges 16 and up mean faults, so Audio's supervisor requests use an
        // app identity that never holds the lifecycle endpoint.
        AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071 };
+// Shared music stream (see runtime/protocol.rs STREAM_*).
+#define STREAM_BASE 0x0d000000u
+#define STREAM_RING (512u << 10)
 static struct process procs[TOTAL];
 static seL4_CPtr life, scratch_slot;
 static volatile unsigned *report;
@@ -242,16 +245,24 @@ static void quit_app(unsigned id) {
   fill_frame(p->task.ipc, 0, 0);
   p->running = false;
 }
+// Each app gets one private drawing surface at 0x06000000. Classic apps use
+// the first 240x400 pixels; HD apps draw the full 720x1600 panel. Display sees
+// every surface read-only in its own 5 MiB window.
+#define SURFACE_BYTES (720 * 1600 * 4)
+#define DISPLAY_SURFACES 0x20000000u
 static void surface(unsigned id) {
   struct task *display = &procs[DISPLAY].task;
-  ensure_table(display, 0x06000000 + (id - 1) * 0x100000);
+  unsigned shown = DISPLAY_SURFACES + (id - 1) * 0x500000;
   struct task *app = &procs[id].task;
-  if (app->pd)
-    ensure_table(app, 0x06000000);
-  for (unsigned off = 0; off < 240 * 400 * 4; off += 65536) {
+  for (unsigned mb = 0; mb < SURFACE_BYTES; mb += 0x100000) {
+    ensure_table(display, shown + mb);
+    if (app->pd)
+      ensure_table(app, 0x06000000 + mb);
+  }
+  for (unsigned off = 0; off < SURFACE_BYTES; off += 65536) {
     seL4_CPtr f = create(ram, seL4_ARM_LargePageObject);
     check(seL4_ARM_Page_Map(
-        f, display->pd, 0x06000000 + (id - 1) * 0x100000 + off,
+        f, display->pd, shown + off,
         seL4_CapRights_new(0, 0, 1, 0),
         seL4_ARM_Default_VMAttributes | seL4_ARM_ExecuteNever));
     if (app->pd) {
@@ -560,6 +571,18 @@ static void wire(void) {
     grant(&procs[RUNTIME].task, RUNTIME_AUDIO_SLOT, procs[AUDIO].ep, RUNTIME, false);
     if (procs[POWER].package)
       grant(&procs[AUDIO].task, AUDIO_POWER_SLOT, procs[POWER].ep, AUDIO, false);
+  }
+  if (procs[AUDIO].package && procs[RADIO].package) {
+    // Music stream: Audio posts which track it wants in the control page and
+    // Radio fills the ring with that track's bytes. Nobody else maps it.
+    seL4_CPtr control = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(control, &procs[AUDIO].task, STREAM_BASE, seL4_AllRights);
+    map_shared(control, &procs[RADIO].task, STREAM_BASE, seL4_AllRights);
+    for (unsigned off = 0; off < STREAM_RING; off += 65536) {
+      seL4_CPtr ring = create(ram, seL4_ARM_LargePageObject);
+      map_shared(ring, &procs[AUDIO].task, STREAM_BASE + 65536 + off, seL4_CanRead);
+      map_shared(ring, &procs[RADIO].task, STREAM_BASE + 65536 + off, seL4_AllRights);
+    }
   }
   for (unsigned id = 1; id < COUNT; id++)
     if ((id == LAUNCHER || id == WATCH || id >= WIFI) && procs[id].package)

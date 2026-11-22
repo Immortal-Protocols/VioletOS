@@ -12,14 +12,25 @@ pub fn run() -> ! {
         if m.op != EXECUTE || m.key != PRESENT || !is_app(m.value) {
             return Message::error(INVALID);
         }
-        let first = (m.arg >> 16) as usize;
+        // Bit 31 marks an HD frame drawn at the panel's full 720x1600.
+        let hd = m.arg & HD_PRESENT != 0;
+        let first = ((m.arg & !HD_PRESENT) >> 16) as usize;
         let end = (m.arg & 0xffff) as usize;
-        if first >= end || end > 400 {
+        let rows = if hd { 1600 } else { 400 };
+        if first >= end || end > rows {
             return Message::error(INVALID);
         }
-        let src = (0x06000000 + (m.value as usize - 1) * 0x100000) as *const u32;
+        let src = (0x20000000 + (m.value as usize - 1) * 0x500000) as *const u32;
         let dst = 0x08000000 as *mut u32;
         for y in first..end {
+            if hd {
+                for x in 0..720 {
+                    unsafe {
+                        dst.add(y * 720 + x).write_volatile(src.add(y * 720 + x).read_volatile());
+                    }
+                }
+                continue;
+            }
             for x in 0..240 {
                 let color = unsafe { src.add(y * 240 + x).read_volatile() };
                 for dy in 0..4 {

@@ -47,6 +47,13 @@
     "title": "WI-FI SETUP"
   },
   {
+    "id": 12,
+    "name": "music",
+    "required": false,
+    "title": "MUSIC",
+    "entry": "apps/music/process.rs"
+  },
+  {
     "id": 13,
     "name": "sounds",
     "required": false,

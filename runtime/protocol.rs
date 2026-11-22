@@ -103,6 +103,8 @@ pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {
 
 pub const INVENTORY: u32 = 11;
 pub const SURFACE: u32 = 12;
+/// PRESENT value flag: the rows are from a full-resolution 720x1600 frame.
+pub const HD_PRESENT: u32 = 1 << 31;
 
 pub const APP_LAST: u32 = 14;
 pub fn is_app(id: u32) -> bool {
@@ -231,3 +233,82 @@ pub const PLAYBACK_NO_OUTPUT: u32 = 3 << 16; // No output path could play it.
 pub const PLAYBACK_OUTCOME: u32 = 3 << 16;
 /// Internal: Audio -> Power, a PMIC register read or masked write on the handset.
 pub const PMIC_ACCESS: u32 = 0x4070;
+
+// Music. Apps reach it through Runtime; Audio decodes the stream and Radio
+// fetches it from the music library over HTTPS.
+//
+// EXECUTE MUSIC (the app on screen only): value is a MUSIC_* command.
+//   MUSIC_PLAY: arg is the track (1..=MUSIC_TRACKS) in the low 8 bits and the
+//   start position in seconds above. MUSIC_SEEK: arg is seconds.
+// GET MUSIC (any app): value is the track loaded (0 when stopped). arg holds
+// the MUSIC_STATE_* in its low 4 bits and the position in milliseconds above.
+// The text carries MUSIC_BANDS spectrum levels (0..=255, low to high) in bytes
+// 0..16, the seconds of audio buffered ahead in tenths at 16..18 (little
+// endian), the output peak 0..=255 at 18, and the track length in
+// milliseconds at 20..24 once Radio knows it (little endian, 0 before).
+pub const MUSIC: u32 = 32;
+pub const MUSIC_TRACKS: u32 = 10;
+pub const MUSIC_BANDS: usize = 16;
+pub const MUSIC_PLAY: u32 = 1;
+pub const MUSIC_PAUSE: u32 = 2;
+pub const MUSIC_RESUME: u32 = 3;
+pub const MUSIC_STOP: u32 = 4;
+pub const MUSIC_SEEK: u32 = 5;
+pub const MUSIC_STATE_STOPPED: u32 = 0;
+pub const MUSIC_STATE_BUFFERING: u32 = 1;
+pub const MUSIC_STATE_PLAYING: u32 = 2;
+pub const MUSIC_STATE_PAUSED: u32 = 3;
+/// No network, or the library did not answer. Radio keeps retrying.
+pub const MUSIC_STATE_OFFLINE: u32 = 4;
+/// The track ended.
+pub const MUSIC_STATE_ENDED: u32 = 5;
+/// The library's host. Radio only fetches `/tracks/NN.mp3` from it.
+pub const MUSIC_HOST: &[u8] = b"agent-39868422bcfa413fa7149c56084664db.apps.chariots.sh\0";
+
+// The music stream shared by Audio and Radio, mapped by the supervisor at
+// STREAM_BASE in both. Control words (u32 at STREAM_BASE + 4 * index):
+pub const STREAM_BASE: usize = 0x0d000000;
+pub const STREAM_DATA: usize = STREAM_BASE + 0x10000;
+pub const STREAM_RING: u32 = 512 << 10;
+pub const STREAM_MAGIC: u32 = 0x3152_5453; // "STR1"
+/// Audio: bumped for every new request (new track or seek).
+pub const STREAM_GENERATION: usize = 1;
+/// Audio: the track wanted, 0 for none.
+pub const STREAM_TRACK: usize = 2;
+/// Audio: the byte offset in the file where this generation starts.
+pub const STREAM_START: usize = 3;
+/// Audio: bytes of this generation consumed from the ring.
+pub const STREAM_CONSUMED: usize = 4;
+/// Radio: the generation the data below belongs to.
+pub const STREAM_FILLED_GENERATION: usize = 5;
+/// Radio: bytes of this generation written to the ring (ring offset = n % STREAM_RING).
+pub const STREAM_WRITTEN: usize = 6;
+/// Radio: the file's total size in bytes, 0 until known.
+pub const STREAM_TOTAL: usize = 7;
+/// Radio: STREAM_STATE_*.
+pub const STREAM_STATE: usize = 8;
+/// Radio: the last HTTP status or local failure code, and fetch counters.
+pub const STREAM_HTTP: usize = 9;
+pub const STREAM_FETCHES: usize = 10;
+pub const STREAM_FAILURES: usize = 11;
+pub const STREAM_LAST_MS: usize = 12;
+pub const STREAM_STATE_IDLE: u32 = 0;
+pub const STREAM_STATE_FETCHING: u32 = 1;
+pub const STREAM_STATE_RETRYING: u32 = 2;
+pub const STREAM_STATE_COMPLETE: u32 = 3;
+/// No network connection to fetch over.
+pub const STREAM_STATE_OFFLINE: u32 = 4;
+/// The largest single range request. The library's gateway refuses
+/// responses over about 2 MiB.
+pub const STREAM_CHUNK: u32 = 128 << 10;
+
+/// Path of a library track: "/tracks/NN.mp3".
+pub fn music_path(track: u32, out: &mut [u8; 16]) -> bool {
+    if !(1..=MUSIC_TRACKS).contains(&track) {
+        return false;
+    }
+    *out = *b"/tracks/00.mp3\0\0";
+    out[8] = b'0' + (track / 10) as u8;
+    out[9] = b'0' + (track % 10) as u8;
+    true
+}

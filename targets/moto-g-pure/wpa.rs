@@ -292,3 +292,15 @@ pub unsafe fn weather(city: usize, out: &mut [u8; 40]) -> usize {
 pub unsafe fn uuid(out: &mut [u8; 36]) -> bool {
     station_net_uuid(out.as_mut_ptr()) == 1
 }
+extern "C" {
+    fn station_net_range(host: *const u8, path: *const u8, from: u32, to: u32, out: *mut u8,
+                         status: *mut u32, total: *mut u32) -> i32;
+}
+/// Bytes `from..=to` of a music library file into `out`. Returns the count, or
+/// -1 with the HTTP status (0 if nothing answered).
+pub unsafe fn music_range(path: &[u8], from: u32, to: u32, out: &mut [u8], status: &mut u32,
+                          total: &mut u32) -> i32 {
+    debug_assert!(out.len() as u32 >= to - from + 1 && path.contains(&0));
+    station_net_range(crate::protocol::MUSIC_HOST.as_ptr(), path.as_ptr(), from, to,
+                      out.as_mut_ptr(), status, total)
+}

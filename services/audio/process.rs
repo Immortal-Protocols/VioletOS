@@ -4,6 +4,12 @@
 use crate::{audio_backend as board, protocol::*};
 #[path = "synth.rs"]
 mod synth;
+#[path = "music.rs"]
+mod music;
+static mut PLAYER: music::Music = music::Music::new();
+fn music() -> &'static mut music::Music {
+    unsafe { &mut *core::ptr::addr_of_mut!(PLAYER) }
+}
 
 extern "C" {
     fn ipc_try_receive(slot: u32, m: &mut Message) -> u32;
@@ -134,13 +140,25 @@ impl Audio {
         }
     }
     fn finish(&mut self, outcome: u32) {
-        if self.voice.take().is_some() || self.output_on {
+        if self.voice.take().is_some() {
             self.outcome = outcome;
         }
-        if self.output_on {
+        if self.output_on && !music().active() {
             board::stop();
             self.output_on = false;
         }
+    }
+    /// Start the output if it is off. False when there is no path to play on.
+    fn ensure_output(&mut self) -> bool {
+        if self.output_on {
+            return true;
+        }
+        if self.caps & self.wanted_output() == 0 || !board::start(self.to_headphones()) {
+            return false;
+        }
+        self.output_on = true;
+        board::set_volume(self.level, self.to_headphones());
+        true
     }
     fn play(&mut self, sound: u32, arg: u32) -> Message {
         if sound == SOUND_STOP {
@@ -154,12 +172,10 @@ impl Audio {
         self.serial = (self.serial + 1) & 0xffff;
         self.sound = sound;
         self.outcome = 0;
-        if self.caps & self.wanted_output() == 0 || !board::start(self.to_headphones()) {
+        if !self.ensure_output() {
             self.outcome = PLAYBACK_NO_OUTPUT;
             return Message::error(OFFLINE);
         }
-        self.output_on = true;
-        board::set_volume(self.level, self.to_headphones());
         self.voice = Some(voice);
         self.playback()
     }
@@ -177,6 +193,13 @@ impl Audio {
             }
             (GET, PLAYBACK) => self.playback(),
             (EXECUTE, PLAYBACK) => self.play(m.value, m.arg),
+            (GET, MUSIC) => music().status(),
+            (EXECUTE, MUSIC) => {
+                if !music().command(m.value, m.arg) {
+                    return Message::error(INVALID);
+                }
+                music().status()
+            }
             _ => Message::error(DENIED),
         }
     }
@@ -205,24 +228,50 @@ impl Audio {
         }
     }
     fn pump(&mut self) {
-        let Some(voice) = self.voice.as_mut() else {
+        let music = music();
+        music.poll();
+        if music.active() && !self.ensure_output() {
+            // No output path: the music cannot play.
+            music.command(MUSIC_PAUSE, 0);
+        }
+        if !self.output_on {
             return;
-        };
+        }
         let gain = synth::GAIN[self.level as usize];
         let mut due = board::writable();
         let mut block = [[0i16; 2]; CHUNK];
-        while due > 0 && !voice.done() {
+        let voice_left = self.voice.as_ref().is_some_and(|v| !v.done());
+        let sounding = voice_left || music.active();
+        while due > 0 && sounding {
             let n = due.min(CHUNK);
             for frame in block[..n].iter_mut() {
-                let s = (voice.next() * gain >> 15) as i16;
-                *frame = [s, s];
+                let (mut l, mut r) = (0i32, 0i32);
+                if let Some(voice) = self.voice.as_mut() {
+                    if !voice.done() {
+                        let s = voice.next();
+                        l += s;
+                        r += s;
+                    }
+                }
+                if let Some([a, b]) = music.next() {
+                    l += a as i32;
+                    r += b as i32;
+                }
+                let clip = |x: i32| ((x * gain) >> 15).clamp(-32768, 32767) as i16;
+                *frame = [clip(l), clip(r)];
             }
             board::write(&block[..n]);
             due -= n;
         }
-        if voice.done() && board::drained() {
+        // A finished sound is over once its tail has played, or at once while
+        // music keeps the output busy.
+        if self.voice.as_ref().is_some_and(|v| v.done()) && (music.active() || board::drained()) {
             self.voice = None;
             self.finish(PLAYBACK_PLAYED);
+        }
+        if self.voice.is_none() && !music.active() && self.output_on && board::drained() {
+            board::stop();
+            self.output_on = false;
         }
     }
 }
@@ -245,6 +294,7 @@ pub fn run() -> ! {
         output_on: false,
         force: 0,
     };
+    music().init();
     board::set_volume(audio.level, audio.headphones);
     board::publish(audio.level, audio.flags(), 0, 0);
     loop {

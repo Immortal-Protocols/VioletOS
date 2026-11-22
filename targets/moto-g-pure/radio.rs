@@ -8,6 +8,8 @@ mod wlan_image;
 
 #[path = "passive_scan.rs"]
 mod passive_scan;
+#[path = "../../services/radio/stream.rs"]
+mod stream;
 #[path = "radio_io.rs"]
 mod radio_io;
 #[path = "softap.rs"]
@@ -620,6 +622,7 @@ pub fn run() -> ! {
     extern "C" {
         fn ipc_try_receive(slot: u32, m: *mut Message) -> u32;
     }
+    let mut music = stream::Streamer::default();
     loop {
         let mut m = Message::default();
         wpa::tick_clock();
@@ -651,6 +654,15 @@ pub fn run() -> ! {
                 }
                 radio_io::barrier();
                 record(65, if ok { 1 } else { 55 });
+            }
+            if (!relaying || leased) && music.wants() {
+                music.step(true, &mut |path, from, to, out| {
+                    let (mut status, mut total) = (0u32, 0u32);
+                    let n = unsafe {
+                        wpa::music_range(path, from, to, out, &mut status, &mut total)
+                    };
+                    if n < 0 { Err(status) } else { Ok((n as usize, total)) }
+                });
             }
             if unsafe { ipc_try_receive(SERVER, &mut m) } == 0 {
                 unsafe {

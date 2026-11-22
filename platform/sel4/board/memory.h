@@ -6,7 +6,7 @@ static seL4_CPtr ram, next_slot;
 static unsigned cursor[CONFIG_MAX_NUM_BOOTINFO_UNTYPED_CAPS];
 struct task {
     seL4_CPtr pd, caps, thread, ipc;
-    unsigned sections[32], count;
+    unsigned sections[96], count;
 };
 static struct task bootstrap;
 static struct task *mapping;
@@ -14,7 +14,12 @@ static void stop(void) { for (;;) seL4_Yield(); }
 static void check(int error) { if(error) stop(); }
 static seL4_CPtr allocate(seL4_CPtr source,unsigned type,unsigned bits) {
     if(next_slot>=boot->empty.end) stop();
-    check(seL4_Untyped_Retype(source,type,bits,seL4_CapInitThreadCNode,0,0,next_slot,1));
+    int error=seL4_Untyped_Retype(source,type,bits,seL4_CapInitThreadCNode,0,0,next_slot,1);
+    // When the main RAM untyped is full, use any other untyped RAM that fits.
+    for(unsigned i=0;error && source==ram && i<boot->untyped.end-boot->untyped.start;i++)
+        if(!boot->untypedList[i].isDevice && boot->untyped.start+i!=ram)
+            error=seL4_Untyped_Retype(boot->untyped.start+i,type,bits,seL4_CapInitThreadCNode,0,0,next_slot,1);
+    check(error);
     return next_slot++;
 }
 static seL4_CPtr create(seL4_CPtr source,unsigned type) { return allocate(source,type,0); }

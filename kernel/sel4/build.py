@@ -72,6 +72,15 @@ def build_target(target,out):
     source(DTC,BUILD/DTC[0])
     bear=("bearssl-0.6","https://bearssl.org/bearssl-0.6.tar.gz","6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14")
     source(bear,BUILD/bear[0])
+    # minimp3 (CC0) decodes the music stream in Audio. One pinned header.
+    mp3 = BUILD / "minimp3/minimp3.h"
+    if not mp3.exists():
+        url = "https://raw.githubusercontent.com/lieff/minimp3/ea99364f61c14656440e8d77e9c233ccf3124633/minimp3.h"
+        mp3.parent.mkdir(parents=True, exist_ok=True)
+        data = subprocess.run(["curl", "-fLsS", "--retry", "2", url], check=True, capture_output=True).stdout
+        if hashlib.sha256(data).hexdigest() != "57e437c5c1f0e8b243885d3929c8973b5e6c778451e0100ab4251d19915cb3ad":
+            sys.exit("Unexpected download checksum for minimp3.h")
+        mp3.write_bytes(data)
     if target == "moto":
         supplicant = ("wpa_supplicant-2.11", "https://w1.fi/releases/wpa_supplicant-2.11.tar.gz",
                       "912ea06f74e30a8e36fbb68064d6cdff218d8d591db0fc5d75dee6c81ac7fc0a")

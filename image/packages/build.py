@@ -180,6 +180,18 @@ SECTIONS {
             tls_objects.extend(supplicant_objects(repo, out, common))
             tls_objects.extend(ip_objects(repo, out, common))
             tls_objects.extend(build(repo, out, common))
+        if name == "audio":
+            # minimp3 runs with hardware floating point (soft-float calling
+            # convention, so it links with everything else). Its 16 KiB scratch
+            # moves off Audio's 8 KiB stack into .bss.
+            header = (repo / "build/sel4/minimp3/minimp3.h").read_text()
+            assert header.count("    mp3dec_scratch_t scratch;") == 1
+            (dest / "minimp3.h").write_text(header.replace("    mp3dec_scratch_t scratch;", "    static mp3dec_scratch_t scratch;"))
+            fast = [("-O2" if f == "-Oz" else "-mfloat-abi=softfp" if f == "-mfloat-abi=soft" else f) for f in common]
+            mp3 = dest / "mp3.o"
+            run([*fast, "-mfpu=neon-vfpv4", "-I", dest, "-I", repo / "services/audio/freestanding",
+                 "-c", repo / "services/audio/mp3.c", "-o", mp3])
+            tls_objects.append(mp3)
         moto_radio = target == "moto" and name == "radio"
         link_script = script
         if moto_radio:

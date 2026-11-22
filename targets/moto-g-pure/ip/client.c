@@ -421,3 +421,15 @@ int station_net_text(const char *host, const char *path, unsigned char *out,
   abort_connection();
   return n;
 }
+extern long guest_https_range(const char *, const char *, unsigned long, unsigned long,
+                              unsigned char *, unsigned *, unsigned long *);
+// One ranged HTTPS read (bytes from..to) into `out`, for the music stream.
+// Returns the bytes read, or -1 with the HTTP status (0 if none) in `*status`.
+long station_net_range(const char *host, const char *path, unsigned long from,
+                       unsigned long to, unsigned char *out, unsigned *status,
+                       unsigned long *total) {
+  *status = 0;
+  long n = open_https(host) ? guest_https_range(host, path, from, to, out, status, total) : -1;
+  abort_connection();
+  return n;
+}

@@ -1,5 +1,6 @@
 #include <stddef.h>
 void *memcpy(void *v,const void *s,size_t n) { unsigned char *d=v; const unsigned char *p=s; while(n--) *d++=*p++; return v; }
+void *memmove(void *v,const void *s,size_t n) { unsigned char *d=v; const unsigned char *p=s; if (d<p) while(n--) *d++=*p++; else while(n--) d[n]=p[n]; return v; }
 void *memset(void *v,int c,size_t n) { unsigned char *d=v; while(n--) *d++=c; return v; }
 int memcmp(const void *v,const void *s,size_t n) { const unsigned char *a=v,*b=s; while(n--) { if(*a!=*b) return *a-*b; ++a; ++b; } return 0; }
 void *memchr(const void *v,int c,size_t n) { const unsigned char *p=v; while(n--) { if(*p==(unsigned char)c) return (void *)p; ++p; } return NULL; }
@@ -10,3 +11,4 @@ char *strrchr(const char *s,int c) { const char *found=NULL; do { if (*s==c) fou
 void __aeabi_memcpy(void *d,const void *s,size_t n) { memcpy(d,s,n); }
 void __aeabi_memclr(void *d,size_t n) { memset(d,0,n); }
 void __aeabi_memclr8(void *d,size_t n) { memset(d,0,n); }
+void __aeabi_memmove(void *d,const void *s,size_t n) { memmove(d,s,n); }

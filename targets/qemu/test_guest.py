@@ -187,10 +187,10 @@ try:
         check_label(130,"CONNECTED",ink)
         if args.wifi=="save": sys.exit(0)
         if args.wifi=="weather":
-            # Home -> Applications -> NEXT past WATCH, WIFI and SOUNDS (empty slots are skipped) -> Open.
+            # Home -> Applications -> NEXT past WATCH, WIFI, MUSIC and SOUNDS (empty slots are skipped) -> Open.
             tap(1340); time.sleep(.3)
             tap(260,560); time.sleep(.3)
-            for _ in range(3): tap(440)
+            for _ in range(4): tap(440)
             time.sleep(.3)
             assert read_label(62,7,ink,2)=="WEATHER",read_label(62,7,ink,2)
             tap(650); time.sleep(.5)
@@ -280,9 +280,9 @@ try:
                 tap(680 if args.fault_id==10 else 920)  # The stopwatch loads on demand.
             if args.fault_id in (13,14):
                 # Sounds and Weather load on demand too: Apps -> NEXT past STOPWATCH
-                # and WI-FI (and Sounds, for Weather) -> OPEN.
+                # WI-FI and MUSIC (and Sounds, for Weather) -> OPEN.
                 tap(260,560); time.sleep(.3)
-                for _ in range(2 if args.fault_id==13 else 3): tap(440)
+                for _ in range(3 if args.fault_id==13 else 4): tap(440)
                 time.sleep(.3)
                 tap(650)
             for _ in range(140):
