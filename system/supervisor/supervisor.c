@@ -79,7 +79,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
       !abi_ok || !p->id || p->id == PACKAGES ||
       !allowed_id || !p->code || p->code % PAGE || p->size < p->code ||
       p->size > limit - sizeof(*p) ||
-      p->size > ((p->id == RADIO || p->id == RUNTIME) ? 0x38000 : 0x3e000))
+      p->size > (p->id == RUNTIME ? 0x38000 : 0x3e000))
     return false;
   if (p->id >= 11 && p->id < COUNT) {
     if (p->size > 65512 || p->size < p->code + 20 ||
@@ -168,8 +168,13 @@ static void private_page(struct process *p, unsigned va,
     p->frames[(va - BASE) / PAGE] = frame;
 }
 // Storage uses nested 512-byte sector buffers. Keep its stack separate from
-// the package image, with an unmapped guard page below it.
+// the package image, with an unmapped guard page below it. Radio's stack is
+// separate too, so its package may use the full 0x3e000-byte image window.
 enum { STORAGE_STACK_TOP = 0x02400000, STORAGE_STACK_PAGES = 8 };
+enum { RADIO_STACK_TOP = 0x02600000, RADIO_STACK_PAGES = 8 };
+static unsigned stack_top(unsigned id) {
+  return id == STORAGE ? STORAGE_STACK_TOP : id == RADIO ? RADIO_STACK_TOP : STACK_TOP;
+}
 static void prepare_process(unsigned id) {
   struct process *p = &procs[id];
   const struct package *pkg = p->package;
@@ -185,7 +190,7 @@ static void prepare_process(unsigned id) {
     private_page(p, BASE + off, pkg->bytes + off, n > PAGE ? PAGE : n,
                  off < pkg->code);
   }
-  if (id == RADIO || id == RUNTIME) {
+  if (id == RUNTIME) {
     check(pkg->size > 0x38000);
     for (unsigned i = 3; i <= 8; i++)
       private_page(p, STACK_TOP - i * PAGE, 0, 0, false);
@@ -197,6 +202,9 @@ static void prepare_process(unsigned id) {
   if (id == STORAGE) {
     for (unsigned i = 1; i <= STORAGE_STACK_PAGES; i++)
       private_page(p, STORAGE_STACK_TOP - i * PAGE, 0, 0, false);
+  } else if (id == RADIO) {
+    for (unsigned i = 1; i <= RADIO_STACK_PAGES; i++)
+      private_page(p, RADIO_STACK_TOP - i * PAGE, 0, 0, false);
   } else {
     private_page(p, STACK_TOP - 2 * PAGE, 0, 0, false);
     private_page(p, STACK_TOP - PAGE, 0, 0, false);
@@ -212,7 +220,7 @@ static void start(unsigned id) {
   struct process *p = &procs[id];
   if (p->running)
     return;
-  seL4_UserContext regs = {.pc = BASE, .sp = id == STORAGE ? STORAGE_STACK_TOP : STACK_TOP, .r0 = id};
+  seL4_UserContext regs = {.pc = BASE, .sp = stack_top(id), .r0 = id};
   check(seL4_TCB_WriteRegisters(p->task.thread, 1, 0,
                                 sizeof(regs) / sizeof(unsigned), &regs));
   p->running = true;
@@ -1097,6 +1105,12 @@ void root_main(seL4_BootInfo *bi) {
           seL4_SetMR(0, 0x56464c53);
           seL4_MessageInfo_t reply = seL4_Call(procs[STORAGE].ep, seL4_MessageInfo_new(0,0,0,14));
           if (seL4_MessageInfo_get_length(reply) == 14 && seL4_GetMR(0) == 0) {
+            // A warm reset with the connectivity domain still powered (for example
+            // while hosting the relay access point) can stop the next boot of slot B.
+            if (conn_saved.powered) {
+              unsigned seen = 0, chip = 0, clock = 0, mailbox = 0;
+              radio_domain(&seen, &chip, &clock, &mailbox, true);
+            }
             volatile unsigned *reset = (void *)0x09703014;
             for (;;) { *reset = 0x1209; __asm__ volatile("dsb sy" ::: "memory"); }
           }

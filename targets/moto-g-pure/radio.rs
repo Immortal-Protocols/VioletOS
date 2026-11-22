@@ -10,6 +10,8 @@ mod wlan_image;
 mod passive_scan;
 #[path = "radio_io.rs"]
 mod radio_io;
+#[path = "softap.rs"]
+mod softap;
 mod station;
 #[path = "wlan_axi.rs"]
 mod wlan_axi;
@@ -132,7 +134,16 @@ pub fn run() -> ! {
             }
         }
         if connected != 0 {
-            if usb_job.arg != 0 {
+            if usb_job.arg != 0 && unsafe { (*core::ptr::addr_of!(RELAY)).is_some() } {
+                // Relay hosting: any join request re-runs the HTTPS test through the phone.
+                run_test.set(usb_job.arg);
+                unsafe {
+                    if let Some(r) = (*core::ptr::addr_of_mut!(RELAY)).as_mut() {
+                        r.started = radio_io::now();
+                    }
+                }
+                usb_job = Message::default();
+            } else if usb_job.arg != 0 {
                 if scan.aps[..scan.ap_count].iter().any(|ap| {
                     ap.profile_id() == connected
                         && ap.ssid_len == usb_job.value as usize
@@ -147,6 +158,7 @@ pub fn run() -> ! {
             let alive = unsafe { wpa::poll() };
             if !alive || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO) && m.value == 0) {
                 unsafe { wpa::close() };
+                unsafe { RELAY = None };
                 let stopped = unsafe { (*dev).shutdown() }
                     && Message::new(EXECUTE, 0x4054, 0).call(7).value == 1;
                 connected = 0;
@@ -297,6 +309,38 @@ pub fn run() -> ! {
                 } else if usb_job.arg != 0 {
                     scan.preferred_ssid = usb_job.data;
                     scan.preferred_len = usb_job.value as usize;
+                }
+                let relay_name = &usb_job.data[..(usb_job.value as usize).min(32)];
+                let relay = usb_job.arg != 0 && relay_name.starts_with(b"VioletRelay");
+                if relay {
+                    let result = wmt::enable(files[2], profile, stage)
+                        .and_then(|()| relay_start(axi, relay_name, files[3]));
+                    probe_status = result.err().unwrap_or(43);
+                    record(11, probe_status);
+                    record(12, axi.mgmt_frames);
+                    if probe_status == 43 {
+                        connected = 0x5245_4c59;
+                        active.set(true);
+                        run_test.set(usb_job.arg);
+                        usb_job = Message::default();
+                        record(3, 54);
+                        let mut r = Message::result(connected);
+                        r.arg = RADIO_RETAIN_POWER;
+                        return r;
+                    }
+                    unsafe { wpa::close() };
+                    let stopped = axi.shutdown()
+                        && Message::new(EXECUTE, 0x4054, 0).call(7).value == 1;
+                    record(15, if stopped { 0 } else { 44 });
+                    if usb_job.arg != 0 {
+                        record(65, probe_status);
+                        usb_job = Message::default();
+                    }
+                    let mut reply = Message::error(OFFLINE);
+                    if !stopped {
+                        reply.arg = RADIO_RETAIN_POWER;
+                    }
+                    return reply;
                 }
                 let result = wmt::enable(files[2], profile, stage)
                     .and_then(|()| axi.scan(files[3], &mut scan, stage))
@@ -499,7 +543,16 @@ pub fn run() -> ! {
     loop {
         let mut m = Message::default();
         if active.get() {
-            if run_test.replace(0) != 0 {
+            let relaying = unsafe { (*core::ptr::addr_of!(RELAY)).is_some() };
+            let leased = relaying && relay_step(dev);
+            if relaying && !leased && run_test.get() != 0 {
+                let started = unsafe { (*core::ptr::addr_of!(RELAY)).as_ref().map_or(0, |r| r.started) };
+                if radio_io::expired(started, 150_000) {
+                    run_test.set(0);
+                    record(65, 59);
+                }
+            }
+            if (!relaying || leased) && run_test.replace(0) != 0 {
                 let mut uuid = [0; 36];
                 let ok = unsafe { wpa::uuid(&mut uuid) };
                 for (i, bytes) in uuid.chunks_exact(4).enumerate() {
@@ -525,6 +578,74 @@ pub fn run() -> ! {
         }
         r.reply();
     }
+}
+
+/// Relay access point that stays up between requests while the phone comes and goes.
+struct Relay {
+    pmk: [u8; 32],
+    wpa2: bool,
+    net_up: bool,
+    started: u32,
+}
+static mut RELAY: Option<Relay> = None;
+
+/// Host `ssid` as an access point. Names starting with "VioletRelayOpen" are open
+/// networks; others use WPA2-PSK. The phone is served from Radio's event loop.
+fn relay_start(axi: &mut wlan_axi::Axi, ssid: &[u8], image: &[u8]) -> Result<(), u32> {
+    let pmk = wpa::profile_key(ssid).ok_or(50u32)?;
+    axi.boot(image, stage)?;
+    stage(56);
+    let wpa2 = !ssid.starts_with(b"VioletRelayOpen");
+    axi.start_ap(ssid, 6, wpa2)?;
+    stage(58);
+    unsafe { RELAY = Some(Relay { pmk, wpa2, net_up: false, started: radio_io::now() }) };
+    Ok(())
+}
+
+/// Service the access point once. Returns true when the phone holds a DHCP lease.
+fn relay_step(dev: *mut wlan_axi::Axi) -> bool {
+    let Some(relay) = (unsafe { (*core::ptr::addr_of_mut!(RELAY)).as_mut() }) else { return false };
+    let axi = unsafe { &mut *dev };
+    let ready = axi.client_state == 2 && !axi.new_client && (!relay.wpa2 || wpa::authenticated());
+    if relay.net_up && !ready {
+        // The phone left or is associating again: drop IP state and wait for it.
+        unsafe { wpa::close_net() };
+        relay.net_up = false;
+        stage(58);
+    }
+    if !relay.net_up {
+        if !relay.wpa2 {
+            axi.new_client = false; // open network: association alone admits the phone
+        }
+        let mut frame = [0; 1518];
+        let mut key = [0; 1536];
+        for _ in 0..8 {
+            let Ok((_, eapol)) = axi.ap_poll(&mut frame, &mut key) else { break };
+            if relay.wpa2 && axi.client_state == 2 {
+                let _ = wpa::authenticator_step(axi, &relay.pmk, &key[..eapol]);
+            }
+            if eapol == 0 {
+                break;
+            }
+        }
+        record(12, axi.mgmt_frames);
+        record(13, wpa::handshake_report());
+        if !relay.wpa2 {
+            axi.new_client = false;
+        }
+        let ready = axi.client_state == 2 && !axi.new_client && (!relay.wpa2 || wpa::authenticated());
+        if ready {
+            stage(61);
+            relay.net_up = unsafe { wpa::host_ip(dev, &relay.pmk) };
+        }
+        return false;
+    }
+    unsafe { wpa::poll() };
+    let leased = wpa::leased();
+    if leased {
+        stage(63);
+    }
+    leased
 }
 
 fn scan_entry(scan: &passive_scan::Results, index: u32) -> Message {

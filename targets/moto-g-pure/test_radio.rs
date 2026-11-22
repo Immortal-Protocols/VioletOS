@@ -1,6 +1,7 @@
 //! Host tests against the exact bundle that the handset loader embeds.
 mod conn_firmware;
 mod passive_scan;
+mod softap;
 mod station;
 mod wlan_download;
 mod wlan_image;

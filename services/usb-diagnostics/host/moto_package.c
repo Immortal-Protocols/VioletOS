@@ -126,7 +126,7 @@ int main(int argc,char **argv) {
             uint32_t token=arc4random_uniform(UINT32_MAX)+1;
             unsigned char result[44];
             if (!transfer(chosen,0x40,0x6c,token,NULL,0)) {
-                time_t until=time(NULL)+85;
+                time_t until=time(NULL)+(getenv("MOTO_WIFI_WAIT") ? atoi(getenv("MOTO_WIFI_WAIT")) : 85);
                 while(time(NULL)<until) {
                     if(transfer(chosen,0xc0,0x58,0,result,sizeof result)) break;
                     unsigned state=word(result+4);

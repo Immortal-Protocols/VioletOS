@@ -23,7 +23,7 @@ def inspect(blob):
         raise ValueError("unsupported package or ABI")
     if not 0 < code <= size <= 0x3E000 or code % 4096 or len(blob) != 24 + size:
         raise ValueError("invalid segment sizes")
-    if identity in (3, 7) and size > 0x38000:
+    if identity == 3 and size > 0x38000:
         raise ValueError("package overlaps its process stack")
     if binascii.crc32(blob[24:]) != crc:
         raise ValueError("package checksum mismatch")

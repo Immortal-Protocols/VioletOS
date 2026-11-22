@@ -6,7 +6,7 @@ import subprocess
 FILES = """
 rsn_supp/wpa rsn_supp/wpa_ie rsn_supp/pmksa_cache
 common/wpa_common common/ieee802_11_common utils/common utils/wpabuf
-crypto/aes-unwrap crypto/aes-internal crypto/aes-internal-dec crypto/aes-internal-enc
+crypto/aes-unwrap crypto/aes-wrap crypto/aes-internal crypto/aes-internal-dec crypto/aes-internal-enc
 crypto/aes-omac1 crypto/md5 crypto/md5-internal crypto/sha1 crypto/sha1-internal
 crypto/sha1-prf crypto/sha256 crypto/sha256-internal crypto/sha256-prf
 """.split()
@@ -22,6 +22,7 @@ def objects(repo, out, common):
     sources = [src / (name + ".c") for name in FILES]
     sources.append(Path(__file__).with_name("supplicant.c"))
     sources.append(Path(__file__).with_name("supplicant_os.c"))
+    sources.append(Path(__file__).with_name("ap_wpa.c"))
     def compile(source):
         obj = target / (source.stem + ".o")
         if not obj.exists() or obj.stat().st_mtime_ns < max(
