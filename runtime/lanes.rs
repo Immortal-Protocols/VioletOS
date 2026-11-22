@@ -101,7 +101,7 @@ fn execute(lane: u32, owner: u32, mut m: Message) -> Message {
         }
         5 => m.call(4),
         7 => {
-            if matches!(m.key, RADIO | PROFILE) && m.op == EXECUTE { m.arg = 0; }
+            if matches!(m.key, RADIO | PROFILE | RELAY) && m.op == EXECUTE { m.arg = 0; }
             let reply = m.call(5);
             if reply.arg == RADIO_RELEASE_POWER {
                 let cleanup=Message::new(EXECUTE,RADIO_RAILS,0).call(6);
@@ -109,7 +109,8 @@ fn execute(lane: u32, owner: u32, mut m: Message) -> Message {
                 return Message::result(reply.value);
             }
             let needs_rails = m.op == EXECUTE &&
-                ((m.key == RADIO && m.value == 1) || (m.key == PROFILE && m.value != 0));
+                ((m.key == RADIO && m.value == 1) || (m.key == PROFILE && m.value != 0)
+                 || (m.key == RELAY && m.value == 1));
             if reply.op != RADIO_PREPARE_POWER || !needs_rails {
                 return reply;
             }

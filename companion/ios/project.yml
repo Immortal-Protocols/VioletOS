@@ -25,6 +25,7 @@ targets:
           Wi-Fi and forwards them over this iPhone's cellular data.
         NSBonjourServices: [_violetrelay._tcp]
         UIFileSharingEnabled: true
+        UIBackgroundModes: [audio]
         LSSupportsOpeningDocumentsInPlace: true
   VioletRelayUITests:
     type: bundle.ui-testing

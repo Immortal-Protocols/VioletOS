@@ -21,7 +21,7 @@ fn service(key: u32) -> u32 {
     match key {
         SAVE | FILE_LIST..=FILE_DELETE => 6,
         PRESENT => 5,
-        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | WEATHER => 7,
+        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | WEATHER | RELAY => 7,
         POWER => 8,
         CATALOG | INBOX | INSTALL | REMOVE => 9,
         _ => 0,
@@ -35,7 +35,7 @@ const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK];
 /// The component whose inventory bit gates a key.
 fn component(key: u32) -> u32 {
     match key {
-        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER => 7,
+        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
         POWER => 8,
         SAVE | FILE_LIST..=FILE_DELETE => 6,
         VOLUME | PLAYBACK => AUDIO_COMPONENT,
@@ -145,6 +145,7 @@ impl Runtime {
             }
             (GET, RADIO) => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
+            (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
             (GET, POWER) => self.forward(who, 8, m),
             (GET, VOLUME | PLAYBACK) => audio(m),
             // Volume is shared. Only the app on screen may change it or make sound.

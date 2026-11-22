@@ -10,6 +10,17 @@ pub fn submit(op: u32, key: u32, value: u32) -> Result<Ticket, u32> {
         Err(r.op)
     }
 }
+/// Like `submit`, with up to 40 bytes of text (for example a pairing code).
+pub fn submit_text(op: u32, key: u32, value: u32, text: &[u8]) -> Result<Ticket, u32> {
+    let mut m = Message::new(op, key, value);
+    m.put_text(text);
+    let r = m.call(SERVER);
+    if r.op == OK {
+        Ok(Ticket(r.value))
+    } else {
+        Err(r.op)
+    }
+}
 impl Ticket {
     pub fn poll(&self) -> Message {
         Message::new(POLL, 0, self.0).call(SERVER)

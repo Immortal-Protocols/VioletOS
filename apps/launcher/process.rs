@@ -1,6 +1,8 @@
 use crate::{drawing::*, protocol::*, sdk::*};
 #[path = "library.rs"]
 mod library;
+#[path = "phone.rs"]
+mod phone;
 pub fn run() -> ! {
     acquire_surface();
     let mut status = request(GET, STATUS, 0);
@@ -18,6 +20,8 @@ pub fn run() -> ! {
     let mut manual_scan = false;
     let mut scan_ticket: Option<Ticket> = None;
     let mut scan_attempted = false;
+    // A Phone Internet start still in progress (from boot or from the Phone page).
+    let mut relay_start: Option<Ticket> = None;
     let mut usb_stage = (0,0);
     let mut usb_request=0;
     let mut usb_poll = unsafe { ticks() };
@@ -40,6 +44,13 @@ pub fn run() -> ! {
                     file(FILE_WRITE, b"radio-probe", 0, &radio_state.text()[..24]);
                     previous = file(FILE_READ, b"radio-probe", 0, &[]);
                 }
+                redraw = true;
+            }
+        }
+        if let Some(t) = &relay_start {
+            if t.poll().op != BUSY {
+                relay_start = None;
+                radio_state = request(GET, RADIO, 0);
                 redraw = true;
             }
         }
@@ -69,7 +80,7 @@ pub fn run() -> ! {
         if active && unsafe { ticks().wrapping_sub(usb_poll) >= ticks_per_ms*500 } {
             usb_poll=unsafe {ticks()};
             let usb=request(GET,0x4057,0);
-            if usb.op==OK && usb.key!=0 && usb.key!=usb_request && scan_ticket.is_none() {
+            if usb.op==OK && usb.key!=0 && usb.key!=usb_request && scan_ticket.is_none() && relay_start.is_none() {
                 usb_request=usb.key;scan_attempted=false;manual_scan=true;
             }
             if (usb.value,usb.arg)!=usb_stage {usb_stage=(usb.value,usb.arg);redraw=true;}
@@ -138,15 +149,11 @@ pub fn run() -> ! {
             if catalog.value != 0 {
                 button(206, &catalog.text());
             }
-            if radio_state.op == OK && !scan_attempted {
-                button(
-                    266,
-                    if radio_state.arg & RADIO_DIAGNOSTIC != 0 {
-                        b"SCAN WI-FI"
-                    } else {
-                        b"RADIO"
-                    },
-                );
+            // The handset radio offers Phone Internet; the virtual radio has an on/off switch.
+            if radio_state.op == OK && radio_state.arg & RADIO_DIAGNOSTIC != 0 {
+                button(266, b"PHONE INTERNET");
+            } else if radio_state.op == OK && !scan_attempted {
+                button(266, b"RADIO");
             }
             if power_events.is_some() {
                 button(
@@ -187,6 +194,10 @@ pub fn run() -> ! {
             if status.arg != 0 {
                 if radio_state.arg & RADIO_DIAGNOSTIC != 0 {
                     previous = file(FILE_READ, b"radio-probe", 0, &[]);
+                    // Phone Internet was on before the restart: turn it back on.
+                    if let Some(p) = phone::load().filter(|p| p.on) {
+                        relay_start = phone::start(&p.code);
+                    }
                 } else {
                     let preference = request(GET, SAVE, 0);
                     if preference.op == OK { request(EXECUTE, RADIO, (preference.value == 0) as u32); }
@@ -209,8 +220,8 @@ pub fn run() -> ! {
                     request(EXECUTE, OPEN, catalog.value);
                 }
                 1064..1264 if radio_state.op == OK && radio_state.arg & RADIO_DIAGNOSTIC != 0 => {
-                    if !scan_attempted {
-                        manual_scan = true;
+                    if scan_ticket.is_none() {
+                        phone::open(&mut relay_start);
                     }
                     redraw = true;
                 }

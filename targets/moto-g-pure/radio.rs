@@ -107,6 +107,9 @@ pub fn run() -> ! {
     let dev = core::ptr::addr_of_mut!(DEVICE);
     let mut connected = 0u32;
     let mut usb_job = Message::default();
+    // A pairing code from Home's Phone Internet page, kept until hosting starts or fails.
+    let mut relay_job: Option<[u8; RELAY_CODE_LEN]> = None;
+    let relay_failure = core::cell::Cell::new(0u32);
     let run_test = core::cell::Cell::new(0);
     // Only the antenna profile comes from boot. Read memory policy live.
     let profile = unsafe { (0x095ffff8 as *const u32).read_volatile() };
@@ -118,6 +121,44 @@ pub fn run() -> ! {
     let mut probe_status = 0;
     let active = core::cell::Cell::new(false);
     let mut dispatch = |m: Message| {
+        if (m.op, m.key, m.value) == (EXECUTE, RELAY, 2) {
+            let mut bytes = [0u8; RELAY_CODE_LEN / 2];
+            if unsafe { wpa::radio_random(bytes.as_mut_ptr(), bytes.len()) } != 0 {
+                return Message::error(OFFLINE);
+            }
+            let mut code = [0u8; RELAY_CODE_LEN];
+            for (i, b) in bytes.iter().enumerate() {
+                code[2 * i] = b"0123456789ABCDEF"[(b >> 4) as usize];
+                code[2 * i + 1] = b"0123456789ABCDEF"[(b & 15) as usize];
+            }
+            let mut r = Message::result(1);
+            r.put_text(&code);
+            return r;
+        }
+        let relay_request = (m.op, m.key, m.value) == (EXECUTE, RELAY, 1);
+        if relay_request {
+            let text = m.text();
+            if !valid_relay_code(&text) {
+                return Message::error(INVALID);
+            }
+            if connected != 0 {
+                // Already hosting (or joined to a network): report the current state.
+                let mut r = Message::result(relay_state());
+                r.arg = relay_failure.get();
+                return r;
+            }
+            relay_job = Some(text[..RELAY_CODE_LEN].try_into().unwrap());
+            if m.arg == 0 {
+                relay_failure.set(0);
+                probed = false;
+                join_target = None;
+            }
+        }
+        if (m.op, m.key) == (GET, RELAY) && connected == 0 {
+            let mut r = Message::result(RELAY_OFF);
+            r.arg = relay_failure.get();
+            return r;
+        }
         if (m.op, m.key, m.value, m.arg) == (EXECUTE, RADIO, 1, 0) {
             usb_job = Message::new(GET, 0x4060, 0).call(7);
             if usb_job.op != OK || !(1..=32).contains(&usb_job.value) {
@@ -134,11 +175,11 @@ pub fn run() -> ! {
             }
         }
         if connected != 0 {
-            if usb_job.arg != 0 && unsafe { (*core::ptr::addr_of!(RELAY)).is_some() } {
+            if usb_job.arg != 0 && unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() } {
                 // Relay hosting: any join request re-runs the HTTPS test through the phone.
                 run_test.set(usb_job.arg);
                 unsafe {
-                    if let Some(r) = (*core::ptr::addr_of_mut!(RELAY)).as_mut() {
+                    if let Some(r) = (*core::ptr::addr_of_mut!(RELAY_AP)).as_mut() {
                         r.started = radio_io::now();
                     }
                 }
@@ -156,9 +197,9 @@ pub fn run() -> ! {
                 usb_job = Message::default();
             }
             let alive = unsafe { wpa::poll() };
-            if !alive || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO) && m.value == 0) {
+            if !alive || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO | RELAY) && m.value == 0) {
                 unsafe { wpa::close() };
-                unsafe { RELAY = None };
+                unsafe { RELAY_AP = None };
                 let stopped = unsafe { (*dev).shutdown() }
                     && Message::new(EXECUTE, 0x4054, 0).call(7).value == 1;
                 connected = 0;
@@ -184,7 +225,17 @@ pub fn run() -> ! {
                 (GET, NETWORK) | (GET, RADIO) | (EXECUTE, RADIO) => {
                     let mut r = Message::result(1);
                     r.arg = RADIO_DIAGNOSTIC;
-                    r.put_text(b"WIFI CONNECTED");
+                    r.put_text(match relay_state() {
+                        RELAY_OFF => b"WIFI CONNECTED" as &[u8],
+                        RELAY_ONLINE => b"PHONE INTERNET ON",
+                        RELAY_JOINED => b"PHONE JOINED",
+                        _ => b"WAITING FOR PHONE",
+                    });
+                    r
+                }
+                (GET, RELAY) => {
+                    let mut r = Message::result(relay_state());
+                    r.arg = relay_failure.get();
                     r
                 }
                 (EXECUTE, WEATHER) => {
@@ -228,7 +279,7 @@ pub fn run() -> ! {
             probed = false;
             join_target = None;
         }
-        if firmware && !probed && ((m.op, m.key, m.value) == (EXECUTE, RADIO, 1) || joining) {
+        if firmware && !probed && ((m.op, m.key, m.value) == (EXECUTE, RADIO, 1) || joining || relay_request) {
             if m.arg == 0 {
                 requested = true;
                 memory_policy = memory_request(EXECUTE);
@@ -317,11 +368,33 @@ pub fn run() -> ! {
                     scan.preferred_ssid = usb_job.data;
                     scan.preferred_len = usb_job.value as usize;
                 }
-                let relay_name = &usb_job.data[..(usb_job.value as usize).min(32)];
-                let relay = usb_job.arg != 0 && relay_name.starts_with(b"VioletRelay");
+                let mut app_name = [0u8; 32];
+                let usb_name = &usb_job.data[..(usb_job.value as usize).min(32)];
+                // Home's pairing code wins over a USB join job; both host a relay network.
+                let pairing = relay_job.take().map(|code| {
+                    let n = relay_ssid(&code, &mut app_name);
+                    let mut password = [0u8; 16];
+                    password[..8].copy_from_slice(&code[4..]);
+                    (n, Some(code), password)
+                });
+                let relay = pairing.is_some()
+                    || (usb_job.arg != 0 && usb_name.starts_with(b"VioletRelay"));
                 if relay {
-                    let result = wmt::enable(files[2], profile, stage)
-                        .and_then(|()| relay_start(axi, relay_name, files[3]));
+                    let result = wmt::enable(files[2], profile, stage).and_then(|()| match pairing {
+                        Some((n, _, password)) => relay_start(axi, &app_name[..n], files[3], None, &password[..8]),
+                        None => {
+                            let pmk = wpa::profile_key(usb_name).ok_or(50u32)?;
+                            let mut password = [0u8; 16];
+                            for (i, b) in pmk[..8].iter().enumerate() {
+                                password[2 * i] = b"0123456789abcdef"[(b >> 4) as usize];
+                                password[2 * i + 1] = b"0123456789abcdef"[(b & 15) as usize];
+                            }
+                            relay_start(axi, usb_name, files[3], Some(pmk), &password)
+                        }
+                    });
+                    if pairing.is_some() {
+                        relay_failure.set(result.err().unwrap_or(0));
+                    }
                     probe_status = result.err().unwrap_or(43);
                     record(11, probe_status);
                     record(12, axi.mgmt_frames);
@@ -549,11 +622,12 @@ pub fn run() -> ! {
     }
     loop {
         let mut m = Message::default();
+        wpa::tick_clock();
         if active.get() {
-            let relaying = unsafe { (*core::ptr::addr_of!(RELAY)).is_some() };
+            let relaying = unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() };
             let leased = relaying && relay_step(dev);
             if relaying && !leased && run_test.get() != 0 {
-                let started = unsafe { (*core::ptr::addr_of!(RELAY)).as_ref().map_or(0, |r| r.started) };
+                let started = unsafe { (*core::ptr::addr_of!(RELAY_AP)).as_ref().map_or(0, |r| r.started) };
                 if radio_io::expired(started, 150_000) {
                     run_test.set(0);
                     record(65, 59);
@@ -600,34 +674,74 @@ pub fn run() -> ! {
 /// Relay access point that stays up between requests while the phone comes and goes.
 struct Relay {
     pmk: [u8; 32],
+    password: [u8; 16],
+    password_len: usize,
     wpa2: bool,
     net_up: bool,
+    /// The phone answered a time request through its relay, so internet works.
+    online: bool,
+    last_time_try: u32,
     started: u32,
 }
-static mut RELAY: Option<Relay> = None;
+static mut RELAY_AP: Option<Relay> = None;
 
 /// Host `ssid` as an access point. Names starting with "VioletRelayOpen" are open
 /// networks; others use WPA2-PSK. The phone is served from Radio's event loop.
-fn relay_start(axi: &mut wlan_axi::Axi, ssid: &[u8], image: &[u8]) -> Result<(), u32> {
-    let pmk = wpa::profile_key(ssid).ok_or(50u32)?;
+/// `pmk` is the USB-provisioned key (WPA2 networks need it); `password` is what the
+/// phone's SOCKS relay expects.
+fn relay_start(
+    axi: &mut wlan_axi::Axi,
+    ssid: &[u8],
+    image: &[u8],
+    pmk: Option<[u8; 32]>,
+    password: &[u8],
+) -> Result<(), u32> {
+    let wpa2 = !ssid.starts_with(b"VioletRelayOpen");
+    if wpa2 && pmk.is_none() {
+        return Err(50);
+    }
     axi.boot(image, stage)?;
     stage(56);
-    let wpa2 = !ssid.starts_with(b"VioletRelayOpen");
     axi.start_ap(ssid, 6, wpa2)?;
     stage(58);
-    unsafe { RELAY = Some(Relay { pmk, wpa2, net_up: false, started: radio_io::now() }) };
+    let mut stored = [0u8; 16];
+    let password_len = password.len().min(16);
+    stored[..password_len].copy_from_slice(&password[..password_len]);
+    unsafe {
+        RELAY_AP = Some(Relay {
+            pmk: pmk.unwrap_or([0; 32]),
+            password: stored,
+            password_len,
+            wpa2,
+            net_up: false,
+            online: false,
+            last_time_try: 0,
+            started: radio_io::now(),
+        })
+    };
     Ok(())
+}
+
+/// RELAY_OFF when not hosting, otherwise how far the phone has got.
+fn relay_state() -> u32 {
+    match unsafe { (*core::ptr::addr_of!(RELAY_AP)).as_ref() } {
+        None => RELAY_OFF,
+        Some(r) if r.online => RELAY_ONLINE,
+        Some(r) if r.net_up && wpa::leased() => RELAY_JOINED,
+        Some(_) => RELAY_WAITING,
+    }
 }
 
 /// Service the access point once. Returns true when the phone holds a DHCP lease.
 fn relay_step(dev: *mut wlan_axi::Axi) -> bool {
-    let Some(relay) = (unsafe { (*core::ptr::addr_of_mut!(RELAY)).as_mut() }) else { return false };
+    let Some(relay) = (unsafe { (*core::ptr::addr_of_mut!(RELAY_AP)).as_mut() }) else { return false };
     let axi = unsafe { &mut *dev };
     let ready = axi.client_state == 2 && !axi.new_client && (!relay.wpa2 || wpa::authenticated());
     if relay.net_up && !ready {
         // The phone left or is associating again: drop IP state and wait for it.
         unsafe { wpa::close_net() };
         relay.net_up = false;
+        relay.online = false;
         stage(58);
     }
     if !relay.net_up {
@@ -653,7 +767,7 @@ fn relay_step(dev: *mut wlan_axi::Axi) -> bool {
         let ready = axi.client_state == 2 && !axi.new_client && (!relay.wpa2 || wpa::authenticated());
         if ready {
             stage(61);
-            relay.net_up = unsafe { wpa::host_ip(dev, &relay.pmk) };
+            relay.net_up = unsafe { wpa::host_ip(dev, &relay.password[..relay.password_len]) };
         }
         return false;
     }
@@ -661,6 +775,14 @@ fn relay_step(dev: *mut wlan_axi::Axi) -> bool {
     let leased = wpa::leased();
     if leased {
         stage(63);
+        // Ask the phone for the time (every 5 s until it answers). TLS needs it, and an
+        // answer proves the relay reaches the internet side of the phone.
+        if !relay.online && (relay.last_time_try == 0 || radio_io::expired(relay.last_time_try, 5000)) {
+            relay.last_time_try = radio_io::now() | 1;
+            relay.online = unsafe { wpa::phone_time() };
+        }
+    } else {
+        relay.online = false;
     }
     leased
 }

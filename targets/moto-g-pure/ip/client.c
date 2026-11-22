@@ -339,10 +339,10 @@ static int socks_connect(const char *host, unsigned port) {
 }
 // Open a TCP stream ready for TLS to host:443. When hosting the phone's network,
 // the stream goes through the phone's SOCKS5 relay and the phone resolves `host`.
-static int relay_open(const char *host) {
+static int relay_open(const char *host, unsigned port, int attempts) {
   IP4_ADDR(ip_2_ip4(&destination), 192, 168, 77, 2);
-  // The companion may still be starting its listener: retry for about 10 s.
-  for (int attempt = 0; attempt < 5 && !established; attempt++) {
+  // The companion may still be starting its listener: retry (2 s per attempt).
+  for (int attempt = 0; attempt < attempts && !established; attempt++) {
     abort_connection();
     failed = 0;
     connection = tcp_new();
@@ -356,7 +356,7 @@ static int relay_open(const char *host) {
         station_net_poll();
   }
   request_start = sys_now();
-  return established && !failed && socks_connect(host, 443);
+  return established && !failed && socks_connect(host, port);
 }
 static int station_open(const char *host) {
   static unsigned generation;
@@ -390,7 +390,23 @@ static int open_https(const char *host) {
   failed = 0;
   eof = 0;
   request_start = sys_now();
-  return hosting ? relay_open(host) : station_open(host);
+  return hosting ? relay_open(host, 443, 5) : station_open(host);
+}
+// Violet Relay answers a CONNECT to "time.violet" with the phone's Unix time as four
+// big-endian bytes. One quick attempt: Radio's event loop retries every few seconds.
+int station_net_phone_time(unsigned *out) {
+  if (!hosting || !attached || !leased)
+    return 0;
+  abort_connection();
+  failed = 0;
+  eof = 0;
+  request_start = sys_now();
+  unsigned char b[4];
+  int ok = relay_open("time.violet", 1, 1) && read_exact(b, 4);
+  abort_connection();
+  if (ok)
+    *out = (unsigned)b[0] << 24 | (unsigned)b[1] << 16 | (unsigned)b[2] << 8 | b[3];
+  return ok;
 }
 int station_net_uuid(unsigned char *out) {
   int ok = open_https("www.uuidgenerator.net") && guest_https(out);

@@ -170,13 +170,37 @@ pub fn weather_path(city: usize, out: &mut [u8; 64]) -> Option<usize> {
 
 pub const PROFILE: u32 = 27;
 
+/// Phone internet: Radio hosts a Wi-Fi network for a phone running Violet Relay.
+/// GET: value is RELAY_OFF..=RELAY_ONLINE, arg the last failure code.
+/// EXECUTE 1 turns it on with the pairing code in the text (12 characters: the
+/// network tag, then the relay password); EXECUTE 0 turns it off; EXECUTE 2 returns
+/// a new random pairing code. Only Home (the launcher) may send it.
+pub const RELAY: u32 = 29;
+pub const RELAY_OFF: u32 = 0;
+pub const RELAY_STARTING: u32 = 1;
+pub const RELAY_WAITING: u32 = 2;
+pub const RELAY_JOINED: u32 = 3;
+pub const RELAY_ONLINE: u32 = 4;
+pub const RELAY_CODE_LEN: usize = 12;
+/// Network name for a pairing code: "VioletRelayOpen-" + its first four characters.
+pub fn relay_ssid(code: &[u8], out: &mut [u8; 32]) -> usize {
+    let prefix = b"VioletRelayOpen-";
+    out[..prefix.len()].copy_from_slice(prefix);
+    out[prefix.len()..prefix.len() + 4].copy_from_slice(&code[..4]);
+    prefix.len() + 4
+}
+pub fn valid_relay_code(code: &[u8]) -> bool {
+    code.len() >= RELAY_CODE_LEN
+        && code[..RELAY_CODE_LEN].iter().all(|c| matches!(c, b'0'..=b'9' | b'A'..=b'F'))
+}
+
 pub const STORAGE_DIAGNOSTIC: u32 = 0x300;
 
 // Audio. VOLUME and PLAYBACK can be subscribed to, read with GET and changed
 // with EXECUTE. Runtime forwards them to the Audio process, which also owns the
 // hardware volume buttons and the headphone jack.
-pub const VOLUME: u32 = 29;
-pub const PLAYBACK: u32 = 30;
+pub const VOLUME: u32 = 30;
+pub const PLAYBACK: u32 = 31;
 /// Audio is component 22, beside USB Diagnostics, so app and service IDs keep their values.
 pub const AUDIO_COMPONENT: u32 = 22;
 /// Runtime's capability slot for the Audio endpoint.

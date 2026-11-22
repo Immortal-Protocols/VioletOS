@@ -14,10 +14,28 @@ struct VioletRelayApp: App {
 
 struct StatusView: View {
     @ObservedObject var model: RelayModel
+    @State private var code = RelayConfig.pairingCode ?? ""
 
     var body: some View {
         let s = model.status
         List {
+            Section {
+                TextField("Pairing code", text: $code)
+                    .font(.title3.monospaced())
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("pairing-code")
+                Button("Join VioletOS") { model.pair(code: code) }
+                    .disabled(RelayConfig.normalizedCode(code) == nil)
+                    .accessibilityIdentifier("join")
+                row("Network", RelayConfig.pairingCode.map(RelayConfig.ssid(forCode:)) ?? "not paired", id: "network")
+                row("Wi-Fi", s.hotspot ?? "—", id: "hotspot")
+                row("Background", s.background ?? "—", id: "background")
+            } header: {
+                Text("VioletOS")
+            } footer: {
+                Text("Enter the code from Phone Internet on VioletOS. The relay keeps running in the background and with the screen locked by playing silent audio. It shows under Now Playing, and starting other music or video pauses it.")
+            }
             Section("SOCKS5 relay") {
                 row("Listener", "\(s.listenerState) :\(s.port)", id: "listener-state")
                 row("Wi-Fi IPv4 (en0)", s.wifiIPv4.isEmpty ? "none" : s.wifiIPv4.joined(separator: ", "), id: "wifi-ip")
@@ -29,9 +47,6 @@ struct StatusView: View {
                 row("Auth failures", "\(s.authFailures)", id: "auth-failures")
                 row("Up (to internet)", Self.bytes(s.bytesUp), id: "bytes-up")
                 row("Down (to client)", Self.bytes(s.bytesDown), id: "bytes-down")
-            }
-            Section("Wi-Fi join") {
-                row("Hotspot", s.hotspot ?? "—", id: "hotspot")
             }
             Section("Last error") {
                 Text(s.lastError ?? "none")
