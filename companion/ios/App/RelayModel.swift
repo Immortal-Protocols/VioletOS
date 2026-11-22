@@ -144,12 +144,6 @@ final class RelayModel: ObservableObject {
         return true
     }
 
-    /// Rejoin the paired network (for example after VioletOS restarted).
-    func rejoin() {
-        guard let code = RelayConfig.pairingCode else { return }
-        joinNetwork(ssid: RelayConfig.ssid(forCode: code), passphrase: "")
-    }
-
     /// Join (and remember) a Wi-Fi network. Empty passphrase = open network.
     func joinNetwork(ssid: String, passphrase: String) {
         let config = passphrase.isEmpty
