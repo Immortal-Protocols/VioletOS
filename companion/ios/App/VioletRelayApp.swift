@@ -34,7 +34,7 @@ struct StatusView: View {
             } header: {
                 Text("VioletOS")
             } footer: {
-                Text("Enter the code from Phone Internet on VioletOS. The relay keeps running in the background by playing silent audio, so you can switch apps or lock the screen.")
+                Text("Enter the code from Phone Internet on VioletOS. The relay keeps running in the background and with the screen locked by playing silent audio. It shows under Now Playing, and starting other music or video pauses it.")
             }
             Section("SOCKS5 relay") {
                 row("Listener", "\(s.listenerState) :\(s.port)", id: "listener-state")

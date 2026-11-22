@@ -75,6 +75,7 @@ struct RelayStatus: Codable {
     var lastErrorAt: Date?
     var hotspot: String?
     var background: String?
+    var backgroundEvents: [String] = []
     var recentErrors: [String] = []
 }
 
@@ -214,7 +215,7 @@ final class RelayModel: ObservableObject {
                              activeConnections: snapshot.activeConnections, totalConnections: snapshot.totalConnections,
                              failedConnections: snapshot.failedConnections, authFailures: snapshot.authFailures,
                              bytesUp: snapshot.bytesUp, bytesDown: snapshot.bytesDown,
-                             lastError: snapshot.lastError, lastErrorAt: snapshot.lastErrorAt, hotspot: hotspotState, background: keepAlive.state,
+                             lastError: snapshot.lastError, lastErrorAt: snapshot.lastErrorAt, hotspot: hotspotState, background: keepAlive.state, backgroundEvents: keepAlive.events,
                              recentErrors: snapshot.recentErrors)
         tick += 1
         if tick % 4 == 1 { writeStatus() }
