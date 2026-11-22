@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -142,6 +142,9 @@ int main(int argc,char **argv) {
         } else if (!strcmp(argv[1],"scan-wifi")) {
             rc=transfer(chosen,0x40,0x69,0,NULL,0);
             if (!rc) puts("Scan requested. Read the result with moto-debug.");
+        } else if (!strcmp(argv[1],"reboot-bootloader")) {
+            rc=transfer(chosen,0x40,0x70,0,NULL,0);
+            if (!rc) puts("Fastboot reboot requested. Wait for the bootloader with fastboot devices.");
         } else if (!strcmp(argv[1],"reboot")) {
             rc=transfer(chosen,0x40,0x65,0,NULL,0);
             if (!rc) puts("Reboot requested. Verify USB reconnect and check the active catalog.");

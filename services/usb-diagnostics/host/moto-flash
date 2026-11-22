@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Flash a VioletOS boot image to slot B of the connected Moto without handset input.
+
+From VioletOS, USB Diagnostics marks the MT6357 RTC fast-boot flag and resets,
+so the bootloader starts fastboot. From Android on slot A, adb requests the
+bootloader. If the running image cannot request fastboot, repeated VioletOS
+reboots use up slot B's retries until the bootloader falls back to Android A.
+"""
+import argparse
+import json
+import subprocess
+import time
+from pathlib import Path
+
+BUILD = Path(__file__).resolve().parents[3] / "build"
+START = time.monotonic()
+
+
+def log(message):
+    print(f"[{time.monotonic() - START:6.1f}s] {message}", flush=True)
+
+
+def ok(*command, timeout=20):
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def violet():
+    result = ok(BUILD / "moto-debug", timeout=10)
+    if result and result.returncode == 0:
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            pass
+    return None
+
+
+def in_fastboot():
+    result = ok("fastboot", "devices", timeout=10)
+    return bool(result and result.stdout.strip())
+
+
+def in_android():
+    result = ok("adb", "devices", timeout=10)
+    return bool(result and any(line.endswith("\tdevice") for line in result.stdout.splitlines()))
+
+
+def state():
+    if in_fastboot():
+        return "fastboot"
+    if in_android():
+        return "android"
+    if violet():
+        return "violet"
+    return None
+
+
+def wait_for(wanted, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        now = state()
+        if now in wanted:
+            return now
+        time.sleep(1)
+    return None
+
+
+def to_fastboot(fallback_reboots):
+    now = wait_for({"fastboot", "android", "violet"}, 30)
+    if now == "violet":
+        log("VioletOS answered; requesting fastboot over USB Diagnostics")
+        request = ok(BUILD / "moto-package", "reboot-bootloader")
+        if request and request.returncode == 0:
+            now = wait_for({"fastboot", "android"}, 45)
+        else:
+            now = None
+        for attempt in range(fallback_reboots):
+            if now in ("fastboot", "android"):
+                break
+            # The running image cannot request fastboot. Each boot of B uses
+            # one retry, after which the bootloader starts Android on A.
+            log(f"Fastboot not reached; fallback reboot {attempt + 1}")
+            ok(BUILD / "moto-package", "reboot")
+            now = wait_for({"fastboot", "android"}, 50)
+    if now == "android":
+        log("Android answered; requesting the bootloader with adb")
+        ok("adb", "reboot", "bootloader")
+        now = wait_for({"fastboot"}, 60)
+    if now != "fastboot":
+        raise SystemExit("The handset did not reach fastboot")
+    log("Fastboot reached")
+
+
+def fastboot(*args):
+    result = subprocess.run(["fastboot", *args], capture_output=True, text=True, timeout=300)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode:
+        raise SystemExit(f"fastboot {' '.join(args)} failed:\n{output}")
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("image", nargs="?", type=Path, default=BUILD / "sel4/moto/boot.img")
+    parser.add_argument("--fallback-reboots", type=int, default=8,
+                        help="VioletOS reboots to try if fastboot is not requested directly")
+    parser.add_argument("--fastboot-only", action="store_true",
+                        help="stop in fastboot without flashing")
+    args = parser.parse_args()
+    if not args.fastboot_only and not args.image.is_file():
+        raise SystemExit(f"{args.image} not found")
+    to_fastboot(args.fallback_reboots)
+    if args.fastboot_only:
+        return
+    log(f"Flashing {args.image} to boot_b")
+    fastboot("flash", "boot_b", str(args.image))
+    fastboot("set_active", "b")
+    log("Slot B selected; rebooting")
+    fastboot("reboot")
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        snapshot = violet()
+        if snapshot and snapshot.get("runtime_ready"):
+            keys = ("generation", "disk_ready", "startup_status", "previous_boot_stage")
+            log("VioletOS answered: " + json.dumps({k: snapshot.get(k) for k in keys}))
+            return
+        if in_android():
+            raise SystemExit("The handset started Android on A instead of VioletOS")
+        time.sleep(1)
+    raise SystemExit("VioletOS did not answer over USB after the flash")
+
+
+if __name__ == "__main__":
+    main()

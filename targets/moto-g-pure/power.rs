@@ -172,3 +172,42 @@ pub fn usb_supply() -> Message {
     }
     Message::error(OFFLINE)
 }
+
+// MT6357 RTC, from Motorola's drivers/misc/mediatek/rtc/mt6357 and
+// include/linux/mfd/mt6357/registers.h. The bootloader enters fastboot when
+// RTC_PDN1 bit 13 is set, which is how rtc_mark_fast() requests it.
+const RTC_BBPU: u16 = 0x0588;
+const RTC_PDN1: u16 = 0x05b4;
+const RTC_PROT: u16 = 0x05bc;
+const RTC_WRTGR: u16 = 0x05c2;
+const RTC_FAST_BOOT: u16 = 1 << 13;
+fn rtc_commit() -> Option<()> {
+    pmic_write(RTC_WRTGR, 1)?;
+    for _ in 0..500 {
+        if pmic_read(RTC_BBPU)? & (1 << 6) == 0 {
+            return Some(());
+        }
+        unsafe { delay_ms(1) };
+    }
+    None
+}
+fn set_fastboot(enable: bool) -> Option<()> {
+    if !ready() {
+        return None;
+    }
+    for key in [0x586a, 0x9136] {
+        pmic_write(RTC_PROT, key)?;
+        rtc_commit()?;
+    }
+    let pdn1 = pmic_read(RTC_PDN1)?;
+    let wanted = if enable { pdn1 | RTC_FAST_BOOT } else { pdn1 & !RTC_FAST_BOOT };
+    pmic_write(RTC_PDN1, wanted)?;
+    rtc_commit()?;
+    (pmic_read(RTC_PDN1)? == wanted).then_some(())
+}
+pub fn fastboot_mark(enable: bool) -> Message {
+    match set_fastboot(enable) {
+        Some(()) => Message::result(u32::from(enable)),
+        None => Message::error(OFFLINE),
+    }
+}
