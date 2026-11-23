@@ -34,10 +34,10 @@ const SRAM_PHYS: u32 = 0x11221000;
 const STATUS: *mut u32 = 0x09203000 as *mut u32;
 const REQUEST: *const u32 = 0x09204000 as *const u32;
 const POLL_MS: u32 = 5;
-// The AFE SRAM at 0x11221000 is 28 KiB: on the XT2163DL a marker written at
-// 28 KiB or beyond reads back as zero (debug request 19000000 shows it). Use
-// all of it: 7168 stereo frames, 149 ms.
-const RING_BYTES: u32 = 0x7000;
+// The AFE SRAM at 0x11221000 is 27 KiB: on the XT2163DL, words read back
+// through offset 0x6bxx and read zero from 0x6c00 (debug request 19006000
+// shows it). Use all of it: 6912 stereo frames, 144 ms.
+const RING_BYTES: u32 = 0x6c00;
 const RING_FRAMES: u32 = RING_BYTES / 4;
 // Keep 120 ms queued: on the single core, Radio's TLS work and app drawing can
 // hold the CPU for tens of milliseconds between Audio's turns.
@@ -1019,13 +1019,21 @@ pub fn debug(command: u32, param: u32) {
             }
             // Probe the AFE SRAM size: a marker per 4 KiB block, read back
             // into words 100..109 (an alias shows a later block's marker).
+            // With a parameter, probe words from byte offset `param` in 16
+            // steps of 256 bytes instead; words 100..116 get what reads back.
+            // Word 116 holds the last word of the ring as read back.
             0x19 if unsafe { OUTPUT } == 0 => {
-                for k in 0..9 {
-                    unsafe { ((SRAM + k * 4096) as *mut u32).write_volatile(0xa500_0000 | k as u32) };
+                let (base, step) = if param == 0 { (0, 4096) } else { (param as usize, 256) };
+                let n = if param == 0 { 9 } else { 16 };
+                for k in 0..n {
+                    unsafe { ((SRAM + base + k * step) as *mut u32).write_volatile(0xa500_0000 | k as u32) };
                 }
-                for k in 0..9 {
-                    note(100 + k, unsafe { ((SRAM + k * 4096) as *const u32).read_volatile() });
+                for k in 0..n {
+                    note(100 + k, unsafe { ((SRAM + base + k * step) as *const u32).read_volatile() });
                 }
+                let last = (SRAM + RING_BYTES as usize - 4) as *mut u32;
+                unsafe { last.write_volatile(0x5a5a_a5a5) };
+                note(116, unsafe { last.read_volatile() });
             }
             // Stall Audio for `param` milliseconds, to test underrun handling.
             0x17 => {

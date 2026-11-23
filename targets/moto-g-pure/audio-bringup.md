@@ -33,7 +33,7 @@ The ellis DWS file and mainline `mtk-pmic-keys.c` give the buttons.
   - **Running state:** with boost on, STATUS reads `0x005f` (no faults, PLL locked, clocks stable) and ANASTAT reads `0x000f` (bandgap, PLL, boost and amplifier running). DIGSTAT shows the DAC running.
   - **Power-down:** afterwards SYSCTRL returns to `0x0001` and ANASTAT to `0x0000`.
 
-- **AFE SRAM size.** Markers written at 4 KiB steps from `0x11221000` read back through 24 KiB, and read zero at 28 and 32 KiB. The usable SRAM is 28 KiB, which bounds the playback ring.
+- **AFE SRAM size.** Markers written from `0x11221000` read back through offset `0x6b00` and read zero from `0x6c00`. The usable SRAM is 27 KiB, which bounds the playback ring.
 - **Hands-on check.** With the image installed, the speaker and headphones both play, Volume Down changes the volume and plugging in headphones moves output to them. **Volume Up does not respond.**
 
 ## Still open
