@@ -13,6 +13,8 @@ pub const ONE: i32 = 16;
 static mut PX: *mut u32 = core::ptr::null_mut();
 static mut CY0: i32 = 0;
 static mut CY1: i32 = H;
+/// Drawing into an off-screen sprite with its own alpha (see `sprite`).
+static mut SPRITE: bool = false;
 
 pub fn init(surface: *mut u32) {
     unsafe { PX = surface };
@@ -52,13 +54,35 @@ pub fn mix(d: u32, c: u32, a: u32, n: u32) -> u32 {
     let g = (((c & 0xff00) * a + (d & 0xff00) * na + (n << 8)) >> 8) & 0xff00;
     0xff00_0000 | rb | g
 }
+/// Blends `c` at alpha `a` (0..=256) into the pixel at `p`. In sprite mode
+/// the target is a transparent canvas: the alpha goes in the top byte.
+#[inline(always)]
+fn blend(p: *mut u32, c: u32, a: u32, n: u32) {
+    unsafe {
+        if SPRITE {
+            let (d, a8) = (*p, a.min(255));
+            let da = d >> 24;
+            *p = if da == 0 {
+                a8 << 24 | (c & 0xff_ffff)
+            } else {
+                da.max(a8) << 24 | (mix(d, c, a, 128) & 0xff_ffff)
+            };
+        } else {
+            *p = mix(*p, c, a, n);
+        }
+    }
+}
 #[inline(always)]
 pub fn plot(x: i32, y: i32, c: u32, a: u32) {
     if a == 0 {
         return;
     }
     let p = at(x, y);
-    unsafe { *p = if a >= 256 { c | 0xff00_0000 } else { mix(*p, c, a, noise(x, y) & 255) } };
+    if a >= 256 {
+        unsafe { *p = c | 0xff00_0000 };
+    } else {
+        blend(p, c, a, noise(x, y) & 255);
+    }
 }
 pub fn lerp_rgb(a: u32, b: u32, t: u32) -> u32 {
     mix(a, b, t.min(256), 128)
@@ -323,6 +347,27 @@ pub fn rbox_v(x: i32, y: i32, w: i32, h: i32, r: i32, top: u32, bottom: u32, a_t
     }
 }
 
+/// Horizontal fade inside a rounded box: colour `c` whose opacity runs from
+/// `a_left` to `a_right`, in one pass.
+pub fn rbox_h(x: i32, y: i32, w: i32, h: i32, r: i32, c: u32, a_left: u32, a_right: u32) {
+    let (cx, cy, hw, hh, rr) = (x * 16 + w * 8, y * 16 + h * 8, w * 8, h * 8, r * 16);
+    let (y0, y1) = rows(y, y + h);
+    let (x0, x1) = (x.max(0), (x + w).min(W));
+    for py in y0..y1 {
+        let qy = (py * 16 + 8 - cy).abs() - (hh - rr);
+        for px in x0..x1 {
+            let f = ((px - x) * 256 / w.max(1)) as u32;
+            let a = (a_left * (256 - f) + a_right * f) >> 8;
+            let qx = (px * 16 + 8 - cx).abs() - (hw - rr);
+            let d = if qx < -16 && qy < -16 { -16 } else { box_d(px * 16 + 8, py * 16 + 8, cx, cy, hw, hh, rr) };
+            let cv = cover(d);
+            if cv != 0 {
+                plot(px, py, c, (cv * a) >> 8);
+            }
+        }
+    }
+}
+
 /// Hairline border of a rounded box.
 pub fn rbox_line(x: i32, y: i32, w: i32, h: i32, r: i32, c: u32, a: u32) {
     let (cx, cy, hw, hh, rr) = (x * 16 + w * 8, y * 16 + h * 8, w * 8, h * 8, r * 16);
@@ -373,7 +418,7 @@ pub fn glow(x: i32, y: i32, w: i32, h: i32, r: i32, spread: i32, c: u32, a: u32)
                 let f = fall((len(dx, dy) - rad) / 2);
                 if f != 0 {
                     let p = at(px, py);
-                    unsafe { *p = mix(*p, c, (f * a) >> 8, noise(px, py) & 255) };
+                    blend(p, c, (f * a) >> 8, noise(px, py) & 255);
                 }
             }
         }
@@ -395,7 +440,7 @@ pub fn glow(x: i32, y: i32, w: i32, h: i32, r: i32, spread: i32, c: u32, a: u32)
             let f = (across[px as usize] as u32 * k) >> 8;
             if f != 0 {
                 let p = at(px, py);
-                unsafe { *p = mix(*p, c, f, noise(px, py) & 255) };
+                blend(p, c, f, noise(px, py) & 255);
             }
         }
     }
@@ -414,7 +459,7 @@ pub fn light(cx: i32, cy: i32, r: i32, ry: i32, c: u32, a: u32) {
                 let u = (256 - t) as u32;
                 let f = (u * u) >> 8;
                 let p = at(px, py);
-                unsafe { *p = mix(*p, c, (f * a) >> 8, noise(px, py) & 255) };
+                blend(p, c, (f * a) >> 8, noise(px, py) & 255);
             }
         }
     }
@@ -587,22 +632,58 @@ fn sample(u: i32, v: i32) -> u32 {
     mix(top, bot, fy, 128)
 }
 
+/// Offsets dx (Q4) where |a * dx / 65536 + b| <= l, with `a` in Q16 and `b`,
+/// `l` in Q4, as an inclusive range (padded by two pixels), or None.
+fn span(a: i32, b: i32, l: i32) -> Option<(i32, i32)> {
+    if a == 0 {
+        return (b.abs() <= l).then_some((i32::MIN / 4, i32::MAX / 4));
+    }
+    // |l| and |b| stay under 2^15, so the products fit in 32 bits.
+    let (p, q) = ((-l - b) * 65536 / a, (l - b) * 65536 / a);
+    let (lo, hi) = if p < q { (p, q) } else { (q, p) };
+    Some((lo - 32, hi + 32))
+}
+
 /// The loaded cover as a rotated rounded card: centre (cx, cy) px, side `size`
-/// px, rotation given by sin/cos in Q16, with a dimming `shade`.
+/// px, rotation given by sin/cos in Q16, with a dimming `shade`. Each row
+/// visits only the pixels the turned card covers, and the interior skips the
+/// edge and rim work.
 pub fn cover_turned(cx: i32, cy: i32, size: i32, radius: i32, sin: i32, cos: i32, shade: u32) {
     let ext = (size * 3) / 4 + 2; // covers the rotated square's reach
     let (y0, y1) = rows(cy - ext, cy + ext);
     let half = size * 8; // Q4
     let rr = radius * 16;
+    let reach = half + 16;
+    let inner = half - rr - 48;
     let tscale = ((SIDE as i32) << 16) / size; // Q16 texels per pixel
     for py in y0..y1 {
         let dy = (py - cy) * 16 + 8;
-        for px in (cx - ext).max(0)..(cx + ext).min(W) {
-            let dx = (px - cx) * 16 + 8;
-            // Inverse rotation into the card's frame (Q4).
-            let lx = ((dx * cos + dy * sin) >> 16) as i32;
-            let ly = ((-dx * sin + dy * cos) >> 16) as i32;
-            if lx.abs() > half + 16 || ly.abs() > half + 16 {
+        // Rows of the card: |dx*cos + dy*sin| and |-dx*sin + dy*cos| within reach.
+        let Some((a0, a1)) = span(cos, dy * sin >> 16, reach) else { continue };
+        let Some((b0, b1)) = span(-sin, dy * cos >> 16, reach) else { continue };
+        let (d0, d1) = (a0.max(b0), a1.min(b1));
+        if d0 > d1 {
+            continue;
+        }
+        let x0 = (cx + ((d0 - 8) >> 4)).max(cx - ext).max(0);
+        let x1 = (cx + ((d1 - 8) >> 4) + 2).min(cx + ext).min(W);
+        let dx0 = (x0 - cx) * 16 + 8;
+        // Card-frame coordinates in Q20 (Q4 << 16), stepped per pixel.
+        let mut lxq = dx0 * cos + dy * sin;
+        let mut lyq = -dx0 * sin + dy * cos;
+        let (sx, sy) = (16 * cos, -16 * sin);
+        for px in x0..x1 {
+            let (lx, ly) = (lxq >> 16, lyq >> 16);
+            lxq += sx;
+            lyq += sy;
+            if lx.abs() > reach || ly.abs() > reach {
+                continue;
+            }
+            let u = ((lx + half) * tscale) >> 4;
+            let v = ((ly + half) * tscale) >> 4;
+            if lx.abs() < inner && ly.abs() < inner {
+                // Well inside: no edge coverage, no rim.
+                unsafe { *at(px, py) = scale_rgb(sample(u, v), shade) };
                 continue;
             }
             let d = box_d(lx, ly, 0, 0, half, half, rr);
@@ -610,8 +691,6 @@ pub fn cover_turned(cx: i32, cy: i32, size: i32, radius: i32, sin: i32, cos: i32
             if cv == 0 {
                 continue;
             }
-            let u = ((lx + half) * tscale) >> 4;
-            let v = ((ly + half) * tscale) >> 4;
             let mut col = scale_rgb(sample(u, v), shade);
             if d > -36 {
                 col = mix(col, 0xffffff, 30, 128);
@@ -715,4 +794,88 @@ pub fn sincos(deci: i32) -> (i32, i32) {
     let s = x - x3 / 6 + ((x3 * x2) >> 16) / 120;
     let c = 65536 - x2 / 2 + x4 / 24;
     (s, c)
+}
+
+// ---------- sprites ----------
+
+/// A rectangle of the off-screen buffer (SCRATCH) holding a pre-drawn image
+/// with straight alpha in the top byte.
+#[derive(Clone, Copy, Default)]
+pub struct Tile {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// Clears rows y0..y1 of tile `t` in the off-screen buffer and runs `draw`
+/// clipped to them, in sprite mode. Coordinates stay those of the off-screen
+/// buffer, so a sprite can be drawn a few rows at a time.
+pub fn sprite(t: &Tile, y0: i32, y1: i32, draw: impl FnOnce()) {
+    unsafe {
+        let screen = PX;
+        let (c0, c1) = (CY0, CY1);
+        PX = crate::protocol::SCRATCH as *mut u32;
+        let (y0, y1) = (y0.max(t.y), y1.min(t.y + t.h));
+        for y in y0..y1 {
+            for x in t.x..t.x + t.w {
+                *at(x, y) = 0;
+            }
+        }
+        CY0 = y0;
+        CY1 = y1;
+        SPRITE = true;
+        draw();
+        SPRITE = false;
+        PX = screen;
+        CY0 = c0;
+        CY1 = c1;
+    }
+}
+
+/// Draws sprite `t` with its top-left corner at (x, y) on the screen, within
+/// the current clip.
+pub fn blit(t: &Tile, x: i32, y: i32) {
+    let (y0, y1) = rows(y, y + t.h);
+    let (x0, x1) = (x.max(0), (x + t.w).min(W));
+    let src = crate::protocol::SCRATCH as *const u32;
+    for py in y0..y1 {
+        let row = unsafe { src.add(((py - y + t.y) * W + t.x - x) as usize) };
+        for px in x0..x1 {
+            let s = unsafe { *row.add(px as usize) };
+            let a = s >> 24;
+            if a == 0 {
+                continue;
+            }
+            let p = at(px, py);
+            unsafe {
+                // The sprite was dithered when drawn; plain rounding is enough here.
+                *p = if a == 255 { s } else { mix(*p, s, a + (a >> 7), 128) };
+            }
+        }
+    }
+}
+
+/// Runs `draw` aimed at the off-screen buffer, at the same coordinates as the
+/// screen (no sprite mode, no clearing).
+pub fn offscreen(draw: impl FnOnce()) {
+    unsafe {
+        let screen = PX;
+        PX = crate::protocol::SCRATCH as *mut u32;
+        draw();
+        PX = screen;
+    }
+}
+
+/// Copies rows y0..y1 (within the clip) from the off-screen buffer to the
+/// same rows of the screen.
+pub fn restore_rows(y0: i32, y1: i32) {
+    let (y0, y1) = rows(y0, y1);
+    if y0 < y1 {
+        let n = ((y1 - y0) * W) as usize;
+        unsafe {
+            let src = (crate::protocol::SCRATCH as *const u32).add((y0 * W) as usize);
+            core::ptr::copy_nonoverlapping(src, at(0, y0), n);
+        }
+    }
 }

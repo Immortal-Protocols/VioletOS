@@ -128,6 +128,9 @@ impl Runtime {
             },
             (GET, FOCUS) => Message::result(if self.asleep { 0 } else { self.focus }),
             (GET, SURFACE) => Message::result(0x06000000),
+            (GET, OFFSCREEN) if (11..=APP_LAST).contains(&who) => {
+                Message::new(GET, OFFSCREEN, who).call(LIFECYCLE)
+            }
             (GET, CATALOG | INBOX) | (EXECUTE, INSTALL | REMOVE) if who == LAUNCHER => {
                 self.forward(who, 9, m)
             }

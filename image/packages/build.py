@@ -241,8 +241,8 @@ SECTIONS {
                 ]
         if "entry" in item:
             image += b"APP1" + item["title"].encode("ascii").ljust(16, b"\0")
-            if len(image) > 65512:
-                raise ValueError("application exceeds 64 KiB package slot")
+            if len(image) > 131048:
+                raise ValueError("application exceeds its 128 KiB package")
         header = struct.pack(
             "<4s5I",
             b"VPK1",

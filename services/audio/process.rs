@@ -196,7 +196,10 @@ impl Audio {
             }
             (GET, PLAYBACK) => self.playback(),
             (EXECUTE, PLAYBACK) => self.play(m.value, m.arg),
-            (GET, MUSIC) => music().status(),
+            (GET, MUSIC) => {
+                board::frame_seen();
+                music().status()
+            }
             (EXECUTE, MUSIC) => {
                 if !music().command(m.value, m.arg) {
                     return Message::error(INVALID);

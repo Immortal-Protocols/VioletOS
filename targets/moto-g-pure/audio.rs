@@ -946,6 +946,32 @@ pub fn music(words: [u32; 6]) {
         note(58 + i, *w);
     }
 }
+/// Music asks for its status once a frame, so these give its frame rate from
+/// outside: word 98 counts requests, word 99 holds the longest gap between
+/// two in milliseconds (debug command 0x18 clears it).
+static mut LAST_FRAME: u32 = 0;
+static mut CAPTURED: u32 = 12;
+static mut SKIP: u32 = 0;
+pub fn frame_seen() {
+    unsafe {
+        let now = ticks();
+        let ms = now.wrapping_sub(LAST_FRAME) / ticks_per_ms.max(1);
+        LAST_FRAME = now;
+        note(98, noted(98) + 1);
+        if ms < 2000 {
+            note(99, noted(99).max(ms));
+        }
+        // The first twelve frame times after a clear, in words 100..112.
+        if CAPTURED < 12 {
+            if SKIP > 0 {
+                SKIP -= 1;
+            } else {
+                note(100 + CAPTURED as usize, ms);
+                CAPTURED += 1;
+            }
+        }
+    }
+}
 /// Radio's join diagnostics for USB (words 80..=95).
 pub fn radio(words: [u32; 16]) {
     for (i, w) in words.iter().enumerate() {
@@ -985,6 +1011,11 @@ pub fn debug(command: u32, param: u32) {
             0x10 => AMP_VOLUME = (param & 0xff) as u16,
             0x11 => AMP_DSP = param as u16,
             0x12 if I2C_ON => AMP_OK = amp_init(),
+            0x18 => {
+                note(99, 0);
+                CAPTURED = 0;
+                SKIP = param;
+            }
             // Stall Audio for `param` milliseconds, to test underrun handling.
             0x17 => {
                 let start = unsafe { ticks() };

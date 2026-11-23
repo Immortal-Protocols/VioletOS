@@ -104,6 +104,10 @@ pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {
 pub const INVENTORY: u32 = 11;
 pub const SURFACE: u32 = 12;
 /// PRESENT value flag: the rows are from a full-resolution 720x1600 frame.
+/// GET OFFSCREEN (library apps, IDs 11-14): maps the app's private 720x1600
+/// off-screen buffer, never shown, and returns its address (SCRATCH).
+pub const OFFSCREEN: u32 = 33;
+pub const SCRATCH: usize = 0x06800000;
 pub const HD_PRESENT: u32 = 1 << 31;
 
 pub const APP_LAST: u32 = 14;

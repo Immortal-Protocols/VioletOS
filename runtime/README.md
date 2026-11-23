@@ -10,6 +10,6 @@ QEMU apps call the [Rust SDK](sdk.rs). The [Runtime process](process.rs) uses th
 
 The version-one [wire format](protocol.rs) uses 14 ARM words. An app can write its own mapped surface between calls. Present requests name the changed rows.
 
-Each app's surface holds a full 720×1600 frame. Classic apps draw 240×400 logical pixels in its first rows and Display scales them 3×4. An app that sets `HD_PRESENT` in its present request draws at the panel's full resolution, with a pitch of 720 pixels, and Display copies its rows unscaled. Music is the first HD app.
+Each app's surface holds a full 720×1600 frame. Classic apps draw 240×400 logical pixels in its first rows and Display scales them 3×4. An app that sets `HD_PRESENT` in its present request draws at the panel's full resolution, with a pitch of 720 pixels, and Display copies its rows unscaled. Music is the first HD app. A library app (IDs 11–14) can also ask for a private off-screen buffer of the same size with `GET OFFSCREEN`. The supervisor maps it the first time, at `SCRATCH`, and it is never shown. Library app packages may be up to 128 KiB.
 
 Volume, playback and music go to the [Audio service](../services/audio/README.md). Runtime calls it directly, because Audio answers between hardware polls and never waits on a device. Any app may read them; only the app on screen may change the volume, play a sound or control the music.

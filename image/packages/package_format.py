@@ -30,7 +30,7 @@ def inspect(blob):
     if 11 <= identity <= 14:
         title = blob[-16:].rstrip(b"\0")
         if (
-            size > 65512
+            size > 131048
             or size < code + 20
             or blob[-20:-16] != b"APP1"
             or not title

@@ -33,6 +33,8 @@ const WARN: u32 = 0xffc56e;
 const FRAME_MS: u32 = 16;
 /// How long the covers take to deal out.
 const DEAL_MS: u32 = 450;
+/// Rows repainted per frame after a song change.
+const WIPE_ROWS: i32 = 120;
 
 #[derive(Clone, Copy, PartialEq)]
 struct Status {
@@ -87,6 +89,19 @@ struct App {
     deal: (i32, u32),
     /// The previous frame's time, for time-based easing.
     last_ms: u32,
+    /// The next row of a strip-by-strip repaint (H when none is running).
+    wipe: i32,
+    /// Off-screen fan card sprites, and the song (plus one) they show.
+    tiles: [Tile; 5],
+    sprites_for: usize,
+    /// The song (plus one) whose colours the cached background has.
+    bg_for: usize,
+    /// Runtime granted the off-screen buffer (sprites and the cache need it).
+    offscreen: bool,
+    /// Sprites made so far for the song being prepared (5 when none is), and
+    /// the rows of the current one.
+    prep: usize,
+    prep_row: i32,
     fan: i32,
     frame: u32,
     flash: Hit,
@@ -433,6 +448,8 @@ fn paint_grid(app: &App) {
 const LIST_Y: i32 = 676;
 const ROW_H: i32 = 76;
 const MINI_Y: i32 = 1450;
+/// Width of the mini player's progress hairline (its panel is 680 wide).
+const MINI_PROGRESS_W: i32 = 600;
 const FAN_CY: i32 = 300;
 const FAN_SIZE: i32 = 232;
 const HERO_PLAY: (i32, i32) = (626, 562);
@@ -468,12 +485,16 @@ fn status_pill(app: &App, x1: i32, cy: i32) {
 }
 
 fn fan_positions(app: &App) -> [(usize, i32, i32, i32, i32); 5] {
+    fan_at(app.current(), app.fan)
+}
+
+/// The fan for song `current` at deal progress `o` (0..=256).
+fn fan_at(current: usize, o: i32) -> [(usize, i32, i32, i32, i32); 5] {
     // (track, centre x, centre y, size, angle in tenths of a degree), back to front.
-    let o = app.fan;
     let mut out = [(0, 0, 0, 0, 0); 5];
     let order = [-2, 2, -1, 1, 0];
     for (k, d) in order.iter().enumerate() {
-        let t = (app.current() as i32 + d).rem_euclid(10) as usize;
+        let t = (current as i32 + d).rem_euclid(10) as usize;
         let cx = 360 + d * 126 * o / 256;
         let lift = if *d == 0 { 22 } else { 0 };
         let cy = FAN_CY + (d.abs() * 26 - lift) * o / 256;
@@ -483,22 +504,89 @@ fn fan_positions(app: &App) -> [(usize, i32, i32, i32, i32); 5] {
     out
 }
 
+/// One fan card (cover and shadow) at its resting size and angle, centred on
+/// (cx, cy). The deal slides these finished cards rather than redrawing them.
+fn draw_card(t: usize, cx: i32, cy: i32, s: i32, ang: i32) {
+    let hs = s / 2;
+    // Coloured shadow that lifts the card off the aurora.
+    glow(cx - hs + 24, cy - hs + 36, s - 48, s - 48, 40, 90, scale_rgb(TRACKS[t].glow, 110), 210);
+    load_cover(t);
+    if ang == 0 {
+        cover_art(cx - hs, cy - hs, s, 30, 256);
+    } else {
+        soften();
+        let (sn, cs) = sincos(ang);
+        cover_turned(cx, cy, s, 30, sn, cs, 190 + 8 * o_abs(ang));
+    }
+}
+
+/// A card sprite's reach from its centre: left/right, up, down (pixels).
+fn card_reach(s: i32) -> (i32, i32, i32) {
+    let (hs, ext) = (s / 2, (s * 3) / 4 + 2);
+    (ext.max(hs + 66), ext.max(hs + 54), ext.max(hs + 78))
+}
+
+/// The off-screen tile for resting card `k`: cards pack in shelves, each
+/// after the one before.
+fn tile_for(app: &App, k: usize) -> Tile {
+    let s = fan_at(app.current(), 256)[k].3;
+    let (side, up, down) = card_reach(s);
+    let (w, h) = (2 * side, up + down);
+    if k == 0 {
+        return Tile { x: 0, y: CACHE_Y1 + 4, w, h };
+    }
+    let p = app.tiles[k - 1];
+    if p.x + p.w + w <= W {
+        return Tile { x: p.x + p.w, y: p.y, w, h };
+    }
+    // A new shelf below the tallest tile on the previous one.
+    let y = app.tiles[..k].iter().filter(|q| q.y == p.y).map(|q| q.y + q.h).max().unwrap_or(p.y);
+    Tile { x: 0, y, w, h }
+}
+
+/// Rows of a card sprite drawn per step; steps run until the frame's budget.
+const SLICE: i32 = 64;
+const PREP_MS: u32 = 12;
+
+/// Draws the next slices of the resting cards into the off-screen buffer
+/// until about PREP_MS have passed. Returns true once all five are done.
+fn prep_sprites(app: &mut App) -> bool {
+    let start = now_ms();
+    while app.prep < 5 {
+        let k = app.prep;
+        if app.prep_row == 0 {
+            app.tiles[k] = tile_for(app, k);
+        }
+        let tile = app.tiles[k];
+        let (t, _, _, s, ang) = fan_at(app.current(), 256)[k];
+        let (side, up, _) = card_reach(s);
+        let y0 = tile.y + app.prep_row;
+        sprite(&tile, y0, y0 + SLICE, || draw_card(t, tile.x + side, tile.y + up, s, ang));
+        app.prep_row += SLICE;
+        if app.prep_row >= tile.h {
+            app.prep += 1;
+            app.prep_row = 0;
+        }
+        if now_ms().wrapping_sub(start) >= PREP_MS {
+            break;
+        }
+    }
+    app.prep == 5
+}
+
 fn draw_fan(app: &App) {
     if !visible(FAN_CY - 230, FAN_CY + 230) {
         return;
     }
-    for (t, cx, cy, s, ang) in fan_positions(app) {
-        let tr = &TRACKS[t];
-        // Coloured shadow that lifts the card off the aurora.
-        let hs = s / 2;
-        glow(cx - hs + 24, cy - hs + 36, s - 48, s - 48, 40, 90, scale_rgb(tr.glow, 110), 210);
-        load_cover(t);
-        if ang == 0 {
-            cover_art(cx - hs, cy - hs, s, 30, 256);
+    let ready = app.sprites_for == app.current() + 1;
+    let rest = fan_at(app.current(), 256);
+    for (k, (t, cx, cy, s, ang)) in fan_positions(app).into_iter().enumerate() {
+        if ready {
+            // The resting card, slid to where the deal has it now.
+            let (side, up, _) = card_reach(rest[k].3);
+            blit(&app.tiles[k], cx - side, cy - up);
         } else {
-            soften();
-            let (sn, cs) = sincos(ang);
-            cover_turned(cx, cy, s, 30, sn, cs, 190 + 8 * o_abs(ang));
+            draw_card(t, cx, cy, s, ang);
         }
     }
 }
@@ -551,10 +639,8 @@ fn draw_mini(app: &App) {
     glow(x + 20, y + 10, w - 40, h - 10, 36, 50, t.glow, 110);
     let left = lerp_rgb(t.deep, RAISED, 90);
     rbox(x, y, w, h, 34, RAISED, 256);
-    // Horizontal tint from the cover's deep colour.
-    for k in 0..4 {
-        rbox(x + k * 60, y, w - k * 60, h, 34, left, 70 - k as u32 * 14);
-    }
+    // Horizontal tint from the cover's deep colour, strongest on the right.
+    rbox_h(x, y, w, h, 34, left, 70, 148);
     rbox_line(x, y, w, h, 34, 0xffffff, 26);
     load_cover(i);
     let breathe = if app.st.playing() { 92 } else { 84 };
@@ -579,7 +665,7 @@ fn draw_mini(app: &App) {
     icon_skip(x + w - 54, by, 40, 1, TEXT, 256);
     // Progress hairline.
     let frac = app.progress();
-    let (px, pw) = (x + 40, w - 80);
+    let (px, pw) = (x + 40, MINI_PROGRESS_W);
     rbox(px, y + h - 9, pw, 4, 2, 0xffffff, 26);
     let fill = (pw * frac) >> 12;
     if fill > 0 {
@@ -989,9 +1075,18 @@ fn present(y0: i32, y1: i32) {
     }
 }
 
+/// Rows of the library whose background is cached off screen (the covers'
+/// band); card sprites are packed below it.
+const CACHE_Y0: i32 = 60;
+const CACHE_Y1: i32 = 476;
+
 fn render(app: &App, y0: i32, y1: i32) {
     set_clip(y0, y1);
-    background(y0, y1);
+    if app.screen == Screen::Library && app.bg_for == app.current() + 1 && y0 >= CACHE_Y0 && y1 <= CACHE_Y1 {
+        restore_rows(y0, y1);
+    } else {
+        background(y0, y1);
+    }
     match app.screen {
         Screen::Library => draw_library(app),
         Screen::Player => draw_player(app),
@@ -1015,6 +1110,8 @@ fn full(app: &mut App) {
         y += 400;
     }
     app.keys = [u32::MAX; 8];
+    // Everything is fresh: no strip repaint needs to follow.
+    app.wipe = H;
     unsafe { PERF.0 = now_ms().wrapping_sub(t0) };
 }
 
@@ -1049,10 +1146,13 @@ fn update(app: &mut App) {
                 digest(&[flash]),
             ];
             for (k, &(y0, y1)) in BANDS.iter().enumerate() {
+                // A strip repaint still to reach this band will draw it anyway.
                 if app.keys[k] != keys[k] {
                     app.keys[k] = keys[k];
-                    render(app, y0, y1);
-                    present(y0, y1);
+                    if y0 < app.wipe {
+                        render(app, y0, y1);
+                        present(y0, y1);
+                    }
                 }
             }
         }
@@ -1063,19 +1163,31 @@ fn update(app: &mut App) {
                 digest(&[line, flash, st.state]),
                 digest(&[st.playing() as u32, flash, cur, st.state]),
                 digest(&[cur, st.track, if st.state == MUSIC_STATE_PLAYING { bands } else { 0 }]),
-                digest(&[(app.progress() >> 5) as u32, st.state, line, flash, cur]),
+                digest(&[st.state, line, flash, cur, st.playing() as u32]),
                 digest(&[app.fan as u32]),
                 // The status dot's pulse alone: its rows clear the covers' shadows.
                 digest(&[pulse]),
+                // The mini player's progress hairline alone, by filled pixels.
+                digest(&[(MINI_PROGRESS_W * app.progress()) as u32 >> 12, cur]),
             ];
             let row_y = LIST_Y + cur as i32 * ROW_H;
-            let bands_y: [(i32, i32); 6] =
-                [(30, 140), (480, 662), (row_y, row_y + ROW_H), (MINI_Y - 40, H), (60, 476), (62, 106)];
+            let bands_y: [(i32, i32); 7] = [
+                (30, 140),
+                (480, 662),
+                (row_y, row_y + ROW_H),
+                (MINI_Y - 40, H),
+                (60, 476),
+                (62, 106),
+                (MINI_Y + 108, MINI_Y + 118),
+            ];
             for (k, &(y0, y1)) in bands_y.iter().enumerate() {
+                // A strip repaint still to reach this band will draw it anyway.
                 if app.keys[k] != keys[k] {
                     app.keys[k] = keys[k];
-                    render(app, y0, y1);
-                    present(y0, y1);
+                    if k == 4 || y0 < app.wipe {
+                        render(app, y0, y1);
+                        present(y0, y1);
+                    }
                 }
             }
         }
@@ -1166,6 +1278,16 @@ pub fn run() -> ! {
         breath: COVER,
         deal: (0, 0),
         last_ms: 0,
+        wipe: H,
+        tiles: [Tile::default(); 5],
+        sprites_for: 0,
+        bg_for: 0,
+        offscreen: {
+            let r = request(GET, OFFSCREEN, 0);
+            r.op == OK && r.value as usize == SCRATCH
+        },
+        prep: 5,
+        prep_row: 0,
         fan: 0,
         frame: 0,
         flash: Hit::None,
@@ -1215,10 +1337,49 @@ pub fn run() -> ! {
             }
             if !shown || changed_track {
                 // Deal the covers out on arrival; gather and re-deal on a new song.
-                app.fan = if shown { 120 } else { 0 };
-                app.deal = (app.fan, now_ms());
+                if !(shown && app.screen == Screen::Library) {
+                    app.fan = if shown { 120 } else { 0 };
+                    app.deal = (app.fan, now_ms());
+                }
                 app.breath = app.target_breath();
-                full(&mut app);
+                if shown {
+                    // A new song: the colours follow its cover. Repaint in
+                    // strips over the next frames (after the deal, on the
+                    // library) instead of stalling on a full redraw.
+                    paint_grid(&app);
+                    app.wipe = 0;
+                } else {
+                    full(&mut app);
+                }
+            }
+            if app.offscreen && app.screen == Screen::Library && app.sprites_for != app.current() + 1 {
+                // One card per frame, while the old fan stays on screen; the
+                // deal and the colour repaint start once all five are ready.
+                if app.prep == 5 {
+                    app.prep = 0;
+                    app.prep_row = 0;
+                    // Cache the covers' band background in the new colours.
+                    offscreen(|| {
+                        set_clip(CACHE_Y0, CACHE_Y1);
+                        background(CACHE_Y0, CACHE_Y1);
+                    });
+                    app.bg_for = app.current() + 1;
+                } else if prep_sprites(&mut app) {
+                    app.sprites_for = app.current() + 1;
+                    app.deal = (app.fan.min(120), now_ms());
+                    app.fan = app.deal.0;
+                }
+            }
+            // The colour repaint follows the deal, so the two never share a frame.
+            let dealt = app.screen == Screen::Player || (app.prep == 5 && app.fan >= 256);
+            if app.wipe < H && dealt {
+                // The covers' band (60..476) redraws every frame while dealing.
+                let (y0, y1) = (app.wipe, (app.wipe + WIPE_ROWS).min(H));
+                app.wipe = y1;
+                if app.screen == Screen::Player || y0 < 60 || y1 > 476 {
+                    render(&app, y0, y1);
+                    present(y0, y1);
+                }
             }
             // Animations run on the clock, so a slow frame never stretches or
             // stalls them: the deal eases out over DEAL_MS.

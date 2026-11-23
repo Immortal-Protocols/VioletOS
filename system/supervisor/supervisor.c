@@ -30,7 +30,7 @@ enum {
   WIFI,
   COUNT = 15
 };
-enum { GET = 2, EXECUTE = 3, OPEN = 4, QUIT = 10, INVENTORY = 11 };
+enum { GET = 2, EXECUTE = 3, OPEN = 4, QUIT = 10, INVENTORY = 11, OFFSCREEN_KEY = 33 };
 struct package {
   unsigned magic, abi, id, code, size, crc;
   unsigned char bytes[];
@@ -43,7 +43,7 @@ struct process {
   struct task task;
   const struct package *package;
   seL4_CPtr ep, frames[64];
-  bool running;
+  bool running, offscreen;
 };
 // Audio follows USB Diagnostics so app and service identities keep their values.
 // QEMU has no USB Diagnostics process; its slot stays empty there.
@@ -54,6 +54,8 @@ enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7,
        // app identity that never holds the lifecycle endpoint.
        AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071 };
 // Shared music stream (see runtime/protocol.rs STREAM_*).
+// Library apps (IDs 11-14) may be up to 128 KiB including the 24-byte header.
+#define APP_PACKAGE_MAX (131072 - 24)
 #define STREAM_BASE 0x0d000000u
 #define STREAM_RING (512u << 10)
 static struct process procs[TOTAL];
@@ -86,7 +88,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
       p->size > (p->id == RUNTIME ? 0x38000 : 0x3e000))
     return false;
   if (p->id >= 11 && p->id < COUNT) {
-    if (p->size > 65512 || p->size < p->code + 20 ||
+    if (p->size > APP_PACKAGE_MAX || p->size < p->code + 20 ||
         memcmp(p->bytes + p->size - 20, "APP1", 4))
       return false;
     const unsigned char *name = p->bytes + p->size - 16;
@@ -250,6 +252,7 @@ static void quit_app(unsigned id) {
 // every surface read-only in its own 5 MiB window.
 #define SURFACE_BYTES (720 * 1600 * 4)
 #define DISPLAY_SURFACES 0x20000000u
+#define SCRATCH_BASE 0x06800000u
 static void surface(unsigned id) {
   struct task *display = &procs[DISPLAY].task;
   unsigned shown = DISPLAY_SURFACES + (id - 1) * 0x500000;
@@ -274,6 +277,24 @@ static void surface(unsigned id) {
                                   seL4_ARM_ExecuteNever));
     }
   }
+}
+// A library app's private off-screen buffer, the size of its surface, mapped
+// the first time the app asks for it through Runtime (OFFSCREEN).
+static bool offscreen(unsigned id) {
+  struct process *p = &procs[id];
+  if (id < 11 || id >= COUNT || !p->package || !p->task.pd)
+    return false;
+  if (p->offscreen)
+    return true;
+  for (unsigned mb = 0; mb < SURFACE_BYTES; mb += 0x100000)
+    ensure_table(&p->task, SCRATCH_BASE + mb);
+  for (unsigned off = 0; off < SURFACE_BYTES; off += 65536) {
+    seL4_CPtr f = create(ram, seL4_ARM_LargePageObject);
+    check(seL4_ARM_Page_Map(f, p->task.pd, SCRATCH_BASE + off, seL4_AllRights,
+                            seL4_ARM_Default_VMAttributes | seL4_ARM_ExecuteNever));
+  }
+  p->offscreen = true;
+  return true;
 }
 static void *device(unsigned id, unsigned pa, unsigned va, unsigned bits) {
   mapping = id ? &procs[id].task : &bootstrap;
@@ -1397,6 +1418,9 @@ void root_main(seL4_BootInfo *bi) {
         } else if (op == EXECUTE && key == QUIT && val < COUNT &&
                    (val == WATCH || val >= WIFI) && procs[val].package) {
           quit_app(val);
+          error = 0;
+        } else if (op == GET && key == OFFSCREEN_KEY && offscreen(val)) {
+          result = SCRATCH_BASE;
           error = 0;
         }
       }
