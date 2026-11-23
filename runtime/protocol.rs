@@ -254,6 +254,13 @@ pub const MUSIC_PAUSE: u32 = 2;
 pub const MUSIC_RESUME: u32 = 3;
 pub const MUSIC_STOP: u32 = 4;
 pub const MUSIC_SEEK: u32 = 5;
+/// MUSIC_MODE: arg is MUSIC_ADVANCE | MUSIC_REPEAT | MUSIC_SHUFFLE flags. With
+/// MUSIC_ADVANCE, Audio starts the next track itself when one ends, even while
+/// the app that started the music is off screen.
+pub const MUSIC_MODE: u32 = 6;
+pub const MUSIC_ADVANCE: u32 = 1;
+pub const MUSIC_REPEAT: u32 = 2;
+pub const MUSIC_SHUFFLE: u32 = 4;
 pub const MUSIC_STATE_STOPPED: u32 = 0;
 pub const MUSIC_STATE_BUFFERING: u32 = 1;
 pub const MUSIC_STATE_PLAYING: u32 = 2;

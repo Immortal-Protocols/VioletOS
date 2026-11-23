@@ -156,6 +156,7 @@ pub struct Music {
     spectrum: Spectrum,
     /// Decoding has finished the whole file.
     exhausted: bool,
+    mode: u32,
 }
 
 impl Music {
@@ -177,6 +178,7 @@ impl Music {
             pcm_at: 0,
             spectrum: Spectrum::new(),
             exhausted: false,
+            mode: 0,
         }
     }
     pub fn init(&mut self) {
@@ -235,6 +237,7 @@ impl Music {
                     self.request(self.track, 0);
                 }
             }
+            MUSIC_MODE if arg & !(MUSIC_ADVANCE | MUSIC_REPEAT | MUSIC_SHUFFLE) == 0 => self.mode = arg,
             MUSIC_STOP => {
                 self.track = 0;
                 self.paused = false;
@@ -313,6 +316,22 @@ impl Music {
     }
     /// Track the stream's state before mixing.
     pub fn poll(&mut self) {
+        if self.track != 0 && self.state == MUSIC_STATE_ENDED && !self.paused && self.mode & MUSIC_ADVANCE != 0 {
+            let next = if self.mode & MUSIC_SHUFFLE != 0 {
+                // Any other track, picked from the timer's low bits.
+                (self.track + 1 + now() % (MUSIC_TRACKS - 1) - 1) % MUSIC_TRACKS + 1
+            } else if self.track < MUSIC_TRACKS {
+                self.track + 1
+            } else if self.mode & MUSIC_REPEAT != 0 {
+                1
+            } else {
+                0
+            };
+            if next != 0 {
+                self.byte_rate = DEFAULT_BYTE_RATE;
+                self.request(next, 0);
+            }
+        }
         if self.track == 0 || self.state == MUSIC_STATE_ENDED {
             self.spectrum.fade();
             return;

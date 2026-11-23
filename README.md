@@ -14,6 +14,7 @@ VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and 
 | `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
 | `make test-apps` | Installs a separately built fourth app, reads its file after reboot, uninstalls it, and recovers from a stalled service update. |
 | `make test-power` | Verifies guest-driven VM pause, resume and shutdown. |
+| `make test-music` | Opens Music, walks the library and player screens and presses play. `make test-music-live` (needs the internet) streams a song from the library and checks the sound card's output. |
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones and plays sounds from the Sounds app, then checks the PCM and the on-screen volume. |
 | `make test-wifi-live` | Validates the certificate in the guest and reads the live UUID from the framebuffer. |
 | `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |

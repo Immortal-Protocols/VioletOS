@@ -905,6 +905,14 @@ fn player_hit(x: i32, y: i32) -> Hit {
 // ---------- the app ----------
 
 impl App {
+    /// Audio advances to the next song itself, so the album keeps playing
+    /// while Music is off screen.
+    fn send_mode(&self) {
+        let mode = MUSIC_ADVANCE
+            | if self.repeat { MUSIC_REPEAT } else { 0 }
+            | if self.shuffle { MUSIC_SHUFFLE } else { 0 };
+        music(MUSIC_MODE, mode);
+    }
     fn current(&self) -> usize {
         if self.st.track != 0 {
             self.st.track as usize - 1
@@ -1109,8 +1117,14 @@ fn act(app: &mut App, hit: Hit) {
                 music(MUSIC_SEEK, s);
             }
         }
-        Hit::Shuffle => app.shuffle = !app.shuffle,
-        Hit::Repeat => app.repeat = !app.repeat,
+        Hit::Shuffle => {
+            app.shuffle = !app.shuffle;
+            app.send_mode();
+        }
+        Hit::Repeat => {
+            app.repeat = !app.repeat;
+            app.send_mode();
+        }
         Hit::Volume(v) => {
             let r = request(EXECUTE, VOLUME, v.clamp(0, VOLUME_MAX as i32) as u32);
             if r.op == OK {
@@ -1150,6 +1164,7 @@ pub fn run() -> ! {
         seed: 0x2545_f491,
         keys: [0; 8],
     };
+    app.send_mode();
     let mut shown = false;
     loop {
         let start = now_ms();

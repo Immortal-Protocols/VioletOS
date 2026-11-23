@@ -26,7 +26,10 @@ fn reg(i: usize) -> u32 {
 fn set(i: usize, v: u32) {
     unsafe { CONTROL.add(i).write_volatile(v) }
 }
-static mut STARTED: u32 = 0;
+/// Ticks since output started, kept in 64 bits: the 32-bit counter wraps
+/// every 68.7 s at QEMU's 62.5 MHz.
+static mut LAST_TICK: u32 = 0;
+static mut ELAPSED: u64 = 0;
 static mut WRITTEN: u64 = 0;
 static mut PEAK: u32 = 0;
 
@@ -50,7 +53,8 @@ pub fn set_volume(level: u32, _headphones: bool) {
 }
 pub fn start(headphones: bool) -> bool {
     unsafe {
-        STARTED = ticks();
+        LAST_TICK = ticks();
+        ELAPSED = 0;
         WRITTEN = 0;
         PEAK = 0;
     }
@@ -68,7 +72,12 @@ pub fn stop() {
 }
 /// Frames due now: real time since start plus the lead, less what was written.
 pub fn writable() -> usize {
-    let elapsed = u64::from(unsafe { ticks().wrapping_sub(STARTED) });
+    let elapsed = unsafe {
+        let now = ticks();
+        ELAPSED += u64::from(now.wrapping_sub(LAST_TICK));
+        LAST_TICK = now;
+        ELAPSED
+    };
     let due = elapsed * 48 / u64::from(unsafe { ticks_per_ms }.max(1)) + LEAD_FRAMES;
     let written = unsafe { WRITTEN };
     due.saturating_sub(written).min(u64::from(RING_FRAMES / 2)) as usize

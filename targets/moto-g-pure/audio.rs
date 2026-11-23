@@ -35,9 +35,12 @@ const STATUS: *mut u32 = 0x09203000 as *mut u32;
 const REQUEST: *const u32 = 0x09204000 as *const u32;
 const POLL_MS: u32 = 5;
 // 16 KiB of SRAM: 4096 stereo frames, 85 ms. Keep about 40 ms queued.
-const RING_BYTES: u32 = 0x4000;
+// 32 KiB of the 36 KiB AFE SRAM mapped: 170 ms of 48 kHz stereo.
+const RING_BYTES: u32 = 0x8000;
 const RING_FRAMES: u32 = RING_BYTES / 4;
-const LEAD_FRAMES: u32 = 48 * 40;
+// Keep 120 ms queued: on the single core, Radio's TLS work and app drawing can
+// hold the CPU for tens of milliseconds between Audio's turns.
+const LEAD_FRAMES: u32 = 48 * 120;
 
 // Status page words.
 const S_MAGIC: usize = 0;
@@ -50,6 +53,7 @@ const S_PLATFORM: usize = 8; // 8: result, 9..=18: supervisor survey
 const S_JACK: usize = 19; // plugged | polarity << 1 | events << 8
 const S_ACCDET: usize = 20; // 20..=24: 0x2320, 0x2324, 0x232c, 0x208c, 0x230a
 const S_PMIC_FAIL: usize = 25; // count | last address << 16
+const S_UNDERRUNS: usize = 26; // times the DMA overtook the samples written
 const S_AFE: usize = 27; // 27..=35
 const S_CODEC: usize = 36; // 36..=41
 const S_AMP: usize = 42; // 42..=50
@@ -728,6 +732,9 @@ static mut WR: u32 = 0;
 static mut QUIET: u32 = 0;
 static mut HW_LAST: u32 = 0;
 static mut SEEN: u32 = 0;
+/// Frames written but not yet played. Negative means the DMA overtook us.
+static mut AHEAD: i32 = 0;
+static mut UNDERRUNS: u32 = 0;
 
 fn platform(want: u32) -> u32 {
     let m = Message::new(EXECUTE, AUDIO_PLATFORM, want).call(LIFE_SLOT);
@@ -816,6 +823,7 @@ pub fn start(headphones: bool) -> bool {
         }
         afe_prepare();
         WR = 0;
+        AHEAD = 0;
         QUIET = 0;
         HW_LAST = 0;
         // The headphone codec powers up before the stream; the speaker amplifier
@@ -869,7 +877,16 @@ fn buffered() -> u32 {
         HW_LAST = hw;
         SEEN = SEEN.wrapping_add(moved);
         note(S_CONSUMED, SEEN);
-        (WR + RING_FRAMES - hw) % RING_FRAMES
+        AHEAD -= moved as i32;
+        if AHEAD < 0 {
+            // The DMA passed the last sample written: resume writing just
+            // ahead of it instead of waiting for it to lap the ring.
+            UNDERRUNS += 1;
+            note(S_UNDERRUNS, UNDERRUNS);
+            WR = hw;
+            AHEAD = 0;
+        }
+        AHEAD as u32
     }
 }
 pub fn writable() -> usize {
@@ -885,6 +902,7 @@ pub fn write(frames: &[[i16; 2]]) {
             ((SRAM + WR as usize * 4) as *mut u32).write_volatile(word);
             WR = (WR + 1) % RING_FRAMES;
         }
+        AHEAD += frames.len() as i32;
     }
 }
 /// Fill with silence until a whole ring of it has gone out, so no stale samples replay.
@@ -898,6 +916,7 @@ pub fn drained() -> bool {
             ((SRAM + WR as usize * 4) as *mut u32).write_volatile(0);
             WR = (WR + 1) % RING_FRAMES;
         }
+        AHEAD += n as i32;
         QUIET += n as u32;
         QUIET >= RING_FRAMES
     }

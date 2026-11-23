@@ -77,6 +77,10 @@ test-power: qemu-image
 test-audio: qemu-image
 	$(PYTHON) targets/qemu/test_audio.py
 
+.PHONY: test-music
+test-music: qemu-image
+	$(PYTHON) targets/qemu/test_music_ui.py
+
 .PHONY: test-music-live
 test-music-live: qemu-image
 	$(PYTHON) targets/qemu/test_music.py
