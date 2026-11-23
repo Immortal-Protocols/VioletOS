@@ -13,6 +13,8 @@ Run high-performance, fully capable apps in **essentially any language**—inclu
 
 ## Architecture
 
+![Proposed open VioletOS app stack on pure seL4 with zero Linux.](open-violetos-app-stack.png)
+
 ```
   /apps/music/main.py  (#!/bin/python3)      /apps/music-go  (GOOS=linux GOARCH=arm)
                 │                                           │
