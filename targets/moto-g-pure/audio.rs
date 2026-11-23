@@ -34,9 +34,10 @@ const SRAM_PHYS: u32 = 0x11221000;
 const STATUS: *mut u32 = 0x09203000 as *mut u32;
 const REQUEST: *const u32 = 0x09204000 as *const u32;
 const POLL_MS: u32 = 5;
-// 16 KiB of SRAM: 4096 stereo frames, 85 ms. Keep about 40 ms queued.
-// 32 KiB of the 36 KiB AFE SRAM mapped: 170 ms of 48 kHz stereo.
-const RING_BYTES: u32 = 0x8000;
+// The AFE SRAM at 0x11221000 is 28 KiB: on the XT2163DL a marker written at
+// 28 KiB or beyond reads back as zero (debug request 19000000 shows it). Use
+// all of it: 7168 stereo frames, 149 ms.
+const RING_BYTES: u32 = 0x7000;
 const RING_FRAMES: u32 = RING_BYTES / 4;
 // Keep 120 ms queued: on the single core, Radio's TLS work and app drawing can
 // hold the CPU for tens of milliseconds between Audio's turns.
@@ -1015,6 +1016,16 @@ pub fn debug(command: u32, param: u32) {
                 note(99, 0);
                 CAPTURED = 0;
                 SKIP = param;
+            }
+            // Probe the AFE SRAM size: a marker per 4 KiB block, read back
+            // into words 100..109 (an alias shows a later block's marker).
+            0x19 if unsafe { OUTPUT } == 0 => {
+                for k in 0..9 {
+                    unsafe { ((SRAM + k * 4096) as *mut u32).write_volatile(0xa500_0000 | k as u32) };
+                }
+                for k in 0..9 {
+                    note(100 + k, unsafe { ((SRAM + k * 4096) as *const u32).read_volatile() });
+                }
             }
             // Stall Audio for `param` milliseconds, to test underrun handling.
             0x17 => {
