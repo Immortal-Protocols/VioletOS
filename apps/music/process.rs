@@ -332,9 +332,7 @@ fn icon_speaker(cx: i32, cy: i32, s: i32, waves: i32, c: u32, a: u32) {
     prims[1] = Prim::Poly([p(-22, -12), p(6, -36), p(6, 36), p(-22, 12)], r);
     let mut n = 2;
     for w in 0..waves {
-        let rad = s * 16 * (22 + w * 16) / 100;
         prims[n] = Prim::Seg(q(cx, s, 18 + w * 14), q(cy, s, -(12 + w * 9)), q(cx, s, 18 + w * 14), q(cy, s, 12 + w * 9), r);
-        let _ = rad;
         n += 1;
     }
     shape(&prims[..n], c, a);
@@ -669,7 +667,7 @@ const BANDS: [(i32, i32); 6] = [
     (130, 850),        // cover, title
     (VIS_Y, 1062),     // spectrum
     (1062, 1226),      // scrubber, times, status
-    (1238, 1424),      // transport
+    (1220, 1452),      // transport and its buffering dots
     (1440, 1560),      // volume
     (30, 140),         // top bar
 ];
@@ -832,7 +830,7 @@ fn draw_transport(app: &App, t: &Track) {
             let ang = (k as u32 * 8 + 64 - (app.frame % 64)) % 64;
             let a = 40 + ang * 3;
             let (dx, dy) = DOTS[k as usize];
-            rbox(360 + dx * 104 / 100 - 7, cy + dy * 104 / 100 - 7, 14, 14, 7, t.accent, a.min(256));
+            rbox(360 + dx - 7, cy + dy - 7, 14, 14, 7, t.accent, a.min(256));
         }
     }
     if app.st.playing() && app.st.state != MUSIC_STATE_BUFFERING {
@@ -868,7 +866,7 @@ fn draw_volume(app: &App, t: &Track) {
     rbox(kx - 14, cy - 14, 28, 28, 14, TEXT, 256);
 }
 
-fn player_hit(app: &App, x: i32, y: i32) -> Hit {
+fn player_hit(x: i32, y: i32) -> Hit {
     if y < 140 {
         return if x < 160 {
             Hit::Close
@@ -1068,7 +1066,7 @@ fn update(app: &mut App) {
     }
 }
 
-fn act(app: &mut App, hit: Hit, me: u32) {
+fn act(app: &mut App, hit: Hit) {
     app.flash = hit;
     app.flash_frames = 4;
     match hit {
@@ -1076,7 +1074,6 @@ fn act(app: &mut App, hit: Hit, me: u32) {
         Hit::Home => {
             update(app);
             request(EXECUTE, OPEN, LAUNCHER);
-            let _ = me;
         }
         Hit::Close => {
             app.screen = Screen::Library;
@@ -1213,9 +1210,9 @@ pub fn run() -> ! {
                 let (x, y) = (e.value as i32, e.arg as i32);
                 let hit = match app.screen {
                     Screen::Library => library_hit(&app, x, y),
-                    Screen::Player => player_hit(&app, x, y),
+                    Screen::Player => player_hit(x, y),
                 };
-                act(&mut app, hit, me);
+                act(&mut app, hit);
                 if request(GET, FOCUS, 0).value != me {
                     break;
                 }
