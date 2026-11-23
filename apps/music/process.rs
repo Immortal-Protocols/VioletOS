@@ -730,15 +730,17 @@ fn draw_spectrum(app: &App, t: &Track) {
     }
     for k in 0..16 {
         let x = x0 + k as i32 * (bw + gap);
-        let level = if on { app.st.bands[k] as i32 } else { 0 };
+        // At rest the bars show the song's loudness shape, dimmed.
+        let level = if on { app.st.bands[k] as i32 } else { t.bars[k * 3 + 1] as i32 / 2 };
         let h = 10 + level * 126 / 255;
         // Bar: accent at the top fading to the glow colour at the base.
         let top = lerp_rgb(t.accent, TEXT, (40 + level as u32 / 3).min(256));
         let bottom = lerp_rgb(t.glow, t.accent, 60);
-        rbox_v(x, VIS_BASE - h, bw, h, bw / 2, top, bottom, if on { 256 } else { 90 });
+        let a = if on { 256 } else { 70 };
+        rbox_v(x, VIS_BASE - h, bw, h, bw / 2, top, bottom, a, a);
         // Reflection.
         let rh = h * 2 / 5;
-        rbox_v(x, VIS_BASE + 6, bw, rh, bw / 2, scale_rgb(t.glow, 160), NIGHT, 60);
+        rbox_v(x, VIS_BASE + 6, bw, rh, bw / 2, bottom, t.glow, a * 3 / 10, 0);
         // Falling peak cap.
         let cap = app.caps[k] >> 4;
         if on && cap > h + 4 {
@@ -1189,9 +1191,8 @@ pub fn run() -> ! {
                 app.advanced = 0;
             }
             if !shown || changed_track {
-                if !shown {
-                    app.fan = 0;
-                }
+                // Deal the covers out on arrival; gather and re-deal on a new song.
+                app.fan = if shown { 120 } else { 0 };
                 app.breath = app.target_breath();
                 full(&mut app);
             }

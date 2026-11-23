@@ -195,9 +195,6 @@ pub fn box_d(px: i32, py: i32, cx: i32, cy: i32, hw: i32, hh: i32, r: i32) -> i3
         oy
     } else if oy == 0 {
         ox
-    } else if ox.max(oy) > r + 32 {
-        // Far outside: alpha-max-beta-min estimate of the length (about 4%).
-        (ox.max(oy) * 123 + ox.min(oy) * 51) >> 7
     } else {
         len(ox, oy)
     };
@@ -315,11 +312,14 @@ pub fn rbox(x: i32, y: i32, w: i32, h: i32, r: i32, c: u32, a: u32) {
 }
 
 /// Vertical gradient inside a rounded box.
-pub fn rbox_v(x: i32, y: i32, w: i32, h: i32, r: i32, top: u32, bottom: u32, a: u32) {
+/// Colour and opacity both run from the top value to the bottom one.
+pub fn rbox_v(x: i32, y: i32, w: i32, h: i32, r: i32, top: u32, bottom: u32, a_top: u32, a_bottom: u32) {
     let (cx, cy, hw, hh, rr) = (x * 16 + w * 8, y * 16 + h * 8, w * 8, h * 8, r * 16);
     let (y0, y1) = rows(y, y + h);
     for py in y0..y1 {
-        let c = lerp_rgb(top, bottom, ((py - y) * 256 / h.max(1)) as u32);
+        let f = ((py - y) * 256 / h.max(1)) as u32;
+        let c = lerp_rgb(top, bottom, f);
+        let a = (a_top * (256 - f) + a_bottom * f) >> 8;
         for px in x.max(0)..(x + w).min(W) {
             let cv = cover(box_d(px * 16 + 8, py * 16 + 8, cx, cy, hw, hh, rr));
             if cv != 0 {
