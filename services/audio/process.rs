@@ -311,6 +311,7 @@ pub fn run() -> ! {
         audio.poll_inputs();
         audio.pump();
         board::music(music().debug_words());
+        board::radio(music().radio_words());
         board::publish(
             audio.level,
             audio.flags(),

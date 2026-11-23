@@ -377,6 +377,10 @@ impl Music {
         self.spectrum.push((frame[0] as i32 + frame[1] as i32) / 2);
         Some(frame)
     }
+    /// Radio's join diagnostics from the stream page's spare words 16..32.
+    pub fn radio_words(&self) -> [u32; 16] {
+        core::array::from_fn(|i| word(16 + i))
+    }
     /// Six words for the handset's USB status page.
     pub fn debug_words(&self) -> [u32; 6] {
         let state = if self.paused { MUSIC_STATE_PAUSED } else { self.state };

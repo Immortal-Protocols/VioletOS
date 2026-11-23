@@ -344,7 +344,23 @@ impl Axi {
         Err(46)
     }
 
+    /// Authentication or association, sent up to three times: a busy access
+    /// point (or a lost frame) often misses the first request.
     fn management_exchange(
+        &mut self,
+        ap: &passive_scan::AccessPoint,
+        associate: bool,
+    ) -> Result<u16, u32> {
+        let mut result = Err(47);
+        for _ in 0..3 {
+            result = self.management_once(ap, associate);
+            if !matches!(result, Err(47 | 48)) {
+                break;
+            }
+        }
+        result
+    }
+    fn management_once(
         &mut self,
         ap: &passive_scan::AccessPoint,
         associate: bool,

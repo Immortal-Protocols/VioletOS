@@ -927,6 +927,12 @@ pub fn music(words: [u32; 6]) {
         note(58 + i, *w);
     }
 }
+/// Radio's join diagnostics for USB (words 80..=95).
+pub fn radio(words: [u32; 16]) {
+    for (i, w) in words.iter().enumerate() {
+        note(80 + i, *w);
+    }
+}
 pub fn publish(level: u32, flags: u32, serial: u32, sound: u32) {
     note(S_STATE, level | flags << 8 | unsafe { OUTPUT } << 24);
     note(S_PLAY, serial | sound << 16);

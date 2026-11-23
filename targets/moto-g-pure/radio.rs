@@ -27,6 +27,21 @@ fn record(index: usize, word: u32) {
         (0x09200000 as *mut u32).add(index).write_volatile(word);
     }
 }
+// Join diagnostics in the music stream page's spare words; Audio copies them
+// to its USB status page (words 80..).
+const JOIN_ATTEMPTS: usize = 16;
+const JOIN_FOUND: usize = 17; // matching APs | all APs << 8
+const JOIN_AP: usize = 18; // last BSSID tried, bytes 2..6
+const JOIN_CHANNEL: usize = 19;
+const JOIN_RESULT: usize = 20; // 0 or the failing stage | scan index << 16
+const JOIN_MS: usize = 21;
+const JOIN_PER_AP: usize = 22; // 22..=29, by scan index
+fn join_note(i: usize, v: u32) {
+    unsafe { ((STREAM_BASE + 4 * i) as *mut u32).write_volatile(v) }
+}
+fn join_noted(i: usize) -> u32 {
+    unsafe { ((STREAM_BASE + 4 * i) as *const u32).read_volatile() }
+}
 fn stage(value: u32) {
     record(10, value);
 }
@@ -430,39 +445,86 @@ pub fn run() -> ! {
                     .and_then(|()| axi.scan(files[3], &mut scan, stage))
                     .and_then(|()| {
                         if usb_job.arg != 0 {
+                            let named = |ap: &&passive_scan::AccessPoint| {
+                                ap.wpa2_psk_ccmp
+                                    && ap.ssid_len == usb_job.value as usize
+                                    && ap.ssid[..ap.ssid_len] == usb_job.data[..ap.ssid_len]
+                            };
+                            // A USB job names only the network: prefer its 5 GHz radio.
                             join_target = scan.aps[..scan.ap_count]
                                 .iter()
-                                .find(|ap| {
-                                    ap.wpa2_psk_ccmp
-                                        && ap.ssid_len == usb_job.value as usize
-                                        && ap.ssid[..ap.ssid_len] == usb_job.data[..ap.ssid_len]
-                                })
+                                .filter(named)
+                                .max_by_key(|ap| ap.channel > 14)
                                 .copied();
                             if join_target.is_none() {
                                 return Err(49);
                             }
                         }
                         if let Some(target) = join_target.take() {
-                            let ap = scan.aps[..scan.ap_count]
-                                .iter()
-                                .find(|ap| {
-                                    ap.bssid == target.bssid
-                                        && ap.ssid_len == target.ssid_len
-                                        && ap.ssid[..ap.ssid_len] == target.ssid[..target.ssid_len]
-                                })
-                                .ok_or(49u32)?;
-                            stage(46);
-                            axi.associate(ap)?;
-                            stage(52);
-                            wpa::authorize(axi, ap)?;
-                            stage(53);
-                            if !unsafe { wpa::join_ip(dev) } {
-                                unsafe { wpa::close() };
-                                return Err(53);
+                            // The chosen access point first, then any other with the same
+                            // name and security (a mesh or a second band).
+                            let same = |ap: &passive_scan::AccessPoint| {
+                                ap.wpa2_psk_ccmp
+                                    && ap.ssid_len == target.ssid_len
+                                    && ap.ssid[..ap.ssid_len] == target.ssid[..target.ssid_len]
+                            };
+                            let found = scan.aps[..scan.ap_count].iter().filter(|ap| same(ap)).count();
+                            let mut order = [0usize; 8];
+                            let mut n = 0;
+                            for (i, ap) in scan.aps[..scan.ap_count].iter().enumerate() {
+                                if same(ap) && ap.bssid == target.bssid && n < 8 {
+                                    order[n] = i;
+                                    n += 1;
+                                }
                             }
-                            connected = ap.profile_id();
-                            last_ap.set(Some(*ap));
-                            active.set(true);
+                            // Then the rest, 5 GHz first: it is usually the less crowded band.
+                            for five in [true, false] {
+                                for (i, ap) in scan.aps[..scan.ap_count].iter().enumerate() {
+                                    if same(ap) && ap.bssid != target.bssid && (ap.channel > 14) == five && n < 8 {
+                                        order[n] = i;
+                                        n += 1;
+                                    }
+                                }
+                            }
+                            if n == 0 {
+                                return Err(49);
+                            }
+                            join_note(JOIN_ATTEMPTS, join_noted(JOIN_ATTEMPTS) + 1);
+                            join_note(JOIN_FOUND, found as u32 | (scan.ap_count as u32) << 8);
+                            let mut last = 49;
+                            for &i in &order[..n] {
+                                let ap = scan.aps[i];
+                                join_note(JOIN_AP, u32::from_le_bytes(ap.bssid[2..6].try_into().unwrap()));
+                                join_note(JOIN_CHANNEL, ap.channel as u32);
+                                let began = radio_io::now();
+                                stage(46);
+                                let step = axi.associate(&ap).map(|_| ()).and_then(|()| {
+                                    stage(52);
+                                    wpa::authorize(axi, &ap)
+                                }).and_then(|()| {
+                                    stage(53);
+                                    if unsafe { wpa::join_ip(dev) } { Ok(()) } else { Err(53) }
+                                });
+                                join_note(JOIN_RESULT, step.err().unwrap_or(0) | (i as u32) << 16);
+                                // Per access point: channel | last result << 8 | tries << 16.
+                                let slot = JOIN_PER_AP + i.min(7);
+                                join_note(slot, ap.channel as u32 | step.err().unwrap_or(0) << 8
+                                    | ((join_noted(slot) >> 16) + 1) << 16);
+                                join_note(JOIN_MS, radio_io::now().wrapping_sub(began) / unsafe { ticks_per_ms }.max(1));
+                                match step {
+                                    Ok(()) => {
+                                        connected = ap.profile_id();
+                                        last_ap.set(Some(ap));
+                                        active.set(true);
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        unsafe { wpa::close() };
+                                        last = e;
+                                    }
+                                }
+                            }
+                            return Err(last);
                         }
                         Ok(())
                     });
