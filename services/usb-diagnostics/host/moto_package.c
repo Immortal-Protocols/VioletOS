@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -156,6 +156,30 @@ int main(int argc,char **argv) {
             uint32_t request=(uint32_t)strtoul(argv[1]+6,NULL,16);
             rc=transfer(chosen,0x40,0x4e,request,NULL,0);
             if (!rc) printf("Audio request %08x sent.\n",request);
+        } else if (!strcmp(argv[1],"open-log")) {
+            // The Open Runtime's 4 KiB log ring: magic, bytes written, then text.
+            unsigned char ring[4096];
+            rc=0;
+            for (uint16_t c=0;c<64 && !rc;c++)
+                rc=libusb_control_transfer(chosen,0xc0,0x4d,0,c,ring+64*c,64,3000)!=64;
+            if (!rc && !memcmp(ring,"OLOG",4)) {
+                uint32_t head=word(ring+4), size=4088, start=head>size?head%size:0, n=head>size?size:head;
+                for (uint32_t i=0;i<n;i++) putchar(ring[8+(start+i)%size]);
+            } else if (!rc) { fputs("The Open Runtime has not started.\n",stderr); rc=1; }
+            unsigned char fault[56];
+            if (libusb_control_transfer(chosen,0xc0,0x4b,0,0,fault,56,3000)==56) {
+                if (!memcmp(fault,"FALT",4))
+                    printf("Open Runtime fault: label %u, words %08x %08x %08x %08x\n",word(fault+4),word(fault+8),word(fault+12),word(fault+16),word(fault+20));
+                fprintf(stderr,"Open Runtime setup: stage %u, slots %#x, loader %s, image %u bytes\n",word(fault+24),word(fault+28),
+                        word(fault+32)==0x4e45504f?"OPEN":"refused",word(fault+36));
+                if (word(fault+32)!=0x4e45504f)
+                    fprintf(stderr,"First reservation in the window: %#010x, %#x bytes; ramdisk %#010x-%#010x\n",
+                            word(fault+40),word(fault+44),word(fault+48),word(fault+52));
+            }
+        } else if (!strncmp(argv[1],"open-run=",9)) {
+            size_t n=strlen(argv[1]+9);
+            rc=n<1||n>40||transfer(chosen,0x40,0x4c,0,(unsigned char *)argv[1]+9,(uint16_t)n);
+            if (!rc) printf("Asked the Open Runtime to start %s.\n",argv[1]+9);
         } else if (!strcmp(argv[1],"scan-wifi")) {
             rc=transfer(chosen,0x40,0x69,0,NULL,0);
             if (!rc) puts("Scan requested. Read the result with moto-debug.");

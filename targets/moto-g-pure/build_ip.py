@@ -25,4 +25,4 @@ def sources(root, port):
         core/init core/def core/dns core/inet_chksum core/ip core/mem core/memp
         core/netif core/pbuf core/sys core/tcp core/tcp_in core/tcp_out core/timeouts core/udp
         core/ipv4/acd core/ipv4/dhcp core/ipv4/etharp core/ipv4/icmp core/ipv4/ip4 core/ipv4/ip4_addr
-        netif/ethernet""".split()] + [port / "client.c"]
+        netif/ethernet""".split()] + [port / "client.c", port / "sockets.c"]

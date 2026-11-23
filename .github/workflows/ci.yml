@@ -55,8 +55,11 @@ jobs:
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
           fi
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
-          rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi
+          rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi --target armv7-unknown-linux-musleabihf
           rustup override set 1.91.1
+          brew install go
+      - name: Build the musl sysroot for open C apps
+        run: python3 tools/build_python.py musl
       - name: Build simulator, emulator viewer and USB clients
         run: make build/simulator build/sel4/VioletOS.app/Contents/MacOS/viewer build/moto-debug build/moto-package
       - name: Test touch, storage and isolation
@@ -64,4 +67,4 @@ jobs:
       - name: Test lifecycle and package updates
         run: make test-stack test-apps
       - name: Test Wi-Fi and power
-        run: make test-wifi test-power test-audio
+        run: make test-wifi test-power test-audio test-open

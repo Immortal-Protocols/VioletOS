@@ -18,7 +18,7 @@ def inspect(blob):
     if (
         magic != b"VPK1"
         or (abi != package_abi(identity) and (identity, abi) != (7, 3))
-        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22))
+        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24))
     ):
         raise ValueError("unsupported package or ABI")
     if not 0 < code <= size <= 0x3E000 or code % 4096 or len(blob) != 24 + size:

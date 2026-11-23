@@ -40,6 +40,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
         "radio": repo / "services/radio/process.rs",
         "power": repo / "services/power/process.rs",
         "audio": repo / "services/audio/process.rs",
+        "open": repo / "runtime/open/mod.rs",
     }
     board = repo / "targets" / ("moto-g-pure" if target == "moto" else "qemu")
     if target == "moto":
@@ -92,6 +93,10 @@ SECTIONS {
         only = name
     if only is not None and only not in [*names, "package_manager"]:
         raise ValueError(f"Unknown component: {only}")
+    # Open apps' wall clock starts at the source's commit time (no RTC driver yet).
+    if "VIOLET_BUILD_EPOCH" not in os.environ:
+        stamp = subprocess.run(["git", "log", "-1", "--format=%ct"], cwd=repo, capture_output=True, text=True).stdout.strip()
+        os.environ["VIOLET_BUILD_EPOCH"] = os.environ.get("SOURCE_DATE_EPOCH", stamp or "1795000000")
     os.environ["VIOLET_WATCH_TITLE"] = titles["stopwatch"]
     os.environ["VIOLET_WIFI_TITLE"] = titles["wifi"]
     # Package manager is always loaded from the factory recovery image.
@@ -132,8 +137,10 @@ SECTIONS {
             )
             body = "storage::storage_task()"
         crate = dest / (name + ".rs")
+        # The Open Runtime keeps its tables on a heap.
+        prelude = "extern crate alloc;\n" if name == "open" else ""
         crate.write_text(
-            "#![no_std]\n#![allow(dead_code)]\n"
+            "#![no_std]\n#![allow(dead_code)]\n" + prelude
             + "".join(
                 f"#[path={json.dumps(str(v))}] mod {k};\n" for k, v in modules.items()
             )
@@ -151,7 +158,7 @@ SECTIONS {
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
                 "-Copt-level=s",
-                *(["--cfg", "moto_board"] if target=="moto" and name=="power" else []),
+                *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,
                 "-o",
@@ -159,6 +166,10 @@ SECTIONS {
             ]
         )
         tls_objects = []
+        if name == "open":
+            shim = dest / "open-sel4.o"
+            run([*common, *incs, "-DNDEBUG", "-std=gnu11", "-I", platform_include, "-c", repo / "runtime/open/sel4.c", "-o", shim])
+            tls_objects.append(shim)
         if name == "radio" and target == "qemu":
             import sys
 

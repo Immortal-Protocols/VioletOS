@@ -1,6 +1,6 @@
 # RFC: Open, Polyglot App Model on Pure seL4
 
-**Status:** Draft RFC (code skeleton — intentionally not wired into the build yet)
+**Status:** Implemented for compiled programs and Python, with TCP, on QEMU and the Moto G Pure; persistent files remain. See [Implementation status](#implementation-status) and the [Open Runtime README](../runtime/open/README.md).
 **Context:** Prompted by PR #13 (*Music*), where streaming an album required hardcoding `MUSIC_HOST` and `/tracks/NN.mp3` in `Radio`, embedding `minimp3` and playback state in `Audio`, adding a bespoke `MUSIC` key to `Runtime`, and squeezing cover art into 32×32 pixels to stay under the 128 KiB app limit.
 
 ## Goal
@@ -76,3 +76,23 @@ Almost every language toolchain already targets Linux ARM EABI (`armv7-linux-mus
 1. **AArch32 (`armhf`) vs. AArch64:** Staying AArch32 keeps the existing Moto bootloader, seL4 config, and Wi-Fi SMC patch untouched while supporting Go (`GOARM=7`), Rust, and CPython. Is AArch32 the right starting target?
 2. **Storage partition on Moto:** Start with the unused ~15 MiB inside `boot_b` for dev, or mount a larger partition on eMMC?
 3. **Fast 2D drawing for Python:** Bake a small native canvas module (e.g. `tiny-skia` + font rasterizer) into `/bin/python3`, or keep graphics strictly raw `mmap` buffers + user libraries?
+
+## Implementation status
+
+The Open Runtime is component 24. Unmodified Rust `std`, C (musl), Go and CPython 3.12 programs run in QEMU and on the Moto G Pure; `make test-open` checks each one. Details are in the [Open Runtime README](../runtime/open/README.md).
+
+| Milestone | State |
+| --- | --- |
+| 1. Hardware and services | The supervisor gives the Open Runtime a 384 MiB (QEMU) or 256 MiB (handset) page pool beyond the kernel's 50 MiB. Floating point and NEON work in apps. Audio plays raw PCM from apps. Radio serves apps' TCP connections (DNS answered by the Open Runtime). **Not done:** a persistent folder file system (writes stay in memory); listening sockets and general UDP; the rest of the handset's DRAM. |
+| 2. Process manager, first C and Rust programs | Done: 64 KiB demand paging, a static ELF loader (ET_EXEC and static PIE), about 150 system calls, `/dev/violet/{screen,events,sys,audio}`. |
+| 3. Zero-build Python | Done: CPython 3.12.16 built statically against musl with zlib; `#!/bin/python3` scripts and bare `.py` files run from `/apps`. Drawing is raw `mmap` pixels for now. |
+| 4. Threads, epoll, sockets, Go | Threads, futexes, `epoll`, `poll`, eventfd, pipes and TCP sockets are done; Go runs (`GODEBUG=asyncpreemptoff=1`) including `net/http` and TLS. **Not done:** signal delivery. |
+| 5. Polish | Not started: dynamic linking, background lifecycle beyond "keep running", multiple cores. |
+
+Decisions made while implementing:
+
+- **The Open Runtime builds app processes itself.** Rather than asking the supervisor to map each page, it receives its own CSpace, the ASID pool, kernel memory and the page pool, and is the fault handler of every app thread. The procmgr code lives in `system/supervisor/procmgr.rs` as the skeleton placed it, but is compiled into the Open Runtime.
+- **Pages are 64 KiB.** Every pool page stays mapped in the Open Runtime too, which makes copying to and from apps a plain memory access and keeps the capability count manageable.
+- **AArch32 stays** (open question 1). The kernel now uses `TPIDRURO` as its TLS register, which is what Linux ARM programs read.
+- **The handset's image rides in the boot image's ramdisk** (open question 2), compressed, so no new eMMC partition is needed yet; the 16 MiB boot payload limit leaves about 7 MiB for more programs.
+- **Coexistence uses Runtime's client 9.** Built-in apps are unchanged. Home's **/APPS** button gives the Open Runtime the screen; it draws the app list or the app in front itself.

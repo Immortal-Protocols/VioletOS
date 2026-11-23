@@ -175,7 +175,15 @@ pub fn run() -> ! {
             }
         }
         if connected != 0 {
-            if usb_job.arg != 0 && unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() } {
+            // A USB join of an ordinary network while hosting the relay: stop hosting
+            // first (the next join request then joins it).
+            let relaying = unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() };
+            let usb_ssid = &usb_job.data[..(usb_job.value as usize).min(32)];
+            let leave_relay = usb_job.arg != 0 && relaying && !usb_ssid.starts_with(b"VioletRelay");
+            if leave_relay {
+                record(65, 60);
+                usb_job = Message::default();
+            } else if usb_job.arg != 0 && relaying {
                 // Relay hosting: any join request re-runs the HTTPS test through the phone.
                 run_test.set(usb_job.arg);
                 unsafe {
@@ -197,7 +205,7 @@ pub fn run() -> ! {
                 usb_job = Message::default();
             }
             let alive = unsafe { wpa::poll() };
-            if !alive || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO | RELAY) && m.value == 0) {
+            if !alive || leave_relay || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO | RELAY) && m.value == 0) {
                 unsafe { wpa::close() };
                 unsafe { RELAY_AP = None };
                 let stopped = unsafe { (*dev).shutdown() }
@@ -439,16 +447,40 @@ pub fn run() -> ! {
                             }
                         }
                         if let Some(target) = join_target.take() {
-                            let ap = scan.aps[..scan.ap_count]
-                                .iter()
-                                .find(|ap| {
-                                    ap.bssid == target.bssid
-                                        && ap.ssid_len == target.ssid_len
-                                        && ap.ssid[..ap.ssid_len] == target.ssid[..target.ssid_len]
-                                })
-                                .ok_or(49u32)?;
+                            // Every access point with this name is a candidate, 2.4 GHz first:
+                            // one that does not answer authentication should not end the join.
+                            let mut order = [0usize; 16];
+                            let mut count = 0;
+                            for pass in 0..2 {
+                                for (k, ap) in scan.aps[..scan.ap_count].iter().enumerate() {
+                                    let same = ap.wpa2_psk_ccmp && ap.ssid_len == target.ssid_len
+                                        && ap.ssid[..ap.ssid_len] == target.ssid[..target.ssid_len];
+                                    if same && ((ap.channel <= 14) == (pass == 0)) && count < order.len() {
+                                        order[count] = k;
+                                        count += 1;
+                                    }
+                                }
+                            }
+                            if count == 0 {
+                                return Err(49);
+                            }
                             stage(46);
-                            axi.associate(ap)?;
+                            let mut chosen = None;
+                            let mut last = 47;
+                            let mut tried = 0u32;
+                            for &k in order[..count].iter() {
+                                tried = tried << 8 | u32::from(scan.aps[k].channel);
+                                match axi.associate(&scan.aps[k]) {
+                                    Ok(_) => {
+                                        chosen = Some(k);
+                                        break;
+                                    }
+                                    Err(e) => last = e,
+                                }
+                            }
+                            // moto-debug's "wlan_result" after a join: the channels tried, last in the low byte.
+                            record(42, tried);
+                            let ap = &scan.aps[chosen.ok_or(last)?];
                             stage(52);
                             wpa::authorize(axi, ap)?;
                             stage(53);
@@ -619,10 +651,22 @@ pub fn run() -> ! {
     };
     extern "C" {
         fn ipc_try_receive(slot: u32, m: *mut Message) -> u32;
+        // Open apps' TCP sockets (ip/sockets.c), in pages shared with the Open Runtime.
+        fn open_sockets_poll(base: *mut u8, online: u32);
     }
+    const SOCKETS: *mut u8 = 0x0b00_0000 as *mut u8;
     loop {
         let mut m = Message::default();
         wpa::tick_clock();
+        // 1 on a joined network, 2 through the phone's relay once it reaches the internet.
+        let online = if !active.get() {
+            0
+        } else if let Some(relay) = unsafe { (*core::ptr::addr_of!(RELAY_AP)).as_ref() } {
+            if relay.online { 2 } else { 0 }
+        } else {
+            1
+        };
+        unsafe { open_sockets_poll(SOCKETS, online) };
         if active.get() {
             let relaying = unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() };
             let leased = relaying && relay_step(dev);

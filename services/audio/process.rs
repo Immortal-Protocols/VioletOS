@@ -5,6 +5,22 @@ use crate::{audio_backend as board, protocol::*};
 #[path = "synth.rs"]
 mod synth;
 
+/// Raw PCM from the Open Runtime (/dev/violet/audio): a header page, then a
+/// ring of 48 kHz interleaved stereo s16 frames. Words: 0 magic, 1 ring frames,
+/// 2 frames written (Open Runtime), 3 frames played (Audio), 4 underruns.
+mod stream {
+    pub const HEADER: *mut u32 = 0x0930_0000 as *mut u32;
+    pub const RING: *const [i16; 2] = 0x0930_1000 as *const [i16; 2];
+    pub const MAGIC: u32 = 0x314d_4350; // "PCM1"
+    pub const FRAMES: u32 = 16 * 4096 / 4;
+    pub fn reg(i: usize) -> u32 {
+        unsafe { HEADER.add(i).read_volatile() }
+    }
+    pub fn set(i: usize, v: u32) {
+        unsafe { HEADER.add(i).write_volatile(v) }
+    }
+}
+
 extern "C" {
     fn ipc_try_receive(slot: u32, m: &mut Message) -> u32;
 }
@@ -64,6 +80,8 @@ struct Audio {
     serial: u32,
     outcome: u32,
     output_on: bool,
+    /// The Open Runtime's PCM ring is mapped.
+    stream: bool,
     /// Developer override over USB: 0 follows the jack, 1 speaker, 2 headphones.
     force: u32,
 }
@@ -92,10 +110,14 @@ impl Audio {
         r.put_text(&text);
         r
     }
+    /// The sound now playing: a built-in one, SOUND_STREAM for open apps' PCM, or 0.
+    fn playing(&self) -> u32 {
+        if self.voice.is_some() || (self.output_on && self.sound == SOUND_STREAM) { self.sound } else { 0 }
+    }
     fn playback(&self) -> Message {
-        let mut r = Message::result(if self.voice.is_some() { self.sound } else { 0 });
+        let mut r = Message::result(self.playing());
         r.arg = (self.serial & 0xffff) | self.outcome;
-        r.put_text(match (self.voice.is_some(), self.outcome) {
+        r.put_text(match (self.playing() != 0, self.outcome) {
             (true, _) => b"PLAYING" as &[u8],
             (false, PLAYBACK_NO_OUTPUT) => b"NO AUDIO OUTPUT",
             _ => b"IDLE",
@@ -204,7 +226,50 @@ impl Audio {
             self.reroute();
         }
     }
+    /// Play queued PCM while no built-in sound is playing. Volume and routing
+    /// apply as for every sound; the stream holds the output until it runs dry.
+    fn pump_stream(&mut self) {
+        if !self.stream || self.voice.is_some() {
+            return;
+        }
+        let (written, read) = (stream::reg(2), stream::reg(3));
+        let queued = written.wrapping_sub(read).min(stream::FRAMES);
+        if queued == 0 {
+            if self.output_on && self.sound == SOUND_STREAM && board::drained() {
+                board::stop();
+                self.output_on = false;
+                self.sound = 0;
+            }
+            return;
+        }
+        if !self.output_on {
+            if self.caps & self.wanted_output() == 0 || !board::start(self.to_headphones()) {
+                // Nowhere to play: drop it rather than stall the writer.
+                stream::set(3, written);
+                return;
+            }
+            self.output_on = true;
+            self.sound = SOUND_STREAM;
+            board::set_volume(self.level, self.to_headphones());
+        }
+        let gain = synth::GAIN[self.level as usize];
+        let mut due = board::writable().min(queued as usize);
+        let mut at = read;
+        let mut block = [[0i16; 2]; CHUNK];
+        while due > 0 {
+            let n = due.min(CHUNK);
+            for frame in block[..n].iter_mut() {
+                let f = unsafe { stream::RING.add((at % stream::FRAMES) as usize).read_volatile() };
+                *frame = [(i32::from(f[0]) * gain >> 15) as i16, (i32::from(f[1]) * gain >> 15) as i16];
+                at = at.wrapping_add(1);
+            }
+            board::write(&block[..n]);
+            due -= n;
+        }
+        stream::set(3, at);
+    }
     fn pump(&mut self) {
+        self.pump_stream();
         let Some(voice) = self.voice.as_mut() else {
             return;
         };
@@ -243,8 +308,14 @@ pub fn run() -> ! {
         serial: 0,
         outcome: 0,
         output_on: false,
+        stream: false,
         force: 0,
     };
+    // The supervisor always maps the PCM ring; it stays empty without an Open Runtime.
+    audio.stream = true;
+    stream::set(1, stream::FRAMES);
+    stream::set(3, stream::reg(2));
+    stream::set(0, stream::MAGIC);
     board::set_volume(audio.level, audio.headphones);
     board::publish(audio.level, audio.flags(), 0, 0);
     loop {
@@ -261,7 +332,7 @@ pub fn run() -> ! {
             audio.level,
             audio.flags(),
             audio.serial,
-            if audio.voice.is_some() { audio.sound } else { 0 },
+            audio.playing(),
         );
         unsafe { delay_ms(1) };
     }

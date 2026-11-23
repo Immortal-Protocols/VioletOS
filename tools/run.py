@@ -2,6 +2,7 @@
 from pathlib import Path
 import sys
 from emulator_endpoint import endpoint_peer
+from net_relay import Relay as NetRelay
 import os
 import binascii
 import json
@@ -48,6 +49,10 @@ def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,N
     for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
                                   ("entry.bin", "0x44000000", ",cpu-num=0")]:
         cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
+    # The open apps' file system image, read by the Open Runtime.
+    initfs=image/"initfs.cpio"
+    if initfs.exists():
+        cmd+=["-device",f"loader,file={str(initfs).replace(',', ',,')},addr=0x4a000000,force-raw=on"]
     inbox=os.environ.get("VIOLET_INBOX")
     if inbox:
         from package_format import inspect
@@ -101,6 +106,9 @@ def main(viewer):
                            "-machine", "memory-backend=ram", "-serial", "stdio"]
         monitor_path=Path(tmp)/"power.sock"
         cmd+=["-qmp",f"unix:{monitor_path},server=on,wait=off"]
+        # Open apps' TCP sockets go through the Mac (Radio serves them on the handset).
+        net=NetRelay(ram)
+        net.start()
         guest = subprocess.Popen(cmd,pass_fds=(peer,), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
         try:
             monitor=Monitor(monitor_path,guest)
@@ -151,6 +159,7 @@ def main(viewer):
         finally:
             guest.stdin.close()
             finish(guest)
+            net.stop()
 
 if __name__=="__main__":
     signal.signal(signal.SIGTERM, lambda *_: exit(0))

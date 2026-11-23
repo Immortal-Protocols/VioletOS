@@ -77,6 +77,14 @@ test-power: qemu-image
 test-audio: qemu-image
 	$(PYTHON) targets/qemu/test_audio.py
 
+.PHONY: test-open
+test-open: qemu-image
+	$(PYTHON) targets/qemu/test_open.py
+	@mkdir -p build/tests
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
+	build/tests/inflate
+
 .PHONY: test-moto-diagnostics
 test-moto-diagnostics: moto qemu-image
 	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial confirm

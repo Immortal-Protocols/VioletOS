@@ -110,6 +110,7 @@ with TemporaryDirectory() as tmp:
         (out / "root.bin").symlink_to(moto / "root.bin")
     asm = [cc, "--target=arm-none-eabi", "-mcpu=cortex-a53", "-marm", "-c"]
     (out / "wifi-firmware.bin").symlink_to(moto / "wifi-firmware.bin")
+    (out / "initfs.cpio").symlink_to(moto / "initfs.cpio")
     run(*asm, moto / "payload.S", "-o", "payload.o")
     objects = ["loader.S.o", "loader.c.o", "strings.c.o", "fdt.c.o", "fdt_ro.c.o",
                "fdt_check.c.o", "fdt_addresses.c.o"]
@@ -122,7 +123,10 @@ with TemporaryDirectory() as tmp:
     (out / "handoff.dtb").symlink_to(qemu / "handoff.dtb")
     stage_va = int(next(line.split()[0] for line in symbols.splitlines() if line.endswith(" boot_stages")), 16)
     stage_pa = 0x40200000 + stage_va - 0x100000
-    guest = subprocess.Popen(machine(image=out) + extra_devices + ["-serial", "none", "-qmp", "stdio"],
+    # The handset has 3 GiB; open apps use memory at 0xc0000000.
+    cmd = machine(image=out)
+    cmd[cmd.index("-m") + 1] = "3G"
+    guest = subprocess.Popen(cmd + extra_devices + ["-serial", "none", "-qmp", "stdio"],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         def receive():
@@ -202,6 +206,10 @@ with TemporaryDirectory() as tmp:
                 assert reason == {"fault": 1, "timeout": 2}[args.diagnostics_trial], reason
                 assert read_root("volume_bank") == 0
                 print(f"Supervisor abandoned the {args.diagnostics_trial} candidate and restarted from the factory catalog.")
+        if any(line.endswith(" open_setup") for line in symbols.splitlines()):
+            base = 0x40200000 + root_offset("open_setup")
+            words = [int(command("human-monitor-command", {"command-line": f"xp /1wx {base + 4 * i:#x}"}).strip().rsplit(None, 1)[1], 16) for i in range(4)]
+            print(f"Open Runtime setup stage {words[0]}, root CNode slots {words[1]:#x} of {words[3]:#x}")
         condition = "touch and storage deliberately stalled" if args.stall_services else "handset peripherals absent"
         if args.diagnostics_trial != "confirm":
             print(f"Moto launcher presented Home on the 720-pixel scanout with {condition}.")
