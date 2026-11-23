@@ -1,8 +1,10 @@
-"""Drive the emulated sound card: volume buttons, headphone jack and playback.
+"""Drive the emulated sound card: volume buttons, headphone jack, playback and
+the microphone.
 
 A scripted viewer takes the place of the SDL window. It holds the virtual volume
-buttons, plugs in headphones, opens Sounds and taps its controls, then checks
-the guest's sound card registers, the PCM it wrote and the volume bar on screen.
+buttons, plugs in headphones, opens Sounds and taps its controls, feeds a tone
+into the microphone ring, then checks the guest's sound card registers, the PCM
+it wrote and the volume bar on screen.
 """
 
 from pathlib import Path
@@ -14,9 +16,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 import run
 
 SCRIPT = r'''#!/usr/bin/env python3
-import math, mmap, os, struct, sys, time
+import math, mmap, os, struct, sys, threading, time
 ram = open(sys.argv[1], "r+b")
-card = mmap.mmap(ram.fileno(), 9 * 4096, offset=0x49204000 - 0x40000000)
+card = mmap.mmap(ram.fileno(), 11 * 4096, offset=0x49204000 - 0x40000000)
 screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000,
                    prot=mmap.PROT_READ)
 ACCENT, PANEL = 0xffd1b0fe, 0xff302a39
@@ -25,7 +27,7 @@ GAIN = [0, 260, 368, 519, 734, 1036, 1464, 2067, 2920, 4125, 5827, 8231, 11626, 
 def word(i): return struct.unpack_from("<I", card, 4 * i)[0]
 def put(i, v): struct.pack_into("<I", card, 4 * i, v)
 def fail(why):
-    print("audio test failed:", why, [word(i) for i in range(12)], file=sys.stderr)
+    print("audio test failed:", why, [word(i) for i in range(17)], file=sys.stderr)
     sys.exit(1)
 def until(what, check, timeout=6.0):
     deadline = time.monotonic() + timeout
@@ -47,7 +49,25 @@ def ring():
     base = 4096
     return [struct.unpack_from("<h", card, base + 4 * ((end - n) % size))[0] for n in range(4096, 0, -1)]
 
+def microphone():
+    # A 1 kHz tone at -12 dBFS, delivered at 16 kHz in real time while the guest listens.
+    start, sent = time.monotonic(), 0
+    while True:
+        due = int((time.monotonic() - start) * 16000)
+        if word(12) & 1:
+            written = word(13)
+            for n in range(sent, due):
+                struct.pack_into("<h", card, 9 * 4096 + 2 * (written % 4096),
+                                 int(8192 * math.sin(2 * math.pi * 1000 * n / 16000)))
+                written += 1
+            put(13, written)
+        sent = due
+        time.sleep(0.004)
+threading.Thread(target=microphone, daemon=True).start()
+def mic_mode(): return word(15) & 0xff
+
 until("sound card ready", lambda: word(2) == 0x31445541, 20)
+if word(12) & 1: fail("the microphone must start off")
 put(1, 0)
 until("default volume", lambda: word(4) == 8)
 time.sleep(1.5)  # Let Home finish starting services.
@@ -90,7 +110,28 @@ tap_logical(170, 260)  # STOP
 until("stop ends the tone early", lambda: word(9) == 0 and word(3) == 0, 2)
 if word(11) >= 1.4 * 48000: fail("tone was not stopped early")
 hold(2, 0.12); until("buttons work inside an app", lambda: word(4) == 13 and bar(13))
+
+tap_logical(60, 311)  # RECORD
+until("recording starts", lambda: mic_mode() == 2 and word(12) & 1)
+until("the meter shows the tone", lambda: 75 <= word(16) <= 85, 2)
+until("recording stops at four seconds", lambda: mic_mode() == 0 and word(15) >> 16 == 400, 7)
+if word(12) & 1: fail("the microphone stayed on after recording")
+if not word(15) & 0x100: fail("no recording reported")
+tap_logical(170, 311)  # PLAY
+until("the recording plays", lambda: word(9) == 5)
+time.sleep(0.4)
+samples = ring()
+crossings = sum(1 for a, b in zip(samples, samples[1:]) if a < 0 <= b)
+hz = crossings * 48000 / len(samples)
+if not 980 <= hz <= 1020: fail(f"recording played back at {hz:.0f} Hz")
+expected = 16384 * GAIN[13] >> 15
+if not 0.85 * expected <= max(samples) <= 1.02 * expected:
+    fail(f"recording peak {max(samples)}, expected about {expected}")
+until("the recording finishes", lambda: word(9) == 0, 6)
+tap_logical(60, 311)  # RECORD again, then leave the app while it records.
+until("second recording starts", lambda: mic_mode() == 2)
 tap_logical(120, 368)  # HOME
+until("leaving the app turns the microphone off", lambda: mic_mode() == 0 and not word(12) & 1, 2)
 time.sleep(0.5)
 print("audio checks passed", file=sys.stderr)
 '''
@@ -110,4 +151,4 @@ with TemporaryDirectory() as tmp:
     status = run.main(str(viewer))
     if status != 0:
         raise SystemExit(f"audio test failed (viewer status {status})")
-    print("Audio service verified: buttons, jack routing, playback, volume scaling")
+    print("Audio service verified: buttons, jack routing, playback, volume scaling, microphone")

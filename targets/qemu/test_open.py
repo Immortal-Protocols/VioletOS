@@ -98,7 +98,7 @@ if "pytone" in PRESENT:
         peak, frames, sound = max(peak, card_word(10)), max(frames, card_word(11)), max(sound, card_word(9))
         time.sleep(0.01)
     # 12000 at volume 8 (gain 2920/32768) is about 1069.
-    if sound != 5 or frames < 24000 or not 1000 <= peak <= 1100:
+    if sound != 6 or frames < 24000 or not 1000 <= peak <= 1100:
         fail(f"PCM stream: sound {sound}, frames {frames}, peak {peak}")
     until("app list after pytone", on_list)
     print("pytone: passed", file=sys.stderr)

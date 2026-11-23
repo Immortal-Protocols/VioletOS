@@ -33,11 +33,13 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
           rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi
           rustup override set 1.91.1
-      - name: Build the QEMU image and test stopwatch logic
+      - name: Build the QEMU image and test stopwatch and microphone logic
         run: |
           make qemu-image
           rustc --edition=2021 --test apps/stopwatch/state.rs -o build/state-tests
           build/state-tests
+          rustc --edition=2021 --test services/audio/mic.rs -o build/mic-tests
+          build/mic-tests
 
   mac:
     name: macOS build and QEMU tests

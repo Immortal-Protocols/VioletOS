@@ -8,5 +8,6 @@
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>VioletOS apps can record from the Mac's microphone while one of them is recording.</string>
 </dict>
 </plist>

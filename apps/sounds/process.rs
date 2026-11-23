@@ -1,6 +1,7 @@
-//! Sounds: shows the shared volume and output, and plays the built-in sounds.
-//! Volume and playback state arrive through Runtime subscriptions, so the
-//! hardware buttons and the headphone jack update this screen as they change.
+//! Sounds: shows the shared volume and output, plays the built-in sounds, and
+//! records a few seconds from the microphone to play back. Volume, playback and
+//! microphone state arrive through Runtime subscriptions, so the hardware
+//! buttons and the headphone jack update this screen as they change.
 use crate::{drawing::*, protocol::*, sdk::*};
 
 const MINUS: (usize, usize) = (14, 118);
@@ -11,6 +12,8 @@ const PADS: [(usize, usize, &[u8], u32, u32); 4] = [
     (14, 240, b"TONE", SOUND_TONE, 440 | 1500 << 16),
     (124, 240, b"STOP", SOUND_STOP, 0),
 ];
+const RECORD: (usize, usize) = (14, 290);
+const PLAY: (usize, usize) = (124, 290);
 const PAD_W: usize = 102;
 const PAD_H: usize = 42;
 const HOME_Y: usize = 344;
@@ -28,11 +31,12 @@ fn sound_name(sound: u32) -> &'static [u8] {
         SOUND_CHIME => b"CHIME",
         SOUND_ALERT => b"ALERT",
         SOUND_TONE => b"TONE 440 HZ",
+        SOUND_RECORDING => b"RECORDING",
         _ => b"",
     }
 }
 
-fn draw(volume: &Message, playback: &Message) {
+fn draw(volume: &Message, playback: &Message, mic: &Message) {
     rect(0, 0, 240, 400, BG);
     label(14, 14, b"SOUNDS", 1, ACCENT);
     if volume.op != OK {
@@ -80,14 +84,32 @@ fn draw(volume: &Message, playback: &Message) {
     for (x, y, name, _, _) in PADS {
         pad(x, y, name);
     }
-    if flags & AUDIO_BUTTONS != 0 {
-        label(14, 300, b"SIDE BUTTONS CHANGE VOLUME", 1, INK);
-    }
-    if flags & AUDIO_JACK != 0 {
-        label(14, 312, b"PLUG IN HEADPHONES TO SWITCH", 1, INK);
+    if flags & AUDIO_MIC != 0 {
+        draw_mic(mic);
     }
     button(HOME_Y, b"HOME");
     present(0, 400);
+}
+
+/// The microphone line and its two pads: RECORD (FINISH while recording) and PLAY.
+fn draw_mic(mic: &Message) {
+    let (mode, tens) = if mic.op == OK { (mic.arg & MIC_MODE, mic.arg >> 16) } else { (MIC_OFF, 0) };
+    let recording = mode == MIC_RECORD;
+    let mut text = *b"MIC 0.0 S";
+    text[4] = b'0' + (tens / 100 % 10) as u8;
+    text[6] = b'0' + (tens / 10 % 10) as u8;
+    if tens > 0 || recording {
+        label(14, 178, &text, 1, if recording { ACCENT } else { INK });
+    }
+    // Ten segments, 10 level points each, while the microphone is on.
+    if mode != MIC_OFF {
+        for i in 0..10 {
+            let lit = (i as u32) * 10 < mic.value;
+            rect(76 + i * 15, 177, 11, 8, if lit { ACCENT } else { PANEL });
+        }
+    }
+    pad(RECORD.0, RECORD.1, if recording { b"FINISH" } else { b"RECORD" });
+    pad(PLAY.0, PLAY.1, b"PLAY");
 }
 
 pub fn run() -> ! {
@@ -96,12 +118,18 @@ pub fn run() -> ! {
     let touch = submit(SUBSCRIBE, CONTACT, 0).unwrap_or_else(|_| panic!());
     let volume_events = submit(SUBSCRIBE, VOLUME, 0).ok();
     let playback_events = submit(SUBSCRIBE, PLAYBACK, 0).ok();
+    let mic_events = submit(SUBSCRIBE, MICROPHONE, 0).ok();
     let mut volume = Message::error(OFFLINE);
     let mut playback = Message::error(OFFLINE);
+    let mut mic = Message::error(OFFLINE);
     let mut visible = false;
     let mut redraw = true;
     loop {
-        for (stream, state) in [(&volume_events, &mut volume), (&playback_events, &mut playback)] {
+        for (stream, state) in [
+            (&volume_events, &mut volume),
+            (&playback_events, &mut playback),
+            (&mic_events, &mut mic),
+        ] {
             if let Some(s) = stream {
                 let r = s.poll();
                 if r.op == OK {
@@ -112,7 +140,7 @@ pub fn run() -> ! {
         }
         let active = request(GET, FOCUS, 0).value == me;
         if active && (!visible || redraw) {
-            draw(&volume, &playback);
+            draw(&volume, &playback, &mic);
             redraw = false;
         }
         visible = active;
@@ -130,6 +158,16 @@ pub fn run() -> ! {
                     request(EXECUTE, PLAYBACK, SOUND_CLICK);
                     redraw = true;
                 }
+            } else if volume.arg & AUDIO_MIC != 0 && inside(x, y, RECORD) {
+                let recording = mic.op == OK && mic.arg & MIC_MODE == MIC_RECORD;
+                let r = request(EXECUTE, MICROPHONE, if recording { MIC_OFF } else { MIC_RECORD });
+                if r.op == OK {
+                    mic = r;
+                    redraw = true;
+                }
+            } else if volume.arg & AUDIO_MIC != 0 && inside(x, y, PLAY) {
+                request(EXECUTE, PLAYBACK, SOUND_RECORDING);
+                redraw = true;
             } else if let Some(&(_, _, _, sound, arg)) =
                 PADS.iter().find(|p| inside(x, y, (p.0, p.1)))
             {

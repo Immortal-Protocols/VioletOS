@@ -1,7 +1,9 @@
-//! Audio service: volume, output routing, playback and the volume buttons.
-//! Only Runtime calls it. Requests are served between hardware polls, so a
-//! sound keeps playing while apps read or change state.
+//! Audio service: volume, output routing, playback, the volume buttons and the
+//! microphone. Only Runtime calls it. Requests are served between hardware
+//! polls, so a sound keeps playing while apps read or change state.
 use crate::{audio_backend as board, protocol::*};
+#[path = "mic.rs"]
+mod mic;
 #[path = "synth.rs"]
 mod synth;
 
@@ -31,6 +33,35 @@ const REPEAT_DELAY_MS: u32 = 500;
 const REPEAT_MS: u32 = 150;
 const JACK_DEBOUNCE_MS: u32 = 100;
 const CHUNK: usize = 96;
+/// The recording lives in 128 KiB of private RAM the supervisor maps for Audio.
+const CLIP: *mut i16 = 0x02800000 as *mut i16;
+const CLIP_SAMPLES: u32 = MIC_RECORD_MS * (mic::RATE / 1000);
+/// The codec's power-up transient would set the recording's peak and so its
+/// playback level, so the first 150 ms after the microphone starts are dropped.
+const SETTLE_SAMPLES: u32 = mic::RATE * 15 / 100;
+fn clip() -> &'static mut [i16] {
+    unsafe { core::slice::from_raw_parts_mut(CLIP, CLIP_SAMPLES as usize) }
+}
+
+/// What is playing: a built-in sound or the recording.
+enum Source {
+    Synth(synth::Voice),
+    Recording(mic::Playback),
+}
+impl Source {
+    fn done(&self) -> bool {
+        match self {
+            Source::Synth(v) => v.done(),
+            Source::Recording(p) => p.done(),
+        }
+    }
+    fn next(&mut self) -> i32 {
+        match self {
+            Source::Synth(v) => v.next(),
+            Source::Recording(p) => p.next(clip()),
+        }
+    }
+}
 
 #[derive(Default)]
 struct Button {
@@ -75,7 +106,7 @@ struct Audio {
     jack_since: u32,
     up: Button,
     down: Button,
-    voice: Option<synth::Voice>,
+    voice: Option<Source>,
     sound: u32,
     serial: u32,
     outcome: u32,
@@ -84,6 +115,12 @@ struct Audio {
     stream: bool,
     /// Developer override over USB: 0 follows the jack, 1 speaker, 2 headphones.
     force: u32,
+    mic_mode: u32,
+    meter: mic::Meter,
+    clip_len: u32,
+    clip_peak: u32,
+    /// Samples still to skip after power-up while the ADC and DC filter settle.
+    settle: u32,
 }
 impl Audio {
     /// Where output goes: the jack decides unless a developer request forced it.
@@ -152,6 +189,8 @@ impl Audio {
                 self.reroute();
             }
             5 => { let _ = self.play(SOUND_STOP, 0); },
+            6 => { let _ = self.set_mic(param); },
+            7 => { let _ = self.play(SOUND_RECORDING, 0); },
             _ => board::debug(command, param),
         }
     }
@@ -169,8 +208,20 @@ impl Audio {
             self.finish(PLAYBACK_STOPPED);
             return self.playback();
         }
-        let Some(voice) = synth::Voice::new(sound, arg) else {
-            return Message::error(INVALID);
+        let voice = if sound == SOUND_RECORDING {
+            if self.clip_len == 0 {
+                return Message::error(EMPTY);
+            }
+            // Playing the recording ends a recording in progress.
+            if self.mic_mode == MIC_RECORD {
+                self.set_mic(MIC_OFF);
+            }
+            Source::Recording(mic::Playback::new(self.clip_len, self.clip_peak))
+        } else {
+            match synth::Voice::new(sound, arg) {
+                Some(v) => Source::Synth(v),
+                None => return Message::error(INVALID),
+            }
         };
         self.finish(PLAYBACK_STOPPED);
         self.serial = (self.serial + 1) & 0xffff;
@@ -199,7 +250,85 @@ impl Audio {
             }
             (GET, PLAYBACK) => self.playback(),
             (EXECUTE, PLAYBACK) => self.play(m.value, m.arg),
+            (GET, MICROPHONE) => self.microphone(),
+            (EXECUTE, MICROPHONE) => self.set_mic(m.value),
             _ => Message::error(DENIED),
+        }
+    }
+    fn microphone(&self) -> Message {
+        let level = if self.mic_mode == MIC_OFF { 0 } else { self.meter.level };
+        let mut r = Message::result(level);
+        let tens = self.clip_len / (mic::RATE / 100);
+        r.arg = self.mic_mode | if self.clip_len > 0 { MIC_HAS_RECORDING } else { 0 } | tens << 16;
+        let mut text = *b"RECORDING 0.0 S     ";
+        match self.mic_mode {
+            MIC_LISTEN => r.put_text(b"LISTENING"),
+            MIC_RECORD => {
+                text[10] = b'0' + (tens / 100 % 10) as u8;
+                text[12] = b'0' + (tens / 10 % 10) as u8;
+                r.put_text(&text);
+            }
+            _ => r.put_text(b"MICROPHONE OFF"),
+        }
+        r
+    }
+    fn set_mic(&mut self, mode: u32) -> Message {
+        match mode {
+            MIC_OFF => {
+                if self.mic_mode != MIC_OFF {
+                    board::mic_stop();
+                }
+                self.mic_mode = MIC_OFF;
+                self.meter.reset();
+            }
+            MIC_LISTEN | MIC_RECORD => {
+                if self.caps & AUDIO_MIC == 0 {
+                    return Message::error(OFFLINE);
+                }
+                if self.mic_mode == MIC_OFF {
+                    self.meter.reset();
+                    if !board::mic_start() {
+                        return Message::error(OFFLINE);
+                    }
+                    self.settle = SETTLE_SAMPLES;
+                }
+                if mode == MIC_RECORD {
+                    // The new recording overwrites the old one.
+                    if matches!(self.voice, Some(Source::Recording(_))) {
+                        self.finish(PLAYBACK_STOPPED);
+                    }
+                    self.clip_len = 0;
+                    self.clip_peak = 0;
+                }
+                self.mic_mode = mode;
+            }
+            _ => return Message::error(INVALID),
+        }
+        self.microphone()
+    }
+    fn poll_mic(&mut self) {
+        let mut block = [0i16; 64];
+        while self.mic_mode != MIC_OFF {
+            let n = board::mic_read(&mut block);
+            if n == 0 {
+                return;
+            }
+            for &raw in &block[..n] {
+                let s = self.meter.feed(raw);
+                if self.settle > 0 {
+                    self.settle -= 1;
+                    continue;
+                }
+                if self.mic_mode == MIC_RECORD {
+                    clip()[self.clip_len as usize] = s;
+                    self.clip_peak = self.clip_peak.max(s.unsigned_abs() as u32);
+                    self.clip_len += 1;
+                    if self.clip_len == CLIP_SAMPLES {
+                        self.set_mic(MIC_OFF);
+                        return;
+                    }
+                }
+            }
         }
     }
     fn poll_inputs(&mut self) {
@@ -310,6 +439,11 @@ pub fn run() -> ! {
         output_on: false,
         stream: false,
         force: 0,
+        mic_mode: MIC_OFF,
+        meter: mic::Meter::default(),
+        clip_len: 0,
+        clip_peak: 0,
+        settle: 0,
     };
     // The supervisor always maps the PCM ring; it stays empty without an Open Runtime.
     audio.stream = true;
@@ -327,6 +461,7 @@ pub fn run() -> ! {
             audio.developer(request);
         }
         audio.poll_inputs();
+        audio.poll_mic();
         audio.pump();
         board::publish(
             audio.level,
@@ -334,6 +469,8 @@ pub fn run() -> ! {
             audio.serial,
             audio.playing(),
         );
+        let m = audio.microphone();
+        board::publish_mic(m.arg, m.value);
         unsafe { delay_ms(1) };
     }
 }
