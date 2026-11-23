@@ -8,9 +8,28 @@
 
 enum { WIDTH = 720, HEIGHT = 1600, PITCH = WIDTH * 4 };
 // Emulated sound card shared with the guest Audio service (targets/qemu/audio.rs).
-enum { SOUND_PAGE = 0x49204000 - 0x40000000, SOUND_BYTES = 9 * 4096, SOUND_MAGIC = 0x31445541 };
+// Control page, eight-page PCM ring, then a two-page 16 kHz mono microphone ring.
+enum { SOUND_PAGE = 0x49204000 - 0x40000000, SOUND_BYTES = 11 * 4096, SOUND_MAGIC = 0x31445541,
+       MIC_OFFSET = 9 * 4096, MIC_SAMPLES = 4096 };
 static volatile uint32_t *sound;
 static uint32_t heard;
+// Captured samples go into the guest's ring; word 13 counts them.
+static void listen(void *unused, Uint8 *stream, int bytes) {
+    (void)unused;
+    volatile int16_t *ring = (volatile int16_t *)((volatile uint8_t *)sound + MIC_OFFSET);
+    const int16_t *in = (const int16_t *)stream;
+    uint32_t written = sound[13];
+    for (int i = 0; i < bytes / 2; i++) ring[written++ % MIC_SAMPLES] = in[i];
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    sound[13] = written;
+}
+// Without a capture device (or without permission) the guest hears silence.
+static void silence(uint32_t samples) {
+    volatile int16_t *ring = (volatile int16_t *)((volatile uint8_t *)sound + MIC_OFFSET);
+    uint32_t written = sound[13];
+    while (samples--) ring[written++ % MIC_SAMPLES] = 0;
+    sound[13] = written;
+}
 static void play(void *unused, Uint8 *stream, int bytes) {
     (void)unused;
     int16_t *out = (int16_t *)stream;
@@ -69,6 +88,11 @@ int main(int argc, char **argv) {
         if (speaker) SDL_PauseAudioDevice(speaker, 0);
     }
     if (!speaker) fprintf(stderr, "VioletOS display: no sound output (%s)\n", SDL_GetError());
+    // The Mac's microphone opens only while the guest asks for it (word 12), so
+    // macOS asks for permission the first time an app records.
+    SDL_AudioDeviceID mic = 0;
+    int mic_tried = 0;
+    Uint32 mic_clock = 0;
     SDL_Window *window = SDL_CreateWindow("VioletOS · seL4 on QEMU",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH/2, HEIGHT/2,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
@@ -104,12 +128,33 @@ int main(int argc, char **argv) {
                 held = 0;
             }
         }
+        int wanted = sound[2] == SOUND_MAGIC && (sound[12] & 1);
+        if (wanted && !mic && !mic_tried) {
+            SDL_AudioSpec want = {.freq = 16000, .format = AUDIO_S16SYS, .channels = 1,
+                                  .samples = 256, .callback = listen};
+            mic = SDL_OpenAudioDevice(NULL, 1, &want, NULL, 0);
+            mic_tried = 1;
+            if (mic) SDL_PauseAudioDevice(mic, 0);
+            else fprintf(stderr, "VioletOS display: no microphone (%s)\n", SDL_GetError());
+            mic_clock = SDL_GetTicks();
+        }
+        if (!wanted && (mic || mic_tried)) {
+            if (mic) SDL_CloseAudioDevice(mic);
+            mic = 0;
+            mic_tried = 0;
+        }
+        if (wanted && !mic) {
+            Uint32 now = SDL_GetTicks();
+            silence((now - mic_clock) * 16);
+            mic_clock = now;
+        }
         if (SDL_UpdateTexture(texture, NULL, frame, PITCH) ||
             SDL_RenderClear(renderer) || SDL_RenderCopy(renderer, texture, NULL, NULL)) goto fail;
         SDL_RenderPresent(renderer);
         SDL_Delay(32);
     }
     if (speaker) SDL_CloseAudioDevice(speaker);
+    if (mic) SDL_CloseAudioDevice(mic);
     SDL_Quit();
     munmap(frame, length);
     return 0;

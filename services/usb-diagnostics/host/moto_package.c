@@ -145,11 +145,13 @@ int main(int argc,char **argv) {
                 if(time(NULL)>=until) fputs("Timed out waiting for the handset Wi-Fi result\n",stderr);
             }
         } else if (!strcmp(argv[1],"audio-status")) {
-            // Sixty-four status words from the Audio process, printed one per line.
+            // Ninety-six status words from the Audio process, printed one per line.
+            // Images from before the microphone answer only the first 64.
             unsigned char page[64];
             rc=0;
-            for (uint16_t p=0;p<4 && !rc;p++) {
+            for (uint16_t p=0;p<6 && !rc;p++) {
                 rc=libusb_control_transfer(chosen,0xc0,0x4f,0,p,page,64,3000)!=64;
+                if (rc && p>=4) { rc=0; break; }
                 for (unsigned i=0;i<16 && !rc;i++) printf("%2u %08x\n",p*16+i,word(page+4*i));
             }
         } else if (!strncmp(argv[1],"audio=",6)) {

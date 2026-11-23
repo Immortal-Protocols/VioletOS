@@ -350,7 +350,7 @@ pub fn run() -> ! {
             (0xc0, 0x52, 0, 0) => send(&runtime_snapshot(), len),
             (0xc0, 0x51, 0, 0) => send(&snapshot(), len),
             // Audio status page, 16 words per request selected by the index.
-            (0xc0, 0x4f, 0, page) if page < 4 => {
+            (0xc0, 0x4f, 0, page) if page < 6 => {
                 let mut out = [0; 64];
                 let src = (0x09203000 + usize::from(page) * 64) as *const u32;
                 for (i, dest) in out.chunks_exact_mut(4).enumerate() {

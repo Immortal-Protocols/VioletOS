@@ -11,6 +11,9 @@
 //! - Speaker: AFE DL1 -> I2S3 -> FourSemi FS1603 on I2C0 at 0x34. The vendor
 //!   preset (fs1603.fsm) is not available, so the amplifier runs on its
 //!   hardcoded register init with its DSP bypassed.
+//! - Microphone: main mic (AIN0, MICBIAS0) -> MT6357 ADC1 -> MTKAIF -> AFE ADDA
+//!   UL -> VUL in AFE SRAM, mono at 16 kHz (TurnOnADcPowerACC in
+//!   mtk-soc-codec-6357.c, set_chip_adc_in in mt6765-sound.c).
 //!
 //! The Audio process cannot touch the PMIC, clocks or pins directly. Power
 //! performs allowlisted PMIC accesses and the supervisor ungates the audio
@@ -58,6 +61,12 @@ const S_REQUESTS: usize = 52; // 52: count, 53: last
 const S_I2C_OK: usize = 54;
 const S_I2C_FAIL: usize = 55; // count | last INTR_STAT << 16
 const S_CONSUMED: usize = 56;
+/// Microphone, words 64..=87: 64 on | PGA << 8, 65 samples read, 66 overruns,
+/// 67 CONN9 | CONN10 << 16, 68 the service's MICROPHONE arg, 69 its level, 70 peak, 71 mean level and 72 DC over the last
+/// 100 ms, 73..=78 AFE (VUL_CUR, UL_SRC_CON0, DAC_CON0, DAC_CON1, UL_SRC_MON0,
+/// MTKAIF_MON0), 79 zero crossings in the last 100 ms (20 per 100 Hz of a
+/// tone louder than 64), 80..=86 codec registers (value | address << 16).
+const S_MIC: usize = 64;
 
 fn note(i: usize, v: u32) {
     unsafe { STATUS.add(i).write_volatile(v) }
@@ -120,7 +129,15 @@ const PMIC_AFE_TOP_CON0: u16 = 0x2110;
 const PMIC_AUDIO_TOP_CON0: u16 = 0x2112;
 const AFUNC_AUD_CON0: u16 = 0x2116;
 const AFUNC_AUD_CON2: u16 = 0x211a;
+const AFE_UL_SRC_CON0_H: u16 = 0x210c;
+const AFE_UL_SRC_CON0_L: u16 = 0x210e;
+const PMIC_AFE_ADDA_MTKAIF_CFG0: u16 = 0x2134;
+const AFE_AUD_PAD_TOP: u16 = 0x214c;
+const AUDENC_ANA_CON0: u16 = 0x2188;
+const AUDENC_ANA_CON1: u16 = 0x218a;
+const AUDENC_ANA_CON3: u16 = 0x218e;
 const AUDENC_ANA_CON6: u16 = 0x2194;
+const AUDENC_ANA_CON8: u16 = 0x2198;
 const AUDENC_ANA_CON9: u16 = 0x219a;
 const AUDENC_ANA_CON10: u16 = 0x219c;
 const AUDDEC_ANA_CON0: u16 = 0x2208;
@@ -143,6 +160,10 @@ const DCXO_CW14: u16 = 0x07ac;
 const GPIO_MODE2: u16 = 0x00b6;
 const GPIO_MODE2_SET: u16 = 0x00b8;
 const GPIO_MODE2_CLR: u16 = 0x00ba;
+const GPIO_MODE3: u16 = 0x00bc;
+const GPIO_MODE3_SET: u16 = 0x00be;
+const GPIO_MODE3_CLR: u16 = 0x00c0;
+const GPIO_DIR0: u16 = 0x0088;
 const SMT_CON1: u16 = 0x002c;
 // ACCDET (mt6357.h, mt6357-accdet.c).
 const AUD_TOP_RST_CON0: u16 = 0x209a;
@@ -277,19 +298,98 @@ const AMP_OFF_TAIL: &[Step] = &[
     W(AFE_DL_SRC2_CON0_L, 0, 0xffff),
     W(AFUNC_AUD_CON2, 0, 0xffff),
     W(AFUNC_AUD_CON0, 0xcba0, 0xffff),
-    W(AFE_UL_DL_CON0, 0, 1),
-    W(PMIC_AUDIO_TOP_CON0, 0x00df, 0x00df),
-    W(0x214c, 0, 0x00ff), // AFE_AUD_PAD_TOP
-    Us(250),
-    W(GPIO_MODE2_CLR, 0xffff, 0xffff), // set_playback_gpio(false)
-    W(GPIO_MODE2, 0, 0xffff),
-    W(SMT_CON1, 0, 0x0ff0),
-    W(AUD_TOP_CKPDN_CON0, 0x66, 0x66),
-    W(AUDENC_ANA_CON6, 0, 1),
-    W(AUDDEC_ANA_CON2, 0, 0x400),
-    W(AUDDEC_ANA_CON11, 1 << 4, 1 << 4),
-    W(DCXO_CW14, 0, 1 << 13),
 ];
+/// The rest of TurnOffDacPower. The uplink shares the AFE, clocks and
+/// regulators, so while the microphone runs only the downlink parts go.
+fn dac_off() {
+    let shared = unsafe { !CAPTURING };
+    if shared {
+        run(&[W(AFE_UL_DL_CON0, 0, 1), W(PMIC_AUDIO_TOP_CON0, 0x00df, 0x00df)]);
+    } else {
+        ana(PMIC_AUDIO_TOP_CON0, 0x0040, 0x0040); // downlink power down
+    }
+    run(&[
+        W(AFE_AUD_PAD_TOP, 0, 0x00ff), // RX FIFOs
+        Us(250),
+        W(GPIO_MODE2_CLR, 0xffff, 0xffff), // set_playback_gpio(false)
+        W(GPIO_MODE2, 0, 0xffff),
+        W(GPIO_DIR0, 0, 0xf << 8),
+        W(AUDDEC_ANA_CON2, 0, 0x400),
+    ]);
+    if shared {
+        codec_common_off();
+    }
+}
+/// Topck, CLKSQ, AUDGLB and the 26 MHz buffer, once neither direction needs them.
+fn codec_common_off() {
+    run(&[
+        W(SMT_CON1, 0, 0x0ff0),
+        W(AUD_TOP_CKPDN_CON0, 0x66, 0x66),
+        W(AUDENC_ANA_CON6, 0, 1),
+        W(AUDDEC_ANA_CON11, 1 << 4, 1 << 4),
+        W(DCXO_CW14, 0, 1 << 13),
+    ]);
+}
+
+// ---- Microphone (TurnOnADcPowerACC for ADC1 with the phone mic) ----
+// ellis has AC-coupled analog mics. ADC1 takes the main mic on AIN0 through
+// the left PGA, biased by MICBIAS0 at 1.9 V. The PMIC sends the ADC stream over
+// the MISO pads (MTKAIF) to the AP, whose UL source filters and decimates it.
+/// PGA gain index, 6 dB steps from 0 dB. The vendor default is 3 (18 dB).
+static mut MIC_PGA: u16 = 3;
+fn mic_codec_on() -> bool {
+    let gain = unsafe { MIC_PGA }.min(5);
+    run(&[
+        W(DCXO_CW14, 1 << 13, 1 << 13), // audckbufEnable
+        W(AUDDEC_ANA_CON11, 0, 1 << 4), // NvregEnable
+        W(AUDENC_ANA_CON6, 1, 1),       // ClsqEnable
+        W(GPIO_MODE3_CLR, 0xffff, 0xffff), // set_capture_gpio: MISO pad mode
+        W(GPIO_MODE3_SET, 0x0249, 0xffff),
+        W(GPIO_MODE3, 0x0249, 0xffff),
+        W(SMT_CON1, 0x0ff0, 0x0ff0),
+        W(AUDDEC_ANA_CON11, 1 << 5, 1 << 5), // ADC CLKGEN
+        W(AUDENC_ANA_CON3, 0, 0xffff),       // ADC clock from CLKGEN (13 MHz)
+        W(AUDDEC_ANA_CON12, 0x0100, 0x2500), // LCLDO_ENC 1.8 V
+        W(AUDDEC_ANA_CON12, 0x2500, 0x2500), // and its remote sense
+        W(AUDENC_ANA_CON8, 0x0021, 0xffff),  // MICBIAS0 on, 1.9 V
+        W(AUDENC_ANA_CON0, gain << 8, 0x0700), // SetMicPGAGain
+        W(AUDENC_ANA_CON1, gain << 8, 0x0700),
+        W(AUDENC_ANA_CON0, 0x0041, 0xf0ff), // L PGA from AIN0, enabled
+        W(AUDENC_ANA_CON0, 0x5041, 0xf000), // L ADC from the L PGA, enabled
+        W(AUD_TOP_CKPDN_CON0, 0, 0x66),     // Topck_Enable
+        W(PMIC_AUDIO_TOP_CON0, 0x8000, 0xdfbf), // clocks on
+        W(PMIC_AFE_TOP_CON0, 0, 0xffff),
+        W(AFE_UL_DL_CON0, 1, 1),
+        W(PMIC_AFE_ADDA_MTKAIF_CFG0, 0, 0xffff), // MTKAIF TX format
+        W(AFE_AUD_PAD_TOP, 0x3100, 0xff00),      // TX FIFOs
+        W(AFE_UL_SRC_CON0_H, 0, 0xffff),         // analog mic, not DMIC
+        W(AFE_UL_SRC_CON0_L, 1, 0xffff),         // uplink on
+    ])
+}
+fn mic_codec_off() {
+    // The headphone path shares the PMIC's AFE and its clocks.
+    let shared = unsafe { OUTPUT != 2 };
+    run(&[W(AFE_UL_SRC_CON0_L, 0, 1), W(AFE_AUD_PAD_TOP, 0x3000, 0xff00)]);
+    if shared {
+        run(&[W(AFE_UL_DL_CON0, 0, 1), W(PMIC_AUDIO_TOP_CON0, 0x00bf, 0x00bf)]);
+    }
+    run(&[
+        W(PMIC_AUDIO_TOP_CON0, 0x0020, 0x0020), // uplink power down
+        W(AUDENC_ANA_CON0, 0, 0xf000),
+        W(AUDENC_ANA_CON0, 0, 0x0fff),
+        W(AUDENC_ANA_CON8, 0, 0xffff), // MICBIAS0 off
+        W(AUDDEC_ANA_CON12, 0x0100, 0x2500),
+        W(AUDDEC_ANA_CON12, 0, 0x2500),
+        W(AUDENC_ANA_CON3, 0, 0xffff),
+        W(AUDDEC_ANA_CON11, 0, 1 << 5),
+        W(GPIO_MODE3_CLR, 0xffff, 0xffff), // MISO pads back to GPIO inputs
+        W(GPIO_MODE3, 0, 0xffff),
+        W(GPIO_DIR0, 0, 0xf << 12),
+    ]);
+    if shared {
+        codec_common_off();
+    }
+}
 
 fn headphones_on() -> bool {
     stage(0x30);
@@ -333,6 +433,7 @@ fn headphones_off() {
         udelay(600);
     }
     run(AMP_OFF_TAIL);
+    dac_off();
     stage(0x39);
 }
 
@@ -428,16 +529,91 @@ fn afe_start(headphones: bool) {
     afe_set(AFE_DAC_CON0, 1 << 1, 1 << 1); // DL1_ON
 }
 fn afe_stop() {
+    let capturing = unsafe { CAPTURING };
     afe_set(AFE_DAC_CON0, 0, 1 << 1);
     afe_set(AFE_I2S_CON1, 0, 1);
     afe_set(AFE_I2S_CON3, 0, 1);
     afe_set(AFE_ADDA_DL_SRC2_CON0, 0, 1);
-    afe_set(AFE_ADDA_UL_DL_CON0, 0, 1);
+    if !capturing {
+        afe_set(AFE_ADDA_UL_DL_CON0, 0, 1);
+    }
     afe_set(AUDIO_TOP_CON1, 1 << 7, 1 << 7);
-    afe_set(AFE_DAC_CON0, 0, 1);
+    if !capturing {
+        afe_set(AFE_DAC_CON0, 0, 1);
+    }
     afe_route(false);
     afe_set(AFE_CONN0, 0, 1 << 5);
     afe_set(AFE_CONN1, 0, 1 << 6);
+}
+
+// Capture: ADDA UL (I03/I04) -> VUL, mono from the left channel, 16-bit at
+// 16 kHz, into AFE SRAM after the playback ring. In normal SRAM mode the
+// usable SRAM is 27 KiB, so the capture ring takes 8 KiB at offset 16 KiB.
+const AFE_VUL_BASE: usize = 0x080;
+const AFE_VUL_END: usize = 0x088;
+const AFE_VUL_CUR: usize = 0x08c;
+const AFE_ADDA_UL_SRC_CON0: usize = 0x114;
+const AFE_ADDA_TOP_CON0: usize = 0x120;
+const AFE_ADDA_UL_SRC_MON0: usize = 0x148;
+const AFE_ADDA_IIR_COEF: usize = 0x290; // five words through 0x2a0
+const AFE_CONN9: usize = 0x440;
+const AFE_CONN10: usize = 0x444;
+const AFE_ADDA_MTKAIF_CFG0: usize = 0xe00;
+const AFE_ADDA_MTKAIF_RX_CFG0: usize = 0xe20;
+const AFE_ADDA_MTKAIF_MON0: usize = 0xe34;
+const AFE_AUD_PAD_TOP_CFG: usize = 0xe40;
+const MIC: usize = SRAM + RING_BYTES as usize;
+const MIC_PHYS: u32 = SRAM_PHYS + RING_BYTES;
+const MIC_BYTES: u32 = 0x2000;
+const MIC_SAMPLES: u32 = MIC_BYTES / 2;
+const MIC_RATE: u32 = 16000;
+
+fn afe_mic_start() {
+    afe_set(AUDIO_TOP_CON0, 0x4000, 0x4044); // AFE clock (AudDrv_Clk_On)
+    afe_set(AUDIO_TOP_CON0, 0, 1 << 24); // ADC clock (AudDrv_ADC_Clk_On)
+    for i in 0..MIC_BYTES as usize / 4 {
+        unsafe { ((MIC + i * 4) as *mut u32).write_volatile(0) };
+    }
+    afe_set(AFE_MEMIF_HDALIGN, 0x7fff << 16, 0x7fff << 16); // SRAM normal mode
+    afe_set(AFE_MEMIF_MSB, 0, 1 << 29);
+    afe_set(AFE_MEMIF_HD_MODE, 0, 3 << 10); // VUL 16-bit
+    afe_set(AFE_MEMIF_HDALIGN, 0, 1 << 5);
+    afe_set(AFE_VUL_BASE, MIC_PHYS, u32::MAX);
+    afe_set(AFE_VUL_END, MIC_PHYS + MIC_BYTES - 1, u32::MAX);
+    afe_set(AFE_DAC_CON1, 4 << 16, 0xf << 16); // VUL 16 kHz
+    afe_set(AFE_DAC_CON1, 1 << 27, 3 << 27); // mono, left channel
+    afe_set(AFE_CONN_24BIT, 0, 3 << 9); // O09/O10 16-bit
+    afe_set(AFE_CONN9, 1 << 3, 1 << 3); // I03 -> O09
+    afe_set(AFE_CONN10, 1 << 4, 1 << 4); // I04 -> O10
+    // set_chip_adc_in(16000), after the PMIC's MISO clock is running.
+    afe_set(AFE_AUD_PAD_TOP_CFG, 0x31, u32::MAX);
+    afe_set(AFE_ADDA_MTKAIF_CFG0, 0, u32::MAX);
+    afe_set(AFE_ADDA_TOP_CON0, 0, 1); // internal ADC
+    for (i, c) in [0, 0x3fb8, 0x3fb8_0000, 0x3fb8_0000, 0xc048].iter().enumerate() {
+        afe_set(AFE_ADDA_IIR_COEF + i * 4, *c, u32::MAX); // 35 Hz high-pass (at 48 kHz)
+    }
+    afe_set(AFE_ADDA_UL_SRC_CON0, 1 << 17 | 1 << 10, u32::MAX); // 16 kHz, IIR on
+    afe_set(AFE_ADDA_MTKAIF_RX_CFG0, 0, 1); // analog mic data
+    // set_adc_enable, then the memory interface and the AFE.
+    afe_set(AFE_ADDA_UL_DL_CON0, 1, 1);
+    afe_set(AFE_ADDA_UL_SRC_CON0, 1, 1);
+    afe_set(AFE_DAC_CON0, 1 << 3, 1 << 3); // VUL_ON
+    afe_set(AFE_DAC_CON0, 1, 1); // AFE_ON
+}
+fn afe_mic_stop() {
+    let output = unsafe { OUTPUT };
+    afe_set(AFE_DAC_CON0, 0, 1 << 3);
+    afe_set(AFE_ADDA_UL_SRC_CON0, 0, 1);
+    if output != 2 {
+        afe_set(AFE_ADDA_UL_DL_CON0, 0, 1);
+    }
+    udelay(150);
+    afe_set(AUDIO_TOP_CON0, 1 << 24, 1 << 24);
+    afe_set(AFE_CONN9, 0, 1 << 3);
+    afe_set(AFE_CONN10, 0, 1 << 4);
+    if output == 0 {
+        afe_set(AFE_DAC_CON0, 0, 1);
+    }
 }
 
 // ---- I2C0 in FIFO mode, polled (i2c-mtk.c, register map version 2) ----
@@ -724,6 +900,17 @@ static mut AMP_DSP: u16 = 0x0092;
 static mut LAST: (u32, bool, bool) = (0, false, false);
 /// The output now running: 0 none, 1 speaker, 2 headphones.
 static mut OUTPUT: u32 = 0;
+static mut CAPTURING: bool = false;
+static mut MIC_PINS: bool = false;
+static mut MIC_RD: u32 = 0;
+static mut MIC_TOTAL: u32 = 0;
+static mut MIC_OVERRUNS: u32 = 0;
+static mut MIC_PEAK: u32 = 0;
+static mut MIC_SUM: u32 = 0;
+static mut MIC_DC: i32 = 0;
+static mut MIC_WINDOW: u32 = 0;
+static mut MIC_CROSSINGS: u32 = 0;
+static mut MIC_POSITIVE: bool = false;
 static mut WR: u32 = 0;
 static mut QUIET: u32 = 0;
 static mut HW_LAST: u32 = 0;
@@ -753,7 +940,7 @@ pub fn init() -> u32 {
         // is unclocked, which would otherwise look like Volume Down held forever.
         KEYPAD_OK = keypad(2) == 0xffff && keypad(5) & 0xff == 0xff;
         stage(2);
-        let done = platform(1 | 2 | 4);
+        let done = platform(1 | 2 | 4 | 8);
         CLOCKS = done & 1 != 0;
         stage(3);
         if PMIC_KEYS {
@@ -780,6 +967,10 @@ pub fn init() -> u32 {
         }
         if CLOCKS && AMP_OK {
             caps |= AUDIO_SPEAKER_OUT;
+        }
+        MIC_PINS = done & 8 != 0;
+        if CLOCKS && PMIC_KEYS && MIC_PINS {
+            caps |= AUDIO_MIC;
         }
         note(S_CAPS, caps);
         stage(6);
@@ -902,12 +1093,128 @@ pub fn drained() -> bool {
         QUIET >= RING_FRAMES
     }
 }
+/// Power the microphone and start the capture DMA. Samples arrive at MIC_RATE.
+pub fn mic_start() -> bool {
+    unsafe {
+        if !CLOCKS || !PMIC_KEYS || !MIC_PINS || CAPTURING {
+            return CAPTURING;
+        }
+        stage(0x50);
+        CAPTURING = true;
+        // The PMIC's MISO clock must run before the AP's pad FIFO is enabled.
+        if !mic_codec_on() {
+            mic_codec_off();
+            CAPTURING = false;
+            stage(0x5f);
+            mic_report();
+            return false;
+        }
+        afe_mic_start();
+        MIC_RD = 0;
+        MIC_WINDOW = 0;
+        MIC_SUM = 0;
+        MIC_PEAK = 0;
+        stage(0x51);
+        mic_codec_report();
+        mic_report();
+        true
+    }
+}
+pub fn mic_stop() {
+    unsafe {
+        if !CAPTURING {
+            return;
+        }
+        afe_mic_stop();
+        mic_codec_off();
+        CAPTURING = false;
+        stage(0x52);
+        mic_report();
+    }
+}
+/// Copies the samples captured since the last call into `out`; returns the count.
+pub fn mic_read(out: &mut [i16]) -> usize {
+    unsafe {
+        if !CAPTURING {
+            return 0;
+        }
+        let cur = afe(AFE_VUL_CUR);
+        let hw = if (MIC_PHYS..MIC_PHYS + MIC_BYTES).contains(&cur) { (cur - MIC_PHYS) / 2 } else { MIC_RD };
+        let mut ready = (hw + MIC_SAMPLES - MIC_RD) % MIC_SAMPLES;
+        // Fell a whole ring behind: drop what was overwritten.
+        if ready > MIC_SAMPLES - 256 {
+            MIC_OVERRUNS += 1;
+            MIC_RD = hw;
+            ready = 0;
+        }
+        let n = (ready as usize).min(out.len());
+        for s in out[..n].iter_mut() {
+            *s = ((MIC + MIC_RD as usize * 2) as *const i16).read_volatile();
+            MIC_RD = (MIC_RD + 1) % MIC_SAMPLES;
+            // Peak and mean level over 100 ms windows, around a slow DC estimate.
+            let v = i32::from(*s);
+            MIC_DC += (v * 256 - MIC_DC) >> 10;
+            let a = (v - (MIC_DC >> 8)).unsigned_abs();
+            MIC_PEAK = MIC_PEAK.max(a);
+            MIC_SUM += a;
+            // Zero crossings with a little hysteresis: twice the pitch of a tone.
+            let ac = v - (MIC_DC >> 8);
+            if (MIC_POSITIVE && ac < -64) || (!MIC_POSITIVE && ac > 64) {
+                MIC_POSITIVE = !MIC_POSITIVE;
+                MIC_CROSSINGS += 1;
+            }
+            MIC_WINDOW += 1;
+            if MIC_WINDOW == MIC_RATE / 10 {
+                note(S_MIC + 6, MIC_PEAK);
+                note(S_MIC + 7, MIC_SUM / MIC_WINDOW);
+                note(S_MIC + 8, (MIC_DC >> 8) as u32);
+                note(S_MIC + 15, MIC_CROSSINGS);
+                MIC_WINDOW = 0;
+                MIC_SUM = 0;
+                MIC_PEAK = 0;
+                MIC_CROSSINGS = 0;
+            }
+        }
+        MIC_TOTAL = MIC_TOTAL.wrapping_add(n as u32);
+        n
+    }
+}
+/// The service's microphone state for the status page: MICROPHONE arg and level.
+pub fn publish_mic(state: u32, level: u32) {
+    note(S_MIC + 4, state);
+    note(S_MIC + 5, level);
+}
+fn mic_report() {
+    unsafe {
+        note(S_MIC, CAPTURING as u32 | u32::from(MIC_PGA) << 8);
+        note(S_MIC + 1, MIC_TOTAL);
+        note(S_MIC + 2, MIC_OVERRUNS);
+        if CLOCKS {
+            for (i, reg) in [AFE_VUL_CUR, AFE_ADDA_UL_SRC_CON0, AFE_DAC_CON0, AFE_DAC_CON1,
+                AFE_ADDA_UL_SRC_MON0, AFE_ADDA_MTKAIF_MON0].iter().enumerate()
+            {
+                note(S_MIC + 9 + i, afe(*reg));
+            }
+            note(S_MIC + 3, afe(AFE_CONN9) | afe(AFE_CONN10) << 16);
+        }
+    }
+}
+fn mic_codec_report() {
+    for (i, reg) in [AUDENC_ANA_CON0, AUDENC_ANA_CON8, PMIC_AUDIO_TOP_CON0, AFE_UL_SRC_CON0_L,
+        AFE_AUD_PAD_TOP, GPIO_MODE3, AUDDEC_ANA_CON12].iter().enumerate()
+    {
+        note(S_MIC + 16 + i, pmic(*reg).map_or(0xdead_0000, u32::from) | u32::from(*reg) << 16);
+    }
+}
 pub fn publish(level: u32, flags: u32, serial: u32, sound: u32) {
     note(S_STATE, level | flags << 8 | unsafe { OUTPUT } << 24);
     note(S_PLAY, serial | sound << 16);
     if unsafe { OUTPUT != 0 } {
         let _ = buffered();
         afe_report();
+    }
+    if unsafe { CAPTURING } {
+        mic_report();
     }
 }
 static mut REQUEST_SEEN: u32 = 0;
@@ -928,7 +1235,8 @@ pub fn request() -> Option<u32> {
 /// Board commands from the developer link: 0x10 amplifier volume (8 bits),
 /// 0x11 amplifier DSP control word, 0x12 re-run the amplifier init, 0x13 refresh
 /// the status page, 0x14 codec register readback, 0x15 amplifier register
-/// write (register << 16 | value), 0x16 amplifier register read into word 57.
+/// write (register << 16 | value), 0x16 amplifier register read into word 57,
+/// 0x17 microphone PGA gain index.
 pub fn debug(command: u32, param: u32) {
     unsafe {
         match command {
@@ -938,6 +1246,8 @@ pub fn debug(command: u32, param: u32) {
             0x13 => {
                 accdet_report();
                 afe_report();
+                mic_report();
+                mic_codec_report();
                 if I2C_ON {
                     amp_report();
                 }
@@ -956,6 +1266,16 @@ pub fn debug(command: u32, param: u32) {
             0x16 if I2C_ON => {
                 let reg = param as u8;
                 note(57, amp_r(reg).map_or(0xdead_0000, u32::from) | u32::from(reg) << 24);
+            }
+            // Microphone PGA gain index, 0 dB to 30 dB in 6 dB steps. It applies
+            // at once while capturing.
+            0x17 if param <= 5 => {
+                MIC_PGA = param as u16;
+                if CAPTURING {
+                    ana(AUDENC_ANA_CON0, MIC_PGA << 8, 0x0700);
+                    ana(AUDENC_ANA_CON1, MIC_PGA << 8, 0x0700);
+                }
+                mic_report();
             }
             _ => {}
         }
