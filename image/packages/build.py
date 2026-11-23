@@ -149,9 +149,12 @@ SECTIONS {
                 "--edition=2021",
                 "--crate-type=staticlib",
                 "--target=armv7a-none-eabi",
+                # Both boards run Cortex-A53 cores (QEMU uses -cpu max): this
+                # enables hardware divide and A53 scheduling. Floats stay soft.
+                "-Ctarget-cpu=cortex-a53",
                 "-Cpanic=abort",
                 "-Copt-level=s",
-                *(["--cfg", "moto_board"] if target=="moto" and name=="power" else []),
+                *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "display") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,
                 "-o",

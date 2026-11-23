@@ -56,5 +56,8 @@ void delay_ms(unsigned ms) {
     seL4_Yield();
 }
 
+// Give the rest of this time slice to other runnable threads.
+void ipc_yield(void) { seL4_Yield(); }
+
 void worker_signal(unsigned cap) { seL4_Signal(cap); }
 void worker_wait(unsigned cap) { seL4_Wait(cap, 0); }

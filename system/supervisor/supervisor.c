@@ -627,6 +627,8 @@ static void wire(void) {
     unsigned status_frame = create(ram, seL4_ARM_SmallPageObject);
     map_shared(status_frame, &procs[AUDIO].task, 0x09203000, seL4_AllRights);
     map_shared(status_frame, &procs[USB_DIAG].task, 0x09203000, seL4_CanRead);
+    // Display records present timings in words 112..127 of the same page.
+    map_shared(status_frame, &procs[DISPLAY].task, 0x09203000, seL4_AllRights);
     unsigned request_frame = create(ram, seL4_ARM_SmallPageObject);
     map_shared(request_frame, &procs[USB_DIAG].task, 0x09204000, seL4_AllRights);
     map_shared(request_frame, &procs[AUDIO].task, 0x09204000, seL4_CanRead);
@@ -1245,6 +1247,12 @@ void root_main(seL4_BootInfo *bi) {
           volatile unsigned *generation=(void *)(LANE_BASE+982*sizeof(unsigned));
           if (++*generation==0) ++*generation;
           ok = 1;
+        } else if(key==0x71 && val && val<COUNT) {
+          // USB asks Home to open app `val`; the serial in the high half makes
+          // repeats of the same app count.
+          volatile unsigned *open=(void *)(LANE_BASE+983*sizeof(unsigned));
+          *open=((*open>>16)+1)<<16 | val;
+          ok=1;
         } else if(key==0x63) {
           ((volatile unsigned *)LANE_BASE)[980]=val;
           ((volatile unsigned *)LANE_BASE)[981]=n;ok=1;

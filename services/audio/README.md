@@ -26,7 +26,7 @@ Music plays recordings from the Rose Music library, the album *Glass Orchard*, h
 - **Buffering.** Playback starts once 48 KiB (about 3 s) is buffered, and resumes after 24 KiB if the stream runs dry. Seeking assumes a constant bit rate, which the library's files have.
 - **Spectrum.** A bank of Goertzel filters measures ten bands on the signal decimated to 12 kHz and six on the full signal, and reports them with a slow fall-off.
 - **Mixing.** Sounds mix on top of the music, and the volume scales both.
-- **Handset output.** The AFE ring holds 170 ms and Audio keeps 120 ms queued, because on the single core Radio's TLS work and app drawing can hold the CPU for tens of milliseconds. Status word 26 counts underruns; after one, Audio resumes just ahead of the DMA.
+- **Handset output.** The AFE ring holds 170 ms and Audio keeps 120 ms queued. On the single core, app drawing and Radio's TLS work compete with Audio. Radio yields while it waits on the network, so it never holds the CPU for a whole time slice. Status word 26 counts underruns, including stalls longer than the ring, which are caught by the clock. After one, Audio resumes just ahead of the DMA. Words 96 and 97 hold the longest gap between output refills in milliseconds and the count over 60 ms. Words 94 and 95 count mid-song dropouts and the silence frames written while music wanted to play. Over a minute of streaming with Music on screen, and across song changes, app launches and volume changes, no refill gap exceeded 60 ms.
 
 `make test-music-live` (needs the internet) connects the emulator's Wi-Fi, opens Music, streams track 1 and checks that the sound card receives 48,000 frames a second, then pauses and resumes. Comparing the emulator's output with ffmpeg's decoding of the same file showed a 29 dB signal-to-noise ratio once aligned, after removing the buffering silence and the MP3 encoder delay.
 
@@ -67,6 +67,6 @@ The speaker runs without its vendor preset (`fs1603s.fsm`), which only root can 
 | `05000000` | Stop. |
 | `06SSSSTT` | Music: play track `TT` from second `SSSS`. For example, `06007805` plays track 5 from 2:00. |
 | `07AAAACC` | Music command `CC` (2 pause, 3 resume, 4 stop, 5 seek) with argument `AAAA`. |
-| `10`–`16` | Board debugging: amplifier volume, DSP word, re-init, refresh, codec readback, amplifier register write (`15RRVVVV`) and read (`160000RR`, into word 57). |
+| `10`–`17` | Board debugging: amplifier volume, DSP word, re-init, refresh, codec readback, amplifier register write (`15RRVVVV`) and read (`160000RR`, into word 57), and a deliberate stall of `17000MMM` milliseconds to test underrun recovery. |
 
-These requests bypass Runtime's rule that only the app on screen may play sound. They exist for testing on the bench.
+These requests bypass Runtime's rule that only the app on screen may play sound. They exist for testing on the bench. `build/moto-package open=ID` wakes the phone and opens an app, for example `open=12` for Music. Display records its present timings in words 112–119: present count, panel rows copied, the last and longest present in microseconds, the rows in the last one, and total microseconds. A full-screen present takes 8.2 ms.

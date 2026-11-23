@@ -316,6 +316,11 @@ pub fn run() -> ! {
                 }
                 send(&result,len);
             }
+            // Ask Home to open an app (bench testing): wValue is the app ID.
+            (0x40, 0x71, id, 0) if configuration == 1 && len == 0 => {
+                let reply = Message::new(EXECUTE, 0x71, u32::from(id)).call(7);
+                put_half(CSR, if reply.op == OK { 0x48 } else { 0x60 });
+            }
             (0x40, 0x69, 0, 0) if configuration == 1 && len == 0 => {
                 let reply = Message::new(EXECUTE, 0x69, 0).call(7);
                 put_half(CSR, if reply.op == OK { 0x48 } else { 0x60 });

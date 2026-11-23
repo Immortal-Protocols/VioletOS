@@ -245,6 +245,7 @@ impl Audio {
         let mut block = [[0i16; 2]; CHUNK];
         let voice_left = self.voice.as_ref().is_some_and(|v| !v.done());
         let sounding = voice_left || music.active();
+        let mut silent = 0u32;
         while due > 0 && sounding {
             let n = due.min(CHUNK);
             for frame in block[..n].iter_mut() {
@@ -259,6 +260,8 @@ impl Audio {
                 if let Some([a, b]) = music.next() {
                     l += a as i32;
                     r += b as i32;
+                } else if music.active() {
+                    silent += 1;
                 }
                 let clip = |x: i32| ((x * gain) >> 15).clamp(-32768, 32767) as i16;
                 *frame = [clip(l), clip(r)];
@@ -268,6 +271,13 @@ impl Audio {
         }
         // A finished sound is over once its tail has played, or at once while
         // music keeps the output busy.
+        if silent != 0 {
+            // Silence frames written while music wanted to play (USB word 95).
+            unsafe {
+                let w = (STREAM_BASE + 4 * 31) as *mut u32;
+                w.write_volatile(w.read_volatile() + silent);
+            }
+        }
         if self.voice.as_ref().is_some_and(|v| v.done()) && (music.active() || board::drained()) {
             self.voice = None;
             self.finish(PLAYBACK_PLAYED);

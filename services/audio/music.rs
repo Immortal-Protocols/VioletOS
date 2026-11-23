@@ -368,6 +368,8 @@ impl Music {
                 self.exhausted = true;
             } else {
                 self.state = MUSIC_STATE_BUFFERING;
+                // A dropout mid-song (USB status word 94).
+                set(30, word(30) + 1);
             }
             return None;
         }

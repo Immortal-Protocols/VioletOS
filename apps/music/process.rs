@@ -30,7 +30,9 @@ const FAINT: u32 = 0x5e5b6c;
 const LIVE: u32 = 0x6cf0b4;
 const WARN: u32 = 0xffc56e;
 
-const FRAME_MS: u32 = 33;
+const FRAME_MS: u32 = 16;
+/// How long the covers take to deal out.
+const DEAL_MS: u32 = 450;
 
 #[derive(Clone, Copy, PartialEq)]
 struct Status {
@@ -81,6 +83,10 @@ struct App {
     repeat: bool,
     caps: [i32; 16],
     breath: i32,
+    /// The fan deal's start: (where it began, when in ms).
+    deal: (i32, u32),
+    /// The previous frame's time, for time-based easing.
+    last_ms: u32,
     fan: i32,
     frame: u32,
     flash: Hit,
@@ -1054,15 +1060,17 @@ fn update(app: &mut App) {
             let cur = app.current() as u32;
             let pulse = anim(st.playing());
             let keys = [
-                digest(&[line, pulse, flash, st.state]),
+                digest(&[line, flash, st.state]),
                 digest(&[st.playing() as u32, flash, cur, st.state]),
                 digest(&[cur, st.track, if st.state == MUSIC_STATE_PLAYING { bands } else { 0 }]),
                 digest(&[(app.progress() >> 5) as u32, st.state, line, flash, cur]),
                 digest(&[app.fan as u32]),
+                // The status dot's pulse alone: its rows clear the covers' shadows.
+                digest(&[pulse]),
             ];
             let row_y = LIST_Y + cur as i32 * ROW_H;
-            let bands_y: [(i32, i32); 5] =
-                [(30, 140), (480, 662), (row_y, row_y + ROW_H), (MINI_Y - 40, H), (60, 476)];
+            let bands_y: [(i32, i32); 6] =
+                [(30, 140), (480, 662), (row_y, row_y + ROW_H), (MINI_Y - 40, H), (60, 476), (62, 106)];
             for (k, &(y0, y1)) in bands_y.iter().enumerate() {
                 if app.keys[k] != keys[k] {
                     app.keys[k] = keys[k];
@@ -1087,6 +1095,7 @@ fn act(app: &mut App, hit: Hit) {
             app.screen = Screen::Library;
             app.flash = Hit::None;
             app.fan = 0;
+            app.deal = (0, now_ms());
             full(app);
         }
         Hit::Open => {
@@ -1155,6 +1164,8 @@ pub fn run() -> ! {
         repeat: true,
         caps: [0; 16],
         breath: COVER,
+        deal: (0, 0),
+        last_ms: 0,
         fan: 0,
         frame: 0,
         flash: Hit::None,
@@ -1205,17 +1216,26 @@ pub fn run() -> ! {
             if !shown || changed_track {
                 // Deal the covers out on arrival; gather and re-deal on a new song.
                 app.fan = if shown { 120 } else { 0 };
+                app.deal = (app.fan, now_ms());
                 app.breath = app.target_breath();
                 full(&mut app);
             }
-            // Animations.
+            // Animations run on the clock, so a slow frame never stretches or
+            // stalls them: the deal eases out over DEAL_MS.
+            let now = now_ms();
+            let dt = now.wrapping_sub(app.last_ms).min(100) as i32;
+            app.last_ms = now;
             if app.fan < 256 && app.screen == Screen::Library {
-                app.fan = (app.fan + 40 + (256 - app.fan) / 4).min(256);
+                let x = (now.wrapping_sub(app.deal.1).min(DEAL_MS) * 256 / DEAL_MS) as i32;
+                let rest = 256 - x;
+                let eased = 256 - rest * rest / 256 * rest / 256;
+                app.fan = app.deal.0 + (256 - app.deal.0) * eased / 256;
             }
             let target = app.target_breath();
             if app.breath != target {
                 let d = target - app.breath;
-                app.breath += if d.abs() <= 4 { d } else { d / 3 };
+                let step = d * (dt * 256 / 90).min(256) / 256;
+                app.breath += if d.abs() <= 2 { d } else if step == 0 { d.signum() } else { step };
             }
             for _ in 0..4 {
                 let e = touch.poll();

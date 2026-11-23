@@ -12,6 +12,7 @@ extern int radio_l2_send(const unsigned char *, size_t),
     radio_l2_recv(unsigned char *, size_t);
 extern int radio_random(unsigned char *, size_t), guest_https(unsigned char *);
 extern unsigned radio_monotonic_ms(void);
+extern void ipc_yield(void);
 static struct netif iface;
 // Access-point mode: VioletOS hosts 192.168.77.0/24 and relays TCP through the phone.
 #define HOST_ADDR 0xc0a84d01u  /* 192.168.77.1 */
@@ -122,7 +123,8 @@ static int serve_dhcp(const unsigned char *f, int len) {
 void station_net_poll(void) {
   if (!attached)
     return;
-  for (unsigned i = 0; i < 8; i++) {
+  unsigned i;
+  for (i = 0; i < 8; i++) {
     int len = radio_l2_recv(frame, sizeof(frame));
     if (!len)
       break;
@@ -138,6 +140,10 @@ void station_net_poll(void) {
       pbuf_free(p);
   }
   sys_check_timeouts();
+  // Network waits spin on this poll. With nothing received, give the rest of
+  // the time slice away so Audio and the app on screen keep running.
+  if (i == 0)
+    ipc_yield();
 }
 static void abort_connection(void) {
   if (connection) {

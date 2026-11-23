@@ -68,26 +68,20 @@ pub fn scale_rgb(c: u32, k: u32) -> u32 {
     0xff00_0000 | ch(16) | ch(8) | ch(0)
 }
 
+/// Integer square root: Newton's method from a power of two above the root,
+/// which the hardware divide makes a few cycles per step.
 pub fn isqrt(v: u32) -> u32 {
-    if v == 0 {
-        return 0;
+    if v < 2 {
+        return v;
     }
-    let mut x = v;
-    let mut r = 0u32;
-    let mut bit = 1u32 << 30;
-    while bit > x {
-        bit >>= 2;
-    }
-    while bit != 0 {
-        if x >= r + bit {
-            x -= r + bit;
-            r = (r >> 1) + bit;
-        } else {
-            r >>= 1;
+    let mut x = 1u32 << ((33 - v.leading_zeros()) / 2);
+    loop {
+        let y = (x + v / x) >> 1;
+        if y >= x {
+            return x;
         }
-        bit >>= 2;
+        x = y;
     }
-    r
 }
 #[inline(always)]
 fn len(dx: i32, dy: i32) -> i32 {
@@ -362,22 +356,46 @@ fn falloff(t: i32) -> u32 {
 
 /// A soft shadow or glow around a rounded box (pixels): `spread` px of falloff.
 pub fn glow(x: i32, y: i32, w: i32, h: i32, r: i32, spread: i32, c: u32, a: u32) {
-    let (cx, cy, hw, hh, rr) = (x * 16 + w * 8, y * 16 + h * 8, w * 8, h * 8, r * 16);
     let (y0, y1) = rows(y - spread, y + h + spread);
-    let inv = (256 * 65536) / (spread * 16);
-    for py in y0..y1 {
-        let qy = (py * 16 + 8 - cy).abs() - hh;
-        for px in (x - spread).max(0)..(x + w + spread).min(W) {
-            let qx = (px * 16 + 8 - cx).abs() - hw;
-            if qx < -48 - rr && qy < -48 - rr {
-                continue; // under the box itself
+    let (x0, x1) = ((x - spread).max(0), (x + w + spread).min(W));
+    if x0 >= x1 {
+        return;
+    }
+    let inv = (256 * 65536) / spread.max(1);
+    let fall = |q: i32| falloff((q.max(0) * inv) >> 16);
+    if 2 * r >= w.min(h) {
+        // A circle: falloff by distance from the edge.
+        let (cx2, cy2, rad) = (2 * x + w, 2 * y + h, w.min(h));
+        for py in y0..y1 {
+            let dy = 2 * py + 1 - cy2;
+            for px in x0..x1 {
+                let dx = 2 * px + 1 - cx2;
+                let f = fall((len(dx, dy) - rad) / 2);
+                if f != 0 {
+                    let p = at(px, py);
+                    unsafe { *p = mix(*p, c, (f * a) >> 8, noise(px, py) & 255) };
+                }
             }
-            let d = box_d(px * 16 + 8, py * 16 + 8, cx, cy, hw, hh, rr);
-            let t = (d.max(0) * inv) >> 16;
-            let f = falloff(t);
+        }
+        return;
+    }
+    // Cards: the falloff across times the falloff down. With this much spread
+    // it reads as a rounded shadow, at a multiply per pixel.
+    let mut across = [0u16; W as usize];
+    for px in x0..x1 {
+        across[px as usize] = fall((x - px).max(px - (x + w - 1))) as u16;
+    }
+    for py in y0..y1 {
+        let fy = fall((y - py).max(py - (y + h - 1)));
+        if fy == 0 {
+            continue;
+        }
+        let k = (fy * a) >> 8;
+        for px in x0..x1 {
+            let f = (across[px as usize] as u32 * k) >> 8;
             if f != 0 {
                 let p = at(px, py);
-                unsafe { *p = mix(*p, c, (f * a) >> 8, noise(px, py) & 255) };
+                unsafe { *p = mix(*p, c, f, noise(px, py) & 255) };
             }
         }
     }
@@ -497,12 +515,14 @@ pub fn cover_art(x: i32, y: i32, size: i32, radius: i32, shade: u32) {
     let soft = size > 150;
     let (cx, cy, h, rr) = (x * 16 + size * 8, y * 16 + size * 8, size * 8, radius * 16);
     let step = ((SIDE as i32) << 16) / size; // texels per pixel, Q16
+    let weights: [[i32; 4]; 64] = core::array::from_fn(|f| cubic(f as i32, soft));
+    let sheen_k = 96 * 65536 / size;
     let (y0, y1) = rows(y, y + size);
     for py in y0..y1 {
         // Vertical pass: one row of SIDE texels, Q8 per channel.
         let v = ((py - y) * step + step / 2 - 32768).max(0);
         let (ti, f) = ((v >> 16) as i32, (v >> 10) & 63);
-        let w = cubic(f, soft);
+        let w = weights[f as usize];
         let mut line = [[0i32; 3]; SIDE];
         for (tx, l) in line.iter_mut().enumerate() {
             for k in 0..4 {
@@ -528,7 +548,7 @@ pub fn cover_art(x: i32, y: i32, size: i32, radius: i32, shade: u32) {
                 continue;
             }
             let (ti, f) = ((uu >> 16) as i32, (uu >> 10) & 63);
-            let w = cubic(f, soft);
+            let w = weights[f as usize];
             let mut acc = [0i32; 3];
             for k in 0..4 {
                 let tx = (ti - 1 + k as i32).clamp(0, SIDE as i32 - 1) as usize;
@@ -541,7 +561,7 @@ pub fn cover_art(x: i32, y: i32, size: i32, radius: i32, shade: u32) {
             let ch = |a: i32| (((a + n) >> 16) * shade as i32 >> 8).clamp(0, 255) as u32;
             let mut col = ch(acc[0]) << 16 | ch(acc[1]) << 8 | ch(acc[2]);
             // Glass: a soft sheen from the top-left corner and a faint rim.
-            let sheen = 64 - ((px - x) + (py - y)) * 96 / size;
+            let sheen = 64 - (((px - x) + (py - y)) * sheen_k >> 16);
             if sheen > 0 {
                 col = mix(col, 0xffffff, sheen as u32, 128);
             }

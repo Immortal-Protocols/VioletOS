@@ -55,6 +55,7 @@ struct Runtime {
     focus: u32,
     held: bool,
     asleep: bool,
+    usb_open: u32,
     ready: Message,
     clients: [Client; 15],
 }
@@ -88,7 +89,30 @@ impl Runtime {
         self.clients[who as usize].jobs[(lane - 3) as usize].lane = lane;
         Message::error(BUSY)
     }
+    /// A bench request over USB (moto-package open=ID) to wake the phone and
+    /// open an app. The supervisor bumps a serial in the high half of the cell.
+    fn usb_open(&mut self) {
+        let cell = unsafe { (0x07400000 as *const u32).add(983).read_volatile() };
+        if cell == self.usb_open {
+            return;
+        }
+        let first = self.usb_open == u32::MAX;
+        self.usb_open = cell;
+        let id = cell & 0xffff;
+        if first || !is_app(id) {
+            return;
+        }
+        if self.asleep {
+            crate::lanes::take(8, 0);
+            crate::lanes::queue(8, 0, LAUNCHER, Message::new(EXECUTE, POWER, 0));
+            self.asleep = false;
+        }
+        if Message::new(EXECUTE, OPEN, id).call(LIFECYCLE).op == OK {
+            self.focus = id;
+        }
+    }
     fn dispatch(&mut self, who: u32, m: Message) -> Message {
+        self.usb_open();
         let component = component(m.key);
         if component != 0 && self.inventory & (1 << component) == 0 {
             return Message::error(OFFLINE);
@@ -229,6 +253,7 @@ pub fn run() -> ! {
         focus: LAUNCHER,
         held: false,
         asleep: false,
+        usb_open: u32::MAX,
         ready: status,
         clients: [Client::default(); 15],
     };

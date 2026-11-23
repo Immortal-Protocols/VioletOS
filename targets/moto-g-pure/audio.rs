@@ -54,6 +54,8 @@ const S_JACK: usize = 19; // plugged | polarity << 1 | events << 8
 const S_ACCDET: usize = 20; // 20..=24: 0x2320, 0x2324, 0x232c, 0x208c, 0x230a
 const S_PMIC_FAIL: usize = 25; // count | last address << 16
 const S_UNDERRUNS: usize = 26; // times the DMA overtook the samples written
+// 96: longest gap between output polls in ms; 97: gaps over 60 ms.
+const S_GAP: usize = 96;
 const S_AFE: usize = 27; // 27..=35
 const S_CODEC: usize = 36; // 36..=41
 const S_AMP: usize = 42; // 42..=50
@@ -735,6 +737,7 @@ static mut SEEN: u32 = 0;
 /// Frames written but not yet played. Negative means the DMA overtook us.
 static mut AHEAD: i32 = 0;
 static mut UNDERRUNS: u32 = 0;
+static mut LAST_POLL: u32 = 0;
 
 fn platform(want: u32) -> u32 {
     let m = Message::new(EXECUTE, AUDIO_PLATFORM, want).call(LIFE_SLOT);
@@ -826,6 +829,7 @@ pub fn start(headphones: bool) -> bool {
         AHEAD = 0;
         QUIET = 0;
         HW_LAST = 0;
+        LAST_POLL = ticks();
         // The headphone codec powers up before the stream; the speaker amplifier
         // locks its PLL to the I2S3 bit clock, so the stream starts first.
         let ok = if headphones {
@@ -873,8 +877,23 @@ fn buffered() -> u32 {
     let cur = afe(AFE_DL1_CUR);
     let hw = if (SRAM_PHYS..SRAM_PHYS + RING_BYTES).contains(&cur) { (cur - SRAM_PHYS) / 4 } else { 0 };
     unsafe {
-        let moved = (hw + RING_FRAMES - HW_LAST) % RING_FRAMES;
+        let mut moved = (hw + RING_FRAMES - HW_LAST) % RING_FRAMES;
         HW_LAST = hw;
+        // A gap longer than the ring wraps the pointer: trust the clock then.
+        let now = ticks();
+        let gap = now.wrapping_sub(LAST_POLL);
+        LAST_POLL = now;
+        let ms = gap / ticks_per_ms.max(1);
+        if OUTPUT != 0 {
+            note(S_GAP, noted(S_GAP).max(ms));
+            if ms > 60 {
+                note(S_GAP + 1, noted(S_GAP + 1) + 1);
+            }
+        }
+        let by_clock = (u64::from(gap) * 48 / u64::from(ticks_per_ms.max(1))) as u32;
+        if by_clock > RING_FRAMES / 2 && by_clock > moved {
+            moved = by_clock;
+        }
         SEEN = SEEN.wrapping_add(moved);
         note(S_CONSUMED, SEEN);
         AHEAD -= moved as i32;
@@ -966,6 +985,11 @@ pub fn debug(command: u32, param: u32) {
             0x10 => AMP_VOLUME = (param & 0xff) as u16,
             0x11 => AMP_DSP = param as u16,
             0x12 if I2C_ON => AMP_OK = amp_init(),
+            // Stall Audio for `param` milliseconds, to test underrun handling.
+            0x17 => {
+                let start = unsafe { ticks() };
+                while unsafe { ticks().wrapping_sub(start) } < param.min(2000) * unsafe { ticks_per_ms } {}
+            }
             0x13 => {
                 accdet_report();
                 afe_report();

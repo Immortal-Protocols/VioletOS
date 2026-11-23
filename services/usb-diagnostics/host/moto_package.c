@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open=APP_ID | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -156,6 +156,10 @@ int main(int argc,char **argv) {
             uint32_t request=(uint32_t)strtoul(argv[1]+6,NULL,16);
             rc=transfer(chosen,0x40,0x4e,request,NULL,0);
             if (!rc) printf("Audio request %08x sent.\n",request);
+        } else if (!strncmp(argv[1],"open=",5)) {
+            unsigned id=(unsigned)strtoul(argv[1]+5,NULL,10);
+            rc=transfer(chosen,0x40,0x71,id,NULL,0);
+            if (!rc) printf("Asked Home to open app %u.\n",id);
         } else if (!strcmp(argv[1],"scan-wifi")) {
             rc=transfer(chosen,0x40,0x69,0,NULL,0);
             if (!rc) puts("Scan requested. Read the result with moto-debug.");
