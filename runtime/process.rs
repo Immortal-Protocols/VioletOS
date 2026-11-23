@@ -30,15 +30,15 @@ fn service(key: u32) -> u32 {
 fn job_slot(key: u32) -> usize {
     service(key).saturating_sub(3) as usize
 }
-const STREAMS: usize = 5;
-const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK];
+const STREAMS: usize = 6;
+const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK, MICROPHONE];
 /// The component whose inventory bit gates a key.
 fn component(key: u32) -> u32 {
     match key {
         RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
         POWER => 8,
         SAVE | FILE_LIST..=FILE_DELETE => 6,
-        VOLUME | PLAYBACK => AUDIO_COMPONENT,
+        VOLUME | PLAYBACK | MICROPHONE => AUDIO_COMPONENT,
         _ => 0,
     }
 }
@@ -59,6 +59,12 @@ struct Runtime {
     clients: [Client; 15],
 }
 impl Runtime {
+    /// The microphone belongs to the app on screen: it stops when focus moves or the phone sleeps.
+    fn mic_off(&self) {
+        if self.inventory & (1 << AUDIO_COMPONENT) != 0 {
+            audio(Message::new(EXECUTE, MICROPHONE, MIC_OFF));
+        }
+    }
     fn contact(&mut self, who: u32) -> Message {
         if who != self.focus {
             return Message::error(EMPTY);
@@ -113,6 +119,7 @@ impl Runtime {
                 let r = m.call(LIFECYCLE);
                 if r.op == OK {
                     self.focus = m.value;
+                    self.mic_off();
                 }
                 r
             }
@@ -120,6 +127,7 @@ impl Runtime {
                 let r = Message::new(EXECUTE, QUIT, who).call(LIFECYCLE);
                 if r.op == OK {
                     self.focus = LAUNCHER;
+                    self.mic_off();
                     let client = &mut self.clients[who as usize];
                     client.streams = [Stream::default(); STREAMS];
                     for job in &mut client.jobs {
@@ -147,11 +155,15 @@ impl Runtime {
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
             (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
             (GET, POWER) => self.forward(who, 8, m),
-            (GET, VOLUME | PLAYBACK) => audio(m),
-            // Volume is shared. Only the app on screen may change it or make sound.
-            (EXECUTE, VOLUME | PLAYBACK) if who == self.focus && !self.asleep => audio(m),
+            (GET, VOLUME | PLAYBACK | MICROPHONE) => audio(m),
+            // Volume is shared. Only the app on screen may change it, make sound
+            // or listen.
+            (EXECUTE, VOLUME | PLAYBACK | MICROPHONE) if who == self.focus && !self.asleep => audio(m),
             (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
                 self.asleep = m.value == 1;
+                if self.asleep {
+                    self.mic_off();
+                }
                 self.forward(who, 8, m)
             }
             _ => Message::error(DENIED),
@@ -275,7 +287,7 @@ pub fn run() -> ! {
                     rt.contact(who).reply();
                     continue;
                 }
-                let state = if matches!(key, VOLUME | PLAYBACK) {
+                let state = if matches!(key, VOLUME | PLAYBACK | MICROPHONE) {
                     audio(Message::new(GET, key, 0))
                 } else {
                     crate::lanes::sample(

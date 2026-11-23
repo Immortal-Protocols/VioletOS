@@ -197,6 +197,9 @@ static void prepare_process(unsigned id) {
     for (unsigned i = 3; i <= 8; i++)
       private_page(p, STACK_TOP - i * PAGE, 0, 0, false);
   }
+  // Audio keeps the microphone recording in 128 KiB of zeroed private RAM.
+  if (id == AUDIO)
+    for (unsigned off = 0; off < 0x20000; off += PAGE) private_page(p, 0x02800000 + off, 0, 0, false);
 #ifdef VIOLET_MOTO
   if (pkg->id==RADIO && pkg->abi==3)
     for (unsigned off=0;off<0x20000;off+=PAGE) private_page(p,0x02800000+off,0,0,false);
@@ -335,12 +338,14 @@ static struct device_page devices[] = {
     {POWER, 0x49002000, 0x09000000, 0},   {STORAGE, 0x49200000, 0x0b000000, 0},
     {RADIO, 0x49201000, 0x09002000, 0},   {RADIO, 0x49202000, 0x09005000, 0},
     {0, 0x49203000, 0x0b003000, 0},
-    // Emulated sound card: control page, then an eight-page PCM ring.
+    // Emulated sound card: control page, an eight-page PCM ring,
     {AUDIO, 0x49204000, 0x09000000, 0}, {AUDIO, 0x49205000, 0x09001000, 0},
     {AUDIO, 0x49206000, 0x09002000, 0}, {AUDIO, 0x49207000, 0x09003000, 0},
     {AUDIO, 0x49208000, 0x09004000, 0}, {AUDIO, 0x49209000, 0x09005000, 0},
     {AUDIO, 0x4920a000, 0x09006000, 0}, {AUDIO, 0x4920b000, 0x09007000, 0},
-    {AUDIO, 0x4920c000, 0x09008000, 0}};
+    {AUDIO, 0x4920c000, 0x09008000, 0},
+    // and the two-page microphone ring.
+    {AUDIO, 0x4920d000, 0x09009000, 0}, {AUDIO, 0x4920e000, 0x0900a000, 0}};
 #else
 static unsigned handset_report[6];
 static unsigned uploaded, upload_size, upload_crc;
@@ -942,7 +947,8 @@ restore_config:
 // (clk-mt6765.c), AudDrv_Clk_On and the ellis pinctrl overlay. Bits in `want`:
 // 1 audio clocks (infra audio + 26 MHz gates, audio_sel = 26 MHz,
 // aud_intbus_sel = syspll1_d4), 2 headphone link pins (GPIO136/138/139 mode 1),
-// 4 speaker pins (I2S3 on GPIO17-20 mode 6, I2C0 gate). Zero leaves the
+// 4 speaker pins (I2S3 on GPIO17-20 mode 6, I2C0 gate), 8 microphone link
+// pins (AUD_CLK_MISO and AUD_DAT_MISO0/1 on GPIO140/142/143 mode 1). Zero leaves the
 // hardware alone. The survey reports gates, muxes and pin modes either way.
 static void set_field(volatile unsigned *reg, unsigned mask, unsigned value) {
   write_board(reg, (*reg & ~mask) | value);
@@ -964,6 +970,10 @@ static unsigned audio_platform(unsigned want, bool change, unsigned survey[10]) 
   if (change && (want & 2)) {
     set_field(gpio + 0x410 / 4, 0xff0f, 0x1101);
     done |= 2;
+  }
+  if (change && (want & 8)) {
+    set_field(gpio + 0x410 / 4, 0xff0f0000u, 0x11010000u);
+    done |= 8;
   }
   if (change && (want & 4)) {
     set_field(gpio + 0x320 / 4, 0xffff0, 0x66660);
@@ -1111,7 +1121,7 @@ void root_main(seL4_BootInfo *bi) {
                result = 0, error = 2;
 #ifdef VIOLET_MOTO
       if (badge == AUDIO_LIFE_BADGE && key == AUDIO_PLATFORM &&
-          seL4_MessageInfo_get_length(msg) == 14 && (op == GET || (op == EXECUTE && val <= 7))) {
+          seL4_MessageInfo_get_length(msg) == 14 && (op == GET || (op == EXECUTE && val <= 15))) {
         unsigned survey[10];
         result = audio_platform(op == EXECUTE ? val : 0, op == EXECUTE, survey);
         for (unsigned i = 0; i < 10; i++) seL4_SetMR(4 + i, survey[i]);

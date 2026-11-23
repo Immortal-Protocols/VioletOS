@@ -215,6 +215,7 @@ pub const AUDIO_SPEAKER_OUT: u32 = 1 << 1; // The speaker path is available.
 pub const AUDIO_HEADPHONE_OUT: u32 = 1 << 2; // The headphone path is available.
 pub const AUDIO_BUTTONS: u32 = 1 << 3; // Hardware volume buttons are being read.
 pub const AUDIO_JACK: u32 = 1 << 4; // Jack detection is being read.
+pub const AUDIO_MIC: u32 = 1 << 5; // The microphone can record.
 /// PLAYBACK: EXECUTE value is a sound (SOUND_STOP stops). For SOUND_TONE, arg is
 /// frequency in hertz in the low 16 bits and duration in milliseconds in the high 16.
 /// Replies carry the sound now playing in value (0 when idle) and, in arg, the
@@ -224,10 +225,27 @@ pub const SOUND_CLICK: u32 = 1;
 pub const SOUND_CHIME: u32 = 2;
 pub const SOUND_ALERT: u32 = 3;
 pub const SOUND_TONE: u32 = 4;
-pub const SOUND_LAST: u32 = SOUND_TONE;
+/// The last microphone recording (see MICROPHONE). EMPTY when there is none.
+pub const SOUND_RECORDING: u32 = 5;
+pub const SOUND_LAST: u32 = SOUND_RECORDING;
 pub const PLAYBACK_PLAYED: u32 = 1 << 16; // The last request finished playing.
 pub const PLAYBACK_STOPPED: u32 = 2 << 16; // It was stopped or replaced.
 pub const PLAYBACK_NO_OUTPUT: u32 = 3 << 16; // No output path could play it.
 pub const PLAYBACK_OUTCOME: u32 = 3 << 16;
+/// MICROPHONE: subscribe, GET or EXECUTE. EXECUTE value is MIC_OFF, MIC_LISTEN
+/// (show the input level) or MIC_RECORD (replace the recording, up to
+/// MIC_RECORD_MS, then stop). Replies carry the input level in value, 0 (-60 dB
+/// or quieter) to 100 (full scale), and in arg the mode in the low byte,
+/// MIC_HAS_RECORDING, and the recording's length in tens of milliseconds in the
+/// high 16 bits. Only the app on screen may turn it on; it turns off when that
+/// app leaves the screen or the phone sleeps.
+pub const MICROPHONE: u32 = 32;
+pub const MIC_OFF: u32 = 0;
+pub const MIC_LISTEN: u32 = 1;
+pub const MIC_RECORD: u32 = 2;
+pub const MIC_MODE: u32 = 0xff;
+pub const MIC_HAS_RECORDING: u32 = 1 << 8;
+pub const MIC_LEVEL_MAX: u32 = 100;
+pub const MIC_RECORD_MS: u32 = 4000;
 /// Internal: Audio -> Power, a PMIC register read or masked write on the handset.
 pub const PMIC_ACCESS: u32 = 0x4070;

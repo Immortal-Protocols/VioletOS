@@ -6,6 +6,11 @@
 //! level, 5 frames written in total, 6 sample rate, 7 ring frames, 8 playback
 //! serial, 9 sound playing, 10 peak sample since output started, 11 frames
 //! written since output started. The ring holds 48 kHz interleaved stereo s16.
+//!
+//! Microphone: 12 capture on (guest, bit 0), 13 samples captured in total
+//! (host), 14 capture ring samples (guest), 15 the service's MICROPHONE arg,
+//! 16 its level. The host writes 16 kHz mono s16 into a two-page ring at guest
+//! 0x4920d000, which Audio maps at 0x09009000.
 use crate::protocol::*;
 
 pub struct Inputs {
@@ -16,6 +21,8 @@ pub struct Inputs {
 const CONTROL: *mut u32 = 0x09000000 as *mut u32;
 const RING: *mut [i16; 2] = 0x09001000 as *mut [i16; 2];
 const RING_FRAMES: u32 = 8 * 4096 / 4;
+const MIC: *const i16 = 0x09009000 as *const i16;
+const MIC_SAMPLES: u32 = 2 * 4096 / 2;
 const MAGIC: u32 = 0x31445541; // "AUD1"
 // Keep about 40 ms queued ahead of the host so scheduling jitter is inaudible.
 const LEAD_FRAMES: u64 = 48 * 40;
@@ -29,6 +36,7 @@ fn set(i: usize, v: u32) {
 static mut STARTED: u32 = 0;
 static mut WRITTEN: u64 = 0;
 static mut PEAK: u32 = 0;
+static mut MIC_RD: u32 = 0;
 
 pub fn init() -> u32 {
     set(3, 0);
@@ -37,8 +45,12 @@ pub fn init() -> u32 {
     set(7, RING_FRAMES);
     set(10, 0);
     set(11, 0);
+    set(12, 0);
+    set(14, MIC_SAMPLES);
+    set(15, 0);
+    set(16, 0);
     set(2, MAGIC);
-    AUDIO_SPEAKER_OUT | AUDIO_HEADPHONE_OUT | AUDIO_BUTTONS | AUDIO_JACK
+    AUDIO_SPEAKER_OUT | AUDIO_HEADPHONE_OUT | AUDIO_BUTTONS | AUDIO_JACK | AUDIO_MIC
 }
 pub fn inputs() -> Inputs {
     let buttons = reg(0);
@@ -97,6 +109,38 @@ pub fn drained() -> bool {
 pub fn publish(_level: u32, _flags: u32, serial: u32, sound: u32) {
     set(8, serial);
     set(9, sound);
+}
+/// Ask the host for microphone samples, starting from what it writes next.
+pub fn mic_start() -> bool {
+    unsafe { MIC_RD = reg(13) };
+    set(12, 1);
+    true
+}
+pub fn mic_stop() {
+    set(12, 0);
+}
+pub fn mic_read(out: &mut [i16]) -> usize {
+    if reg(12) & 1 == 0 {
+        return 0;
+    }
+    let written = reg(13);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    unsafe {
+        // Fell a ring behind (the host ran ahead): skip to the newest half.
+        if written.wrapping_sub(MIC_RD) > MIC_SAMPLES {
+            MIC_RD = written.wrapping_sub(MIC_SAMPLES / 2);
+        }
+        let n = (written.wrapping_sub(MIC_RD) as usize).min(out.len());
+        for s in out[..n].iter_mut() {
+            *s = MIC.add((MIC_RD % MIC_SAMPLES) as usize).read_volatile();
+            MIC_RD = MIC_RD.wrapping_add(1);
+        }
+        n
+    }
+}
+pub fn publish_mic(state: u32, level: u32) {
+    set(15, state);
+    set(16, level);
 }
 /// The emulator has no developer link; the viewer drives the card directly.
 pub fn request() -> Option<u32> {
