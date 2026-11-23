@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Builds apps/music/catalog.rs from the library catalog and its cover art.
+
+    python3 apps/music/tools/make_catalog.py catalog.json covers/ > apps/music/catalog.rs
+
+catalog.json is the library's rose-music-catalog/v1 file; covers/ holds
+01.jpg .. 10.jpg. macOS `sips` shrinks each cover; this script then makes a
+SIDE x SIDE thumbnail in 4x4 colour blocks (two RGB565 end colours and a
+2-bit index per pixel, 8 bytes a block), a palette (accent, deep, glow) in the
+manner of the Android app, and 48 loudness bars from the 160 catalog peaks.
+"""
+import colorsys
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+
+SIDE = 32
+BARS = 48
+
+
+def load_bmp(path):
+    data = open(path, "rb").read()
+    off = struct.unpack_from("<I", data, 10)[0]
+    w, h = struct.unpack_from("<ii", data, 18)
+    bpp = struct.unpack_from("<H", data, 28)[0]
+    step = bpp // 8
+    stride = (w * step + 3) & ~3
+    rows = []
+    for y in range(abs(h)):
+        src = y if h < 0 else abs(h) - 1 - y
+        base = off + src * stride
+        rows.append([tuple(data[base + x * step + 2 - c] for c in range(3)) for x in range(w)])
+    return rows
+
+
+def shrink(path, side):
+    with tempfile.TemporaryDirectory() as tmp:
+        big = os.path.join(tmp, "c.bmp")
+        subprocess.run(["sips", "-s", "format", "bmp", "-z", str(side * 4), str(side * 4), path, "--out", big],
+                       check=True, capture_output=True)
+        px = load_bmp(big)
+    # Box filter 4x4 for a clean, alias-free thumbnail.
+    out = []
+    for y in range(side):
+        row = []
+        for x in range(side):
+            acc = [0, 0, 0]
+            for dy in range(4):
+                for dx in range(4):
+                    p = px[y * 4 + dy][x * 4 + dx]
+                    for c in range(3):
+                        acc[c] += p[c]
+            row.append(tuple(a / 16 for a in acc))
+        out.append(row)
+    return out
+
+
+def to565(c):
+    r, g, b = (max(0, min(255, round(v))) for v in c)
+    return (r * 31 + 127) // 255 << 11 | (g * 63 + 127) // 255 << 5 | (b * 31 + 127) // 255
+
+
+def from565(v):
+    r, g, b = v >> 11, v >> 5 & 63, v & 31
+    return (r * 255 // 31, g * 255 // 63, b * 255 // 31)
+
+
+def block_colours(a, b):
+    ca, cb = from565(a), from565(b)
+    return [ca, cb, tuple((2 * x + y) / 3 for x, y in zip(ca, cb)), tuple((x + 2 * y) / 3 for x, y in zip(ca, cb))]
+
+
+def err(c, d):
+    return sum((x - y) ** 2 * w for x, y, w in zip(c, d, (3, 4, 2)))
+
+
+def encode_block(pixels):
+    mean = [sum(p[c] for p in pixels) / 16 for c in range(3)]
+    cov = [[sum((p[i] - mean[i]) * (p[j] - mean[j]) for p in pixels) for j in range(3)] for i in range(3)]
+    axis = [1.0, 1.0, 1.0]
+    for _ in range(8):
+        axis = [sum(cov[i][j] * axis[j] for j in range(3)) for i in range(3)]
+        n = max(1e-9, sum(v * v for v in axis) ** 0.5)
+        axis = [v / n for v in axis]
+    proj = [sum((p[c] - mean[c]) * axis[c] for c in range(3)) for p in pixels]
+    lo, hi = min(proj), max(proj)
+    best = None
+    # Try the principal-axis extremes and a few inset variants.
+    for inset in (0.0, 0.06, 0.12, 0.2):
+        span = hi - lo
+        e0 = [mean[c] + (hi - inset * span) * axis[c] for c in range(3)]
+        e1 = [mean[c] + (lo + inset * span) * axis[c] for c in range(3)]
+        a, b = to565(e0), to565(e1)
+        if a < b:
+            a, b = b, a
+        if a == b:
+            if a < 0xFFFF:
+                a += 1
+            else:
+                b -= 1
+        cols = block_colours(a, b)
+        idx = [min(range(4), key=lambda k: err(p, cols[k])) for p in pixels]
+        total = sum(err(p, cols[k]) for p, k in zip(pixels, idx))
+        if best is None or total < best[0]:
+            best = (total, a, b, idx)
+    _, a, b, idx = best
+    bits = 0
+    for i, k in enumerate(idx):
+        bits |= k << (2 * i)
+    return struct.pack("<HHI", a, b, bits)
+
+
+def palette(px):
+    best, accent = 0.0, (185, 162, 255)
+    tot = [0, 0, 0]
+    flat = [p for row in px for p in row]
+    for p in flat:
+        for c in range(3):
+            tot[c] += p[c]
+        h, s, v = colorsys.rgb_to_hsv(*(x / 255 for x in p))
+        score = s * v * (1.2 if v > 0.45 else 0.6)
+        if score > best:
+            best, accent = score, p
+    h, s, v = colorsys.rgb_to_hsv(*(x / 255 for x in accent))
+    acc = colorsys.hsv_to_rgb(h, min(0.8, max(0.35, s)), min(1, max(0.82, v)))
+    glow = colorsys.hsv_to_rgb(h, min(0.9, max(0.4, s)), 0.65)
+    ah, as_, av = colorsys.rgb_to_hsv(*(x / 255 / len(flat) for x in tot))
+    deep = colorsys.hsv_to_rgb(ah, min(0.7, max(0.2, as_ * 1.1)), 0.16)
+    return [tuple(round(x * 255) for x in c) for c in (acc, deep, glow)]
+
+
+def rgb(c):
+    return "0x%06x" % (c[0] << 16 | c[1] << 8 | c[2])
+
+
+def main():
+    catalog = json.load(open(sys.argv[1]))
+    covers = sys.argv[2]
+    tracks = catalog["tracks"]
+    assert len(tracks) == 10
+    out = ["// Generated by apps/music/tools/make_catalog.py from the library catalog. Do not edit.",
+           "pub struct Track { pub title: &'static str, pub ms: u32, pub bpm: u16, pub key: &'static str,",
+           "    pub accent: u32, pub deep: u32, pub glow: u32, pub bars: [u8; %d], pub cover: [u8; %d] }" % (BARS, SIDE * SIDE // 2),
+           "pub const SIDE: usize = %d;" % SIDE,
+           "pub const BARS: usize = %d;" % BARS,
+           "pub const ALBUM: &str = %s;" % json.dumps(catalog["album"]),
+           "pub const ARTIST: &str = %s;" % json.dumps(tracks[0]["artist"]),
+           "pub const TOTAL_MS: u32 = %d;" % sum(t["durationMs"] for t in tracks),
+           "pub static TRACKS: [Track; 10] = ["]
+    for t in tracks:
+        px = shrink(os.path.join(covers, "%02d.jpg" % t["number"]), SIDE)
+        blocks = b""
+        for by in range(SIDE // 4):
+            for bx in range(SIDE // 4):
+                blocks += encode_block([px[by * 4 + y][bx * 4 + x] for y in range(4) for x in range(4)])
+        acc, deep, glow = palette(px)
+        peaks = t["peaks"]
+        bars = []
+        for i in range(BARS):
+            a, b = i * len(peaks) // BARS, max((i + 1) * len(peaks) // BARS, i * len(peaks) // BARS + 1)
+            bars.append(round(255 * min(1, max(peaks[a:b]))))
+        out.append("  Track { title: %s, ms: %d, bpm: %d, key: %s, accent: %s, deep: %s, glow: %s,\n    bars: %s,\n    cover: [%s] },"
+                   % (json.dumps(t["title"]), t["durationMs"], t["bpm"], json.dumps(t["key"]), rgb(acc), rgb(deep), rgb(glow),
+                      bars, ",".join(str(b) for b in blocks)))
+    out.append("];")
+    print("\n".join(out))
+
+
+main()

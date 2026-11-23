@@ -1,0 +1,15 @@
+Music app third-party notices
+
+apps/music/font.rs contains glyph bitmaps rendered from two typefaces, both
+licensed under the SIL Open Font License, Version 1.1:
+
+- Space Grotesk, Copyright 2020 The Space Grotesk Project Authors
+  (https://github.com/floriankarsten/space-grotesk). See fonts/SpaceGrotesk-OFL.txt.
+- Inter, Copyright 2020 The Inter Project Authors (https://github.com/rsms/inter).
+  See fonts/Inter-OFL.txt.
+
+The font software itself is not distributed here; tools/make_font.swift
+regenerates font.rs from the .ttf files.
+
+apps/music/catalog.rs contains small thumbnails of the Glass Orchard cover art
+and data from the Rose Music library catalog (tools/make_catalog.py).
