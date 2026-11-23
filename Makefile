@@ -77,6 +77,10 @@ test-power: qemu-image
 test-audio: qemu-image
 	$(PYTHON) targets/qemu/test_audio.py
 
+.PHONY: test-music-live
+test-music-live: qemu-image
+	$(PYTHON) targets/qemu/test_music.py
+
 .PHONY: test-moto-diagnostics
 test-moto-diagnostics: moto qemu-image
 	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial confirm

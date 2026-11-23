@@ -1,13 +1,14 @@
 # Audio service
 
-The Audio process owns sound output, the shared volume, the volume buttons and the headphone jack. Only Runtime calls it. Apps reach it through two Runtime keys:
+The Audio process owns sound output, music playback, the shared volume, the volume buttons and the headphone jack. Only Runtime calls it. Apps reach it through three Runtime keys:
 
 | Key | Subscribe / Get | Execute |
 | --- | --- | --- |
 | `VOLUME` | `value` is the level, 0 to 15. `arg` flags: `AUDIO_HEADPHONES` (a plug is in the jack, so output goes there), `AUDIO_SPEAKER_OUT` and `AUDIO_HEADPHONE_OUT` (that path can play), `AUDIO_BUTTONS` and `AUDIO_JACK` (the buttons or the jack are being read). | `value` is a level 0 to 15, `VOLUME_UP` or `VOLUME_DOWN`. |
 | `PLAYBACK` | `value` is the sound now playing, or 0. The low 16 bits of `arg` are the serial of the latest request; `PLAYBACK_OUTCOME` bits say whether it played, was stopped or found no output. | `value` is `SOUND_CLICK`, `SOUND_CHIME`, `SOUND_ALERT`, `SOUND_TONE` or `SOUND_STOP`. For a tone, `arg` holds the frequency in hertz (20 to 20,000) in its low 16 bits and the duration in milliseconds (1 to 5,000) in its high 16. Use `sdk::request_with` to pass it. |
+| `MUSIC` | `value` is the track loaded (1–10), or 0. The low 4 bits of `arg` are a `MUSIC_STATE_*` (stopped, buffering, playing, paused, offline, ended) and the rest is the position in milliseconds. The text holds 16 spectrum levels, the seconds buffered ahead, the output peak and the track length; see `runtime/protocol.rs`. | `MUSIC_PLAY` with `arg` = track \| seconds << 8, `MUSIC_PAUSE`, `MUSIC_RESUME`, `MUSIC_STOP`, or `MUSIC_SEEK` with `arg` = seconds. |
 
-Any app can subscribe or read. Only the app on screen can change the volume or start a sound, and not while the phone sleeps. A new sound replaces the one playing. The volume buttons work on every screen: one step per press, then repeated steps after half a second. Pressing both does nothing.
+Any app can subscribe or read. Only the app on screen can change the volume, start a sound or control the music, and not while the phone sleeps. A new sound replaces the one playing; music keeps playing underneath it and after its app leaves the screen. The volume buttons work on every screen: one step per press, then repeated steps after half a second. Pressing both does nothing.
 
 The service synthesizes the built-in sounds at 48 kHz ([synth.rs](synth.rs)) and scales them by the volume, 3 dB per step. Its loop serves Runtime without blocking, reads the buttons and jack, and refills the output. Each board supplies a backend with the same functions:
 
@@ -15,6 +16,18 @@ The service synthesizes the built-in sounds at 48 kHz ([synth.rs](synth.rs)) and
 - [Moto G Pure](../../targets/moto-g-pure/audio.rs): see the handset section below.
 
 Audio is component 22, beside USB Diagnostics (21), so existing app and service IDs keep their values. It is optional: without it, Runtime reports `OFFLINE` for both keys.
+
+## Music
+
+Music plays recordings from the Rose Music library, the album *Glass Orchard*, hosted at `MUSIC_HOST` (`runtime/protocol.rs`). The tracks are 48 kHz stereo MP3s at 128 kbps.
+
+- **Fetching.** Radio fetches the file. Audio writes the track and start offset into a stream control page that the supervisor maps only into Audio and Radio. From its event loop, Radio fills a 512 KiB ring with HTTPS range requests of up to 128 KiB each. Radio builds the path itself (`/tracks/NN.mp3`) and fetches only from that host, so no app can name a URL. A library that answers 503 (asleep) is retried every 4 seconds; other failures every 1.5 seconds.
+- **Decoding.** Audio decodes with [minimp3](https://github.com/lieff/minimp3) (CC0). The build fetches one pinned header and checks its hash. The decoder runs with hardware floating point; its 16 KiB scratch space lives in `.bss`, because Audio has an 8 KiB stack.
+- **Buffering.** Playback starts once 48 KiB (about 3 s) is buffered, and resumes after 24 KiB if the stream runs dry. Seeking assumes a constant bit rate, which the library's files have.
+- **Spectrum.** A bank of Goertzel filters measures ten bands on the signal decimated to 12 kHz and six on the full signal, and reports them with a slow fall-off.
+- **Mixing.** Sounds mix on top of the music, and the volume scales both.
+
+`make test-music-live` (needs the internet) connects the emulator's Wi-Fi, opens Music, streams track 1 and checks that the sound card receives 48,000 frames a second, then pauses and resumes. Comparing the emulator's output with ffmpeg's decoding of the same file showed a 29 dB signal-to-noise ratio once aligned, after removing the buffering silence and the MP3 encoder delay.
 
 ## Try it
 
@@ -42,7 +55,7 @@ The speaker runs without its vendor preset (`fs1603s.fsm`), which only root can 
 
 ### Developer requests over USB
 
-`build/moto-package audio-status` prints the 64-word status page: capabilities, raw button and jack registers, the supervisor's clock and pin survey, AFE and codec registers, and FS1603 status. `build/moto-package audio=HEX` sends a request, with the command in the high byte:
+`build/moto-package audio-status` prints the 64-word status page: capabilities, raw button and jack registers, the supervisor's clock and pin survey, AFE and codec registers, and FS1603 status. Words 58–63 show the music: track, state and peak; position in milliseconds; bytes fetched; file size; last HTTP status and fetch count; and failures, Radio's stream state and the last fetch's duration in milliseconds. `build/moto-package audio=HEX` sends a request, with the command in the high byte:
 
 | Request | Effect |
 | --- | --- |
@@ -51,6 +64,8 @@ The speaker runs without its vendor preset (`fs1603s.fsm`), which only root can 
 | `030000LL` | Set the volume level. |
 | `0400000R` | Route: 0 follows the jack, 1 forces the speaker, 2 forces headphones. |
 | `05000000` | Stop. |
+| `06SSSSTT` | Music: play track `TT` from second `SSSS`. For example, `06007805` plays track 5 from 2:00. |
+| `07AAAACC` | Music command `CC` (2 pause, 3 resume, 4 stop, 5 seek) with argument `AAAA`. |
 | `10`–`16` | Board debugging: amplifier volume, DSP word, re-init, refresh, codec readback, amplifier register write (`15RRVVVV`) and read (`160000RR`, into word 57). |
 
 These requests bypass Runtime's rule that only the app on screen may play sound. They exist for testing on the bench.

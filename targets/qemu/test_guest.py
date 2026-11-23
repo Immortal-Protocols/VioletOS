@@ -46,7 +46,7 @@ cmd=machine(peer=peer,catalogs=catalogs,image=image,watchdog=enabled, scenario=m
 if args.stack=="recovered" or args.library=="radio-rollback":
     cmd+=["-device","loader,addr=0x49300014,data=1,data-len=4"]
 if args.probe:
-    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000,"scanout":0x08000000,"peer":0x06100000,"radio":0x09001000,"radio-dma":0x09002000}[args.probe]
+    address={"touch":0x09003000,"storage":0x0a000000,"dma":0x0b000000,"scanout":0x08000000,"peer":0x06500000,"radio":0x09001000,"radio-dma":0x09002000}[args.probe]
     cmd+=["-device",f"loader,addr=0x49300000,data={address},data-len=4"]
 p=subprocess.Popen(cmd,pass_fds=(peer,) if peer is not None else (),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
 try:
@@ -278,11 +278,11 @@ try:
         if args.stack=="recovered":
             if args.fault_id in (2,10):
                 tap(680 if args.fault_id==10 else 920)  # The stopwatch loads on demand.
-            if args.fault_id in (13,14):
-                # Sounds and Weather load on demand too: Apps -> NEXT past STOPWATCH
-                # WI-FI and MUSIC (and Sounds, for Weather) -> OPEN.
+            if args.fault_id in (12,13,14):
+                # Music, Sounds and Weather load on demand too: Apps -> NEXT past
+                # STOPWATCH and WI-FI (then MUSIC and SOUNDS as needed) -> OPEN.
                 tap(260,560); time.sleep(.3)
-                for _ in range(3 if args.fault_id==13 else 4): tap(440)
+                for _ in range(args.fault_id-10): tap(440)
                 time.sleep(.3)
                 tap(650)
             for _ in range(140):

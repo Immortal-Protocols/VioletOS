@@ -13,25 +13,39 @@ fn set(i: usize, v: u32) {
 fn fence() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
-fn now_ms() -> u32 {
-    unsafe { ticks() / ticks_per_ms.max(1) }
+fn now() -> u32 {
+    unsafe { ticks() }
+}
+fn ms(n: u32) -> u32 {
+    n.wrapping_mul(unsafe { ticks_per_ms })
 }
 
 /// The result of one range read: bytes read and the file's total size (0 if
 /// unknown), or the HTTP status (0 when nothing answered).
 pub type Fetch<'a> = &'a mut dyn FnMut(&[u8], u32, u32, &mut [u8]) -> Result<(usize, u32), u32>;
 
+/// Count a network recovery (shown to USB diagnostics through Audio).
+pub fn relinked() {
+    set(STREAM_RELINKS, word(STREAM_RELINKS) + 1);
+}
+
 /// Don't start a fetch for less than this unless it finishes the file.
 const MIN_FETCH: u32 = 32 << 10;
 
 #[derive(Default)]
 pub struct Streamer {
-    retry_at: Option<u32>,
+    /// (tick of the failure, ticks to wait) before the next attempt.
+    retry: Option<(u32, u32)>,
+    /// Fetches in a row that got no answer at all.
+    pub silent: u32,
 }
 impl Streamer {
     /// True when Audio wants bytes that Radio could fetch now.
     pub fn wants(&self) -> bool {
-        word(0) == STREAM_MAGIC && word(STREAM_TRACK) != 0 && word(STREAM_STATE) != STREAM_STATE_COMPLETE
+        word(0) == STREAM_MAGIC
+            && word(STREAM_TRACK) != 0
+            && (word(STREAM_GENERATION) != word(STREAM_FILLED_GENERATION)
+                || word(STREAM_STATE) != STREAM_STATE_COMPLETE)
     }
     /// Do at most one range request. `online` says whether a network is up.
     pub fn step(&mut self, online: bool, fetch: Fetch) {
@@ -45,7 +59,7 @@ impl Streamer {
             set(STREAM_STATE, STREAM_STATE_IDLE);
             fence();
             set(STREAM_FILLED_GENERATION, generation);
-            self.retry_at = None;
+            self.retry = None;
         }
         let track = word(STREAM_TRACK);
         let mut path = [0u8; 16];
@@ -63,8 +77,8 @@ impl Streamer {
             set(STREAM_STATE, STREAM_STATE_OFFLINE);
             return;
         }
-        if let Some(at) = self.retry_at {
-            if (now_ms().wrapping_sub(at) as i32) < 0 {
+        if let Some((at, wait)) = self.retry {
+            if now().wrapping_sub(at) < wait {
                 return;
             }
         }
@@ -76,10 +90,10 @@ impl Streamer {
             return;
         }
         set(STREAM_STATE, STREAM_STATE_FETCHING);
-        let began = now_ms();
+        let began = now();
         let ring = unsafe { core::slice::from_raw_parts_mut((STREAM_DATA + at as usize) as *mut u8, n as usize) };
         let result = fetch(&path, from, from + n - 1, ring);
-        set(STREAM_LAST_MS, now_ms().wrapping_sub(began));
+        set(STREAM_LAST_MS, now().wrapping_sub(began) / unsafe { ticks_per_ms }.max(1));
         if word(STREAM_GENERATION) != generation {
             // Audio moved on while this was in flight; the next step resets.
             return;
@@ -93,7 +107,8 @@ impl Streamer {
                 set(STREAM_WRITTEN, written + got as u32);
                 set(STREAM_FETCHES, word(STREAM_FETCHES) + 1);
                 set(STREAM_HTTP, 206);
-                self.retry_at = None;
+                self.retry = None;
+                self.silent = 0;
                 let done = (size != 0 && from + got as u32 >= size) || got == 0;
                 set(STREAM_STATE, if done { STREAM_STATE_COMPLETE } else { STREAM_STATE_IDLE });
             }
@@ -106,8 +121,9 @@ impl Streamer {
                 set(STREAM_HTTP, status);
                 set(STREAM_FAILURES, word(STREAM_FAILURES) + 1);
                 set(STREAM_STATE, if status == 0 { STREAM_STATE_OFFLINE } else { STREAM_STATE_RETRYING });
+                self.silent = if status == 0 { self.silent + 1 } else { 0 };
                 // A sleeping library answers 503; give it longer.
-                self.retry_at = Some(now_ms().wrapping_add(if status == 503 { 4000 } else { 1500 }));
+                self.retry = Some((now(), ms(if status == 503 { 4000 } else { 1500 })));
             }
         }
     }

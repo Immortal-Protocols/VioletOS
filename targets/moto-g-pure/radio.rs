@@ -104,6 +104,8 @@ pub fn run() -> ! {
     let mut scan = passive_scan::Results::default();
     let mut requested = false;
     let mut join_target = None;
+    // The access point of the current station connection, for relinking.
+    let last_ap: core::cell::Cell<Option<passive_scan::AccessPoint>> = core::cell::Cell::new(None);
     // The supplicant retains its device context for group rekeys across IPC calls.
     static mut DEVICE: wlan_axi::Axi = wlan_axi::Axi::new();
     let dev = core::ptr::addr_of_mut!(DEVICE);
@@ -459,6 +461,7 @@ pub fn run() -> ! {
                                 return Err(53);
                             }
                             connected = ap.profile_id();
+                            last_ap.set(Some(*ap));
                             active.set(true);
                         }
                         Ok(())
@@ -664,6 +667,16 @@ pub fn run() -> ! {
                     if n < 0 { Err(status) } else { Ok((n as usize, total)) }
                 });
             }
+            // Three fetches in a row with no answer at all: the station link has
+            // gone quiet without a deauthentication. Associate again.
+            if !relaying && music.silent >= 3 {
+                music.silent = 0;
+                if let Some(ap) = last_ap.get() {
+                    if unsafe { relink(dev, &ap) } {
+                        stream::relinked();
+                    }
+                }
+            }
             if unsafe { ipc_try_receive(SERVER, &mut m) } == 0 {
                 unsafe {
                     wpa::poll();
@@ -681,6 +694,14 @@ pub fn run() -> ! {
         }
         r.reply();
     }
+}
+
+/// Re-associate with `ap` and redo the WPA2 handshake and DHCP, keeping the
+/// firmware running. Used when the link goes silent mid-stream.
+unsafe fn relink(dev: *mut wlan_axi::Axi, ap: &passive_scan::AccessPoint) -> bool {
+    wpa::close();
+    let axi = &mut *dev;
+    axi.associate(ap).is_ok() && wpa::authorize(axi, ap).is_ok() && wpa::join_ip(dev)
 }
 
 /// Relay access point that stays up between requests while the phone comes and goes.

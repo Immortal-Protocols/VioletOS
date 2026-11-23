@@ -103,3 +103,4 @@ pub fn request() -> Option<u32> {
     None
 }
 pub fn debug(_command: u32, _param: u32) {}
+pub fn music(_words: [u32; 6]) {}

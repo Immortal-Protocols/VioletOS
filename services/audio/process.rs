@@ -136,6 +136,9 @@ impl Audio {
                 self.reroute();
             }
             5 => { let _ = self.play(SOUND_STOP, 0); },
+            // Music: 6 plays track (low byte) from seconds (above); 7 sends a MUSIC command.
+            6 => { music().command(MUSIC_PLAY, param); },
+            7 => { music().command(param & 0xff, param >> 8); },
             _ => board::debug(command, param),
         }
     }
@@ -307,6 +310,7 @@ pub fn run() -> ! {
         }
         audio.poll_inputs();
         audio.pump();
+        board::music(music().debug_words());
         board::publish(
             audio.level,
             audio.flags(),

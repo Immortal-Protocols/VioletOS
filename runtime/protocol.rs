@@ -292,6 +292,8 @@ pub const STREAM_HTTP: usize = 9;
 pub const STREAM_FETCHES: usize = 10;
 pub const STREAM_FAILURES: usize = 11;
 pub const STREAM_LAST_MS: usize = 12;
+/// Radio: times the network link was re-established after going silent.
+pub const STREAM_RELINKS: usize = 13;
 pub const STREAM_STATE_IDLE: u32 = 0;
 pub const STREAM_STATE_FETCHING: u32 = 1;
 pub const STREAM_STATE_RETRYING: u32 = 2;

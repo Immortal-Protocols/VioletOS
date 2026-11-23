@@ -18,8 +18,8 @@ fn set(i: usize, v: u32) {
 fn fence() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
-fn now_ms() -> u32 {
-    unsafe { ticks() / ticks_per_ms.max(1) }
+fn now() -> u32 {
+    unsafe { ticks() }
 }
 
 /// Bytes per second assumed for seeking before the first frame is decoded
@@ -206,7 +206,7 @@ impl Music {
         self.exhausted = false;
         self.state = MUSIC_STATE_BUFFERING;
         self.generation = self.generation.wrapping_add(1);
-        self.requested_at = now_ms();
+        self.requested_at = now();
         unsafe { music_mp3_reset() };
         set(STREAM_TRACK, track);
         set(STREAM_START, byte);
@@ -321,7 +321,7 @@ impl Music {
             self.spectrum.fade();
             return;
         }
-        let silent_radio = !self.ours() && now_ms().wrapping_sub(self.requested_at) > OFFLINE_MS;
+        let silent_radio = !self.ours() && now().wrapping_sub(self.requested_at) > OFFLINE_MS * unsafe { ticks_per_ms };
         let offline = silent_radio || (self.ours() && word(STREAM_STATE) == STREAM_STATE_OFFLINE);
         if self.state != MUSIC_STATE_PLAYING {
             let want = if self.played == 0 { START_BYTES } else { RESUME_BYTES };
@@ -358,10 +358,24 @@ impl Music {
         self.spectrum.push((frame[0] as i32 + frame[1] as i32) / 2);
         Some(frame)
     }
+    /// Six words for the handset's USB status page.
+    pub fn debug_words(&self) -> [u32; 6] {
+        let state = if self.paused { MUSIC_STATE_PAUSED } else { self.state };
+        let position = self.start_ms.wrapping_add((self.played / 48) as u32);
+        [
+            self.track | state << 8 | (self.spectrum.shown_peak as u32) << 16,
+            position,
+            word(STREAM_WRITTEN) | word(STREAM_RELINKS) << 24,
+            word(STREAM_TOTAL),
+            word(STREAM_HTTP) | word(STREAM_FETCHES) << 16,
+            word(STREAM_FAILURES) | word(STREAM_STATE) << 8 | word(STREAM_LAST_MS) << 16,
+        ]
+    }
     pub fn status(&self) -> Message {
         let mut r = Message::result(self.track);
         let position = self.start_ms.wrapping_add((self.played / 48) as u32);
-        r.arg = self.state | position << 4;
+        let state = if self.paused { MUSIC_STATE_PAUSED } else { self.state };
+        r.arg = state | position << 4;
         let mut text = [0u8; 40];
         text[..MUSIC_BANDS].copy_from_slice(&self.spectrum.bands);
         let ahead = (self.available() + self.staged as u32) as u64 * 10 / self.byte_rate.max(1) as u64;

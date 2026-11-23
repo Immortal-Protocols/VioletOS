@@ -902,6 +902,12 @@ pub fn drained() -> bool {
         QUIET >= RING_FRAMES
     }
 }
+/// Music state for USB (words 58..=63, see Music::debug_words).
+pub fn music(words: [u32; 6]) {
+    for (i, w) in words.iter().enumerate() {
+        note(58 + i, *w);
+    }
+}
 pub fn publish(level: u32, flags: u32, serial: u32, sound: u32) {
     note(S_STATE, level | flags << 8 | unsafe { OUTPUT } << 24);
     note(S_PLAY, serial | sound << 16);
