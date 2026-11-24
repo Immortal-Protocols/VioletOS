@@ -180,6 +180,9 @@ pub fn run() -> ! {
     put(1, 0x40);
     progress(4,u32::from(byte(0x60)));
     let mut pending_out: Option<(u32,u32,usize)>=None;
+    // A multi-packet install write: window offset, bytes expected, bytes so far.
+    let mut install_out: Option<(usize,usize,usize)>=None;
+    let mut busy = 0u32;
     let mut address = None;
     let mut configuration = 0;
     let mut action_after_status = None;
@@ -191,6 +194,7 @@ pub fn run() -> ! {
         if bus & 4 != 0 {
             progress(5,u32::from(byte(0x60)));
             pending_out=None;
+            install_out=None;
             address = None;
             configuration = 0;
             action_after_status = None;
@@ -207,6 +211,7 @@ pub fn run() -> ! {
             action_after_status = None;
             address = None;
             pending_out=None;
+            install_out=None;
             continue;
         }
         if csr & 4 != 0 {
@@ -232,7 +237,36 @@ pub fn run() -> ! {
             }
         }
         if csr & 1 == 0 {
-            unsafe { delay_ms(1) };
+            // Stay awake briefly after traffic so back-to-back packets and
+            // requests are not each held up by a millisecond's sleep.
+            if busy > 0 {
+                busy -= 1;
+                core::hint::spin_loop();
+            } else {
+                unsafe { delay_ms(1) };
+            }
+            continue;
+        }
+        busy = 200_000;
+        if let Some((at,total,got))=install_out {
+            // Install data in 64-byte packets, straight into the window.
+            let n=usize::from(half(0x18));
+            if n==0 || got+n>total {
+                install_out=None;
+                put_half(CSR,0x60);
+                continue;
+            }
+            for i in 0..n {
+                let b=byte(0x20);
+                unsafe { ((0x09211000 + at + got + i) as *mut u8).write_volatile(b) };
+            }
+            if got+n==total {
+                install_out=None;
+                put_half(CSR,0x48);
+            } else {
+                install_out=Some((at,total,got+n));
+                put_half(CSR,0x40);
+            }
             continue;
         }
         if let Some((key,offset,n))=pending_out.take() {
@@ -360,6 +394,12 @@ pub fn run() -> ! {
                     dest.copy_from_slice(&unsafe { (0x09210000 as *const u32).add(i).read_volatile() }.to_le_bytes());
                 }
                 send(&out, len);
+            }
+            // Install data up to 4 KiB per request (many fewer round trips).
+            (0x40, 0x4a, lo, hi) if configuration==1 && (1..=4096).contains(&len)
+                && (usize::from(lo)|(usize::from(hi)<<16)) + usize::from(len) <= 65536 => {
+                install_out=Some((usize::from(lo)|(usize::from(hi)<<16),usize::from(len),0));
+                put_half(CSR,0x40);
             }
             (0x40, key @ (0x49|0x4a|0x4c|0x60|0x61|0x66|0x67|0x6a|0x6b), lo, hi) if configuration==1
                 && (if key==0x60 {len==4} else {(1..=40).contains(&len)}) => {

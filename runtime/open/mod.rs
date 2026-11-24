@@ -33,7 +33,7 @@ pub const MAX_APPS: usize = 3;
 const APP_KERNEL_BITS: u32 = 20;
 const APP_CNODE_BITS: u32 = 8;
 /// Pages of the pool kept for the runtime's own heap.
-const HEAP_PAGES: usize = 256;
+const HEAP_PAGES: usize = 768; // 48 MiB: the runtime, pushed apps and file data
 
 pub struct Log;
 impl Log {
@@ -438,7 +438,7 @@ impl Runtime {
                 if app.space.fault(&mut self.k, &mut self.pool, addr) {
                     sys::reply(&[]);
                 } else {
-                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x}", app.name, app.pid, addr, pc);
+                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x} ({} KiB free)", app.name, app.pid, addr, pc, self.pool.available() * 64);
                     app.exit_code = Some(139);
                     self.reap(index);
                 }
@@ -494,6 +494,13 @@ impl Runtime {
             *b = unsafe { (0x0900_1008 as *const u8).add(i).read_volatile() };
         }
         let path = String::from_utf8_lossy(&bytes[..len]).into_owned();
+        // A new build replaces the copy that is running.
+        for i in 0..MAX_APPS {
+            if self.apps[i].as_ref().map_or(false, |a| a.path == path) {
+                log!("replacing the running {}", path);
+                self.reap(i);
+            }
+        }
         match self.launch(&path, &[]) {
             Ok(i) => {
                 self.foreground = Some(i);
@@ -527,12 +534,25 @@ impl Runtime {
         let data = unsafe { core::slice::from_raw_parts(0x0950_1000 as *const u8, len.min(65536)) };
         let ok = !name.is_empty() && !name.contains('/') && match self.fs.writable(&path, true, offset == 0, 0) {
             Some(file) => {
+                if offset == 0 {
+                    // Free the old copy before the new one grows.
+                    *file = Vec::new();
+                }
                 if file.len() < offset {
                     false
                 } else {
                     file.truncate(offset);
-                    file.extend_from_slice(data);
-                    true
+                    // Grow in 1 MiB steps rather than doubling, and fail the
+                    // install (not the runtime) when the heap is full.
+                    let want = file.len() + data.len();
+                    let step = if want > file.capacity() { (want - file.len()).max(1 << 20) } else { 0 };
+                    if file.try_reserve_exact(step).is_err() {
+                        log!("not enough memory to install {}", path);
+                        false
+                    } else {
+                        file.extend_from_slice(data);
+                        true
+                    }
                 }
             }
             None => false,

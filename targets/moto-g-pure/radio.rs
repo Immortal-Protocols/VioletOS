@@ -120,6 +120,8 @@ pub fn run() -> ! {
     let mut probed = false;
     let mut probe_status = 0;
     let active = core::cell::Cell::new(false);
+    // The access point of the current station connection, to rejoin when the link fails.
+    let joined: core::cell::Cell<Option<passive_scan::AccessPoint>> = core::cell::Cell::new(None);
     let mut dispatch = |m: Message| {
         if (m.op, m.key, m.value) == (EXECUTE, RELAY, 2) {
             let mut bytes = [0u8; RELAY_CODE_LEN / 2];
@@ -489,6 +491,7 @@ pub fn run() -> ! {
                                 return Err(53);
                             }
                             connected = ap.profile_id();
+                            joined.set(Some(*ap));
                             active.set(true);
                         }
                         Ok(())
@@ -697,10 +700,23 @@ pub fn run() -> ! {
                 record(65, if ok { 1 } else { 55 });
             }
             if unsafe { ipc_try_receive(SERVER, &mut m) } == 0 {
-                unsafe {
-                    wpa::poll();
-                    delay_ms(1);
+                let alive = unsafe { wpa::poll() };
+                // A station link that failed (deauthentication or a driver error):
+                // associate again, redo the handshake and DHCP, with the firmware
+                // still running. Apps' connections reset and they reconnect.
+                if !alive && !relaying {
+                    if let Some(ap) = joined.get() {
+                        for attempt in 0..3 {
+                            stage(70 + attempt);
+                            if unsafe { relink(dev, &ap) } {
+                                stage(73);
+                                break;
+                            }
+                            unsafe { delay_ms(500) };
+                        }
+                    }
                 }
+                unsafe { delay_ms(1) };
                 continue;
             }
         } else {
@@ -713,6 +729,14 @@ pub fn run() -> ! {
         }
         r.reply();
     }
+}
+
+/// Re-associate with `ap` and redo the WPA2 handshake and DHCP, keeping the
+/// firmware running. Used when a station link fails.
+unsafe fn relink(dev: *mut wlan_axi::Axi, ap: &passive_scan::AccessPoint) -> bool {
+    wpa::close();
+    let axi = &mut *dev;
+    axi.associate(ap).is_ok() && wpa::authorize(axi, ap).is_ok() && wpa::join_ip(dev)
 }
 
 /// Relay access point that stays up between requests while the phone comes and goes.

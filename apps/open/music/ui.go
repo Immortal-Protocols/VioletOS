@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
@@ -180,16 +181,18 @@ func clock(sec float64) string {
 }
 
 func LoadCover(url string) image.Image {
-	resp, err := get(url, 0)
+	data, err := fetch(url)
 	if err != nil {
 		return nil
 	}
-	defer resp.Body.Close()
-	img, err := jpeg.Decode(resp.Body)
+	img, err := jpeg.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil
 	}
-	return img
+	// Keep the cover at the size it is drawn, not 1024x1024.
+	small := image.NewRGBA(image.Rect(0, 0, coverBox.Dx(), coverBox.Dy()))
+	xdraw.CatmullRom.Scale(small, small.Bounds(), img, img.Bounds(), xdraw.Src, nil)
+	return small
 }
 
 // Static draws everything that changes only with the track.
@@ -350,4 +353,4 @@ func Hit(x, y int, songs int) (control string, song int) {
 }
 
 func rgbaOf(r, g, b uint8) color.RGBA { return color.RGBA{r, g, b, 255} }
-func (Palette) deepOr() color.RGBA   { return color.RGBA{20, 14, 30, 255} }
+func (Palette) deepOr() color.RGBA    { return color.RGBA{20, 14, 30, 255} }

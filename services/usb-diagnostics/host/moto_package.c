@@ -188,8 +188,8 @@ int main(int argc,char **argv) {
             if (rc) fputs("open-push=NAME < FILE (a name of 1-31 characters, under 64 MiB)\n",stderr);
             for (size_t at=0; !rc && at<size; at+=65536) {
                 size_t block=size-at<65536?size-at:65536;
-                for (size_t pos=0; !rc && pos<block; pos+=40) {
-                    uint16_t count=block-pos<40?(uint16_t)(block-pos):40;
+                for (size_t pos=0; !rc && pos<block; pos+=4096) {
+                    uint16_t count=block-pos<4096?(uint16_t)(block-pos):4096;
                     rc=transfer(chosen,0x40,0x4a,(uint32_t)pos,file+at+pos,count);
                 }
                 unsigned char commit[40]={0}, state[12];
@@ -204,8 +204,8 @@ int main(int argc,char **argv) {
                         rc=word(state+8)!=0;
                         break;
                     }
-                    if (tries>200) { fputs("The Open Runtime did not take the block\n",stderr); rc=1; }
-                    usleep(20000);
+                    if (tries>2000) { fputs("The Open Runtime did not take the block\n",stderr); rc=1; }
+                    usleep(2000);
                 }
                 fprintf(stderr,"\r%zu of %zu KiB",(at+block)>>10,size>>10);
             }
