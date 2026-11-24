@@ -56,7 +56,70 @@ struct DecisionOutput: Codable {
     let verdictProbs: [Float]          // calibrated 4-class softmax
     let recommendedAction: ShieldAction
     let threatTags: [String: Float]    // multi-label sigmoid scores
+    let noveltyCosineDist: Float       // 256-d Matryoshka distance to app's benign cluster
     let latencyMs: Double
+}
+
+/// Explicit structured side-features concatenated with EmbeddingGemma 2's 768-d
+/// embedding before the 2-layer MLP decision head (solves frozen-embedding flag blindness).
+/// Order matches `TelemetryWindow.to_side_features()` in `tools/shield-trainer/schema.py`.
+struct StructuredWindowFeatures: Codable {
+    let minCosineDistToAppHist: Float
+    let isBackground: Float
+    let isNewHash: Float
+    let devPushRecent: Float
+    let log1pUserIdleSec: Float
+    let crossAppCount: Float
+    let socks5MismatchCount: Float
+    let wxMemoryCount: Float
+    let log1pTxBytes: Float
+
+    var vector: [Float] {
+        [
+            minCosineDistToAppHist,
+            isBackground,
+            isNewHash,
+            devPushRecent,
+            log1pUserIdleSec,
+            crossAppCount,
+            socks5MismatchCount,
+            wxMemoryCount,
+            log1pTxBytes,
+        ]
+    }
+}
+
+/// Per-app `(appPath, shaPrefix)` behavioral cluster storing up to 16 benign
+/// 256-dim Matryoshka vectors (~16 KB/app) for zero-day unsupervised novelty scoring.
+final class AppNoveltyIndex {
+    private var prototypes: [String: [[Float]]] = [:]
+    private let maxPrototypesPerApp = 16
+
+    func minCosineDistance(key: String, matryoshka256: [Float]) -> Float {
+        guard let bank = prototypes[key], !bank.isEmpty else { return 0.5 }
+        var best: Float = 1.0
+        for p in bank {
+            let d = Self.cosineDistance(matryoshka256, p)
+            if d < best { best = d }
+        }
+        return best
+    }
+
+    func recordBenign(key: String, matryoshka256: [Float]) {
+        var bank = prototypes[key] ?? []
+        if bank.count >= maxPrototypesPerApp { bank.removeFirst() }
+        bank.append(matryoshka256)
+        prototypes[key] = bank
+    }
+
+    private static func cosineDistance(_ a: [Float], _ b: [Float]) -> Float {
+        let n = min(a.count, b.count)
+        guard n > 0 else { return 1.0 }
+        var dot: Float = 0, na: Float = 0, nb: Float = 0
+        for i in 0..<n { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+        let denom = sqrt(na) * sqrt(nb)
+        return denom > 0 ? max(0, 1.0 - (dot / denom)) : 1.0
+    }
 }
 
 // MARK: - Canonical `violet-log-v1` Window Formatter + SOCKS5 Cross-Checker
@@ -107,22 +170,27 @@ struct CanonicalWindowFormatter {
     }
 }
 
-// MARK: - Tier 0 (Deterministic) + Tier 1 (Local CoreML ANE Decision Head)
+// MARK: - Tier 0 (Deterministic) + Tier 1 (EmbeddingGemma 2 + Hybrid MLP Decision Head)
 
 final class LocalShieldChecker {
-    /// Compiled CoreML student model (e.g., ModernBERT-base ~150M or Qwen3-0.6B with
-    /// merged teacher-distilled LoRA + 3-head linear/MLP decision head).
-    /// Runs on Apple Neural Engine (`computeUnits = .all`) in ~10–25 ms, ~100–250 MB RAM,
+    /// Compiled EmbeddingGemma 2 (270M text+code slice: 130M transformer + 140M embedder)
+    /// producing a 768-dim embedding (truncatable to 256-dim Matryoshka for novelty).
+    /// Runs quantized INT4/INT8 on Apple Neural Engine in ~10–20 ms (~150–250 MB RAM),
     /// staying inside iOS background Jetsam limits with zero cloud API calls.
-    private var model: MLModel?
+    private var embedderModel: MLModel?
+    /// Lightweight 2-layer MLP decision head (<500 KB, hot-updatable independently from
+    /// the frozen backbone in Stage 1) taking `concat([embedding_768, side_features_9])`.
+    private var decisionHeadModel: MLModel?
+    private let noveltyIndex = AppNoveltyIndex()
     private var blockedHosts: Set<String> = []
     private let signer = SecureEnclaveShieldSigner()
     private let feedbackStore = AlertFeedbackStore()
 
-    func loadModel(at compiledURL: URL) throws {
+    func loadModels(embedderURL: URL, headURL: URL) throws {
         let cfg = MLModelConfiguration()
         cfg.computeUnits = .all // prefer Apple Neural Engine (ANE) for minimal battery/RAM
-        self.model = try MLModel(contentsOf: compiledURL, configuration: cfg)
+        self.embedderModel = try MLModel(contentsOf: embedderURL, configuration: cfg)
+        self.decisionHeadModel = try MLModel(contentsOf: headURL, configuration: cfg)
     }
 
     /// Synchronous hook called by `Socks5Session.connect(host:port:)` (Phase 1 ready).
@@ -138,18 +206,28 @@ final class LocalShieldChecker {
         return nil
     }
 
-    /// Tier 1 single-forward-pass evaluation (prefill only, no autoregressive decoding).
-    func scoreWindow(_ canonicalText: String) -> DecisionOutput {
+    /// Tier 1 single-forward-pass evaluation (no autoregressive decoding):
+    ///   1. Embed `canonicalText` -> 768-dim vector (EmbeddingGemma 2 270M text+code).
+    ///   2. Compute 256-dim Matryoshka cosine distance against `noveltyIndex[appKey]`.
+    ///   3. Run Hybrid MLP head on `concat([embedding_768, sideFeatures.vector])`.
+    func scoreWindow(
+        appKey: String,
+        canonicalText: String,
+        sideFeatures: StructuredWindowFeatures
+    ) -> DecisionOutput {
         let start = CFAbsoluteTimeGetCurrent()
-        // RFC skeleton: tokenize `canonicalText` -> input_ids / attention_mask ->
-        // `model?.prediction(...)` -> calibrated `verdict_probs`, `action_probs`, `tag_probs`.
-        let _ = (model, canonicalText)
+        // RFC skeleton: run `embedderModel`, slice first 256 dims for `noveltyIndex`,
+        // then feed `embedding_768 + sideFeatures.vector` into `decisionHeadModel`.
+        let fakeEmbedding256 = [Float](repeating: 0.0, count: 256)
+        let novelty = noveltyIndex.minCosineDistance(key: appKey, matryoshka256: fakeEmbedding256)
+        let _ = (embedderModel, decisionHeadModel, canonicalText, sideFeatures.vector)
         let elapsedMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
         return DecisionOutput(
             verdict: .benign,
             verdictProbs: [0.99, 0.005, 0.003, 0.002],
             recommendedAction: .allow,
             threatTags: [:],
+            noveltyCosineDist: novelty,
             latencyMs: elapsedMs
         )
     }

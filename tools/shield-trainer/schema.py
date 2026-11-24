@@ -8,6 +8,7 @@ was trained on.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Iterable
 
 VERDICTS = (
@@ -58,7 +59,7 @@ class TelemetryWindow:
     socks5_only_flows: list[tuple[str, int, int]] = field(default_factory=list)
 
     def to_canonical_text(self) -> str:
-        """Compact ~200-400 token representation for ModernBERT / Qwen-0.6B."""
+        """Compact ~200-400 token representation for EmbeddingGemma 2 (8K ctx)."""
         header = (
             f"APP={self.app_path} SHA={self.sha_prefix} "
             f"NEW_HASH={int(self.new_hash)} BG={int(self.background)} "
@@ -73,6 +74,32 @@ class TelemetryWindow:
         for target, tx_b, rx_b in self.socks5_only_flows[-12:]:
             lines.append(f"[SOCKS5_ONLY] UNREPORTED_CONN {target} TX={tx_b}B RX={rx_b}B")
         return "\n".join(lines)
+
+    def to_side_features(self, min_cosine_dist: float = 0.0) -> list[float]:
+        """Explicit 9-element numeric side-feature vector concatenated with
+        EmbeddingGemma 2's 768-dim embedding before the Hybrid MLP decision head.
+        Matches `StructuredWindowFeatures.vector` in `ShieldChecker.swift`.
+        """
+        cross_app_count = sum(1 for ev in self.events if ev.cross_app)
+        mismatch_count = len(self.socks5_only_flows) + sum(
+            1 for ev in self.events if ev.socks5_seen is False
+        )
+        wx_count = sum(1 for ev in self.events if ev.kind == "MEM_WX")
+        tx_bytes = sum(tx_b for _, tx_b, _ in self.socks5_only_flows)
+        for ev in self.events:
+            if ev.kind == "SOCK_TX" and ev.detail.endswith("B") and ev.detail[:-1].isdigit():
+                tx_bytes += int(ev.detail[:-1])
+        return [
+            float(min_cosine_dist),
+            float(int(self.background)),
+            float(int(self.new_hash)),
+            float(int(self.dev_push_recent)),
+            math.log1p(max(0, self.user_idle_sec)),
+            float(cross_app_count),
+            float(mismatch_count),
+            float(wx_count),
+            math.log1p(max(0, tx_bytes)),
+        ]
 
 
 @dataclass
