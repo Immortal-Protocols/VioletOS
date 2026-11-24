@@ -95,3 +95,9 @@ void open_send(unsigned cap, const unsigned *mrs, unsigned length) {
   seL4_Send(cap, load(0, mrs, length));
 }
 void open_yield(void) { seL4_Yield(); }
+
+/* Write back the data cache over [start, end) of the Open Runtime's own
+   address space; the range must lie within one page. */
+int open_clean(unsigned pd, unsigned start, unsigned end) {
+  return seL4_ARM_PageDirectory_Clean_Data(pd, start, end);
+}

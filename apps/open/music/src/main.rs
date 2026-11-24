@@ -75,7 +75,9 @@ fn main() {
     play(&mut player, 0); // start the album right away
 
     let mut last_log = Instant::now();
-    let mut last_look = None;
+    let mut last_look: Option<(u32, [u8; player::BANDS], bool, Option<usize>, String)> = None;
+    let mut last_frame = Instant::now();
+    let (mut draw_us, mut show_us, mut frames) = (0u64, 0u64, 0u32);
     loop {
         match events.recv_timeout(Duration::from_millis(100)) {
             Ok(e) if e.focus_gained() => shown = None,
@@ -125,7 +127,10 @@ fn main() {
                 last_log = Instant::now();
                 let paused = if player.paused.load(Relaxed) { " (paused)" } else { "" };
                 let p = player.position() as u32;
-                println!("music: {} at {}:{:02}{}", catalog.tracks[i].title, p / 60, p % 60, paused);
+                let secs = 10_000_000u64;
+                println!("music: {} at {}:{:02}{} (draw {}% in {} frames, show {}%, decode {}%)", catalog.tracks[i].title, p / 60, p % 60, paused,
+                    draw_us * 100 / secs, frames, show_us * 100 / secs, player::DECODE_US.swap(0, Relaxed) * 100 / secs);
+                (draw_us, show_us, frames) = (0, 0, 0);
             }
         }
         let full = shown != Some(current);
@@ -145,15 +150,28 @@ fn main() {
             current,
             status.clone(),
         );
-        if !full && last_look.as_ref() == Some(&look) {
+        // At most ten frames a second: every present is copied to the
+        // framebuffer by the Open Runtime.
+        if !full && (last_look.as_ref() == Some(&look) || last_frame.elapsed() < Duration::from_millis(100)) {
             continue;
         }
+        let controls_changed = last_look.as_ref().is_none_or(|l| l.2 != look.2 || l.3 != look.3);
         last_look = Some(look);
+        last_frame = Instant::now();
+        let t0 = Instant::now();
         ui::draw_dynamic(&mut frame, &layer, &fonts, &catalog, &player, pal, &status);
+        let t1 = Instant::now();
         if full {
             screen.show_all(&frame);
         } else {
-            screen.show(&frame, ui::DYNAMIC);
+            screen.show(&frame, ui::PROGRESS);
+            screen.show(&frame, ui::SPECTRUM);
+            if controls_changed {
+                screen.show(&frame, ui::CONTROLS);
+            }
         }
+        draw_us += (t1 - t0).as_micros() as u64;
+        show_us += t1.elapsed().as_micros() as u64;
+        frames += 1;
     }
 }

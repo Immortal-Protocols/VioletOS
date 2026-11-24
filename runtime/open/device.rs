@@ -107,6 +107,9 @@ fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
             unsafe { fb.add(row * WIDTH + col).write_volatile(color) };
         }
     }
+    if w == WIDTH && h == HEIGHT {
+        sys::clean_framebuffer(0, HEIGHT); // a screen cleared outside draw_shell
+    }
 }
 fn text(x: usize, y: usize, s: &str, scale: usize, color: u32) {
     for (n, c) in s.bytes().enumerate() {
@@ -240,6 +243,7 @@ impl Runtime {
         }
         fill(42, HOME_Y, WIDTH - 84, 150, PANEL);
         text(78, HOME_Y + 54, "HOME", 7, INK);
+        sys::clean_framebuffer(0, HEIGHT);
     }
 
     fn shell_tap(&mut self, x: i32, y: i32) {
@@ -366,6 +370,7 @@ impl Runtime {
                 dst += n;
             }
         }
+        sys::clean_framebuffer(y0, y1);
     }
 
     /// The app's screen surface, created on first open.

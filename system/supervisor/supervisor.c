@@ -574,14 +574,23 @@ static void workers(void) {
     grant(&procs[RUNTIME].task, 9 + index, wake, 0, false);
   }
 }
-static void share_with_open(seL4_CPtr frame, unsigned va) {
+static void share_with_open_attrs(seL4_CPtr frame, unsigned va, seL4_ARM_VMAttributes attrs) {
   struct task *t = &procs[OPEN_RT].task;
   if (!t->pd) return;
   ensure_table(t, va);
   unsigned copy = next_slot++;
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode, frame, 32,
                         seL4_AllRights));
-  check(seL4_ARM_Page_Map(copy, t->pd, va, seL4_AllRights, seL4_ARM_ExecuteNever));
+  check(seL4_ARM_Page_Map(copy, t->pd, va, seL4_AllRights, attrs));
+}
+static void share_with_open(seL4_CPtr frame, unsigned va) {
+  share_with_open_attrs(frame, va, seL4_ARM_ExecuteNever);
+}
+// Scanout, cached for the Open Runtime: it copies whole frames there and
+// cleans the data cache over the rows it wrote (uncached, every store went to
+// memory on its own, about 27 MB/s on the handset).
+static void share_scanout_with_open(seL4_CPtr frame, unsigned va) {
+  share_with_open_attrs(frame, va, seL4_ARM_PageCacheable | seL4_ARM_ExecuteNever);
 }
 // Kernel memory for the Open Runtime from any RAM untyped except the one the
 // other processes share, so its app objects never crowd them out.
@@ -889,13 +898,13 @@ static void wire(void) {
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode,
                         boot_display_frame, 32, seL4_AllRights));
   check(seL4_ARM_Page_Map(copy, display->pd, 0x08000000, seL4_AllRights, seL4_ARM_ExecuteNever));
-  share_with_open(boot_display_frame, 0x08000000);
+  share_scanout_with_open(boot_display_frame, 0x08000000);
   first = 65536;
 #endif
   for (unsigned off = first; off < 720 * 1600 * 4; off += 65536) {
     device(DISPLAY, 0x79450000 + off, 0x08000000 + off, 16);
     // The Open Runtime draws the app in front straight to scanout.
-    share_with_open(next_slot - 1, 0x08000000 + off);
+    share_scanout_with_open(next_slot - 1, 0x08000000 + off);
   }
 }
 static void dismantle(void) {

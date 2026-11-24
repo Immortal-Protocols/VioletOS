@@ -14,6 +14,12 @@ const SPEC: Rect = Rect::new(50, 1170, 670, 1240);
 const LIST_TOP: i32 = 1262;
 const ROW_H: i32 = 33;
 pub const DYNAMIC: Rect = Rect::new(0, 860, W as i32, 1250);
+/// The parts of DYNAMIC that change while a song plays: the waveform and its
+/// times, and the spectrum (with the status line above it). The controls
+/// between them change only with play and pause.
+pub const PROGRESS: Rect = Rect::new(0, 860, W as i32, 990);
+pub const CONTROLS: Rect = Rect::new(0, 990, W as i32, 1140);
+pub const SPECTRUM: Rect = Rect::new(0, 1140, W as i32, 1250);
 const WHITE: Color = rgb(255, 255, 255);
 
 /// A cover, already scaled to the size it is drawn.

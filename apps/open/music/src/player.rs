@@ -175,6 +175,8 @@ impl Read for Pieces {
 }
 
 pub const BANDS: usize = 16;
+/// Microseconds spent decoding and analysing (for the log).
+pub static DECODE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct Player {
     audio: Arc<Mutex<File>>,
@@ -301,6 +303,7 @@ fn decode(
         if packet.track_id() != id {
             continue;
         }
+        let t0 = std::time::Instant::now();
         let buf = match decoder.decode(&packet) {
             Ok(b) => b,
             Err(SymError::DecodeError(_)) => continue,
@@ -324,6 +327,7 @@ fn decode(
                 window.clear();
             }
         }
+        DECODE_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
         if let Err(e) = audio.lock().unwrap().write_all(&pcm) {
             *failure.lock().unwrap() = format!("audio: {e}");
             return false;
