@@ -1112,11 +1112,13 @@ impl Stats {
 
 /// Enough heap to report a failed start before the pool exists (the pool
 /// then adds HEAP_PAGES of its own; see pool.rs).
-static mut BOOT_HEAP: [u64; 1024] = [0; 1024];
+/// 7.9 KiB: with the other statics, the package (code and zeroed data) must
+/// stay within its 0x3e000-byte window.
+static mut BOOT_HEAP: [u64; 1008] = [0; 1008];
 
 pub fn run() -> ! {
     Log::init();
-    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1024 * 8) };
+    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1008 * 8) };
     let mut rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
