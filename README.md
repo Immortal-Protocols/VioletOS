@@ -3,7 +3,7 @@
 VioletOS is a smartphone operating system built on the seL4 microkernel. It runs on the Moto G Pure (XT2163DL) and in QEMU on a Mac, with no Linux kernel anywhere. Drivers and services are separate seL4 processes, mostly written in Rust. Apps come in two kinds:
 
 - **System components** (the classic launcher, Wi-Fi Setup, and the Stopwatch package used by the package-system tests) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
-- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Wi-Fi, Music, Weather, Stopwatch, Sounds) are open apps written in Rust. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
+- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Wi-Fi, Ladybird, Music, Weather, Stopwatch, Sounds) are open apps written in Rust. [Ladybird](apps/open/ladybird/README.md) is a web browser built on the Ladybird project's own Rust HTML parser. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -26,6 +26,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 | `make test-wifi-app` | Drives the Wi-Fi app by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
 | `make test-open-apps` | Drives the built-in apps: Stopwatch's time in `/data` across a restart, Sounds, and live Weather. |
 | `make test-shield` | Violet Shield end to end: the Sentinel streams telemetry to a companion that scores it with EmbeddingGemma 2 and freezes a data-stealing app with a signed Shield. `make test-shield-ios` uses the real app in the iOS Simulator. See [the proof of concept](docs/violet-shield-poc.md). |
+| `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
 
@@ -44,6 +45,7 @@ The open apps in [`apps/open`](apps/open) need their own toolchains. Each is opt
 | For | Install |
 | --- | --- |
 | Rust `std` programs | `rustup target add armv7-unknown-linux-musleabihf` |
+| The Ladybird browser | `rustup toolchain install 1.98.0 --target armv7-unknown-linux-musleabihf` (Ladybird's Rust version); the build fetches the pinned Ladybird sources |
 | Go programs | `brew install go` |
 | C programs | `python3 tools/build_python.py musl` (builds a musl sysroot with the NDK's clang) |
 | `/bin/python3` | `brew install python@3.12`, then `python3 tools/build_python.py python` (cross-builds CPython 3.12 with zlib) |
@@ -160,7 +162,7 @@ Start the stopwatch, go **Home**, then reopen it to see the timer still running.
 
 Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. The guest verifies the certificate; the Mac only relays TCP bytes. The **Weather** open app fetches wttr.in with its own TLS.
 
-Tap **/APPS** for the open apps. `hello`, `chello`, `gohello` and `pyhello` print to the Open Runtime's log; `canvas` and `pypaint` draw and answer taps; `pytone` plays a chord; `pynet` and `gonet` fetch a web page.
+Tap **/APPS** for the open apps. **Ladybird** opens a start page of links; tap the address bar to type any address. `hello`, `chello`, `gohello` and `pyhello` print to the Open Runtime's log; `canvas` and `pypaint` draw and answer taps; `pytone` plays a chord; `pynet` and `gonet` fetch a web page.
 
 ### Persistence
 

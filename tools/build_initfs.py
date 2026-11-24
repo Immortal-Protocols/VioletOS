@@ -65,6 +65,65 @@ def build_cargo(work):
     return ROOT / "build/open-cargo" / TARGET / "release"
 
 
+def ladybird_toolchain(version):
+    """A rustc at least as new as Ladybird's pinned Rust, with the musl target.
+    VIOLET_LADYBIRD_RUSTC names one; otherwise rustup's toolchain of that
+    version (in ~/.rustup or in a RUSTUP_HOME under build/), or rustc on PATH."""
+    import glob
+    import shutil
+    wanted = tuple(int(n) for n in version.split("."))
+    candidates = [os.environ.get("VIOLET_LADYBIRD_RUSTC")]
+    candidates += sorted(glob.glob(str(Path.home() / f".rustup/toolchains/{version}-*/bin/rustc")))
+    candidates += sorted(glob.glob(str(ROOT / f"build/*/rustup/toolchains/{version}-*/bin/rustc")))
+    candidates += [shutil.which("rustc")]
+    for rustc in filter(None, candidates):
+        if not Path(rustc).exists():
+            continue
+        info = subprocess.run([rustc, "-vV"], capture_output=True, text=True).stdout
+        release = next((line.split()[1] for line in info.splitlines() if line.startswith("release:")), "0")
+        have = tuple(int(n) for n in release.split("-")[0].split(".") if n.isdigit())
+        host = next((line.split()[1] for line in info.splitlines() if line.startswith("host:")), "")
+        sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
+        if have >= wanted and (sysroot / "lib/rustlib" / TARGET).is_dir():
+            return Path(rustc), sysroot / "lib/rustlib" / host / "bin/rust-lld"
+    raise SystemExit(f"Ladybird needs Rust {version} with the musl target: "
+                     f"rustup toolchain install {version} --target {TARGET}")
+
+
+def build_ladybird(folder):
+    """The Ladybird browser: its own Cargo workspace on Ladybird's Rust HTML
+    parser, fetched at a pinned commit, built with Ladybird's Rust version."""
+    import shutil
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fetch_ladybird
+    checkout = fetch_ladybird.main()
+    version = next(line.split('"')[1] for line in (checkout / "rust-toolchain.toml").read_text().splitlines()
+                   if line.strip().startswith("channel"))
+    rustc, lld = ladybird_toolchain(version)
+    cargo = rustc.parent / "cargo"
+    if not cargo.exists():
+        cargo = Path(shutil.which("cargo") or "cargo")
+    key = TARGET.replace("-", "_")
+    # No target RUSTFLAGS: the parser's build script runs cargo metadata for the
+    # host, which would inherit them. rustc infers the lld flavor from rust-lld.
+    env = dict(os.environ, **{
+        f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
+        "CARGO_TARGET_DIR": str(ROOT / "build/ladybird-cargo"),
+        "RUSTC": str(rustc),
+        # rust-lld finds libLLVM through rustup's proxy, which is bypassed here.
+        "DYLD_FALLBACK_LIBRARY_PATH": str(lld.parents[3]),
+        "LD_LIBRARY_PATH": str(lld.parents[3]),
+    })
+    env.setdefault("CARGO_HOME", str(ROOT / "build/cargo-home"))
+    ndk = Path(os.environ.get("ANDROID_NDK_HOME", Path.home() / "Library/Android/sdk/ndk/28.2.13676358"))
+    bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
+    if bins:
+        env.update({f"CC_{key}": str(bins[0] / "clang"), f"AR_{key}": str(bins[0] / "llvm-ar"),
+                    f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard"})
+    subprocess.run([cargo, "build", "--release", "--locked", "--target", TARGET], cwd=folder, env=env, check=True)
+    return ROOT / "build/ladybird-cargo" / TARGET / "release/ladybird"
+
+
 def build_go(folder, out):
     """A standard Go program for linux/arm (ARMv7, hard float), statically linked."""
     import shutil
@@ -144,6 +203,14 @@ def main(out, python=True, compress=False, skip=()):
     cargo_out = None
     for app in apps:
         if not app.is_dir() or app.name in skip:
+            continue
+        if app.name == "ladybird":
+            try:
+                binary = build_ladybird(app)
+            except (SystemExit, subprocess.CalledProcessError) as e:
+                print(f"skipping ladybird: {e}", file=sys.stderr)
+                continue
+            files[f"apps/{app.name}"] = (binary.read_bytes(), 0o100755)
             continue
         if (app / "Cargo.toml").exists():
             if cargo_out is None:
