@@ -2,7 +2,7 @@
 
     build/shield/venv/bin/python targets/qemu/test_shield.py --companion ios|sim [--record DIR]
 
-QEMU runs the Open Runtime with the apps in apps/shield-demo. Every TCP
+QEMU runs the Open Runtime with the built-in apps plus apps/shield-demo. Every TCP
 connection the guest makes goes through the companion's SOCKS5 relay
 (tools/net_relay.py, VIOLET_NET_SOCKS), exactly like Phone Internet mode on the
 handset, and the Sentinel links to `sentinel.violet` on the companion.
@@ -14,12 +14,13 @@ handset, and the Sentinel links to `sentinel.violet` on the companion.
                    PyTorch, for runs without Xcode.
 
 A scripted viewer taps through the demo and checks the Open Runtime's log:
-  1. notes, weather: ordinary apps; nothing is blocked.
+  1. notes, weather (the built-in app, live from wttr.in) and Home: ordinary
+     apps; nothing is blocked.
   2. photosync: reads another app's secrets and uploads from the background; the
      model flags it, the relay cuts the upload, and VioletOS freezes it on a
      signed Shield, then thaws it when the Shield's TTL runs out.
-  3. themes: maps W+X memory, then writes into /apps/launcher: frozen inside the
-     write call by a baseline Shield the companion signed when it linked.
+  3. themes: maps W+X memory, then tries to overwrite /apps/home: frozen inside
+     the write call by a baseline Shield the companion signed when it linked.
   4. A connection that reaches the relay without the Sentinel reporting it
      (telemetry missing or tampered) is blocked as unattributed.
 Then it checks the companion's status (verdicts) and that the sink received
@@ -47,7 +48,10 @@ import run  # noqa: E402
 
 SIM = os.environ.get("VIOLET_SIM", "D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA")
 BUNDLE = "com.immortal.violet.relay"
-APPS = ["notes", "photosync", "themes", "weather"]  # as /APPS lists them (sorted)
+# As the Programs list shows them: titled apps, sorted by folder name.
+APPS = ["music", "notes", "photosync", "sounds", "stopwatch", "themes", "weather"]
+# The test programs stay out of the demo image so the list fits on one screen.
+SKIP = "canvas,chello,gohello,gonet,hello,pyhello,pynet,pypaint,pytone"
 FREEZE_TTL = 30
 
 SCRIPT = r'''#!PYTHON
@@ -121,16 +125,25 @@ def pixel(x, y):
     return struct.unpack_from("<I", screen, (y * 720 + x) * 4)[0]
 def on_list():
     return pixel(60, 300) == 0xff302a39 and pixel(5, 5) == 0xff191620
+def on_home():
+    # The Home app (apps/open/home): its gradient starts at 2a1740.
+    return pixel(5, 5) == 0xff2a1740
 def open_apps():
-    tap(570, 400)
+    # Home's Programs tile shows the list of every program (with Shield's line).
+    if on_list():
+        return
+    if not on_home():
+        tap(570, 276)  # the classic launcher's APPS button shows Home
+        until("Home", on_home, 30)
+    tap(360, 1141)
     until("app list", on_list)
-def back_to_list():
+def back_home():
     # Holding the top edge for a second leaves the app in front (even a frozen one).
     os.write(1, bytes([9, 360 >> 4, 20 >> 4, ((360 & 15) << 4) | (20 & 15), 1, 1]))
     hold(1.4); os.write(1, bytes(6)); hold(.5)
-    until("app list", on_list, 10)
+    until("Home", on_home, 10)
 def start(name):
-    tap(360, 260 + APPS.index(name) * 110 + 48)
+    tap(360, 260 + APPS.index(name) * 80 + 34)
 def status():
     try:
         return json.load(open(STATUS))
@@ -153,38 +166,44 @@ hold(3)
 caption("notes: an ordinary app saves notes (with an API key) and syncs to its server")
 start("notes")
 until("notes runs", lambda: "notes done" in everything(), 90)
-until("list after notes", on_list, 15)
-caption("weather: an ordinary app fetches a forecast")
+until("Home after notes", on_home, 15)
+open_apps()
+caption("weather: the built-in Weather app fetches live conditions from wttr.in")
 start("weather")
-until("weather runs", lambda: "weather done" in everything(), 90)
-until("list after weather", on_list, 15)
+hold(2)
+tap(195, 894)  # Oakland
+until("weather runs", lambda: "weather: Oakland" in everything(), 90)
+hold(2)
+back_home()
 caption("The companion scores each app's telemetry window on the phone: benign, nothing blocked")
 until("benign verdicts", lambda: decisions("notes") and decisions("weather"), 45)
 hold(3)
+open_apps()
 
 frozen_before = count("froze pid")
 caption("photosync: 'syncs photos', then quietly reads notes' secrets...")
 start("photosync")
 until("photosync hides", lambda: "going to the background" in everything(), 90)
-hold(1.5)
-open_apps()
+until("Home", on_home, 15)
 caption("...slips into the background and uploads 4 MiB to drop.c2-exfil.test")
 until("photosync frozen by a signed Shield", lambda: count("froze pid") > frozen_before, 120)
 caption("Model on the iPhone: exfiltration. Relay cut the upload; VioletOS froze photosync mid-call")
-hold(6)
+hold(4)
+open_apps()
+hold(3)
 caption(f"The freeze is reversible and TTL-bounded: it thaws on its own after {TTL} s")
 until("photosync thaws", lambda: "thawed pid" in everything(), TTL + 30)
 until("photosync's upload fails", lambda: "photosync: upload stopped" in everything() or "photosync (pid" in everything(), 60)
 hold(2)
 
 frozen_before = count("froze pid")
-caption("themes: maps W+X memory, then tries to plant a hook inside /apps/launcher")
-until("list", on_list, 30)
+caption("themes: maps W+X memory, then tries to overwrite Home's program, /apps/home")
+open_apps()
 start("themes")
 until("themes frozen inside its write", lambda: count("froze pid") > frozen_before, 60)
 caption("Frozen inside the write call by a baseline Shield: the hook never lands")
 hold(5)
-back_to_list()
+back_home()
 hold(4)
 
 caption("A connection the Sentinel never reported (tampered telemetry) reaches the relay...")
@@ -252,7 +271,7 @@ def web_server():
 
 
 def build_image(out: Path):
-    env = dict(os.environ, VIOLET_OPEN_APPS_DIR=str(ROOT / "apps/shield-demo"))
+    env = dict(os.environ, VIOLET_OPEN_EXTRA_APPS=str(ROOT / "apps/shield-demo"), VIOLET_OPEN_SKIP=SKIP)
     subprocess.run([sys.executable, str(ROOT / "tools/build_initfs.py"), str(out)], env=env, check=True)
 
 
@@ -361,6 +380,8 @@ def main():
                 else:
                     helper.terminate()
         st = json.loads(Path(status).read_text())
+        # The companion's decisions, with each scored window, for a look after the run.
+        (ROOT / "build/shield/last-status.json").write_text(json.dumps(st, indent=1))
         if record:
             (record / "shield-status.json").write_text(json.dumps(st, indent=1))
     problems = []
@@ -369,7 +390,7 @@ def main():
     by_app = {}
     for d in st.get("decisions", []):
         by_app.setdefault(d["app"], []).append(d)
-    for benign in ("notes", "weather"):
+    for benign in ("notes", "weather", "home"):
         if any(d.get("contained") for d in by_app.get(benign, [])):
             problems.append(f"{benign} was contained: {by_app[benign]}")
     if not any(d.get("contained") and d.get("tier") == "model" for d in by_app.get("photosync", [])):

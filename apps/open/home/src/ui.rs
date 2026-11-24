@@ -18,6 +18,16 @@ pub struct State {
     pub city: String,
     pub running: HashSet<String>,
     pub pressed: Option<usize>,
+    pub shield: Shield,
+}
+
+/// Violet Shield as the Open Runtime reports it ("shield" in /dev/violet/sys).
+#[derive(Clone, Default, PartialEq)]
+pub struct Shield {
+    pub known: bool,
+    pub linked: bool,
+    pub rules: u32,
+    pub frozen: Vec<String>,
 }
 
 pub struct Tile {
@@ -92,7 +102,53 @@ pub fn draw(c: &mut Canvas, f: &Fonts, s: &State) {
     for (i, t) in TILES.iter().enumerate() {
         tile(c, f, i, t, s.running.contains(&format!("/apps/{}", t.name)), s.pressed == Some(i));
     }
+    shield(c, f, &s.shield);
     f.regular(21.0).centered(c, "Hold the top edge in any app to come back here", 0, W as i32, 1530, rgb(0x6c, 0x63, 0x84));
+}
+
+const ALERT: Color = rgb(0xf0, 0x60, 0x60);
+const SAFE: Color = rgb(0x45, 0xc4, 0x8f);
+
+/// A card under the tiles: the Shield's link and rules, or the apps it froze.
+fn shield(c: &mut Canvas, f: &Fonts, s: &Shield) {
+    if !s.known {
+        return;
+    }
+    let r = Rect::new(40, 1300, W as i32 - 40, 1460);
+    let alert = !s.frozen.is_empty();
+    c.round_rect(r, 30.0, if alert { rgb(0x4a, 0x1a, 0x26) } else { CARD });
+    let tint = if alert { ALERT } else if s.linked { SAFE } else { DIM };
+    // A shield: a rounded top and a point at the bottom.
+    let (cx, cy) = (112.0, 1380.0);
+    c.round_rect(Rect::new(cx as i32 - 30, cy as i32 - 40, cx as i32 + 30, cy as i32 + 4), 10.0, tint);
+    c.triangle([[cx - 30.0, cy], [cx + 30.0, cy], [cx, cy + 40.0]], tint);
+    let x = 180;
+    let title = f.bold(32.0);
+    let line = f.medium(26.0);
+    if alert {
+        let names: Vec<String> = s.frozen.iter().map(|n| title_of(n)).collect();
+        title.draw(c, &title.fit(&format!("{} frozen", names.join(", ")), r.x1 - 30 - x), x, 1368, INK);
+        line.draw(c, "Violet Shield stopped it mid-call", x, 1414, rgb(0xf4, 0xb8, 0xc0));
+    } else {
+        title.draw(c, "Violet Shield", x, 1368, INK);
+        let state = if s.linked {
+            format!("On · linked to your iPhone · {} rule{}", s.rules, if s.rules == 1 { "" } else { "s" })
+        } else {
+            "Waiting for your iPhone".to_string()
+        };
+        line.draw(c, &line.fit(&state, r.x1 - 30 - x), x, 1414, DIM);
+    }
+}
+
+/// "photosync" -> "PhotoSync" for the demo apps, else the name capitalised.
+fn title_of(name: &str) -> String {
+    match name {
+        "photosync" => "PhotoSync".to_string(),
+        n => {
+            let mut ch = n.chars();
+            ch.next().map(|f| f.to_uppercase().chain(ch).collect()).unwrap_or_default()
+        }
+    }
 }
 
 fn tile(c: &mut Canvas, f: &Fonts, i: usize, t: &Tile, running: bool, pressed: bool) {

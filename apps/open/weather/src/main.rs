@@ -1,6 +1,6 @@
 //! Weather: current conditions for twenty cities, fetched from wttr.in over
 //! HTTPS by this app (rustls, the Mozilla root certificates). The last city
-//! chosen is kept in /data/weather.
+//! chosen is the shared setting weather.city (Home shows the same city).
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ const CITIES: [&str; 20] = [
     "Honolulu", "Anchorage", "Mexico City", "London", "Paris",
     "Berlin", "Tokyo", "Sydney", "Mumbai", "Cairo",
 ];
-const SAVED: &str = "/data/weather";
 const GRID_TOP: i32 = 800;
 const ROW_H: i32 = 66;
 const ROWS: i32 = 10;
@@ -108,7 +107,7 @@ impl App {
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
-    let saved = std::fs::read_to_string(SAVED).ok().and_then(|s| s.trim().parse::<usize>().ok()).filter(|&n| n < CITIES.len());
+    let saved = violet::sys("get weather.city").parse::<usize>().ok().filter(|&n| n < CITIES.len());
     let mut app = App { fonts: Fonts::load(), c: Canvas::new(W, H), city: None, shown: Report::default(), status: "Tap a city for live weather".into() };
     let (tx, results) = mpsc::channel::<(usize, Result<Report, String>)>();
     let mut loading = false;
@@ -139,7 +138,7 @@ fn main() {
                 } else if let Some(i) = (0..CITIES.len()).find(|&i| cell(i).contains(e.x, e.y)) {
                     if !loading {
                         start(&mut app, i, &mut loading);
-                        let _ = std::fs::write(SAVED, format!("{i}\n"));
+                        violet::sys(&format!("set weather.city {i}"));
                         app.draw();
                         screen.show_all(&app.c);
                     }

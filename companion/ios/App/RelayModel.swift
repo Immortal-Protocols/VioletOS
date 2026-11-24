@@ -124,6 +124,7 @@ final class RelayModel: ObservableObject {
             Task { @MainActor in self?.cellularAvailable = path.status == .satisfied }
         }
         cellMonitor.start(queue: .main)
+        StandIns.shared.start(kinds: Set(RelayConfig.hostMap.values.filter { $0.hasPrefix("standin:") }.map { String($0.dropFirst(8)) }))
         server.start()
         Shield.shared.start(relay: server)
         if let ssid = RelayConfig.forgetSSID, !ssid.isEmpty {

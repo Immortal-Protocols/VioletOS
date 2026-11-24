@@ -185,7 +185,8 @@ SECTIONS {
                 "--crate-type=staticlib",
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
-                "-Copt-level=s",
+                # The Open Runtime (with the Sentinel) is optimised for size to fit the 0x3e000-byte window.
+                "-Copt-level=z" if name == "open" else "-Copt-level=s",
                 *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,

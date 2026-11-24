@@ -3,7 +3,8 @@
 # ordinary Linux program; lib/violet is their shared crate.
 [workspace]
 resolver = "2"
-members = ["lib/violet", "open/home", "open/music", "open/sounds", "open/stopwatch", "open/weather"]
+members = ["lib/violet", "open/home", "open/music", "open/sounds", "open/stopwatch", "open/weather",
+           "shield-demo/notes", "shield-demo/photosync", "shield-demo/themes"]
 
 [workspace.dependencies]
 violet = { path = "lib/violet" }

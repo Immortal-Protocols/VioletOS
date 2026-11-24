@@ -17,9 +17,11 @@ const CITIES: [&str; 20] = [
     "Berlin", "Tokyo", "Sydney", "Mumbai", "Cairo",
 ];
 
-/// The city Weather last showed (apps/open/weather keeps it in /data/weather).
+/// The city chosen in Weather: the shared setting weather.city, not Weather's own
+/// files (reading another app's data and then going to the network is what data
+/// theft looks like, and Violet Shield flags it).
 fn city() -> &'static str {
-    std::fs::read_to_string("/data/weather").ok().and_then(|s| s.trim().parse::<usize>().ok()).and_then(|n| CITIES.get(n).copied()).unwrap_or(CITIES[0])
+    violet::sys("get weather.city").parse::<usize>().ok().and_then(|n| CITIES.get(n).copied()).unwrap_or(CITIES[0])
 }
 
 fn fetch(name: &str) -> Result<Glance, String> {
@@ -50,7 +52,7 @@ fn main() {
     let mut c = Canvas::new(W, H);
     let mut s = ui::State {
         now: None, online: false, battery: -1, volume: 0, phones: false,
-        temp: String::new(), sky: String::new(), city: String::new(), running: Default::default(), pressed: None,
+        temp: String::new(), sky: String::new(), city: String::new(), running: Default::default(), pressed: None, shield: Default::default(),
     };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
@@ -62,10 +64,18 @@ fn main() {
     };
     let status = |s: &mut ui::State| {
         let f = violet::fields(&violet::sys("status"));
-        s.battery = f.get("battery").and_then(|v| v.parse().ok()).unwrap_or(-1);
+        // A percentage; the handset's Power reports millivolts for now, so hide anything else.
+        s.battery = f.get("battery").and_then(|v| v.parse().ok()).filter(|b| (0..=100).contains(b)).unwrap_or(-1);
         s.volume = f.get("volume").and_then(|v| v.parse().ok()).unwrap_or(0);
         s.phones = f.get("headphones").is_some_and(|v| v == "1");
         s.running = violet::sys("running").split_whitespace().map(String::from).collect();
+        let sh = violet::fields(&violet::sys("shield"));
+        s.shield = ui::Shield {
+            known: sh.contains_key("linked"),
+            linked: sh.get("linked").is_some_and(|v| v == "1"),
+            rules: sh.get("rules").and_then(|v| v.parse().ok()).unwrap_or(0),
+            frozen: sh.get("frozen").filter(|v| *v != "-").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default(),
+        };
     };
     let draw = |c: &mut Canvas, s: &mut ui::State, glance: &Option<Glance>, screen: &mut Screen| {
         s.now = glance.as_ref().and_then(|g| g.now());
@@ -131,12 +141,12 @@ fn main() {
             last_fetch = Instant::now();
             refresh();
         }
-        if last_status.elapsed() > Duration::from_secs(5) {
+        if last_status.elapsed() > Duration::from_secs(2) {
             last_status = Instant::now();
-            let (b, v, p, r) = (s.battery, s.volume, s.phones, s.running.clone());
+            let (b, v, p, r, sh) = (s.battery, s.volume, s.phones, s.running.clone(), s.shield.clone());
             status(&mut s);
             let minute = glance.as_ref().and_then(|g| g.now()).map(|t| t.minute);
-            if minute != shown_minute || (b, v, p) != (s.battery, s.volume, s.phones) || r != s.running {
+            if minute != shown_minute || (b, v, p) != (s.battery, s.volume, s.phones) || r != s.running || sh != s.shield {
                 shown_minute = minute;
                 draw(&mut c, &mut s, &glance, &mut screen);
             }
@@ -155,6 +165,7 @@ mod preview {
         let s = super::ui::State {
             now: g.now(), online: true, battery: 82, volume: 8, phones: false, temp: g.temp.clone(), sky: g.sky.clone(),
             city: g.city.clone(), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
+            shield: Default::default(),
         };
         let mut c = violet::Canvas::new(violet::W, violet::H);
         super::ui::draw(&mut c, &violet::Fonts::load(), &s);

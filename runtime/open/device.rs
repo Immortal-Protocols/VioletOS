@@ -179,7 +179,21 @@ const ROWS: usize = (HOME_Y - 40 - ROW_Y) / ROW_H;
 const BG_ROW: u32 = 0xff231d2e;
 pub const HOME_Y: usize = 1380;
 
+/// Shared settings (see "get" and "set" in /dev/violet/sys).
+const SETTINGS: &str = "/data/settings";
+
+fn setting_key(k: &str) -> bool {
+    (1..=24).contains(&k.len()) && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
 impl Runtime {
+    fn settings_text(&self) -> String {
+        self.fs.contents(SETTINGS).map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default()
+    }
+    fn setting(&self, key: &str) -> Option<String> {
+        self.settings_text().lines().find_map(|l| l.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| String::from(v)))
+    }
+
     /// Titles from /apps/.home ("name<TAB>title" lines), for the apps that have one.
     fn titles(&self) -> Vec<(String, String)> {
         let Some(home) = self.fs.contents("/apps/.home") else { return Vec::new() };
@@ -241,7 +255,7 @@ impl Runtime {
         for (i, path) in entries.iter().take(ROWS).enumerate() {
             let y = ROW_Y + i * ROW_H;
             let name = path.trim_start_matches("/apps/");
-            let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_uppercase());
+            let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_ascii_uppercase());
             fill(42, y, WIDTH - 84, ROW_H - 12, if title.is_some() { PANEL } else { BG_ROW });
             let shown: String = title.as_deref().unwrap_or(name).chars().take(16).collect();
             text(72, y + 16, &shown, if title.is_some() { 5 } else { 4 }, INK);
@@ -780,6 +794,39 @@ impl Runtime {
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
                 alloc::format!("{}\n", paths.join(" "))
+            }
+            // Shared settings ("get KEY", "set KEY VALUE"), kept by the runtime in
+            // /data/settings, so apps can share a preference (Weather's city, which
+            // Home shows) without opening each other's private /data files.
+            Some("get") => match words.next().filter(|k| setting_key(k)) {
+                Some(key) => alloc::format!("{}\n", self.setting(key).unwrap_or_default()),
+                None => String::from("error\n"),
+            },
+            Some("set") => match (words.next().filter(|k| setting_key(k)), words.next()) {
+                (Some(key), Some(value)) if value.len() <= 64 && words.next().is_none() => {
+                    let mut lines: Vec<String> = self.settings_text().lines()
+                        .filter(|l| l.split_once('=').map_or(false, |(k, _)| k != key)).map(String::from).collect();
+                    lines.push(alloc::format!("{}={}", key, value));
+                    let text = lines.join("\n") + "\n";
+                    match self.fs.writable(SETTINGS, true, true, 0) {
+                        Some(f) if text.len() <= 4096 => {
+                            f.extend_from_slice(text.as_bytes());
+                            String::from("ok\n")
+                        }
+                        _ => String::from("error\n"),
+                    }
+                }
+                _ => String::from("error\n"),
+            },
+            // Violet Shield: the companion link, live rules and frozen apps, for Home.
+            Some("shield") => {
+                let frozen: Vec<&str> = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).map(|a| a.name.as_str()).collect();
+                alloc::format!(
+                    "linked={} rules={} frozen={}\n",
+                    self.sentinel.online() as u32,
+                    self.shield.active(),
+                    if frozen.is_empty() { String::from("-") } else { frozen.join(",") }
+                )
             }
             Some("status") => {
                 let power = request(GET, POWER, 0);

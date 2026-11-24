@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | open-push=NAME | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | open-push=NAME | screenshot[=SCALE] | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -217,6 +217,35 @@ int main(int argc,char **argv) {
             size_t n=strlen(argv[1]+9);
             rc=n<1||n>40||transfer(chosen,0x40,0x4c,0,(unsigned char *)argv[1]+9,(uint16_t)n);
             if (!rc) printf("Asked the Open Runtime to start %s.\n",argv[1]+9);
+        } else if (!strncmp(argv[1],"screenshot",10)) {
+            // screenshot[=SCALE] writes the screen, scaled down by SCALE (default 2), as a PPM
+            // to standard output, one strip at a time through the install window.
+            unsigned scale=argv[1][10]=='='?(unsigned)atoi(argv[1]+11):2;
+            if (scale<1||scale>8) scale=2;
+            unsigned w=720/scale, h=1600/scale, per=(65536-32)/(w*2);
+            static unsigned char image[720*1600*3], strip[65536];
+            rc=0;
+            for (unsigned k=0; !rc && k*per<h; k++) {
+                uint32_t nonce=arc4random_uniform(0x7fffffff)+1;
+                char request[40];
+                int n=snprintf(request,sizeof request,"@shot %u %u %u",k,scale,nonce);
+                rc=transfer(chosen,0x40,0x4c,0,(unsigned char *)request,(uint16_t)n);
+                int ready=0;
+                for (int tries=0; !rc && tries<2000 && !ready; tries++) {
+                    if (libusb_control_transfer(chosen,0xc0,0x47,0,0,strip,64,3000)!=64) { rc=1; break; }
+                    ready=!memcmp(strip,"SHOT",4) && word(strip+4)==nonce;
+                    if (!ready) usleep(1000);
+                }
+                if (!rc && !ready) { fputs("The Open Runtime did not answer the screenshot request\n",stderr); rc=1; }
+                unsigned rows=ready?word(strip+28):0, bytes=32+rows*w*2;
+                for (uint16_t c=1; !rc && c*64u<bytes; c++)
+                    rc=libusb_control_transfer(chosen,0xc0,0x47,0,c,strip+64*c,64,3000)!=64;
+                for (unsigned i=0; !rc && i<rows*w; i++) {
+                    unsigned v=strip[32+2*i]|strip[33+2*i]<<8, at=(k*per*w+i)*3;
+                    image[at]=(unsigned char)((v>>11)<<3); image[at+1]=(unsigned char)(((v>>5)&63)<<2); image[at+2]=(unsigned char)((v&31)<<3);
+                }
+            }
+            if (!rc) { printf("P6\n%u %u\n255\n",w,h); fwrite(image,3,(size_t)w*h,stdout); }
         } else if (!strcmp(argv[1],"scan-wifi")) {
             rc=transfer(chosen,0x40,0x69,0,NULL,0);
             if (!rc) puts("Scan requested. Read the result with moto-debug.");

@@ -600,6 +600,10 @@ impl Runtime {
             *b = unsafe { (0x0900_1008 as *const u8).add(i).read_volatile() };
         }
         let path = String::from_utf8_lossy(&bytes[..len]).into_owned();
+        if let Some(args) = path.strip_prefix("@shot") {
+            self.usb_shot(args);
+            return;
+        }
         // A new build replaces the copy that is running.
         for i in 0..MAX_APPS {
             if self.apps[i].as_ref().map_or(false, |a| a.path == path) {
@@ -620,6 +624,44 @@ impl Runtime {
     }
     #[cfg(not(moto_board))]
     fn usb_requests(&mut self) {}
+
+    /// A screenshot over USB (handset), one strip per request: "@shot STRIP SCALE NONCE"
+    /// copies screen rows, scaled down by SCALE, as RGB565 into the 64 KiB install
+    /// window after a 32-byte header ("SHOT", nonce, strip, scale, width, height,
+    /// rows per strip, rows here). The nonce is written last, so the host knows
+    /// when the strip is complete.
+    #[cfg(moto_board)]
+    fn usb_shot(&self, args: &str) {
+        let mut words = args.split_whitespace().map(|w| w.parse::<usize>().unwrap_or(0));
+        let (strip, scale, nonce) = (words.next().unwrap_or(0), words.next().unwrap_or(2).clamp(1, 8), words.next().unwrap_or(0));
+        let (w, h) = (device::WIDTH / scale, device::HEIGHT / scale);
+        let per = (65536 - 32) / (w * 2);
+        let (y0, y1) = ((strip * per).min(h), (strip * per + per).min(h));
+        let window = 0x0950_1000 as *mut u8;
+        let mut at = 32;
+        for y in y0..y1 {
+            let row = (sys::FRAMEBUFFER + y * scale * device::STRIDE) as *const u32;
+            for x in 0..w {
+                let p = unsafe { row.add(x * scale).read_volatile() };
+                let v = (((p >> 19) & 0x1f) << 11 | ((p >> 10) & 0x3f) << 5 | ((p >> 3) & 0x1f)) as u16;
+                unsafe {
+                    window.add(at).write_volatile(v as u8);
+                    window.add(at + 1).write_volatile((v >> 8) as u8);
+                }
+                at += 2;
+            }
+        }
+        let head = window as *mut u32;
+        let fields = [u32::from_le_bytes(*b"SHOT"), 0, strip as u32, scale as u32, w as u32, h as u32, per as u32, (y1 - y0) as u32];
+        unsafe {
+            for (i, f) in fields.iter().enumerate().skip(2) {
+                head.add(i).write_volatile(*f);
+            }
+            head.write_volatile(fields[0]);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            head.add(1).write_volatile(nonce as u32);
+        }
+    }
 
     /// Installs over USB (handset): append the 64 KiB window to /apps/NAME.
     /// Control words: 0 commit serial (USB), 1 done serial, 2 result; file

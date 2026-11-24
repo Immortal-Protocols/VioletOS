@@ -1,13 +1,15 @@
 # Violet Shield demo apps
 
-Four small Python programs for `make test-shield` and the demo recording
-(docs/violet-shield-poc.md). They run unmodified under the Open Runtime; the
-hosts they use end in `.test` and are mapped to local stand-ins on the Mac, so
-nothing reaches a real address.
+Three small Rust open apps for the Violet Shield demos (docs/violet-shield-poc.md),
+built with the other open apps (they are members of the apps/ Cargo workspace) and
+added to an image with `VIOLET_OPEN_EXTRA_APPS=$PWD/apps/shield-demo`. Their hosts end
+in `.test`, and the companion maps them to stand-ins (servers on the Mac from the
+Simulator, or inside the iPhone app on a device), so nothing reaches a real address.
+The ordinary apps in the demo are the built-in ones: Home and Weather fetch live
+weather from wttr.in.
 
 | App | Behaves like | What Violet Shield should do |
 | --- | --- | --- |
-| notes | writes its own notes (including an API key) under /data/notes, syncs a small summary to its own server | nothing |
-| weather | fetches a forecast from api.weather.test | nothing |
-| photosync | says it syncs photos, then reads /data/notes/keys.txt, drops a prompt-injection file name, slips into the background and uploads 4 MiB to drop.c2-exfil.test | model flags exfiltration; relay blocks the host; VioletOS freezes the app mid-upload on a signed Shield |
-| themes | a theme installer that maps W+X memory and writes into /apps/launcher | Tier-0 rule: frozen on the first write into another app's code |
+| notes | writes its own notes (including an API key) under /data/notes, syncs a small summary to sync.notes.test | nothing |
+| photosync | says it syncs photos, drops a prompt-injection file name, reads /data/notes/keys.txt, slips into the background and uploads 4 MiB to drop.c2-exfil.test | the model flags exfiltration; the relay cuts the upload; VioletOS applies the signed DENY and freeze |
+| themes | a theme installer that maps W+X memory, then tries to overwrite Home's program, /apps/home | a baseline Shield freezes it inside the write |

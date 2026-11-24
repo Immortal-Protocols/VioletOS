@@ -137,7 +137,7 @@ moto-component: setup
 # Violet Shield (docs/violet-shield-poc.md).
 SHIELD_PY := build/shield/venv/bin/python
 SHIELD_SIM ?= D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA
-.PHONY: shield-setup shield-train shield-companion test-shield-unit test-shield test-shield-ios shield-demo
+.PHONY: shield-setup shield-train shield-companion test-shield-unit test-shield test-shield-ios shield-demo moto-shield test-shield-device shield-device-demo
 $(SHIELD_PY):
 	$(PYTHON) -m venv build/shield/venv
 	$(SHIELD_PY) -m pip install -q torch "transformers>=5.24" sentence-transformers coremltools numpy cryptography pillow
@@ -157,3 +157,11 @@ test-shield-ios: qemu-image shield-companion
 shield-demo: qemu-image shield-companion
 	VIOLET_SIM=$(SHIELD_SIM) $(SHIELD_PY) targets/qemu/test_shield.py --companion ios --record build/shield/demo
 	$(SHIELD_PY) tools/shield-trainer/make_video.py build/shield/demo
+# Real devices: the Moto image with the demo apps, then the run (see targets/moto-g-pure/test_shield_device.py).
+moto-shield: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto
+test-shield-device: $(SHIELD_PY)
+	$(SHIELD_PY) targets/moto-g-pure/test_shield_device.py
+shield-device-demo: $(SHIELD_PY)
+	$(SHIELD_PY) targets/moto-g-pure/test_shield_device.py --record build/shield/device-demo
+	$(SHIELD_PY) tools/shield-trainer/make_device_video.py build/shield/device-demo

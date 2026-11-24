@@ -294,12 +294,20 @@ final class Socks5Session {
         flowId = Shield.shared.flowStarted(host: targetHost, port: port)
         phase = "connecting"
         lastActivity = Date()
-        // Simulator demos only: send named test hosts to local stand-ins (-hostMap JSON).
+        // Demos only: send named test hosts to local stand-ins (-hostMap JSON): a host:port
+        // (the Mac, from the Simulator) or standin:sink / standin:web on this phone's loopback.
         var host = host, port = port
+        var local = false
         if let mapped = RelayConfig.hostMap[targetHost.lowercased()] {
-            let parts = mapped.split(separator: ":")
-            host = .name(String(parts[0]), nil)
-            port = parts.count > 1 ? UInt16(parts[1]) ?? port : port
+            if let (h, p) = StandIns.shared.resolve(mapped) {
+                host = .name(h, nil)
+                port = p
+                local = true
+            } else {
+                let parts = mapped.split(separator: ":")
+                host = .name(String(parts[0]), nil)
+                port = parts.count > 1 ? UInt16(parts[1]) ?? port : port
+            }
         }
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
@@ -309,7 +317,11 @@ final class Socks5Session {
         let params = NWParameters(tls: nil, tcp: tcp)
         // Always leave over cellular, even if Wi-Fi has internet. `-upstream any` exists only to
         // measure the relay's own overhead (Wi-Fi in, Wi-Fi out) for comparison.
-        if !server.anyUpstream { params.requiredInterfaceType = .cellular }
+        if local {
+            params.requiredInterfaceType = .loopback
+        } else if !server.anyUpstream {
+            params.requiredInterfaceType = .cellular
+        }
         params.prohibitExpensivePaths = false
         params.prohibitConstrainedPaths = false
         let up = NWConnection(host: host, port: NWEndpoint.Port(rawValue: port)!, using: params)
