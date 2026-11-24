@@ -616,7 +616,7 @@ impl Runtime {
                 if path == HOME_APP {
                     self.home = Some(i);
                 }
-                self.foreground = Some(i);
+                self.set_foreground(Some(i));
                 self.shell.dirty = true;
             }
             Err(e) => log!("could not start {}: {}", path, e),
