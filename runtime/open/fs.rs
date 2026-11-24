@@ -140,6 +140,11 @@ impl Fs {
     pub fn files(&self) -> usize {
         self.image.len()
     }
+    /// The file was written since boot rather than shipped in the image.
+    pub fn from_layer(&self, path: &str) -> bool {
+        self.layer.contains_key(path)
+    }
+
     pub fn stat(&self, path: &str) -> Option<Stat> {
         if path.starts_with("/dev/violet/") || matches!(path, "/dev/null" | "/dev/urandom" | "/dev/random" | "/dev/tty") {
             return Some(Stat { mode: S_IFCHR | 0o666, size: 0, mtime: 0, inode: inode(path) });

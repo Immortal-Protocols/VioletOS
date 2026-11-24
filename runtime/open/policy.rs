@@ -36,6 +36,8 @@ pub enum Action<'a> {
     SpawnThread { total_threads: usize },
     SpawnApp { path: &'a str },
     SystemControl { command: &'a str },
+    /// `mmap`/`mprotect` asking for pages that are writable and executable at once.
+    MapWriteExec { addr: u32, len: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

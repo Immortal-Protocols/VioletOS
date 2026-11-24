@@ -444,6 +444,16 @@ pub fn run() -> ! {
                 }
                 send(&out, len);
             }
+            // The install window, 64 bytes per request: a screenshot strip the Open
+            // Runtime wrote there ("@shot", see usb_shot in runtime/open/mod.rs).
+            (0xc0, 0x47, 0, chunk) if chunk < 1024 => {
+                let mut out = [0; 64];
+                let src = (0x09211000 + usize::from(chunk) * 64) as *const u8;
+                for (i, dest) in out.iter_mut().enumerate() {
+                    *dest = unsafe { src.add(i).read_volatile() };
+                }
+                send(&out, len);
+            }
             // The Open Runtime's log ring (4 KiB), 64 bytes per request.
             (0xc0, 0x4d, 0, chunk) if chunk < 64 => {
                 let mut out = [0; 64];

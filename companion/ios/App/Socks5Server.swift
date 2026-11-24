@@ -118,6 +118,13 @@ final class RelayServer {
         session.start()
     }
 
+    /// Violet Shield blocked these hosts: end their live sessions now (on `queue`).
+    func abortSessions(toHosts hosts: Set<String>) {
+        for s in sessions.values where hosts.contains(s.targetHost.lowercased()) {
+            s.abort("blocked by Violet Shield")
+        }
+    }
+
     func checkCredentials(user: String, pass: String) -> Bool {
         user == credentials.user && pass == credentials.pass
     }
@@ -151,6 +158,8 @@ final class Socks5Session {
     private var timer: DispatchSourceTimer?
     private var phase = "handshake"
     private var target = "?"
+    private(set) var targetHost = ""
+    private var flowId: Int?
     private var upDone = false, downDone = false
     var onFinish: (() -> Void)?
 
@@ -254,6 +263,7 @@ final class Socks5Session {
                     let port = UInt16(p[0]) << 8 | UInt16(p[1])
                     guard cmd == 0x01 else { return self.fail(.commandNotSupported, "command \(cmd) not supported") }
                     if case .name("time.violet", _) = host { return self.sendTime() }
+                    if case .name("sentinel.violet", _) = host { return self.handOffToSentinel() }
                     self.connect(host: host, port: port)
                 }
             }
@@ -277,8 +287,28 @@ final class Socks5Session {
 
     private func connect(host: NWEndpoint.Host, port: UInt16) {
         target = "\(host):\(port)"
+        targetHost = Self.name(of: host)
+        if Shield.shared.isBlocked(host: targetHost, port: port) {
+            return fail(.notAllowed, "\(target) blocked by Violet Shield")
+        }
+        flowId = Shield.shared.flowStarted(host: targetHost, port: port)
         phase = "connecting"
         lastActivity = Date()
+        // Demos only: send named test hosts to local stand-ins (-hostMap JSON): a host:port
+        // (the Mac, from the Simulator) or standin:sink / standin:web on this phone's loopback.
+        var host = host, port = port
+        var local = false
+        if let mapped = RelayConfig.hostMap[targetHost.lowercased()] {
+            if let (h, p) = StandIns.shared.resolve(mapped) {
+                host = .name(h, nil)
+                port = p
+                local = true
+            } else {
+                let parts = mapped.split(separator: ":")
+                host = .name(String(parts[0]), nil)
+                port = parts.count > 1 ? UInt16(parts[1]) ?? port : port
+            }
+        }
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.connectionTimeout = Int(Self.connectTimeout)
@@ -287,7 +317,11 @@ final class Socks5Session {
         let params = NWParameters(tls: nil, tcp: tcp)
         // Always leave over cellular, even if Wi-Fi has internet. `-upstream any` exists only to
         // measure the relay's own overhead (Wi-Fi in, Wi-Fi out) for comparison.
-        if !server.anyUpstream { params.requiredInterfaceType = .cellular }
+        if local {
+            params.requiredInterfaceType = .loopback
+        } else if !server.anyUpstream {
+            params.requiredInterfaceType = .cellular
+        }
         params.prohibitExpensivePaths = false
         params.prohibitConstrainedPaths = false
         let up = NWConnection(host: host, port: NWEndpoint.Port(rawValue: port)!, using: params)
@@ -319,6 +353,36 @@ final class Socks5Session {
             }
         }
         up.start(queue: queue)
+    }
+
+    static func name(of host: NWEndpoint.Host) -> String {
+        switch host {
+        case .name(let n, _): return n
+        case .ipv4(let a): return a.rawValue.map(String.init).joined(separator: ".")
+        case .ipv6(let a): return "\(a)"
+        @unknown default: return "\(host)"
+        }
+    }
+
+    /// "sentinel.violet" is Violet Shield's endpoint on this phone: after the SOCKS
+    /// reply the connection belongs to the Shield, not to an upstream.
+    private func handOffToSentinel() {
+        phase = "sentinel"
+        let reply: [UInt8] = [0x05, Reply.succeeded.rawValue, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+        write(reply) {
+            self.timer?.cancel()
+            self.timer = nil
+            self.finished = true
+            self.client.stateUpdateHandler = nil
+            Shield.shared.attachSentinel(self.client)
+            let done = self.onFinish
+            self.onFinish = nil
+            done?()
+        }
+    }
+
+    func abort(_ why: String) {
+        finish(why)
     }
 
     private static func definitiveReply(_ err: NWError) -> Reply? {
@@ -379,6 +443,7 @@ final class Socks5Session {
             if let data, !data.isEmpty {
                 self.lastActivity = Date()
                 if up { self.counters.bytesUp += UInt64(data.count) } else { self.counters.bytesDown += UInt64(data.count) }
+                if let id = self.flowId { Shield.shared.flowBytes(id, up: up ? data.count : 0, down: up ? 0 : data.count) }
                 dst.send(content: data, completion: .contentProcessed { [weak self] sendErr in
                     guard let self, !self.finished else { return }
                     if let sendErr { return self.finish("send error (\(up ? "up" : "down")) \(self.target): \(sendErr)") }
@@ -404,6 +469,7 @@ final class Socks5Session {
         guard !finished else { return }
         finished = true
         if let error { counters.noteError(error) }
+        if let id = flowId { Shield.shared.flowEnded(id) }
         timer?.cancel()
         timer = nil
         upstream?.cancel()

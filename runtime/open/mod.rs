@@ -13,6 +13,10 @@ pub mod inflate;
 pub mod net;
 pub mod sockets;
 pub mod policy;
+pub mod shield;
+pub mod guard;
+#[path = "../../services/sentinel/mod.rs"]
+pub mod sentinel;
 pub mod pool;
 #[path = "../../system/supervisor/procmgr.rs"]
 pub mod procmgr;
@@ -24,7 +28,8 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use policy::{OpenPolicy, Policy};
+use policy::{Action, AppId, OpenPolicy, Policy};
+use shield::{EventKind, ShieldPolicy, TelemetryEvent};
 use pool::{Kernel, Pool};
 use procmgr::Space;
 use sys::Object;
@@ -83,6 +88,37 @@ pub enum Wait {
     /// A blocking connect, or a send waiting for room in the socket's ring.
     Connect { fd: i32 },
     Send { fd: i32, buf: u32, len: u32 },
+    /// Held by a Violet Shield freeze; answered with EACCES when the app thaws.
+    Frozen,
+}
+
+/// The outcome of the Shield check at the choke point.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    Allow,
+    Deny,
+    /// The app was frozen; the calling thread waits until it thaws.
+    Frozen,
+    /// The app was ended.
+    Killed,
+}
+
+pub struct Frozen {
+    pub until_ns: u64,
+    pub shield_id: u32,
+    /// Threads this freeze suspended (the rest were already blocked in a call).
+    pub suspended: Vec<usize>,
+}
+
+/// Bytes an app has sent on a connection, reported as SOCK_TX.
+pub struct TxStat {
+    pub pid: u32,
+    pub index: usize,
+    pub host: String,
+    pub port: u16,
+    pub pending: u32,
+    pub reported: u64,
+    pub last_ns: u64,
 }
 
 pub struct Thread {
@@ -113,6 +149,11 @@ pub struct App {
     pub events: alloc::collections::VecDeque<abi::InputEvent>,
     pub surface: Option<device::Surface>,
     pub exit_code: Option<i32>,
+    /// SHA-256 of the program file (the script, for interpreted programs).
+    pub digest: [u8; 32],
+    /// Not part of the boot image (written or pushed since boot).
+    pub new_hash: bool,
+    pub frozen: Option<Frozen>,
 }
 
 pub struct Runtime {
@@ -140,6 +181,11 @@ pub struct Runtime {
     /// Audio is installed, so its PCM ring is mapped at 0x09100000.
     pub audio: bool,
     pub net: net::Net,
+    pub shield: ShieldPolicy,
+    pub sentinel: sentinel::Sentinel,
+    pub last_touch_ns: u64,
+    pub tx_stats: Vec<Option<TxStat>>,
+    last_sentinel: u64,
 }
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
@@ -222,6 +268,17 @@ impl Runtime {
             audio: false,
             // Radio (handset) or the emulator's host relay serves the socket pages.
             net: net::Net::new(true),
+            shield: ShieldPolicy::new(),
+            sentinel: {
+                let mut id = [0u8; 16];
+                let (a, b) = (sys::counter() ^ 0x5bd1e995, sys::counter().rotate_left(17) ^ 0x9e3779b97f4a7c15);
+                id[..8].copy_from_slice(&a.to_le_bytes());
+                id[8..].copy_from_slice(&b.to_le_bytes());
+                sentinel::Sentinel::new(crate::companion_key::COMPANION_KEY, id)
+            },
+            last_touch_ns: 0,
+            tx_stats: (0..net::SLOTS).map(|_| None).collect(),
+            last_sentinel: 0,
             // Requests made before this boot are not repeated.
             usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
         })
@@ -257,6 +314,9 @@ impl Runtime {
             }
         }
         let image = self.fs.contents(&program).ok_or("not a file")?;
+        let digest = sentinel::sha256(image);
+        let new_hash = self.fs.from_layer(&program);
+        let measured = program.clone();
         if image.starts_with(b"#!") {
             let line_end = image.iter().position(|&b| b == b'\n').unwrap_or(image.len());
             let line = core::str::from_utf8(&image[2..line_end]).map_err(|_| "bad #! line")?;
@@ -339,6 +399,9 @@ impl Runtime {
             events: Default::default(),
             surface: None,
             exit_code: None,
+            digest,
+            new_hash,
+            frozen: None,
         };
         for _ in 0..3 {
             app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
@@ -350,6 +413,20 @@ impl Runtime {
             return Err(alloc::format!("thread: {}", e));
         }
         log!("started {} as pid {} ({} KiB free)", program, pid, self.pool.available() * 64);
+        let app_name = self.apps[index].as_ref().unwrap().name.clone();
+        self.sentinel.note_exec(pid, &app_name, &digest);
+        let _ = measured;
+        let line = argv.join(" ");
+        match self.gate(index, &Action::SpawnApp { path: &line }) {
+            Gate::Deny | Gate::Killed => {
+                if let Some(app) = self.apps[index].as_mut() {
+                    app.exit_code = Some(126);
+                }
+                self.reap(index);
+                return Err(String::from("blocked by Violet Shield"));
+            }
+            _ => {}
+        }
         Ok(index)
     }
 
@@ -424,6 +501,12 @@ impl Runtime {
         if self.home == Some(index) {
             self.home = None;
         }
+        if app.frozen.is_some() {
+            self.sentinel.frozen_apps = self.sentinel.frozen_apps.saturating_sub(1);
+        }
+        let status = alloc::format!("status {}", app.exit_code.unwrap_or(-1));
+        let ev = TelemetryEvent::new(sys::now_ns(), AppId(app.pid), EventKind::Exit, 0, status.as_bytes());
+        self.shield.ring.emit(ev);
         if self.foreground == Some(index) {
             self.foreground = None;
             self.show_home();
@@ -476,6 +559,9 @@ impl Runtime {
         let now = sys::now_ns();
         for index in 0..MAX_APPS {
             let Some(app) = self.apps[index].as_ref() else { continue };
+            if app.frozen.is_some() {
+                continue;
+            }
             let waiting: Vec<(usize, Wait, Option<u64>)> = app
                 .threads
                 .iter()
@@ -491,6 +577,7 @@ impl Runtime {
                         Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Sleep => 0,
                         Wait::Read { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
                         Wait::Connect { .. } => -110,
+                        Wait::Frozen => syscall::EACCES,
                     };
                     self.wake(index, slot, result);
                 }
@@ -513,6 +600,10 @@ impl Runtime {
             *b = unsafe { (0x0900_1008 as *const u8).add(i).read_volatile() };
         }
         let path = String::from_utf8_lossy(&bytes[..len]).into_owned();
+        if let Some(args) = path.strip_prefix("@shot") {
+            self.usb_shot(args);
+            return;
+        }
         // A new build replaces the copy that is running.
         for i in 0..MAX_APPS {
             if self.apps[i].as_ref().map_or(false, |a| a.path == path) {
@@ -533,6 +624,44 @@ impl Runtime {
     }
     #[cfg(not(moto_board))]
     fn usb_requests(&mut self) {}
+
+    /// A screenshot over USB (handset), one strip per request: "@shot STRIP SCALE NONCE"
+    /// copies screen rows, scaled down by SCALE, as RGB565 into the 64 KiB install
+    /// window after a 32-byte header ("SHOT", nonce, strip, scale, width, height,
+    /// rows per strip, rows here). The nonce is written last, so the host knows
+    /// when the strip is complete.
+    #[cfg(moto_board)]
+    fn usb_shot(&self, args: &str) {
+        let mut words = args.split_whitespace().map(|w| w.parse::<usize>().unwrap_or(0));
+        let (strip, scale, nonce) = (words.next().unwrap_or(0), words.next().unwrap_or(2).clamp(1, 8), words.next().unwrap_or(0));
+        let (w, h) = (device::WIDTH / scale, device::HEIGHT / scale);
+        let per = (65536 - 32) / (w * 2);
+        let (y0, y1) = ((strip * per).min(h), (strip * per + per).min(h));
+        let window = 0x0950_1000 as *mut u8;
+        let mut at = 32;
+        for y in y0..y1 {
+            let row = (sys::FRAMEBUFFER + y * scale * device::STRIDE) as *const u32;
+            for x in 0..w {
+                let p = unsafe { row.add(x * scale).read_volatile() };
+                let v = (((p >> 19) & 0x1f) << 11 | ((p >> 10) & 0x3f) << 5 | ((p >> 3) & 0x1f)) as u16;
+                unsafe {
+                    window.add(at).write_volatile(v as u8);
+                    window.add(at + 1).write_volatile((v >> 8) as u8);
+                }
+                at += 2;
+            }
+        }
+        let head = window as *mut u32;
+        let fields = [u32::from_le_bytes(*b"SHOT"), 0, strip as u32, scale as u32, w as u32, h as u32, per as u32, (y1 - y0) as u32];
+        unsafe {
+            for (i, f) in fields.iter().enumerate().skip(2) {
+                head.add(i).write_volatile(*f);
+            }
+            head.write_volatile(fields[0]);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            head.add(1).write_volatile(nonce as u32);
+        }
+    }
 
     /// Installs over USB (handset): append the 64 KiB window to /apps/NAME.
     /// Control words: 0 commit serial (USB), 1 done serial, 2 result; file
@@ -698,6 +827,10 @@ impl Runtime {
                 self.stats.slowest_poll = self.stats.slowest_poll.max(sys::now_ns().wrapping_sub(now));
             }
             self.check_waiters();
+            if now.wrapping_sub(self.last_sentinel) >= 100_000_000 {
+                self.last_sentinel = now;
+                self.shield_tick(now);
+            }
             if handled == 0 {
                 sys::yield_now();
             }
@@ -732,12 +865,13 @@ impl Stats {
     }
 }
 
-/// Enough heap to report a failed start before the pool exists.
-static mut BOOT_HEAP: [u64; 4096] = [0; 4096];
+/// Enough heap to report a failed start before the pool exists (the pool
+/// then adds HEAP_PAGES of its own; see pool.rs).
+static mut BOOT_HEAP: [u64; 1024] = [0; 1024];
 
 pub fn run() -> ! {
     Log::init();
-    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 4096 * 8) };
+    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1024 * 8) };
     let mut rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {

@@ -19,6 +19,7 @@ struct StatusView: View {
     var body: some View {
         let s = model.status
         List {
+            ShieldSection()
             Section {
                 TextField("Pairing code", text: $code)
                     .font(.title3.monospaced())

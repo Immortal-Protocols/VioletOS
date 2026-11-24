@@ -99,6 +99,18 @@ pub const BG: u32 = 0xff191620;
 pub const PANEL: u32 = 0xff302a39;
 pub const INK: u32 = 0xffeeeaf8;
 pub const ACCENT: u32 = 0xffd1b0fe;
+pub const ALERT: u32 = 0xffff5a5f;
+pub const OK_GREEN: u32 = 0xff6ee7a8;
+
+/// Drawn over a frozen app's last frame while it is on screen.
+pub fn frozen_banner(on: bool) {
+    if !on {
+        return;
+    }
+    fill(0, 0, WIDTH, 150, ALERT);
+    text(36, 30, "FROZEN BY VIOLET SHIELD", 4, 0xff1a0b0d);
+    text(36, 90, "SIGNED BY YOUR IPHONE - MEMORY KEPT", 2, 0xff1a0b0d);
+}
 
 fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
     let fb = FRAMEBUFFER as *mut u32;
@@ -167,7 +179,21 @@ const ROWS: usize = (HOME_Y - 40 - ROW_Y) / ROW_H;
 const BG_ROW: u32 = 0xff231d2e;
 pub const HOME_Y: usize = 1380;
 
+/// Shared settings (see "get" and "set" in /dev/violet/sys).
+const SETTINGS: &str = "/data/settings";
+
+fn setting_key(k: &str) -> bool {
+    (1..=24).contains(&k.len()) && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
 impl Runtime {
+    fn settings_text(&self) -> String {
+        self.fs.contents(SETTINGS).map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default()
+    }
+    fn setting(&self, key: &str) -> Option<String> {
+        self.settings_text().lines().find_map(|l| l.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| String::from(v)))
+    }
+
     /// Titles from /apps/.home ("name<TAB>title" lines), for the apps that have one.
     fn titles(&self) -> Vec<(String, String)> {
         let Some(home) = self.fs.contents("/apps/.home") else { return Vec::new() };
@@ -229,12 +255,17 @@ impl Runtime {
         for (i, path) in entries.iter().take(ROWS).enumerate() {
             let y = ROW_Y + i * ROW_H;
             let name = path.trim_start_matches("/apps/");
-            let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_uppercase());
+            let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_ascii_uppercase());
             fill(42, y, WIDTH - 84, ROW_H - 12, if title.is_some() { PANEL } else { BG_ROW });
             let shown: String = title.as_deref().unwrap_or(name).chars().take(16).collect();
             text(72, y + 16, &shown, if title.is_some() { 5 } else { 4 }, INK);
-            if self.apps.iter().flatten().any(|a| a.path == *path) {
-                text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT);
+            match self.apps.iter().flatten().find(|a| a.path == *path) {
+                Some(a) if a.frozen.is_some() => {
+                    fill(42, y, 10, ROW_H - 12, ALERT);
+                    text(72, y + 52, "FROZEN BY VIOLET SHIELD", 2, ALERT);
+                }
+                Some(_) => text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT),
+                None => {}
             }
         }
         if !self.shell.message.is_empty() {
@@ -243,7 +274,23 @@ impl Runtime {
         }
         fill(42, HOME_Y, WIDTH - 84, 150, PANEL);
         text(78, HOME_Y + 54, "HOME", 7, INK);
+        self.draw_shield_status();
         sys::clean_framebuffer(0, HEIGHT);
+    }
+
+    /// One line under the title: the companion link and the live Shields.
+    pub fn draw_shield_status(&mut self) {
+        fill(42, 190, WIDTH - 84, 40, BG);
+        let linked = self.sentinel.online();
+        let frozen = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).count();
+        let line = alloc::format!(
+            "SHIELD {} - {} RULE{} - {} FROZEN",
+            if linked { "LINKED" } else { "OFFLINE" },
+            self.shield.active(),
+            if self.shield.active() == 1 { "" } else { "S" },
+            frozen
+        );
+        text(42, 196, &line, 3, if frozen > 0 { ALERT } else if linked { OK_GREEN } else { ACCENT });
     }
 
     fn shell_tap(&mut self, x: i32, y: i32) {
@@ -283,6 +330,7 @@ impl Runtime {
 
     /// A touch change from Runtime, in screen pixels.
     pub fn touch(&mut self, x: i32, y: i32, down: bool) {
+        self.last_touch_ns = sys::now_ns();
         if !self.shell.armed {
             self.shell.armed = !down;
             self.shell.held = down;
@@ -414,7 +462,7 @@ impl Runtime {
     /// Whether a wait can finish now, and with what result.
     pub fn ready(&mut self, i: usize, wait: &Wait) -> Option<i32> {
         match wait {
-            Wait::Futex { .. } | Wait::Sleep => None,
+            Wait::Futex { .. } | Wait::Sleep | Wait::Frozen => None,
             Wait::Audio { fd, buf, len } => {
                 let r = self.write_audio(i, *fd, *buf, *len);
                 (r != 0).then_some(r)
@@ -746,6 +794,39 @@ impl Runtime {
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
                 alloc::format!("{}\n", paths.join(" "))
+            }
+            // Shared settings ("get KEY", "set KEY VALUE"), kept by the runtime in
+            // /data/settings, so apps can share a preference (Weather's city, which
+            // Home shows) without opening each other's private /data files.
+            Some("get") => match words.next().filter(|k| setting_key(k)) {
+                Some(key) => alloc::format!("{}\n", self.setting(key).unwrap_or_default()),
+                None => String::from("error\n"),
+            },
+            Some("set") => match (words.next().filter(|k| setting_key(k)), words.next()) {
+                (Some(key), Some(value)) if value.len() <= 64 && words.next().is_none() => {
+                    let mut lines: Vec<String> = self.settings_text().lines()
+                        .filter(|l| l.split_once('=').map_or(false, |(k, _)| k != key)).map(String::from).collect();
+                    lines.push(alloc::format!("{}={}", key, value));
+                    let text = lines.join("\n") + "\n";
+                    match self.fs.writable(SETTINGS, true, true, 0) {
+                        Some(f) if text.len() <= 4096 => {
+                            f.extend_from_slice(text.as_bytes());
+                            String::from("ok\n")
+                        }
+                        _ => String::from("error\n"),
+                    }
+                }
+                _ => String::from("error\n"),
+            },
+            // Violet Shield: the companion link, live rules and frozen apps, for Home.
+            Some("shield") => {
+                let frozen: Vec<&str> = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).map(|a| a.name.as_str()).collect();
+                alloc::format!(
+                    "linked={} rules={} frozen={}\n",
+                    self.sentinel.online() as u32,
+                    self.shield.active(),
+                    if frozen.is_empty() { String::from("-") } else { frozen.join(",") }
+                )
             }
             Some("status") => {
                 let power = request(GET, POWER, 0);

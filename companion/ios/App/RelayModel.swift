@@ -51,6 +51,22 @@ enum RelayConfig {
         return (ssid, (args["joinPassphrase"] as? String) ?? "")
     }
 
+    /// Simulator demos: `-hostMapB64 <base64 of {"drop.c2-exfil.test":"127.0.0.1:9999"}>` sends test names to local
+    /// stand-ins, so nothing reaches a real address. The relay still logs the name it was asked for.
+    static let hostMap: [String: String] = {
+        // Launch arguments are parsed as property lists, so JSON object syntax usually arrives as a dictionary.
+        // `-hostMapB64` (base64 JSON) avoids the property-list parsing of launch arguments.
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        var parsed = args["hostMap"] as? [String: String]
+        var json = (args["hostMap"] as? String)?.data(using: .utf8)
+        if let b = args["hostMapB64"] as? String { json = Data(base64Encoded: b) }
+        if parsed == nil, let d = json {
+            parsed = try? JSONSerialization.jsonObject(with: d) as? [String: String]
+        }
+        guard let m = parsed else { return [:] }
+        return Dictionary(uniqueKeysWithValues: m.map { ($0.key.lowercased(), $0.value) })
+    }()
+
     static var forgetSSID: String? {
         UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["forgetSSID"] as? String
     }
@@ -108,7 +124,9 @@ final class RelayModel: ObservableObject {
             Task { @MainActor in self?.cellularAvailable = path.status == .satisfied }
         }
         cellMonitor.start(queue: .main)
+        StandIns.shared.start(kinds: Set(RelayConfig.hostMap.values.filter { $0.hasPrefix("standin:") }.map { String($0.dropFirst(8)) }))
         server.start()
+        Shield.shared.start(relay: server)
         if let ssid = RelayConfig.forgetSSID, !ssid.isEmpty {
             if ssid.hasSuffix("*") {
                 // "VioletRelay*" removes every configuration this app saved with that prefix.

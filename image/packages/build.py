@@ -1,11 +1,37 @@
 """Link each guest component at its private virtual base, with a versioned package header."""
 
 import binascii
+import os
 import json
 from pathlib import Path
 import re
 import struct
 import subprocess
+
+
+def companion_key(repo, dest):
+    """The iPhone companion's Shield-signing public key, pinned into the image.
+
+    On a real pairing this is the Secure Enclave key's public half. For the
+    emulator the Mac makes a P-256 key once (build/shield/companion-signing.pem)
+    and hands the private half to the companion in the iOS Simulator, which has
+    no Secure Enclave. Only the public key enters the image.
+    """
+    key = Path(os.environ.get("VIOLET_SHIELD_KEY", repo / "build/shield/companion-signing.pem"))
+    if not key.exists():
+        key.parent.mkdir(parents=True, exist_ok=True)
+        tmp = key.with_suffix(".new")
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", tmp], check=True)
+        tmp.chmod(0o600)
+        tmp.replace(key)
+    public = subprocess.check_output(["openssl", "ec", "-in", key, "-pubout", "-outform", "DER",
+                                      "-conv_form", "uncompressed"], stderr=subprocess.DEVNULL)
+    prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+    if len(public) != len(prefix) + 65 or not public.startswith(prefix + b"\x04"):
+        raise SystemExit(f"{key} is not a P-256 key")
+    out = dest / "companion_key.rs"
+    out.write_text("pub const COMPANION_KEY: [u8; 65] = [" + ",".join(map(str, public[len(prefix):])) + "];\n")
+    return out
 
 
 def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=None, storage_backend=None, target="qemu"):
@@ -119,6 +145,8 @@ SECTIONS {
             )
         if name == "stopwatch":
             modules["watch"] = repo / "apps/stopwatch/state.rs"
+        if name == "open":
+            modules["companion_key"] = companion_key(repo, dest)
         body = "process::run()"
         if name == "runtime":
             modules["lanes"] = repo / "runtime/lanes.rs"
@@ -157,7 +185,8 @@ SECTIONS {
                 "--crate-type=staticlib",
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
-                "-Copt-level=s",
+                # The Open Runtime (with the Sentinel) is optimised for size to fit the 0x3e000-byte window.
+                "-Copt-level=z" if name == "open" else "-Copt-level=s",
                 *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,
@@ -170,6 +199,17 @@ SECTIONS {
             shim = dest / "open-sel4.o"
             run([*common, *incs, "-DNDEBUG", "-std=gnu11", "-I", platform_include, "-c", repo / "runtime/open/sel4.c", "-o", shim])
             tls_objects.append(shim)
+            # The Sentinel verifies Shields with BearSSL's P-256, like the supervisor.
+            import sys
+
+            sys.path.insert(0, str(repo / "services/radio"))
+            from build_tls import build as build_crypto
+
+            bearssl = build_crypto(repo, out, common)[1]
+            crypto = dest / "sentinel-crypto.o"
+            run([*common, "-I", repo / "build/sel4/bearssl-0.6/inc", "-I", repo / "services/radio/freestanding",
+                 "-c", repo / "services/sentinel/crypto.c", "-o", crypto])
+            tls_objects += [crypto, bearssl]
         if name == "radio" and target == "qemu":
             import sys
 

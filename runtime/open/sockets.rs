@@ -172,10 +172,20 @@ impl Runtime {
                     _ => EISCONN,
                 })
             }
-            Kind::Tcp { slot, peer } => {
+            Kind::Tcp { .. } => {
                 if ip == 0x7f00_0001 && port == 0 {
                     return Done(EINVAL);
                 }
+                let host = self.net.host_for(ip);
+                drop(file);
+                match self.gate(i, &super::policy::Action::Connect { host: &host, port }) {
+                    super::Gate::Allow => {}
+                    super::Gate::Deny => return Done(-13),
+                    super::Gate::Frozen => return Block(Wait::Frozen, None),
+                    super::Gate::Killed => return Outcome::Gone,
+                }
+                let mut file = f.borrow_mut();
+                let Kind::Tcp { slot, peer } = &mut file.kind else { return Done(EBADF) };
                 match self.net.connect(ip, port) {
                     Ok(s) => {
                         *slot = Some(s);
@@ -183,7 +193,9 @@ impl Runtime {
                     }
                     Err(e) => return Done(e),
                 }
+                let s = slot.unwrap();
                 drop(file);
+                self.track_connection(i, s, &host, port);
                 if nonblock {
                     Done(EINPROGRESS)
                 } else {
@@ -247,6 +259,8 @@ impl Runtime {
                     _ => return -32, // EPIPE
                 }
                 let n = self.net.send(slot, &data);
+                drop(file);
+                self.count_sent(slot, n);
                 if n == 0 { EAGAIN } else { n as i32 }
             }
             Kind::Tcp { slot: None, .. } => ENOTCONN,

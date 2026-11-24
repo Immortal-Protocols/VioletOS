@@ -24,6 +24,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds app, then checks the PCM, the recording and the on-screen volume. |
 | `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. |
 | `make test-open-apps` | Drives the built-in apps: Stopwatch's time in `/data` across a restart, Sounds, and live Weather. |
+| `make test-shield` | Violet Shield end to end: the Sentinel streams telemetry to a companion that scores it with EmbeddingGemma 2 and freezes a data-stealing app with a signed Shield. `make test-shield-ios` uses the real app in the iOS Simulator. See [the proof of concept](docs/violet-shield-poc.md). |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
 
