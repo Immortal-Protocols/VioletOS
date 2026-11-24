@@ -97,7 +97,12 @@ def entry(name, data, mode, mtime=0):
     return blob + bytes(-len(blob) % 4)
 
 
-def main(out, python=True, compress=False):
+# Test programs left out of the handset image, which must fit its boot partition
+# (Python alone is 17 MB); QEMU runs them all.
+HANDSET_SKIP = {"gonet", "pyhello", "pynet", "pypaint", "pytone"}
+
+
+def main(out, python=True, compress=False, skip=()):
     """compress=True writes "VGZ1", the gzip length, then the gzip of the
     archive (the handset carries it compressed in its boot image's ramdisk)."""
     out = Path(out)
@@ -105,7 +110,7 @@ def main(out, python=True, compress=False):
     work.mkdir(parents=True, exist_ok=True)
     files = {}
     for app in sorted((ROOT / "apps/open").iterdir()):
-        if not app.is_dir():
+        if not app.is_dir() or app.name in skip:
             continue
         if (app / "main.go").exists():
             binary = work / app.name
@@ -138,6 +143,10 @@ def main(out, python=True, compress=False):
             if path.is_file():
                 rel = f"apps/{app.name}/{path.relative_to(app)}"
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
+    # Apps with an app.txt are listed first, under their titles, by the shell.
+    titles = [f"{a.name}\t{(a / 'app.txt').read_text().strip()}" for a in sorted((ROOT / "apps/open").iterdir())
+              if (a / "app.txt").exists() and f"apps/{a.name}" in files]
+    files["apps/.home"] = ("\n".join(titles).encode() + b"\n", 0o100644)
     # Name lookups go to the Open Runtime's own DNS answerer; certificates for TLS.
     files["etc/resolv.conf"] = (b"nameserver 10.0.0.53\noptions attempts:2 timeout:2\n", 0o100644)
     files["etc/hosts"] = (b"127.0.0.1 localhost\n", 0o100644)

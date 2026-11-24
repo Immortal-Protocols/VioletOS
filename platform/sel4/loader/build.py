@@ -52,7 +52,7 @@ for source in [repo/"services/touch/events.c", repo/"services/storage/storage_ip
     run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
     shims.append(obj)
 only=os.environ.get("VIOLET_COMPONENT_ONLY")
-selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi","weather","usb-diagnostics","audio","sounds","open"}
+selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi","usb-diagnostics","audio","open"}
 storage_backend=repo/"targets/moto-g-pure/emmc.rs" if variant=="moto" else None
 components(repo,out,cc,common,incs,rustc,shims,only,selected,storage_backend,variant)
 if only or (variant=="qemu" and os.environ.get("VIOLET_APP_DIR")): sys.exit(0)
@@ -115,7 +115,8 @@ for i in range(count):
 sys.path.insert(0,str(repo/"tools"))
 from build_initfs import main as build_initfs
 # The handset carries it gzip-compressed as its boot image's ramdisk.
-build_initfs(out/"initfs.cpio", compress=variant=="moto")
+from build_initfs import HANDSET_SKIP
+build_initfs(out/"initfs.cpio", compress=variant=="moto", **(dict(python=False, skip=HANDSET_SKIP) if variant=="moto" else {}))
 if variant == "moto":
     sys.path.insert(0, str(repo/"targets/moto-g-pure"))
     from wifi_firmware import prepare_wifi

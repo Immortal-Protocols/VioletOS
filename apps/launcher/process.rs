@@ -30,6 +30,11 @@ pub fn run() -> ! {
     let mut usb_poll = unsafe { ticks() };
     let mut visible = false;
     let mut redraw = true;
+    // On the handset the Home app (apps/open/home) is the main screen: hand
+    // over to it once this launcher has restored the radio settings. This
+    // launcher stays as System, which Home opens.
+    let mut hand_over = cfg!(moto_board) && open_apps;
+    let started = unsafe { ticks() };
     loop {
         let active = request(GET, FOCUS, 0).value == LAUNCHER;
         if status.key != 0 {
@@ -57,14 +62,15 @@ pub fn run() -> ! {
                 redraw = true;
             }
         }
-        if active {
-            if let Some(stream) = &radio_events {
-                let r = stream.poll();
-                if r.op == OK {
-                    radio_state = r;
-                    redraw = true;
-                }
+        // Radio state is followed in the background too (USB jobs need it).
+        if let Some(stream) = &radio_events {
+            let r = stream.poll();
+            if r.op == OK {
+                radio_state = r;
+                redraw = true;
             }
+        }
+        if active {
             if let Some(stream) = &volume_events {
                 let r = stream.poll();
                 if r.op == OK {
@@ -80,7 +86,9 @@ pub fn run() -> ! {
                 }
             }
         }
-        if active && unsafe { ticks().wrapping_sub(usb_poll) >= ticks_per_ms*500 } {
+        // USB requests (join-wifi) and Radio restore run even while Home or
+        // another app is in front: Radio picks up USB jobs only through here.
+        if unsafe { ticks().wrapping_sub(usb_poll) >= ticks_per_ms*500 } {
             usb_poll=unsafe {ticks()};
             let usb=request(GET,0x4057,0);
             if usb.op==OK && usb.key!=0 && usb.key!=usb_request && scan_ticket.is_none() && relay_start.is_none() {
@@ -101,11 +109,13 @@ pub fn run() -> ! {
                 }
                 label(166, 20, &text, 1, ACCENT);
             }
+            // APPS lists the open apps (Music, Weather, Stopwatch, Sounds...);
+            // SYSTEM is the catalog of installed components and packages.
             rect(157, 53, 70, 32, PANEL);
             label(163, 65, b"APPS", 2, INK);
             if open_apps {
                 rect(157, 89, 70, 26, PANEL);
-                label(163, 99, b"/APPS", 1, ACCENT);
+                label(163, 99, b"SYSTEM", 1, ACCENT);
             }
             let radio = radio_state;
             let radio_text = radio.text();
@@ -183,7 +193,7 @@ pub fn run() -> ! {
             present(0, 400);
             redraw = false;
         }
-        if active && manual_scan && radio_state.op == OK
+        if manual_scan && radio_state.op == OK
             && radio_state.arg & RADIO_DIAGNOSTIC != 0 && !scan_attempted
         {
             if let Ok(ticket) = submit(EXECUTE, RADIO, 1) {
@@ -196,7 +206,7 @@ pub fn run() -> ! {
             manual_scan = false;
         }
         // Show Home before reading optional preferences or the previous scan.
-        if restore_radio && active && status.key == 0 && radio_state.op == OK {
+        if restore_radio && (active || !hand_over) && status.key == 0 && radio_state.op == OK {
             restore_radio = false;
             if status.arg != 0 {
                 if radio_state.arg & RADIO_DIAGNOSTIC != 0 {
@@ -212,16 +222,22 @@ pub fn run() -> ! {
                 redraw = true;
             }
         }
+        if hand_over && active
+            && (!restore_radio || unsafe { ticks().wrapping_sub(started) } > unsafe { ticks_per_ms } * 4000)
+        {
+            hand_over = false;
+            request(EXECUTE, OPEN, OPEN_APPS);
+        }
         visible = active;
         let e = touch.poll();
         if active && e.op == OK && (42..678).contains(&e.value) {
             match e.arg {
-                212..340 if e.value >= 471 => {
+                212..340 if e.value >= 471 && open_apps => {
+                    request(EXECUTE, OPEN, OPEN_APPS);
+                }
+                212..340 | 356..460 if e.value >= 471 => {
                     library::open();
                     redraw = true;
-                }
-                356..460 if e.value >= 471 && open_apps => {
-                    request(EXECUTE, OPEN, OPEN_APPS);
                 }
                 584..784 if wifi.value == WIFI => {
                     request(EXECUTE, OPEN, WIFI);

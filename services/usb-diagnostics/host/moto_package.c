@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | open-push=NAME | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | open-push=NAME | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -119,16 +119,19 @@ int main(int argc,char **argv) {
                    transfer(chosen,0x40,0x6b,word(payload),payload+37,36);
             }
             for (size_t i=0;i<sizeof payload;i++) ((volatile unsigned char *)payload)[i]=0;
+        } else if (!strcmp(argv[1],"radio-state")) {
+            // Radio's progress words 5-15; word 10 is its stage (70-73: rejoining Wi-Fi).
+            unsigned char r[52];
+            rc=libusb_control_transfer(chosen,0xc0,0x53,0,0,r,52,3000)!=52 || memcmp(r,"VRD2",4);
+            if (!rc) printf("Radio stage %u; words 5-9 %08x %08x %08x, 8-9 %08x %08x, 11-15 %08x %08x %08x %08x %08x\n",
+                            word(r+28),word(r+4),word(r+8),word(r+12),word(r+20),word(r+24),word(r+32),word(r+36),word(r+40),word(r+44),word(r+48));
         } else if (!strcmp(argv[1],"stopwatch")) {
             rc=transfer(chosen,0xc0,0x64,0,b,8) || memcmp(b,"VSW1",4);
             if (!rc) printf("Saved stopwatch: %u.%u seconds\n",word(b+4)/10,word(b+4)%10);
-        } else if (!strcmp(argv[1],"join-wifi") || !strncmp(argv[1],"weather=",8)) {
-            // A weather job sets the token's top bit and carries the city in its low byte.
-            int weather=!strncmp(argv[1],"weather=",8);
+        } else if (!strcmp(argv[1],"join-wifi")) {
             uint32_t token=arc4random_uniform(UINT32_MAX)+1;
             token&=0x7fffffffu;
             if (!token) token=1;
-            if (weather) token=0x80000000u|(token&0x7fffff00u)|((uint32_t)atoi(argv[1]+8)&0xff);
             unsigned char result[44];
             if (!transfer(chosen,0x40,0x6c,token,NULL,0)) {
                 time_t until=time(NULL)+(getenv("MOTO_WIFI_WAIT") ? atoi(getenv("MOTO_WIFI_WAIT")) : 85);
@@ -136,7 +139,7 @@ int main(int argc,char **argv) {
                     if(transfer(chosen,0xc0,0x58,0,result,sizeof result)) break;
                     unsigned state=word(result+4);
                     if(word(result)==token && state) {
-                        if(state==1) {printf(weather ? "Moto weather: %.36s\n" : "Moto HTTPS UUID: %.36s\n",(char *)result+8);rc=0;}
+                        if(state==1) {printf("Moto HTTPS UUID: %.36s\n",(char *)result+8);rc=0;}
                         else fprintf(stderr,"Moto Wi-Fi step failed (%u)\n",state);
                         break;
                     }

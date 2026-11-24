@@ -84,6 +84,7 @@ impl Runtime {
         saved[..8].copy_from_slice(&mrs[..8]);
         saved[8] = mrs[MR_FAULT_IP].wrapping_add(4);
         let number = mrs[7];
+        self.stats.count(number);
         let outcome = self.dispatch(i, slot, number, mrs);
         match outcome {
             Done(r) => {
@@ -678,7 +679,7 @@ impl Runtime {
                 self.poll(i, a[0], a[1], timeout)
             }
             142 | 335 | 413 => Done(ENOSYS),
-            250 | 357 => Done(self.install(i, OpenFile::new(Kind::Epoll { interest: Vec::new() }, 2), 0)),
+            250 | 357 => Done(self.install(i, OpenFile::new(Kind::Epoll { interest: Vec::new(), reported: Vec::new() }, 2), 0)),
             251 => self.epoll_ctl(i, a[0] as i32, a[1], a[2] as i32, a[3]),
             252 | 346 => {
                 let max = a[2];
@@ -1224,7 +1225,9 @@ impl Runtime {
         }
         let Some(f) = self.file(i, epfd) else { return Done(EBADF) };
         let mut f = f.borrow_mut();
-        let Kind::Epoll { interest } = &mut f.kind else { return Done(EINVAL) };
+        let Kind::Epoll { interest, reported } = &mut f.kind else { return Done(EINVAL) };
+        // Adding, changing or removing an entry re-arms its edge.
+        reported.retain(|r| r.0 != fd);
         let existing = interest.iter().position(|e| e.0 == fd);
         match (op, existing) {
             (1, Some(_)) => Done(EEXIST),

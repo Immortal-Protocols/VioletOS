@@ -15,7 +15,7 @@ FRAME = 24 + PAYLOAD
 
 # Hosts the guest may name in a connect command. TLS and certificate checks
 # stay in the guest; the relay only refuses other destinations.
-ENDPOINTS = {"www.uuidgenerator.net", "wttr.in"}
+ENDPOINTS = {"www.uuidgenerator.net"}
 
 
 def connect_endpoint(host="www.uuidgenerator.net"):

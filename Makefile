@@ -80,6 +80,10 @@ test-audio: qemu-image
 .PHONY: test-open
 test-open: qemu-image
 	$(PYTHON) targets/qemu/test_open.py
+
+.PHONY: test-open-apps
+test-open-apps: qemu-image
+	$(PYTHON) targets/qemu/test_open_apps.py
 	@mkdir -p build/tests
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate

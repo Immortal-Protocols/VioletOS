@@ -158,7 +158,7 @@ SECTIONS {
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
                 "-Copt-level=s",
-                *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open") else []),
+                *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,
                 "-o",

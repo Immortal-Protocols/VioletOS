@@ -422,11 +422,3 @@ int station_net_uuid(unsigned char *out) {
   abort_connection();
   return ok;
 }
-extern int guest_https_text(const char *, const char *, unsigned char *, size_t);
-// One short plain-text HTTPS reply (for example a wttr.in weather line).
-int station_net_text(const char *host, const char *path, unsigned char *out,
-                     unsigned cap) {
-  int n = open_https(host) ? guest_https_text(host, path, out, cap) : 0;
-  abort_connection();
-  return n;
-}

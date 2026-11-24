@@ -55,6 +55,20 @@ impl Heap {
     }
 }
 
+impl Heap {
+    /// Free blocks on the list and their total size.
+    pub fn stats(&self) -> (usize, usize) {
+        let (mut blocks, mut bytes) = (0, 0);
+        let mut cur = unsafe { *self.head.get() };
+        while !cur.is_null() {
+            blocks += 1;
+            bytes += unsafe { (*cur).size };
+            cur = unsafe { (*cur).next };
+        }
+        (blocks, bytes)
+    }
+}
+
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align().max(ALIGN);

@@ -248,13 +248,6 @@ pub fn run() -> ! {
                     r.arg = relay_failure.get();
                     r
                 }
-                (EXECUTE, WEATHER) => {
-                    let mut text = [0; 40];
-                    let n = unsafe { wpa::weather(m.value as usize, &mut text) };
-                    let mut r = Message::result(if n > 0 { 1 } else { 2 });
-                    r.put_text(&text[..n]);
-                    r
-                }
                 (EXECUTE, RADIO_TEST) => {
                     let mut id = [0; 36];
                     let mut r = Message::result(2);
@@ -681,16 +674,7 @@ pub fn run() -> ! {
                 }
             }
             let job = if !relaying || leased { run_test.replace(0) } else { 0 };
-            if job & 0x8000_0000 != 0 {
-                // USB weather job: the low byte selects the city.
-                let mut text = [0; 40];
-                let n = unsafe { wpa::weather((job & 0xff) as usize, &mut text) }.min(36);
-                for (i, bytes) in text[..36].chunks_exact(4).enumerate() {
-                    record(66 + i, u32::from_le_bytes(bytes.try_into().unwrap()));
-                }
-                radio_io::barrier();
-                record(65, if n > 0 { 1 } else { 55 });
-            } else if job != 0 {
+            if job != 0 {
                 let mut uuid = [0; 36];
                 let ok = unsafe { wpa::uuid(&mut uuid) };
                 for (i, bytes) in uuid.chunks_exact(4).enumerate() {

@@ -186,6 +186,14 @@ impl Runtime {
     }
 
     pub fn socket_send(&mut self, i: usize, fd: i32, buf: u32, len: u32, to: Option<(u32, u16)>) -> i32 {
+        let r = self.socket_send_now(i, fd, buf, len, to);
+        if r == EAGAIN {
+            self.epoll_rearm(i, fd);
+        }
+        r
+    }
+
+    fn socket_send_now(&mut self, i: usize, fd: i32, buf: u32, len: u32, to: Option<(u32, u16)>) -> i32 {
         let Some(f) = self.socket_file(i, fd) else { return EBADF };
         let data = {
             let app = self.apps[i].as_mut().unwrap();

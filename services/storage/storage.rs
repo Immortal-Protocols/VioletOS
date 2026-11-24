@@ -66,7 +66,7 @@ pub extern "C" fn storage_task() {
             r.reply();
             continue;
         }
-        if (STORAGE_FILE..STORAGE_FILE + 7).contains(&m.op) {
+        if (STORAGE_FILE..STORAGE_FILE + 8).contains(&m.op) {
             let response = if badge != 3 {
                 Message::error(DENIED)
             } else if let Some(d) = disk.as_mut() {

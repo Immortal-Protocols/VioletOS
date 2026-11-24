@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"time"
 )
 
 func main() {
 	fmt.Println("music: starting")
+	// A fatal error in one line: the system log is a small ring.
+	debug.SetTraceback("none")
 	screen, err := OpenScreen()
 	if err != nil {
 		fmt.Println("music: no screen:", err)
@@ -134,7 +138,11 @@ func main() {
 			screen.Show(frame, dynamic)
 			if time.Since(lastLog) > 10*time.Second && current >= 0 {
 				lastLog = time.Now()
-				fmt.Printf("music: %s at %s%s\n", catalog.Tracks[current].Title, clock(player.Position()), map[bool]string{true: " (paused)", false: ""}[player.paused.Load()])
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				fmt.Printf("music: %s at %s%s (heap %d MiB, from system %d MiB, %d goroutines, gc %d)\n", catalog.Tracks[current].Title,
+					clock(player.Position()), map[bool]string{true: " (paused)", false: ""}[player.paused.Load()],
+					m.HeapAlloc>>20, m.Sys>>20, runtime.NumGoroutine(), m.NumGC)
 			}
 		}
 	}

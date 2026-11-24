@@ -170,26 +170,3 @@ int guest_https(unsigned char uuid[36]) {
                    &size) &&
          finish_body(body, size, uuid);
 }
-// Fetch a short plain-text reply and keep only what the bitmap font can draw:
-// upper-case letters, digits, ": - . /", spaces and the ';' field separator.
-int guest_https_text(const char *host, const char *path, unsigned char *out,
-                     size_t cap) {
-  unsigned char body[256];
-  size_t size = 0, n = 0;
-  if (!https_get(host, path, body, sizeof(body), &size))
-    return 0;
-  for (size_t i = 0; i < size && n < cap; i++) {
-    unsigned char c = body[i];
-    if (c >= 'a' && c <= 'z')
-      c -= 32;
-    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ':' ||
-        c == '-' || c == '.' || c == '/' || c == ';') {
-      out[n++] = c;
-    } else if (c == ' ' && n && out[n - 1] != ' ' && out[n - 1] != ';') {
-      out[n++] = ' ';
-    }
-  }
-  while (n && out[n - 1] == ' ')
-    n--;
-  return (int)n;
-}

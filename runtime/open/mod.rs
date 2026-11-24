@@ -5,6 +5,7 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+pub mod data;
 pub mod device;
 pub mod fs;
 pub mod heap;
@@ -29,8 +30,10 @@ use procmgr::Space;
 use sys::Object;
 
 /// Apps that may run at once; each gets a slice of kernel memory for its objects.
-pub const MAX_APPS: usize = 3;
-const APP_KERNEL_BITS: u32 = 20;
+pub const MAX_APPS: usize = 6;
+/// The Home app: started at boot and shown whenever no other app is in front.
+pub const HOME_APP: &str = "/apps/home";
+const APP_KERNEL_BITS: u32 = 19; // 512 KiB of kernel objects per app: six fit in the 4 MiB the supervisor gives
 const APP_CNODE_BITS: u32 = 8;
 /// Pages of the pool kept for the runtime's own heap.
 const HEAP_PAGES: usize = 768; // 48 MiB: the runtime, pushed apps and file data
@@ -123,11 +126,16 @@ pub struct Runtime {
     pub focused: bool,
     /// The app on screen while focused; None shows the app list.
     pub foreground: Option<usize>,
+    /// The running Home app, if /apps/home exists.
+    pub home: Option<usize>,
+    home_tried: bool,
     pub shell: device::Shell,
     next_pid: u32,
     pub random: u64,
     contact: Option<u32>,
     last_poll: u64,
+    /// Loop statistics, logged every 30 s while apps run.
+    pub stats: Stats,
     usb_serial: u32,
     /// Audio is installed, so its PCM ring is mapped at 0x09100000.
     pub audio: bool,
@@ -136,7 +144,11 @@ pub struct Runtime {
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
 pub fn request(op: u32, key: u32, value: u32) -> Message {
-    let r = Message::new(op, key, value).call(sys::SLOT_RUNTIME);
+    request_with(op, key, value, 0)
+}
+/// As `request`, with the argument word (a tone's pitch and length).
+pub fn request_with(op: u32, key: u32, value: u32, arg: u32) -> Message {
+    let r = Message::new(op, key, value).with_arg(arg).call(sys::SLOT_RUNTIME);
     if r.op != OK {
         return Message::error(r.op);
     }
@@ -188,12 +200,15 @@ impl Runtime {
                 }
             }
         }
-        let fs = fs::Fs::new(image);
+        let mut fs = fs::Fs::new(image);
+        data::load(&mut fs);
         Ok(Runtime {
             k,
             pool,
             fs,
-            apps: [None, None, None],
+            apps: core::array::from_fn(|_| None),
+            home: None,
+            home_tried: false,
             untypeds,
             policy: OpenPolicy,
             focused: false,
@@ -203,6 +218,7 @@ impl Runtime {
             random: sys::counter() ^ 0x9e3779b97f4a7c15,
             contact: None,
             last_poll: 0,
+            stats: Stats::default(),
             audio: false,
             // Radio (handset) or the emulator's host relay serves the socket pages.
             net: net::Net::new(true),
@@ -405,9 +421,12 @@ impl Runtime {
         app.space.destroy(&mut self.k, &mut self.pool);
         self.release_objects(index, core::mem::take(&mut app.space.object_slots));
         log!("{} (pid {}) exited with status {}", app.name, app.pid, app.exit_code.unwrap_or(-1));
+        if self.home == Some(index) {
+            self.home = None;
+        }
         if self.foreground == Some(index) {
             self.foreground = None;
-            self.shell.dirty = true;
+            self.show_home();
         }
     }
 
@@ -503,6 +522,9 @@ impl Runtime {
         }
         match self.launch(&path, &[]) {
             Ok(i) => {
+                if path == HOME_APP {
+                    self.home = Some(i);
+                }
                 self.foreground = Some(i);
                 self.shell.dirty = true;
             }
@@ -571,12 +593,24 @@ impl Runtime {
     fn usb_installs(&mut self) {}
 
     fn poll_runtime(&mut self) {
+        let t0 = sys::now_ns();
+        data::flush(&mut self.fs);
         self.usb_requests();
         self.usb_installs();
+        let t1 = sys::now_ns();
         let focus = request(GET, FOCUS, 0);
+        let t2 = sys::now_ns();
+        self.stats.step(0, t1 - t0);
+        self.stats.step(1, t2 - t1);
         let focused = focus.op == OK && focus.value == OPEN_APPS;
         if focused != self.focused {
             log!("in front: {} (focus {} op {})", focused, focus.value, focus.op);
+        }
+        if focused && !self.focused && !self.home_tried {
+            // Home starts the first time the open apps come to the front, so it
+            // costs nothing on a system that never shows them.
+            self.home_tried = true;
+            self.start_home();
         }
         if focused && !self.focused {
             self.shell.dirty = true;
@@ -602,6 +636,7 @@ impl Runtime {
             }
         }
         if let Some(stream) = self.contact {
+            let t = sys::now_ns();
             for _ in 0..8 {
                 let e = Message::new(POLL, 0, stream).call(sys::SLOT_RUNTIME);
                 if e.op != OK {
@@ -609,6 +644,7 @@ impl Runtime {
                 }
                 self.touch(e.value as i32, e.arg as i32, e.key != 0);
             }
+            self.stats.step(2, sys::now_ns() - t);
         }
         if self.foreground.is_none() && self.shell.dirty {
             self.draw_shell();
@@ -627,6 +663,31 @@ impl Runtime {
                 handled += 1;
             }
             let now = sys::now_ns();
+            self.stats.loops += 1;
+            self.stats.faults += handled as u64;
+            if self.stats.since == 0 {
+                self.stats.since = now;
+            }
+            if now.wrapping_sub(self.stats.since) >= 30_000_000_000 && self.apps.iter().any(|a| a.is_some()) {
+                let secs = (now - self.stats.since) / 1_000_000_000;
+                let (blocks, free) = heap::HEAP.stats();
+                let waiting: usize = self.apps.iter().flatten().map(|a| a.threads.iter().filter(|t| t.wait.is_some()).count()).sum();
+                let threads: usize = self.apps.iter().flatten().map(|a| a.threads.iter().filter(|t| t.alive).count()).sum();
+                let mut calls = core::mem::take(&mut self.stats.calls);
+                calls.sort_by_key(|c| core::cmp::Reverse(c.1));
+                let top: Vec<String> = calls.iter().take(4).map(|(n, c)| alloc::format!("{}:{}/s", n, *c as u64 / secs)).collect();
+                log!(
+                    "stats: {} loops/s, {} faults/s [{}], slowest poll {} us (flush {} focus {} touch {}), slowest pass {} us, {} threads ({} waiting), heap {} free blocks {} KiB",
+                    self.stats.loops / secs, self.stats.faults / secs, top.join(" "), self.stats.slowest_poll / 1000,
+                    self.stats.slowest_step[0] / 1000, self.stats.slowest_step[1] / 1000, self.stats.slowest_step[2] / 1000,
+                    self.stats.slowest_pass / 1000, threads, waiting, blocks, free / 1024
+                );
+                self.stats = Stats { since: now, ..Stats::default() };
+            }
+            if self.stats.pass_start != 0 {
+                self.stats.slowest_pass = self.stats.slowest_pass.max(now.wrapping_sub(self.stats.pass_start));
+            }
+            self.stats.pass_start = now;
             // Poll Runtime often while an app runs or the app list is on screen;
             // otherwise rarely, so an idle Open Runtime costs the other processes little.
             let busy = self.focused || self.apps.iter().any(|a| a.is_some());
@@ -634,12 +695,40 @@ impl Runtime {
             if now.wrapping_sub(self.last_poll) >= interval {
                 self.last_poll = now;
                 self.poll_runtime();
+                self.stats.slowest_poll = self.stats.slowest_poll.max(sys::now_ns().wrapping_sub(now));
             }
             self.check_waiters();
             if handled == 0 {
                 sys::yield_now();
             }
         }
+    }
+}
+
+#[derive(Default)]
+pub struct Stats {
+    since: u64,
+    /// The busiest system calls: (number, count).
+    calls: Vec<(u32, u32)>,
+    /// The slowest step of a Runtime poll: flush, focus, touch.
+    slowest_step: [u64; 3],
+    loops: u64,
+    faults: u64,
+    slowest_poll: u64,
+    slowest_pass: u64,
+    pass_start: u64,
+}
+
+impl Stats {
+    pub fn count(&mut self, number: u32) {
+        if let Some(c) = self.calls.iter_mut().find(|c| c.0 == number) {
+            c.1 += 1;
+        } else if self.calls.len() < 64 {
+            self.calls.push((number, 1));
+        }
+    }
+    fn step(&mut self, i: usize, ns: u64) {
+        self.slowest_step[i] = self.slowest_step[i].max(ns);
     }
 }
 

@@ -67,18 +67,27 @@ def card_word(i):
     return struct.unpack_from("<I", card, 4 * i)[0]
 def on_list():
     return pixel(60, 300) == 0xff302a39 and pixel(5, 5) == 0xff191620
+def on_home():
+    # The Home app (apps/open/home): its gradient starts at 2a1740.
+    return pixel(5, 5) == 0xff2a1740
 def open_apps():
-    tap(570, 400)  # Home's /APPS button
+    if on_list():
+        return
+    if not on_home():
+        tap(570, 276)  # the classic launcher's APPS button shows Home
+        until("Home app", on_home, 20)
+    tap(360, 1141)  # Home's Programs tile
     until("app list", on_list)
 def start(name):
-    tap(360, 260 + APPS.index(name) * 110 + 48)
+    tap(360, 260 + APPS.index(name) * 80 + 34)
 def console(name, timeout=60):
     start(name)
     until(f"{name} finishes", lambda: f"{name} (pid" in everything() and "exited" in everything(), timeout)
     for line in CHECKS[name]:
         if line not in everything():
             fail(f"{name} did not print {line!r}")
-    until(f"app list after {name}", on_list)
+    until(f"Home after {name}", on_home)  # a program that exits returns to Home
+    open_apps()
     print(f"{name}: passed", file=sys.stderr)
 
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
@@ -100,7 +109,8 @@ if "pytone" in PRESENT:
     # 12000 at volume 8 (gain 2920/32768) is about 1069.
     if sound != 6 or frames < 24000 or not 1000 <= peak <= 1100:
         fail(f"PCM stream: sound {sound}, frames {frames}, peak {peak}")
-    until("app list after pytone", on_list)
+    until("Home after pytone", on_home)
+    open_apps()
     print("pytone: passed", file=sys.stderr)
 
 if "pypaint" in PRESENT:
@@ -110,7 +120,7 @@ if "pypaint" in PRESENT:
     tap(400, 1000)
     until("pypaint square", lambda: pixel(400, 1000) == 0xffffc14d)
     tap(360, 60)
-    until("back on Home from pypaint", lambda: pixel(5, 5) == 0xff191620 and not on_list(), 6)
+    until("back on Home from pypaint", on_home, 6)
     open_apps()
     print("pypaint: passed", file=sys.stderr)
 
@@ -121,9 +131,9 @@ tap(360, 800)
 until("tap reaches canvas", lambda: "canvas: tap 1 at 360,800" in everything())
 until("square drawn", lambda: pixel(360, 800) == 0xffffffff and pixel(360, 700) != 0xffffffff)
 tap(360, 60)  # canvas asks /dev/violet/sys to go Home
-until("back on Home", lambda: pixel(5, 5) == 0xff191620 and not on_list(), 6)
+until("back on Home", on_home, 6)
 open_apps()
-tap(360, 260 + APPS.index("canvas") * 110 + 48)
+tap(360, 260 + APPS.index("canvas") * 80 + 34)
 until("canvas comes back with its frame", lambda: pixel(360, 800) == 0xffffffff)
 print("canvas: passed", file=sys.stderr)
 '''
@@ -170,7 +180,11 @@ with TemporaryDirectory() as tmp:
         raise SystemExit("Build the QEMU image first (make qemu-image).")
     files = image_files(original / "initfs.cpio")
     python = "bin/python3" in files
-    apps = sorted(p.name for p in (ROOT / "apps/open").iterdir() if p.is_dir())
+    # The shell lists apps with an app.txt first, then the test programs.
+    folders = sorted(p for p in (ROOT / "apps/open").iterdir() if p.is_dir())
+    folders = [p for p in folders if p.name != "home"]  # Home is not in the list
+    apps = [p.name for p in folders if (p / "app.txt").exists() and f"apps/{p.name}" in files] + \
+           [p.name for p in folders if not (p / "app.txt").exists() or f"apps/{p.name}" not in files]
     present = [a for a in apps if f"apps/{a}" in files and (python or not a.startswith("py"))]
     for name in sorted(set(apps) - set(present)):
         print(f"skipping {name}: its toolchain was not available when the image was built", file=sys.stderr)

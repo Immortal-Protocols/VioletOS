@@ -21,7 +21,7 @@ fn service(key: u32) -> u32 {
     match key {
         SAVE | FILE_LIST..=FILE_DELETE => 6,
         PRESENT => 5,
-        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | WEATHER | RELAY => 7,
+        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | RELAY => 7,
         POWER => 8,
         CATALOG | INBOX | INSTALL | REMOVE => 9,
         _ => 0,
@@ -35,7 +35,7 @@ const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK, MI
 /// The component whose inventory bit gates a key.
 fn component(key: u32) -> u32 {
     match key {
-        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | WEATHER | RELAY => 7,
+        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | RELAY => 7,
         POWER => 8,
         SAVE | FILE_LIST..=FILE_DELETE => 6,
         VOLUME | PLAYBACK | MICROPHONE => AUDIO_COMPONENT,
@@ -164,9 +164,6 @@ impl Runtime {
                 self.forward(who, 7, m)
             }
             (GET, SCAN) if who == WIFI => self.forward(who, 7, m),
-            (EXECUTE, WEATHER) if who == WEATHER_APP && (m.value as usize) < CITIES.len() => {
-                self.forward(who, 7, m)
-            }
             (GET, RADIO) => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
             (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
