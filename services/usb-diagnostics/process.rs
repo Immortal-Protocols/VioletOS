@@ -242,7 +242,12 @@ pub fn run() -> ! {
             }
             let mut bytes=[0;40];
             for v in &mut bytes[..n] {*v=byte(0x20);}
-            let ok=upload_request(key,offset,&bytes[..n]);
+            // 0x4c: a program for the Open Runtime to start, as a path.
+            let ok=if key==0x4c {
+                open_request(&bytes[..n])
+            } else {
+                upload_request(key,offset,&bytes[..n])
+            };
             put_half(CSR,if ok {0x48} else {0x60});
             continue;
         }
@@ -325,7 +330,7 @@ pub fn run() -> ! {
                 put_half(CSR, 0x48);
             }
             (0xc0, 0x62, 0, 0) if configuration==1 => send(&package_status(),len),
-            (0x40, key @ (0x60|0x61|0x66|0x67|0x6a|0x6b), lo, hi) if configuration==1
+            (0x40, key @ (0x4c|0x60|0x61|0x66|0x67|0x6a|0x6b), lo, hi) if configuration==1
                 && (if key==0x60 {len==4} else {(1..=40).contains(&len)}) => {
                 pending_out=Some((u32::from(key),u32::from(lo)|(u32::from(hi)<<16),usize::from(len)));
                 put_half(CSR,0x40);
@@ -358,6 +363,25 @@ pub fn run() -> ! {
                 }
                 send(&out, len);
             }
+            // The supervisor's record of an Open Runtime fault: tag, label, four registers.
+            (0xc0, 0x4b, 0, 0) => {
+                // Then the supervisor's setup stage, slots, loader verdict, image size
+                // and the first reservation that overlapped the open-apps window.
+                let mut out = [0; 56];
+                for (i, dest) in out.chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { (0x09202000 as *const u32).add(40 + i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
+            // The Open Runtime's log ring (4 KiB), 64 bytes per request.
+            (0xc0, 0x4d, 0, chunk) if chunk < 64 => {
+                let mut out = [0; 64];
+                let src = (0x09205000 + usize::from(chunk) * 64) as *const u8;
+                for (i, dest) in out.iter_mut().enumerate() {
+                    *dest = unsafe { src.add(i).read_volatile() };
+                }
+                send(&out, len);
+            }
             // A developer audio request for Audio to act on: command in the high byte.
             (0x40, 0x4e, lo, hi) if configuration == 1 && len == 0 => {
                 let request = 0x09204000 as *mut u32;
@@ -372,4 +396,21 @@ pub fn run() -> ! {
             _ => put_half(CSR, 0x40 | 0x20),
         }
     }
+}
+
+/// Hand the Open Runtime a path to launch: word 0 counts requests, word 1 is
+/// the length, the path follows from byte 8.
+fn open_request(path: &[u8]) -> bool {
+    let page = 0x09206000 as *mut u32;
+    unsafe {
+        let bytes = (0x09206008) as *mut u8;
+        for (i, b) in path.iter().enumerate() {
+            bytes.add(i).write_volatile(*b);
+        }
+        page.add(1).write_volatile(path.len() as u32);
+        let serial = page.read_volatile().wrapping_add(1);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        page.write_volatile(serial);
+    }
+    true
 }

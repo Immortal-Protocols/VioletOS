@@ -1,0 +1,604 @@
+//! Open Runtime ("Runtime v2"): runs unmodified Linux ARM EABI programs on
+//! seL4. Each app is an seL4 address space whose threads have this process as
+//! their fault handler. A Linux `svc #0` is an unknown syscall to seL4, so it
+//! arrives here as a fault message; the reply carries the result. Page faults
+//! map memory on demand. Built-in apps keep using Runtime, which knows this
+//! process as client 9 (OPEN_APPS).
+pub mod abi;
+pub mod device;
+pub mod fs;
+pub mod heap;
+pub mod inflate;
+pub mod net;
+pub mod sockets;
+pub mod policy;
+pub mod pool;
+#[path = "../../system/supervisor/procmgr.rs"]
+pub mod procmgr;
+pub mod syscall;
+pub mod sys;
+
+use crate::protocol::*;
+use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use policy::{OpenPolicy, Policy};
+use pool::{Kernel, Pool};
+use procmgr::Space;
+use sys::Object;
+
+/// Apps that may run at once; each gets a slice of kernel memory for its objects.
+pub const MAX_APPS: usize = 3;
+const APP_KERNEL_BITS: u32 = 20;
+const APP_CNODE_BITS: u32 = 8;
+/// Pages of the pool kept for the runtime's own heap.
+const HEAP_PAGES: usize = 256;
+
+pub struct Log;
+impl Log {
+    fn page() -> *mut u32 {
+        sys::LOG_PAGE as *mut u32
+    }
+    pub fn init() {
+        unsafe {
+            Self::page().add(1).write_volatile(0);
+            Self::page().write_volatile(0x474f4c4f); // "OLOG"
+        }
+    }
+    /// Append to the ring: word 0 magic, word 1 bytes written in total, data from byte 8.
+    pub fn write(bytes: &[u8]) {
+        const SIZE: u32 = 4096 - 8;
+        unsafe {
+            let head = Self::page().add(1).read_volatile();
+            let data = (sys::LOG_PAGE + 8) as *mut u8;
+            for (i, b) in bytes.iter().enumerate() {
+                data.add(((head + i as u32) % SIZE) as usize).write_volatile(*b);
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Self::page().add(1).write_volatile(head.wrapping_add(bytes.len() as u32));
+        }
+    }
+}
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        let s = alloc::format!("[open] {}\n", alloc::format!($($arg)*));
+        $crate::process::Log::write(s.as_bytes());
+    }};
+}
+
+#[derive(Clone)]
+pub enum Wait {
+    Futex { app: usize, addr: u32 },
+    Sleep,
+    Poll { fds: Vec<(i32, i16)>, ptr: u32, time64: bool },
+    Epoll { epfd: i32, events: u32, max: u32 },
+    Read { fd: i32, buf: u32, len: u32 },
+    /// A blocking write to /dev/violet/audio waiting for room in the ring.
+    Audio { fd: i32, buf: u32, len: u32 },
+    /// A blocking connect, or a send waiting for room in the socket's ring.
+    Connect { fd: i32 },
+    Send { fd: i32, buf: u32, len: u32 },
+}
+
+pub struct Thread {
+    pub tid: u32,
+    pub tcb: u32,
+    pub reply: Option<u32>,
+    pub wait: Option<Wait>,
+    pub deadline: Option<u64>,
+    /// The fault message to answer with when it wakes: r0..r7 and FaultIP.
+    pub saved: [u32; 9],
+    pub clear_tid: u32,
+    pub alive: bool,
+    pub slot: u32,
+}
+
+pub type FileRef = Rc<RefCell<device::OpenFile>>;
+
+pub struct App {
+    pub pid: u32,
+    pub name: String,
+    pub path: String,
+    pub space: Space,
+    pub cnode: u32,
+    pub threads: Vec<Thread>,
+    pub fds: Vec<Option<FileRef>>,
+    pub cwd: String,
+    pub stub_page: u32,
+    pub events: alloc::collections::VecDeque<abi::InputEvent>,
+    pub surface: Option<device::Surface>,
+    pub exit_code: Option<i32>,
+}
+
+pub struct Runtime {
+    pub k: Kernel,
+    pub pool: Pool,
+    pub fs: fs::Fs,
+    pub apps: [Option<App>; MAX_APPS],
+    untypeds: Vec<u32>,
+    pub policy: OpenPolicy,
+    /// Runtime has put this process in front.
+    pub focused: bool,
+    /// The app on screen while focused; None shows the app list.
+    pub foreground: Option<usize>,
+    pub shell: device::Shell,
+    next_pid: u32,
+    pub random: u64,
+    contact: Option<u32>,
+    last_poll: u64,
+    usb_serial: u32,
+    /// Audio is installed, so its PCM ring is mapped at 0x09100000.
+    pub audio: bool,
+    pub net: net::Net,
+}
+
+/// A request to Runtime, waiting for its ticket like the app SDK does.
+pub fn request(op: u32, key: u32, value: u32) -> Message {
+    let r = Message::new(op, key, value).call(sys::SLOT_RUNTIME);
+    if r.op != OK {
+        return Message::error(r.op);
+    }
+    loop {
+        let p = Message::new(POLL, 0, r.value).call(sys::SLOT_RUNTIME);
+        if p.op != BUSY {
+            return p;
+        }
+        sys::yield_now();
+    }
+}
+
+fn badge(app: usize, thread: usize) -> u32 {
+    ((app as u32) << 12) | (thread as u32 + 1)
+}
+
+impl Runtime {
+    fn new() -> Result<Runtime, i32> {
+        let mut k = Kernel::new();
+        // Each step fails cleanly if the supervisor could not provide its part.
+        sys::retype(sys::SLOT_KERNEL, Object::Endpoint, 0, sys::SLOT_FAULT_EP).map_err(|e| { log!("no kernel memory"); e })?;
+        let (mut pool, _) = Pool::new(&mut k, HEAP_PAGES).map_err(|e| { log!("no app memory pool"); e })?;
+        let mut untypeds = Vec::new();
+        for _ in 0..MAX_APPS {
+            untypeds.push(k.object(sys::SLOT_KERNEL, Object::Untyped, APP_KERNEL_BITS)?);
+        }
+        let mut image: &'static [u8] =
+            unsafe { core::slice::from_raw_parts(sys::INITFS as *const u8, sys::INITFS_BYTES) };
+        // The handset's image is compressed: "VGZ1", the gzip length, the gzip.
+        if &image[..4] == b"VGZ1" {
+            let packed_len = u32::from_le_bytes(image[4..8].try_into().unwrap()) as usize;
+            let packed = &image[8..(8 + packed_len).min(image.len())];
+            let size = inflate::gzip_size(packed).unwrap_or(0);
+            let base = pool.take_top((size + sys::PAGE - 1) / sys::PAGE);
+            let Some(base) = base else {
+                log!("no room to unpack the {} byte file system image", size);
+                return Err(-1);
+            };
+            let dest = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, size) };
+            let start = sys::now_ns();
+            match inflate::gunzip(packed, dest) {
+                Ok(n) => {
+                    log!("unpacked the file system image: {} KiB in {} ms", n >> 10, (sys::now_ns() - start) / 1_000_000);
+                    image = &dest[..n];
+                }
+                Err(e) => {
+                    log!("file system image: {}", e);
+                    image = &[];
+                }
+            }
+        }
+        let fs = fs::Fs::new(image);
+        Ok(Runtime {
+            k,
+            pool,
+            fs,
+            apps: [None, None, None],
+            untypeds,
+            policy: OpenPolicy,
+            focused: false,
+            foreground: None,
+            shell: device::Shell::default(),
+            next_pid: 100,
+            random: sys::counter() ^ 0x9e3779b97f4a7c15,
+            contact: None,
+            last_poll: 0,
+            audio: false,
+            // Radio (handset) or the emulator's host relay serves the socket pages.
+            net: net::Net::new(true),
+            // Requests made before this boot are not repeated.
+            usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
+        })
+    }
+
+    pub fn next_pid_bump(&mut self) -> u32 {
+        self.next_pid += 1;
+        self.next_pid - 1
+    }
+
+    pub fn next_random(&mut self) -> u64 {
+        // xorshift64*, reseeded from the counter's low bits on every call.
+        self.random ^= sys::counter() & 0xffff;
+        self.random ^= self.random >> 12;
+        self.random ^= self.random << 25;
+        self.random ^= self.random >> 27;
+        self.random.wrapping_mul(0x2545f4914f6cdd1d)
+    }
+
+    /// Start a program from the file system. Scripts name their interpreter
+    /// on a "#!" line; a ".py" file without one runs under /bin/python3.
+    pub fn launch(&mut self, path: &str, args: &[String]) -> Result<usize, String> {
+        let st = self.fs.stat(path).ok_or_else(|| alloc::format!("{} not found", path))?;
+        let mut program = String::from(path);
+        let mut argv: Vec<String> = Vec::new();
+        if st.mode & fs::S_IFMT == fs::S_IFDIR {
+            for main in ["main", "main.py"] {
+                let p = alloc::format!("{}/{}", path, main);
+                if self.fs.stat(&p).is_some() {
+                    program = p;
+                    break;
+                }
+            }
+        }
+        let image = self.fs.contents(&program).ok_or("not a file")?;
+        if image.starts_with(b"#!") {
+            let line_end = image.iter().position(|&b| b == b'\n').unwrap_or(image.len());
+            let line = core::str::from_utf8(&image[2..line_end]).map_err(|_| "bad #! line")?;
+            let mut words = line.split_whitespace();
+            let interp = String::from(words.next().ok_or("empty #! line")?);
+            argv.push(interp.clone());
+            argv.extend(words.map(String::from));
+            argv.push(program.clone());
+            program = interp;
+        } else if program.ends_with(".py") {
+            argv.push(String::from("/bin/python3"));
+            argv.push(program.clone());
+            program = String::from("/bin/python3");
+        } else {
+            argv.push(program.clone());
+        }
+        argv.extend(args.iter().cloned());
+        let image = self.fs.contents(&program).ok_or_else(|| alloc::format!("{} not found", program))?;
+        // The image is part of the file system, which outlives the copy below.
+        let image: &'static [u8] = unsafe { core::slice::from_raw_parts(image.as_ptr(), image.len()) };
+
+        let index = self.apps.iter().position(|a| a.is_none()).ok_or("too many apps running")?;
+        let mut random = [0u8; 16];
+        let (a, b) = (self.next_random(), self.next_random());
+        random[..8].copy_from_slice(&a.to_le_bytes());
+        random[8..].copy_from_slice(&b.to_le_bytes());
+        let untyped = self.untypeds[index];
+        let k = &mut self.k;
+        let mut space = Space::new(k, untyped).map_err(|e| alloc::format!("address space: {}", e))?;
+        let cnode = match space.object(k, Object::CNode, APP_CNODE_BITS) {
+            Ok(c) => c,
+            Err(e) => {
+                self.release_objects(index, core::mem::take(&mut space.object_slots));
+                return Err(alloc::format!("cnode: {}", e));
+            }
+        };
+        let name = String::from(path.rsplit('/').next().unwrap_or(path));
+        let cwd = String::from(match path.rfind('/') {
+            Some(0) | None => "/",
+            Some(i) => &path[..i],
+        });
+        let env: Vec<String> = [
+            "HOME=/data",
+            "PATH=/bin",
+            "TMPDIR=/tmp",
+            "LANG=C.UTF-8",
+            "TERM=dumb",
+            "PYTHONHOME=/",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "PYTHONUNBUFFERED=1",
+            "GODEBUG=asyncpreemptoff=1",
+            "VIOLET=1",
+        ]
+        .iter()
+        .map(|s| String::from(*s))
+        .collect();
+        let loaded = match procmgr::load(&mut space, k, &mut self.pool, image, &argv, &env, random) {
+            Ok(l) => l,
+            Err(e) => {
+                space.destroy(k, &mut self.pool);
+                self.release_objects(index, core::mem::take(&mut space.object_slots));
+                return Err(alloc::format!("{}: {}", program, e));
+            }
+        };
+        // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
+        space.add(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
+        let stub_page = space.resolve(k, &mut self.pool, procmgr::STUBS).ok_or("out of memory")? as u32;
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        let mut app = App {
+            pid,
+            name,
+            path: String::from(path),
+            space,
+            cnode,
+            threads: Vec::new(),
+            fds: Vec::new(),
+            cwd,
+            stub_page,
+            events: Default::default(),
+            surface: None,
+            exit_code: None,
+        };
+        for _ in 0..3 {
+            app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
+        }
+        let regs = sys::Regs { sp: loaded.sp, ..Default::default() };
+        self.apps[index] = Some(app);
+        if let Err(e) = self.spawn(index, pid, regs, loaded.entry) {
+            self.reap(index);
+            return Err(alloc::format!("thread: {}", e));
+        }
+        log!("started {} as pid {} ({} KiB free)", program, pid, self.pool.available() * 64);
+        Ok(index)
+    }
+
+    /// Create a thread in app `index` that starts at `target` (bit 0 selects
+    /// Thumb) with `regs`. seL4 clears the Thumb bit in a written CPSR, so the
+    /// thread starts at its ARM-mode trampoline, which jumps there.
+    pub fn spawn(&mut self, index: usize, tid: u32, mut regs: sys::Regs, target: u32) -> Result<usize, i32> {
+        let app = self.apps[index].as_mut().unwrap();
+        let slot = app.threads.len();
+        // The app's CNode holds one badged fault endpoint per thread.
+        if slot >= (1 << APP_CNODE_BITS) - 2 {
+            return Err(-11);
+        }
+        let k = &mut self.k;
+        let tcb = app.space.object(k, Object::Tcb, 0)?;
+        let ep_slot = slot as u32 + 1;
+        sys::mint_into(app.cnode, ep_slot, APP_CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
+        sys::tcb_configure(tcb, ep_slot, app.cnode, APP_CNODE_BITS, app.space.pd)?;
+        let stub = procmgr::STUBS + 8 * slot as u32;
+        let words = [0xe51f_f004u32, target];
+        let at = app.stub_page as usize + 8 * slot;
+        unsafe {
+            (at as *mut u32).write_volatile(words[0]);
+            ((at + 4) as *mut u32).write_volatile(words[1]);
+        }
+        app.space.sync_code(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32);
+        regs.pc = stub;
+        regs.cpsr = 0x10;
+        app.threads.push(Thread {
+            tid,
+            tcb,
+            reply: None,
+            wait: None,
+            deadline: None,
+            saved: [0; 9],
+            clear_tid: 0,
+            alive: true,
+            slot: slot as u32,
+        });
+        sys::tcb_write(tcb, true, &regs)?;
+        Ok(slot)
+    }
+
+    fn release_objects(&mut self, index: usize, slots: Vec<u32>) {
+        // Revoking the app's kernel memory deletes every object made from it.
+        sys::revoke(self.untypeds[index]);
+        for slot in slots {
+            self.k.release(slot);
+        }
+    }
+
+    /// Tear an app down: its threads stop and its memory returns to the pool.
+    pub fn reap(&mut self, index: usize) {
+        let Some(mut app) = self.apps[index].take() else { return };
+        for t in &app.threads {
+            if t.alive {
+                sys::tcb_suspend(t.tcb);
+            }
+            if let Some(r) = t.reply {
+                sys::delete(r);
+                self.k.release(r);
+            }
+        }
+        if let Some(surface) = app.surface.take() {
+            for p in surface.pages {
+                self.pool.give_back(p);
+            }
+        }
+        app.space.destroy(&mut self.k, &mut self.pool);
+        self.release_objects(index, core::mem::take(&mut app.space.object_slots));
+        log!("{} (pid {}) exited with status {}", app.name, app.pid, app.exit_code.unwrap_or(-1));
+        if self.foreground == Some(index) {
+            self.foreground = None;
+            self.shell.dirty = true;
+        }
+    }
+
+    /// Answer a waiting thread and let it run again.
+    pub fn wake(&mut self, index: usize, slot: usize, result: i32) {
+        let Some(app) = self.apps[index].as_mut() else { return };
+        let t = &mut app.threads[slot];
+        let Some(reply) = t.reply.take() else { return };
+        t.wait = None;
+        t.deadline = None;
+        let mut mrs = t.saved;
+        mrs[0] = result as u32;
+        sys::send(reply, &mrs);
+        self.k.release(reply);
+    }
+
+    fn handle_fault(&mut self, r: sys::Received) {
+        let index = (r.badge >> 12) as usize;
+        let slot = ((r.badge & 0xfff) - 1) as usize;
+        if index >= MAX_APPS || self.apps[index].as_ref().map_or(true, |a| slot >= a.threads.len()) {
+            return;
+        }
+        match r.label {
+            sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
+            sys::FAULT_VM => {
+                let (pc, addr) = (r.mrs[0], r.mrs[1]);
+                let app = self.apps[index].as_mut().unwrap();
+                if app.space.fault(&mut self.k, &mut self.pool, addr) {
+                    sys::reply(&[]);
+                } else {
+                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x}", app.name, app.pid, addr, pc);
+                    app.exit_code = Some(139);
+                    self.reap(index);
+                }
+            }
+            _ => {
+                let app = self.apps[index].as_mut().unwrap();
+                log!("{} (pid {}): fault {} at pc {:#x}", app.name, app.pid, r.label, r.mrs[0]);
+                app.exit_code = Some(132);
+                self.reap(index);
+            }
+        }
+    }
+
+    /// Wake threads whose wait finished or timed out.
+    fn check_waiters(&mut self) {
+        let now = sys::now_ns();
+        for index in 0..MAX_APPS {
+            let Some(app) = self.apps[index].as_ref() else { continue };
+            let waiting: Vec<(usize, Wait, Option<u64>)> = app
+                .threads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| t.wait.clone().map(|w| (i, w, t.deadline)))
+                .collect();
+            for (slot, wait, deadline) in waiting {
+                if let Some(result) = self.ready(index, &wait) {
+                    self.wake(index, slot, result);
+                } else if deadline.map_or(false, |d| now >= d) {
+                    let result = match wait {
+                        Wait::Futex { .. } => syscall::ETIMEDOUT,
+                        Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Sleep => 0,
+                        Wait::Read { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
+                        Wait::Connect { .. } => -110,
+                    };
+                    self.wake(index, slot, result);
+                }
+            }
+        }
+    }
+
+    /// On the handset, USB Diagnostics can ask for a program to be started.
+    #[cfg(moto_board)]
+    fn usb_requests(&mut self) {
+        let page = 0x0900_1000 as *const u32;
+        let serial = unsafe { page.read_volatile() };
+        if serial == self.usb_serial {
+            return;
+        }
+        self.usb_serial = serial;
+        let len = (unsafe { page.add(1).read_volatile() } as usize).min(40);
+        let mut bytes = [0u8; 40];
+        for (i, b) in bytes[..len].iter_mut().enumerate() {
+            *b = unsafe { (0x0900_1008 as *const u8).add(i).read_volatile() };
+        }
+        let path = String::from_utf8_lossy(&bytes[..len]).into_owned();
+        match self.launch(&path, &[]) {
+            Ok(i) => {
+                self.foreground = Some(i);
+                self.shell.dirty = true;
+            }
+            Err(e) => log!("could not start {}: {}", path, e),
+        }
+    }
+    #[cfg(not(moto_board))]
+    fn usb_requests(&mut self) {}
+
+    fn poll_runtime(&mut self) {
+        self.usb_requests();
+        let focus = request(GET, FOCUS, 0);
+        let focused = focus.op == OK && focus.value == OPEN_APPS;
+        if focused != self.focused {
+            log!("in front: {} (focus {} op {})", focused, focus.value, focus.op);
+        }
+        if focused && !self.focused {
+            self.shell.dirty = true;
+            self.shell.armed = false;
+            if let Some(i) = self.foreground {
+                self.refresh(i);
+                self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
+            }
+        }
+        if !focused && self.focused {
+            if let Some(i) = self.foreground {
+                self.lifecycle(i, abi::LIFECYCLE_FOCUS_LOST);
+            }
+        }
+        self.focused = focused;
+        if !focused {
+            return;
+        }
+        if self.contact.is_none() {
+            let r = Message::new(SUBSCRIBE, CONTACT, 0).call(sys::SLOT_RUNTIME);
+            if r.op == OK {
+                self.contact = Some(r.value);
+            }
+        }
+        if let Some(stream) = self.contact {
+            for _ in 0..8 {
+                let e = Message::new(POLL, 0, stream).call(sys::SLOT_RUNTIME);
+                if e.op != OK {
+                    break;
+                }
+                self.touch(e.value as i32, e.arg as i32, e.key != 0);
+            }
+        }
+        if self.foreground.is_none() && self.shell.dirty {
+            self.draw_shell();
+        }
+    }
+
+    fn run(&mut self) -> ! {
+        loop {
+            let mut handled = 0;
+            while handled < 64 {
+                let r = sys::receive(false);
+                if r.badge == 0 {
+                    break;
+                }
+                self.handle_fault(r);
+                handled += 1;
+            }
+            let now = sys::now_ns();
+            // Poll Runtime often while an app runs or the app list is on screen;
+            // otherwise rarely, so an idle Open Runtime costs the other processes little.
+            let busy = self.focused || self.apps.iter().any(|a| a.is_some());
+            let interval = if busy { 4_000_000 } else { 50_000_000 };
+            if now.wrapping_sub(self.last_poll) >= interval {
+                self.last_poll = now;
+                self.poll_runtime();
+            }
+            self.check_waiters();
+            if handled == 0 {
+                sys::yield_now();
+            }
+        }
+    }
+}
+
+/// Enough heap to report a failed start before the pool exists.
+static mut BOOT_HEAP: [u64; 4096] = [0; 4096];
+
+pub fn run() -> ! {
+    Log::init();
+    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 4096 * 8) };
+    let mut rt = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            Log::write(alloc::format!("[open] start failed: seL4 error {}\n", e).as_bytes());
+            loop {
+                sys::yield_now();
+            }
+        }
+    };
+    let inventory = request(GET, INVENTORY, 0);
+    rt.audio = inventory.op == OK && inventory.value & (1 << AUDIO_COMPONENT) != 0;
+    log!(
+        "ready: {} files in /apps image, {} MiB for apps",
+        rt.fs.files(),
+        rt.pool.available() / 16
+    );
+    let _ = rt.policy.check(policy::AppId(0), &policy::Action::SpawnApp { path: "/apps" });
+    rt.run()
+}

@@ -228,6 +228,8 @@ pub const SOUND_TONE: u32 = 4;
 /// The last microphone recording (see MICROPHONE). EMPTY when there is none.
 pub const SOUND_RECORDING: u32 = 5;
 pub const SOUND_LAST: u32 = SOUND_RECORDING;
+/// PLAYBACK's value while an open app's PCM stream (/dev/violet/audio) plays.
+pub const SOUND_STREAM: u32 = 6;
 pub const PLAYBACK_PLAYED: u32 = 1 << 16; // The last request finished playing.
 pub const PLAYBACK_STOPPED: u32 = 2 << 16; // It was stopped or replaced.
 pub const PLAYBACK_NO_OUTPUT: u32 = 3 << 16; // No output path could play it.
@@ -249,3 +251,9 @@ pub const MIC_LEVEL_MAX: u32 = 100;
 pub const MIC_RECORD_MS: u32 = 4000;
 /// Internal: Audio -> Power, a PMIC register read or masked write on the handset.
 pub const PMIC_ACCESS: u32 = 0x4070;
+
+// Open Runtime. It hosts Linux-ABI apps (see runtime/open) and is Runtime's
+// client 9, an identity no catalog app uses. The launcher brings it to the
+// front with EXECUTE OPEN OPEN_APPS; it draws the screen itself while in front.
+pub const OPEN_APPS: u32 = 9;
+pub const OPEN_COMPONENT: u32 = 24;

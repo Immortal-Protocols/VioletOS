@@ -1,7 +1,7 @@
 #pragma once
 #define NO_SYS 1
 #define MEM_ALIGNMENT 4
-#define MEM_SIZE 16384
+#define MEM_SIZE 24576
 #define LWIP_SOCKET 0
 #define LWIP_NETCONN 0
 #define LWIP_STATS 0
@@ -19,7 +19,9 @@
 #define TCP_WND (4*TCP_MSS)
 #define TCP_SND_BUF (4*TCP_MSS)
 #define TCP_SND_QUEUELEN 16
-#define PBUF_POOL_SIZE 10
+// Open apps' sockets (sockets.c) plus Radio's own HTTPS connection.
+#define MEMP_NUM_TCP_PCB 10
+#define PBUF_POOL_SIZE 16
 #define LWIP_NETIF_HOSTNAME 0
 #define LWIP_NETIF_STATUS_CALLBACK 0
 #define LWIP_TIMEVAL_PRIVATE 0

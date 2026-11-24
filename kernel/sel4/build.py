@@ -112,7 +112,9 @@ def build_target(target,out):
     run("cmake","-GNinja","-S",src,"-B",kernel,"-DCMAKE_TOOLCHAIN_FILE="+str(src/"llvm.cmake"),
         "-DTRIPLE=arm-none-eabi","-DPYTHON3="+str(py),"-DKernelPlatform=ellis",
         "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS=OFF","-DKernelPrinting=OFF",
-        "-DKernelDebugBuild=OFF","-DKernelVerificationBuild=OFF","-DKernelArmExportVCNTUser=ON")
+        "-DKernelDebugBuild=OFF","-DKernelVerificationBuild=OFF","-DKernelArmExportVCNTUser=ON",
+        # Linux ARM programs read their thread pointer from TPIDRURO; the Open Runtime sets it.
+        "-DKernelArmTLSReg=tpidruro")
     generated=["include/sel4/"+f for f in ["shared_types_gen.h","syscall.h","invocation.h"]]
     generated+=["include/interfaces/sel4_client.h","arch_include/arm/sel4/arch/invocation.h",
                 "sel4_arch_include/aarch32/sel4/sel4_arch/invocation.h",

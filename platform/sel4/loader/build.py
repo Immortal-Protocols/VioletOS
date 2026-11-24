@@ -24,7 +24,7 @@ ld = cc.with_name("ld.lld")
 objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
-defines = ["-DNDEBUG", "-DROOT_BYTES=0xc0000"]
+defines = ["-DNDEBUG", "-DROOT_BYTES=0x100000"]
 if probe: defines.append("-DVIOLET_TEST_ISOLATION")
 defines.append("-DVIOLET_QEMU" if variant=="qemu" else "-DVIOLET_MOTO")
 sys.path.insert(0,str(repo / "services/touch"))
@@ -52,7 +52,7 @@ for source in [repo/"services/touch/events.c", repo/"services/storage/storage_ip
     run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
     shims.append(obj)
 only=os.environ.get("VIOLET_COMPONENT_ONLY")
-selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi","weather","usb-diagnostics","audio","sounds"}
+selected=None if variant=="qemu" else {"launcher","stopwatch","runtime","touch","display","storage","power","radio","wifi","weather","usb-diagnostics","audio","sounds","open"}
 storage_backend=repo/"targets/moto-g-pure/emmc.rs" if variant=="moto" else None
 components(repo,out,cc,common,incs,rustc,shims,only,selected,storage_backend,variant)
 if only or (variant=="qemu" and os.environ.get("VIOLET_APP_DIR")): sys.exit(0)
@@ -96,7 +96,7 @@ else:
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
-assert (out/"root.bin").stat().st_size < 0xbe000
+assert (out/"root.bin").stat().st_size < 0xfe000
 elf = (abi/"kernel.elf").read_bytes()
 assert elf[:6] == b"\x7fELF\x01\x01" and struct.unpack_from("<I",elf,24)[0] == 0xe0000000
 phoff, = struct.unpack_from("<I",elf,28)
@@ -111,6 +111,11 @@ for i in range(count):
     image[index:index+filesz]=elf[offset:offset+filesz]
 (out/"kernel.bin").write_bytes(image+bytes(-len(image)%4))
 (out/"payload.S").write_text('.section .payload,"a"\n.global kernel,kernel_end,root,root_end\nkernel: .incbin "kernel.bin"\nkernel_end:\nroot: .incbin "root.bin"\nroot_end:\n')
+# Open apps' file system image: QEMU loads it at 0x4a000000, the Moto loader carries it.
+sys.path.insert(0,str(repo/"tools"))
+from build_initfs import main as build_initfs
+# The handset carries it gzip-compressed as its boot image's ramdisk.
+build_initfs(out/"initfs.cpio", compress=variant=="moto")
 if variant == "moto":
     sys.path.insert(0, str(repo/"targets/moto-g-pure"))
     from wifi_firmware import prepare_wifi
@@ -138,7 +143,8 @@ if variant=="moto":
     from phone_image import rebuild_v2
     stock=Path(stock_path).read_bytes()
     assert hashlib.sha256(stock).hexdigest()=="36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a"
-    image=rebuild_v2(stock,kernel=z)
+    # The bootloader loads the ramdisk; VioletOS's loader copies it to the open apps' window.
+    image=rebuild_v2(stock,(out/"initfs.cpio").read_bytes(),kernel=z)
     # Only the 1 MiB after this explicit slot-B marker belongs to the filesystem.
     marker_offset=16*1024**2
     if len(image)>marker_offset:raise ValueError("boot payload overlaps the storage window")

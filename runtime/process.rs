@@ -74,6 +74,11 @@ impl Runtime {
             return Message::error(EMPTY);
         }
         let down = event.key != 0;
+        // The Open Runtime passes every touch change on to its apps.
+        if who == OPEN_APPS {
+            self.held = down;
+            return event;
+        }
         let pressed = down && !self.held;
         self.held = down;
         if !pressed {
@@ -101,6 +106,8 @@ impl Runtime {
         }
         match (m.op, m.key) {
             (GET, WHOAMI) => Message::result(who),
+            // Which optional components are installed, one bit per component ID.
+            (GET, INVENTORY) => Message::result(self.inventory),
             (GET, STATUS) => self.ready,
             (GET, 0x4057) if who == LAUNCHER => unsafe {
                 let cell=(0x07400000 as *const u32).add(980);
@@ -113,8 +120,17 @@ impl Runtime {
             (GET, CATALOG | INBOX) | (EXECUTE, INSTALL | REMOVE) if who == LAUNCHER => {
                 self.forward(who, 9, m)
             }
+            // The Open Runtime is always running, so focus moves without a launch.
             (EXECUTE, OPEN)
-                if (who == LAUNCHER && is_app(m.value)) || (is_app(who) && m.value == LAUNCHER) =>
+                if who == LAUNCHER && m.value == OPEN_APPS
+                    && self.inventory & (1 << OPEN_COMPONENT) != 0 =>
+            {
+                self.focus = OPEN_APPS;
+                Message::result(0)
+            }
+            (EXECUTE, OPEN)
+                if (who == LAUNCHER && is_app(m.value))
+                    || ((is_app(who) || who == OPEN_APPS) && m.value == LAUNCHER) =>
             {
                 let r = m.call(LIFECYCLE);
                 if r.op == OK {
@@ -247,7 +263,7 @@ pub fn run() -> ! {
     loop {
         let (who, m) = Message::receive(SERVER);
         startup.update(&mut rt.ready);
-        if !is_app(who) {
+        if !is_app(who) && who != OPEN_APPS {
             Message::error(DENIED).reply();
             continue;
         }

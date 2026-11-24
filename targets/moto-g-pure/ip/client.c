@@ -199,6 +199,14 @@ int station_net_host(const unsigned char *mac, unsigned wait_ms) {
   return !failed;
 }
 int station_net_leased(void) { return hosting && leased && !failed; }
+// For app sockets through the relay (sockets.c): the relay's password, while the phone has a lease.
+int station_relay_info(unsigned char *password, unsigned *len) {
+  if (!hosting || !leased || failed)
+    return 0;
+  memcpy(password, relay_password, relay_password_len);
+  *len = relay_password_len;
+  return 1;
+}
 int station_net_join(const unsigned char *mac) {
   station_net_close();
   failed = 0;

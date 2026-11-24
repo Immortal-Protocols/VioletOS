@@ -122,6 +122,8 @@ The current build ships [USB Diagnostics](../../services/usb-diagnostics/README.
 
 ## Phone relay access point
 
+Radio also serves open apps' TCP sockets from its event loop (see the [Open Runtime](../../runtime/open/README.md#how-it-works)). A USB join now tries every access point broadcasting the network name, 2.4 GHz first, and a join of an ordinary network while hosting the relay stops hosting first.
+
 Radio can host a Wi-Fi network for a phone running the [companion relay](../../companion/ios/README.md) and reach the internet over the phone's cellular data. Run `services/usb-diagnostics/host/moto-relay` from the Mac. It provisions a one-boot profile named `VioletRelay-XXXX` (WPA2-PSK) or, with `--open`, `VioletRelayOpen-XXXX`. It writes the SSID, passphrase and SOCKS password to `build/relay-pairing.json`, then asks Radio to host the network. A join request whose network name starts with `VioletRelay` hosts that network instead of joining one.
 
 - **Access point.** [softap.rs](softap.rs) holds the gen4m access-point commands, following Motorola's driver: activate BSS 1 as a P2P-network BSS with own-MAC slot 1, request the channel, set the BSS information in AP mode, send the beacon template, and report the BSS as created.

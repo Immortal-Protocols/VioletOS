@@ -11,6 +11,21 @@ static int conflicts(uint64_t base, uint64_t size)
 
 // Index into panels[] of the panel the bootloader lit; passed on for touch firmware.
 static unsigned panel_index;
+// Open apps get 0xc0000000-0xdfffffff (their file system image, then a 256 MiB
+// page pool) only if no live reservation touches it. On the measured handset
+// the modem, SCP and ATF reservations all lie below 0xc0000000.
+enum { open_base = 0xc0000000u, open_size = 0x20000000u };
+static int open_memory_ok = 1;
+static uint32_t initrd_start, initrd_end, open_conflicts;
+static uint32_t open_conflict[2];
+static void check_open(uint64_t base, uint64_t size)
+{
+    if (size && base < (uint64_t)open_base + open_size && base + size > open_base) {
+        if (open_memory_ok) open_conflict[0] = (uint32_t)base, open_conflict[1] = (uint32_t)size;
+        open_memory_ok = 0;
+        open_conflicts++;
+    }
+}
 static int layout_ok(const void *dt)
 {
     uintptr_t addr = (uintptr_t)dt;
@@ -35,6 +50,10 @@ static int layout_ok(const void *dt)
     if (!known) return 0;
     const fdt32_t *start = fdt_getprop(dt, chosen, "linux,initrd-start", &len);
     if (!start || len != 4 || fdt32_to_cpu(*start) < ram_end) return 0;
+    initrd_start = fdt32_to_cpu(*start);
+    // The bootloader may write the end as one or two cells.
+    const fdt32_t *end = fdt_getprop(dt, chosen, "linux,initrd-end", &len);
+    initrd_end = !end ? 0 : len == 4 ? fdt32_to_cpu(end[0]) : len == 8 ? (uint32_t)fdt64_ld((const fdt64_t *)end) : 0;
     int reserved = fdt_path_offset(dt, "/reserved-memory");
     if (reserved < 0 || fdt_address_cells(dt,reserved) != 2 || fdt_size_cells(dt,reserved) != 2) return 0;
     int memory = fdt_path_offset(dt,"/memory");
@@ -48,12 +67,14 @@ static int layout_ok(const void *dt)
         for (int offset=0; offset<len/8; offset+=2) {
             uint64_t base=fdt64_ld(reg+offset), size=fdt64_ld(reg+offset+1);
             if (conflicts(base,size)) return 0;
+            check_open(base,size);
             if (base == fb && size == pool && !strcmp(fdt_get_name(dt,node,0),"mblock-16-framebuffer")) match=1;
         }
     }
     for (int i=0; i<fdt_num_mem_rsv(dt); ++i) {
         uint64_t base,size;
         if (fdt_get_mem_rsv(dt,i,&base,&size) || conflicts(base,size)) return 0;
+        check_open(base,size);
     }
     return match;
 }
@@ -156,6 +177,19 @@ void prepare(const void *dt)
     *(volatile unsigned *)0x43fffff0 = 0x50414e00u | panel_index;
     if (previous != UINT32_MAX) record_boot_stage(2);
     *(volatile unsigned *)0x43fffff4 = previous;
+    // The open apps' file system image, then "OPEN" for the supervisor if the
+    // whole window is free.
+    // The image is the boot image's ramdisk, wherever the bootloader put it.
+    *(volatile unsigned *)0x43ffffec = 0;
+    *(volatile unsigned *)0x43ffffe4 = open_conflict[0];
+    *(volatile unsigned *)0x43ffffe0 = open_conflict[1];
+    *(volatile unsigned *)0x43ffffdc = initrd_start;
+    *(volatile unsigned *)0x43ffffd8 = initrd_end;
+    if (open_memory_ok && initrd_end > initrd_start && initrd_end - initrd_start <= 0x06000000) {
+        stage_ram((void *)open_base, (const void *)initrd_start, (initrd_end - initrd_start + 3) & ~3u);
+        *(volatile unsigned *)0x43ffffe8 = initrd_end - initrd_start;
+        *(volatile unsigned *)0x43ffffec = 0x4e45504f;
+    }
     *(volatile unsigned *)0x43dffffc = volume_load((void *)0x43c00000);
     // Resume the bootloader's USB peripheral clock for the diagnostic device.
     *(volatile uint32_t *)0x10000098 = (1u << 23) | (1u << 16);

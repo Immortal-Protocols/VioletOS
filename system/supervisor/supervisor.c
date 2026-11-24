@@ -47,12 +47,18 @@ struct process {
 };
 // Audio follows USB Diagnostics so app and service identities keep their values.
 // QEMU has no USB Diagnostics process; its slot stays empty there.
-enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7,
-       USB_TRANSFER_BADGE = 14, TOTAL = AUDIO + 1, LANE_BASE = 0x07400000,
+// The Open Runtime (24) hosts Linux-ABI apps from /apps. Slot 23 is left for Bluetooth.
+enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7, OPEN_RT = COUNT + 9,
+       USB_TRANSFER_BADGE = 14, TOTAL = OPEN_RT + 1, LANE_BASE = 0x07400000,
        RUNTIME_AUDIO_SLOT = 2, AUDIO_POWER_SLOT = 6,
        // Badges 16 and up mean faults, so Audio's supervisor requests use an
        // app identity that never holds the lifecycle endpoint.
        AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071 };
+// The Open Runtime's CSpace and the capabilities the supervisor places in it.
+// Runtime knows it as client 9, an identity no catalog app uses.
+enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
+       OPEN_SLOT_RUNTIME = 2, OPEN_SLOT_CNODE = 3, OPEN_SLOT_PD = 4, OPEN_SLOT_ASID = 5,
+       OPEN_SLOT_KERNEL = 6, OPEN_SLOT_AUTHORITY = 7, OPEN_SLOT_POOL = 16, OPEN_KERNEL_BITS = 22 };
 static struct process procs[TOTAL];
 static seL4_CPtr life, scratch_slot;
 static volatile unsigned *report;
@@ -72,7 +78,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
 #ifdef VIOLET_MOTO
   if (p->id==RADIO && p->abi==3) abi_ok=true;
 #endif
-  bool allowed_id = p->id < COUNT || p->id == AUDIO;
+  bool allowed_id = p->id < COUNT || p->id == AUDIO || p->id == OPEN_RT;
 #ifdef VIOLET_MOTO
   allowed_id |= p->id == USB_DIAG;
 #endif
@@ -134,11 +140,12 @@ static bool parse(const struct archive *a, unsigned limit) {
   if (found[USB_DIAG]) procs[USB_DIAG].package = found[USB_DIAG];
 #endif
   procs[AUDIO].package = found[AUDIO];
+  procs[OPEN_RT].package = found[OPEN_RT];
   return true;
 }
 static void grant(struct task *t, unsigned slot, seL4_CPtr ep, unsigned badge,
                   bool server) {
-  check(seL4_CNode_Mint(t->caps, slot, CAP_BITS, seL4_CapInitThreadCNode, ep,
+  check(seL4_CNode_Mint(t->caps, slot, t->cap_bits ? t->cap_bits : CAP_BITS, seL4_CapInitThreadCNode, ep,
                         32, seL4_CapRights_new(!server, 0, server, !server),
                         badge));
 }
@@ -175,8 +182,10 @@ static void private_page(struct process *p, unsigned va,
 enum { STORAGE_STACK_TOP = 0x02400000, STORAGE_STACK_PAGES = 8 };
 enum { RADIO_STACK_TOP = 0x02600000, RADIO_STACK_PAGES = 8 };
 static unsigned stack_top(unsigned id) {
-  return id == STORAGE ? STORAGE_STACK_TOP : id == RADIO ? RADIO_STACK_TOP : STACK_TOP;
+  return id == STORAGE ? STORAGE_STACK_TOP : id == RADIO ? RADIO_STACK_TOP
+         : id == OPEN_RT ? OPEN_STACK_TOP : STACK_TOP;
 }
+static seL4_CPtr spare_ram(unsigned type, unsigned bits);
 static void prepare_process(unsigned id) {
   struct process *p = &procs[id];
   const struct package *pkg = p->package;
@@ -185,7 +194,13 @@ static void prepare_process(unsigned id) {
   struct task *t = &p->task;
   t->pd = create(ram, seL4_ARM_PageDirectoryObject);
   check(seL4_ARM_ASIDPool_Assign(seL4_CapInitThreadASIDPool, t->pd));
-  t->caps = allocate(ram, seL4_CapTableObject, CAP_BITS);
+  t->cap_bits = id == OPEN_RT ? OPEN_BITS : CAP_BITS;
+  t->caps = id == OPEN_RT ? spare_ram(seL4_CapTableObject, t->cap_bits) : 0;
+  if (!t->caps) {
+    // Without room for its table the Open Runtime starts with a minimal one and reports it.
+    t->cap_bits = CAP_BITS;
+    t->caps = allocate(ram, seL4_CapTableObject, CAP_BITS);
+  }
   t->thread = create(ram, seL4_TCBObject);
   for (unsigned off = 0; off < pkg->size; off += PAGE) {
     unsigned n = pkg->size - off;
@@ -210,13 +225,16 @@ static void prepare_process(unsigned id) {
   } else if (id == RADIO) {
     for (unsigned i = 1; i <= RADIO_STACK_PAGES; i++)
       private_page(p, RADIO_STACK_TOP - i * PAGE, 0, 0, false);
+  } else if (id == OPEN_RT) {
+    for (unsigned i = 1; i <= OPEN_STACK_PAGES; i++)
+      private_page(p, OPEN_STACK_TOP - i * PAGE, 0, 0, false);
   } else {
     private_page(p, STACK_TOP - 2 * PAGE, 0, 0, false);
     private_page(p, STACK_TOP - PAGE, 0, 0, false);
   }
   private_page(p, IPC_BUFFER, 0, 0, false);
   grant(t, FAULT_SLOT, life, 16 + id, false);
-  unsigned guard = seL4_CNode_CapData_new(0, 32 - CAP_BITS).words[0];
+  unsigned guard = seL4_CNode_CapData_new(0, 32 - t->cap_bits).words[0];
   check(seL4_TCB_Configure(t->thread, FAULT_SLOT, t->caps, guard, t->pd, 0,
                            IPC_BUFFER, t->ipc));
   check(seL4_TCB_SetPriority(t->thread, seL4_CapInitThreadTCB, 100));
@@ -345,7 +363,59 @@ static struct device_page devices[] = {
     {AUDIO, 0x4920a000, 0x09006000, 0}, {AUDIO, 0x4920b000, 0x09007000, 0},
     {AUDIO, 0x4920c000, 0x09008000, 0},
     // and the two-page microphone ring.
-    {AUDIO, 0x4920d000, 0x09009000, 0}, {AUDIO, 0x4920e000, 0x0900a000, 0}};
+    {AUDIO, 0x4920d000, 0x09009000, 0}, {AUDIO, 0x4920e000, 0x0900a000, 0},
+    // Open Runtime log ring: what open apps write to stdout and stderr.
+    {OPEN_RT, 0x49220000, 0x09000000, 0},
+    // Open apps' TCP sockets, served by the emulator's host relay (tools/net_relay.py).
+    {OPEN_RT, 0x49230000, 0x09400000, 0},
+    {OPEN_RT, 0x49231000, 0x09401000, 0},
+    {OPEN_RT, 0x49232000, 0x09402000, 0},
+    {OPEN_RT, 0x49233000, 0x09403000, 0},
+    {OPEN_RT, 0x49234000, 0x09404000, 0},
+    {OPEN_RT, 0x49235000, 0x09405000, 0},
+    {OPEN_RT, 0x49236000, 0x09406000, 0},
+    {OPEN_RT, 0x49237000, 0x09407000, 0},
+    {OPEN_RT, 0x49238000, 0x09408000, 0},
+    {OPEN_RT, 0x49239000, 0x09409000, 0},
+    {OPEN_RT, 0x4923a000, 0x0940a000, 0},
+    {OPEN_RT, 0x4923b000, 0x0940b000, 0},
+    {OPEN_RT, 0x4923c000, 0x0940c000, 0},
+    {OPEN_RT, 0x4923d000, 0x0940d000, 0},
+    {OPEN_RT, 0x4923e000, 0x0940e000, 0},
+    {OPEN_RT, 0x4923f000, 0x0940f000, 0},
+    {OPEN_RT, 0x49240000, 0x09410000, 0},
+    {OPEN_RT, 0x49241000, 0x09411000, 0},
+    {OPEN_RT, 0x49242000, 0x09412000, 0},
+    {OPEN_RT, 0x49243000, 0x09413000, 0},
+    {OPEN_RT, 0x49244000, 0x09414000, 0},
+    {OPEN_RT, 0x49245000, 0x09415000, 0},
+    {OPEN_RT, 0x49246000, 0x09416000, 0},
+    {OPEN_RT, 0x49247000, 0x09417000, 0},
+    {OPEN_RT, 0x49248000, 0x09418000, 0},
+    {OPEN_RT, 0x49249000, 0x09419000, 0},
+    {OPEN_RT, 0x4924a000, 0x0941a000, 0},
+    {OPEN_RT, 0x4924b000, 0x0941b000, 0},
+    {OPEN_RT, 0x4924c000, 0x0941c000, 0},
+    {OPEN_RT, 0x4924d000, 0x0941d000, 0},
+    {OPEN_RT, 0x4924e000, 0x0941e000, 0},
+    {OPEN_RT, 0x4924f000, 0x0941f000, 0},
+    {OPEN_RT, 0x49250000, 0x09420000, 0},
+    {OPEN_RT, 0x49251000, 0x09421000, 0},
+    {OPEN_RT, 0x49252000, 0x09422000, 0},
+    {OPEN_RT, 0x49253000, 0x09423000, 0},
+    {OPEN_RT, 0x49254000, 0x09424000, 0},
+    {OPEN_RT, 0x49255000, 0x09425000, 0},
+    {OPEN_RT, 0x49256000, 0x09426000, 0},
+    {OPEN_RT, 0x49257000, 0x09427000, 0},
+    {OPEN_RT, 0x49258000, 0x09428000, 0},
+    {OPEN_RT, 0x49259000, 0x09429000, 0},
+    {OPEN_RT, 0x4925a000, 0x0942a000, 0},
+    {OPEN_RT, 0x4925b000, 0x0942b000, 0},
+    {OPEN_RT, 0x4925c000, 0x0942c000, 0},
+    {OPEN_RT, 0x4925d000, 0x0942d000, 0},
+    {OPEN_RT, 0x4925e000, 0x0942e000, 0},
+    {OPEN_RT, 0x4925f000, 0x0942f000, 0},
+    {OPEN_RT, 0x49260000, 0x09430000, 0}};
 #else
 static unsigned handset_report[6];
 static unsigned uploaded, upload_size, upload_crc;
@@ -401,9 +471,11 @@ static const char *title(const struct package *p) {
   static const char names[][16] = {"",      "LAUNCHER", "STOPWATCH",  "RUNTIME",
                                    "TOUCH", "DISPLAY",  "STORAGE",    "RADIO",
                                    "POWER", "",         "WI-FI SETUP"};
-  static const char diag_name[16] = "USB DIAGNOSTICS", audio_name[16] = "AUDIO";
+  static const char diag_name[16] = "USB DIAGNOSTICS", audio_name[16] = "AUDIO",
+                    open_name[16] = "OPEN RUNTIME";
   if (p->id == USB_DIAG) return diag_name;
   if (p->id == AUDIO) return audio_name;
+  if (p->id == OPEN_RT) return open_name;
   return p->id >= 11 ? (const char *)p->bytes + p->size - 16 : names[p->id];
 }
 static void reply_title(const struct package *p) {
@@ -419,7 +491,7 @@ static bool update_catalog(unsigned id, bool remove) {
   // Each physical device is wired to a process on this board.
   if (remove && id >= STORAGE && id <= POWER) return false;
 #endif
-  bool known = (id > 0 && id < COUNT && id != PACKAGES) || id == AUDIO;
+  bool known = (id > 0 && id < COUNT && id != PACKAGES) || id == AUDIO || id == OPEN_RT;
 #ifdef VIOLET_MOTO
   if (usb_trial_bytes && id != USB_DIAG) return false;
   if (id == USB_DIAG) known = !remove && usb_trial_bytes && usb_trial_generation == generation;
@@ -433,7 +505,7 @@ static bool update_catalog(unsigned id, bool remove) {
     return false;
   unsigned count = 0, length = 0;
   for (unsigned i = 1; i < TOTAL; i++) {
-    if (i >= COUNT && i != USB_DIAG && i != AUDIO) continue;
+    if (i >= COUNT && i != USB_DIAG && i != AUDIO && i != OPEN_RT) continue;
     const struct package *p = i == id ? (remove ? 0 : inbox) : procs[i].package;
     if (!p || i == PACKAGES)
       continue;
@@ -502,6 +574,108 @@ static void workers(void) {
     grant(&procs[RUNTIME].task, 9 + index, wake, 0, false);
   }
 }
+static void share_with_open(seL4_CPtr frame, unsigned va) {
+  struct task *t = &procs[OPEN_RT].task;
+  if (!t->pd) return;
+  ensure_table(t, va);
+  unsigned copy = next_slot++;
+  check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode, frame, 32,
+                        seL4_AllRights));
+  check(seL4_ARM_Page_Map(copy, t->pd, va, seL4_AllRights, seL4_ARM_ExecuteNever));
+}
+// Kernel memory for the Open Runtime from any RAM untyped except the one the
+// other processes share, so its app objects never crowd them out.
+static seL4_CPtr spare_ram(unsigned type, unsigned bits) {
+  for (unsigned i = 0; i < boot->untyped.end - boot->untyped.start; i++) {
+    seL4_CPtr u = boot->untyped.start + i;
+    if (boot->untypedList[i].isDevice || u == ram || boot->untypedList[i].sizeBits < bits) continue;
+    if (next_slot >= boot->empty.end) stop();
+    if (!seL4_Untyped_Retype(u, type, bits, seL4_CapInitThreadCNode, 0, 0, next_slot, 1))
+      return next_slot++;
+  }
+  // Last, the shared untyped, but never at the cost of booting: 0 means none.
+  if (!seL4_Untyped_Retype(ram, type, bits, seL4_CapInitThreadCNode, 0, 0, next_slot, 1))
+    return next_slot++;
+  return 0;
+}
+// How far Open Runtime setup got, and the root CNode's use, for the boot harness.
+volatile unsigned open_setup[4], open_fault[6];
+static void give_open(unsigned slot, seL4_CPtr cap) {
+  check(seL4_CNode_Copy(procs[OPEN_RT].task.caps, slot, OPEN_BITS, seL4_CapInitThreadCNode, cap, 32,
+                        seL4_AllRights));
+}
+// The Open Runtime builds app processes itself: it gets its own CSpace and
+// VSpace, the ASID pool, kernel memory for app objects, a pool of physical
+// memory for app pages and, in QEMU, the read-only /apps image.
+static void open_runtime(void) {
+  struct task *t = &procs[OPEN_RT].task;
+  open_setup[0] = 1;
+  open_setup[2] = next_slot;
+  open_setup[3] = boot->empty.end;
+  if (!procs[OPEN_RT].package) return;
+  open_setup[0] = 2;
+  if (t->cap_bits != OPEN_BITS) return;
+  give_open(OPEN_SLOT_CNODE, t->caps);
+  give_open(OPEN_SLOT_PD, t->pd);
+  give_open(OPEN_SLOT_ASID, seL4_CapInitThreadASIDPool);
+  // Its own thread, allowed to give app threads the priority every process runs at.
+  check(seL4_TCB_SetMCPriority(t->thread, seL4_CapInitThreadTCB, 100));
+  give_open(OPEN_SLOT_AUTHORITY, t->thread);
+  seL4_CPtr kernel_memory = spare_ram(seL4_UntypedObject, OPEN_KERNEL_BITS);
+  if (kernel_memory) give_open(OPEN_SLOT_KERNEL, kernel_memory);
+#ifdef VIOLET_QEMU
+  // The image QEMU loads at 0x4a000000, read-only at 0x10000000, then the pool.
+  mapping = t;
+  for (unsigned off = 0; off < 0x06000000; off += 0x01000000)
+    map_device_rights(0x4a000000 + off, 0x10000000 + off, 24, seL4_CanRead);
+  // 128 MiB at 0x50000000 (the block ends at a hole at 0x5f000000) and 256 MiB
+  // at 0x60000000, below the framebuffer. The Open Runtime cuts them into pages.
+  give_open(OPEN_SLOT_POOL, device_untyped(0x50000000, 27));
+  give_open(OPEN_SLOT_POOL + 1, device_untyped(0x60000000, 28));
+#else
+  // The loader leaves "OPEN" at 0x43ffffec after staging the image at
+  // 0xc0000000, when no live reservation touches 0xc0000000-0xdfffffff.
+  open_setup[0] = 3;
+#ifdef VIOLET_MOTO
+  // The loader's verdict and image size, for USB.
+  ((volatile unsigned *)0x09202000)[48] = ((volatile unsigned *)0x09f00000)[0xfffec / 4];
+  ((volatile unsigned *)0x09202000)[49] = ((volatile unsigned *)0x09f00000)[0xfffe8 / 4];
+  ((volatile unsigned *)0x09202000)[50] = ((volatile unsigned *)0x09f00000)[0xfffe4 / 4];
+  ((volatile unsigned *)0x09202000)[51] = ((volatile unsigned *)0x09f00000)[0xfffe0 / 4];
+  ((volatile unsigned *)0x09202000)[52] = ((volatile unsigned *)0x09f00000)[0xfffdc / 4];
+  ((volatile unsigned *)0x09202000)[53] = ((volatile unsigned *)0x09f00000)[0xfffd8 / 4];
+#endif
+  if (((volatile unsigned *)0x09f00000)[0xfffec / 4] == 0x4e45504f) {
+    open_setup[0] = 4;
+    mapping = t;
+    for (unsigned off = 0; off < 0x06000000; off += 0x01000000)
+      map_device_rights(0xc0000000 + off, 0x10000000 + off, 24, seL4_CanRead);
+    open_setup[0] = 5;
+    give_open(OPEN_SLOT_POOL, device_untyped(0xd0000000, 28));
+    open_setup[0] = 6;
+  }
+  // Open apps' TCP sockets: a control page and eight slots of 24 KiB of rings,
+  // served by Radio at 0x0b000000, used by the Open Runtime at 0x09400000.
+  for (unsigned i = 0; i < 49; i++) {
+    unsigned frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(frame, &procs[RADIO].task, 0x0b000000 + i * PAGE, seL4_AllRights);
+    map_shared(frame, t, 0x09400000 + i * PAGE, seL4_AllRights);
+  }
+  // USB Diagnostics reads the Open Runtime's log and passes launch requests.
+  unsigned log_frame = create(ram, seL4_ARM_SmallPageObject);
+  map_shared(log_frame, t, 0x09000000, seL4_AllRights);
+  map_shared(log_frame, &procs[USB_DIAG].task, 0x09205000, seL4_CanRead);
+  unsigned request_frame = create(ram, seL4_ARM_SmallPageObject);
+  map_shared(request_frame, &procs[USB_DIAG].task, 0x09206000, seL4_AllRights);
+  map_shared(request_frame, t, 0x09001000, seL4_CanRead);
+#endif
+  grant(t, OPEN_SLOT_RUNTIME, procs[RUNTIME].ep, OPEN_RUNTIME_BADGE, false);
+  open_setup[0] = 9;
+  open_setup[1] = next_slot;
+#ifdef VIOLET_MOTO
+  for (unsigned i = 0; i < 2; i++) ((volatile unsigned *)0x09202000)[46 + i] = open_setup[i];
+#endif
+}
 static void wire(void) {
   build_group();
 #ifdef VIOLET_QEMU
@@ -557,6 +731,8 @@ static void wire(void) {
       grant(&procs[id].task, id == STORAGE ? 2 : 1, procs[id].ep, 0, true);
     }
   }
+  // Before Audio, which shares its PCM ring with the Open Runtime.
+  prepare_process(OPEN_RT);
   if (procs[AUDIO].package) {
     // Only Runtime calls Audio. On the handset Audio reaches the PMIC through Power.
     prepare_process(AUDIO);
@@ -565,6 +741,14 @@ static void wire(void) {
     grant(&procs[RUNTIME].task, RUNTIME_AUDIO_SLOT, procs[AUDIO].ep, RUNTIME, false);
     if (procs[POWER].package)
       grant(&procs[AUDIO].task, AUDIO_POWER_SLOT, procs[POWER].ep, AUDIO, false);
+    // Raw PCM from open apps: a header page and a 16-page ring, at 0x09300000
+    // in Audio and 0x09100000 in the Open Runtime.
+    for (unsigned i = 0; i < 17; i++) {
+      unsigned frame = create(ram, seL4_ARM_SmallPageObject);
+      map_shared(frame, &procs[AUDIO].task, 0x09300000 + i * PAGE, seL4_AllRights);
+      if (procs[OPEN_RT].task.pd)
+        map_shared(frame, &procs[OPEN_RT].task, 0x09100000 + i * PAGE, seL4_AllRights);
+    }
   }
   for (unsigned id = 1; id < COUNT; id++)
     if ((id == LAUNCHER || id == WATCH || id >= WIFI) && procs[id].package)
@@ -689,6 +873,7 @@ static void wire(void) {
   for (unsigned id = WIFI; id < COUNT; id++)
     if (procs[id].package)
       surface(id);
+  open_runtime();
   unsigned first = 0;
 #ifdef VIOLET_MOTO
   struct task *display = &procs[DISPLAY].task;
@@ -697,10 +882,14 @@ static void wire(void) {
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode,
                         boot_display_frame, 32, seL4_AllRights));
   check(seL4_ARM_Page_Map(copy, display->pd, 0x08000000, seL4_AllRights, seL4_ARM_ExecuteNever));
+  share_with_open(boot_display_frame, 0x08000000);
   first = 65536;
 #endif
-  for (unsigned off = first; off < 720 * 1600 * 4; off += 65536)
+  for (unsigned off = first; off < 720 * 1600 * 4; off += 65536) {
     device(DISPLAY, 0x79450000 + off, 0x08000000 + off, 16);
+    // The Open Runtime draws the app in front straight to scanout.
+    share_with_open(next_slot - 1, 0x08000000 + off);
+  }
 }
 static void dismantle(void) {
   for (unsigned i = 1; i < TOTAL; i++)
@@ -735,8 +924,9 @@ static unsigned stalled(unsigned timeout) {
   if ((int)(now - health[1021]) > (int)timeout)
     return RUNTIME;
   unsigned focus = health[1022];
+  // Runtime's client 9 is the Open Runtime.
   if (focus && (int)(now - health[1023]) > (int)timeout)
-    return focus;
+    return focus == OPEN_RUNTIME_BADGE ? OPEN_RT : focus;
   return 0;
 }
 #ifdef VIOLET_MOTO
@@ -1073,6 +1263,18 @@ void root_main(seL4_BootInfo *bi) {
         }
       }
 #endif
+      // An Open Runtime fault stops open apps only: record it and suspend. A
+      // just-installed catalog still rolls back, as for any other component.
+      if (badge == 16 + OPEN_RT && source != 1) {
+        open_fault[0] = 0x544c4146; // "FALT"
+        open_fault[1] = seL4_MessageInfo_get_label(msg);
+        for (unsigned i = 0; i < 4; i++) open_fault[2 + i] = seL4_GetMR(i);
+#ifdef VIOLET_MOTO
+        for (unsigned i = 0; i < 6; i++) ((volatile unsigned *)0x09202000)[40 + i] = open_fault[i];
+#endif
+        check(seL4_TCB_Suspend(procs[OPEN_RT].task.thread));
+        continue;
+      }
       if (badge >= 16) {
 #ifdef VIOLET_TEST_ISOLATION
         if (seL4_MessageInfo_get_label(msg) == seL4_Fault_VMFault &&
@@ -1361,6 +1563,8 @@ void root_main(seL4_BootInfo *bi) {
             result |= 1u << id;
         if (procs[AUDIO].package)
           result |= 1u << AUDIO;
+        if (procs[OPEN_RT].package)
+          result |= 1u << OPEN_RT;
       } else if (badge == PACKAGES && op == GET && key == 9 && val < COUNT) {
         error = 0;
         if (procs[val].package && val != PACKAGES) {

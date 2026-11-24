@@ -8,6 +8,9 @@ pub fn run() -> ! {
     let mut status = request(GET, STATUS, 0);
     let wifi = request(GET, CATALOG, WIFI);
     let catalog = request(GET, CATALOG, 0);
+    let inventory = request(GET, INVENTORY, 0);
+    // Linux-ABI apps from /apps run under the Open Runtime.
+    let open_apps = inventory.op == OK && inventory.value & (1 << OPEN_COMPONENT) != 0;
     let touch = submit(SUBSCRIBE, CONTACT, 0).unwrap_or_else(|_| panic!());
     let radio_events = submit(SUBSCRIBE, RADIO, 0).ok();
     let power_events = submit(SUBSCRIBE, POWER, 0).ok();
@@ -100,6 +103,10 @@ pub fn run() -> ! {
             }
             rect(157, 53, 70, 32, PANEL);
             label(163, 65, b"APPS", 2, INK);
+            if open_apps {
+                rect(157, 89, 70, 26, PANEL);
+                label(163, 99, b"/APPS", 1, ACCENT);
+            }
             let radio = radio_state;
             let radio_text = radio.text();
             label(
@@ -212,6 +219,9 @@ pub fn run() -> ! {
                 212..340 if e.value >= 471 => {
                     library::open();
                     redraw = true;
+                }
+                356..460 if e.value >= 471 && open_apps => {
+                    request(EXECUTE, OPEN, OPEN_APPS);
                 }
                 584..784 if wifi.value == WIFI => {
                     request(EXECUTE, OPEN, WIFI);

@@ -1,0 +1,108 @@
+//! Physical memory for apps: the supervisor's pool untypeds, cut into 64 KiB
+//! pages. Every page stays mapped in the Open Runtime at POOL_VA + index * 64 KiB,
+//! so reading or writing app memory is a plain memory access. Apps get copies
+//! of the page capabilities.
+use super::sys::*;
+use alloc::vec::Vec;
+
+pub struct Pool {
+    first_slot: u32,
+    free: Vec<u32>,
+    pub total: usize,
+}
+
+/// The kernel memory the Open Runtime carves its own objects from.
+pub struct Kernel {
+    next_slot: u32,
+    free_slots: Vec<u32>,
+}
+
+impl Kernel {
+    pub fn new() -> Self {
+        Self { next_slot: SLOT_DYNAMIC, free_slots: Vec::new() }
+    }
+    pub fn slot(&mut self) -> u32 {
+        if let Some(s) = self.free_slots.pop() {
+            return s;
+        }
+        assert!(self.next_slot < SLOTS, "out of capability slots");
+        self.next_slot += 1;
+        self.next_slot - 1
+    }
+    /// Return a slot that is already empty.
+    pub fn release(&mut self, slot: u32) {
+        self.free_slots.push(slot);
+    }
+    pub fn object(&mut self, untyped: u32, o: Object, bits: u32) -> Result<u32, i32> {
+        let slot = self.slot();
+        match retype(untyped, o, bits, slot) {
+            Ok(()) => Ok(slot),
+            Err(e) => {
+                self.release(slot);
+                Err(e)
+            }
+        }
+    }
+}
+
+pub fn page_va(index: u32) -> usize {
+    POOL_VA + (index as usize) * PAGE
+}
+
+impl Pool {
+    /// Retype every pool untyped into pages and map them all into this process.
+    /// The slots are allocated as one contiguous run so a page's index finds its cap.
+    pub fn new(k: &mut Kernel, heap_pages: usize) -> Result<(Pool, usize), i32> {
+        let first_slot = k.next_slot;
+        k.next_slot += POOL_PAGES as u32;
+        let mut mapped_tables = 0usize;
+        let mut index = 0u32;
+        for (u, &bits) in POOL_BITS.iter().enumerate() {
+            for _ in 0..1u32 << (bits - PAGE_BITS) {
+                retype(SLOT_POOL + u as u32, Object::LargePage, PAGE_BITS, first_slot + index)?;
+                let va = page_va(index) as u32;
+                if va & 0xf_ffff == 0 {
+                    let pt = k.object(SLOT_KERNEL, Object::PageTable, 0)?;
+                    pt_map(pt, SLOT_PD, va)?;
+                    mapped_tables += 1;
+                }
+                page_map(first_slot + index, SLOT_PD, va, true)?;
+                index += 1;
+            }
+        }
+        // The heap is the first pages; apps get the rest, highest first. Nothing
+        // above allocated, because the heap did not exist yet.
+        unsafe { super::heap::HEAP.add(POOL_VA, heap_pages * PAGE) };
+        let free = (heap_pages as u32..POOL_PAGES as u32).rev().collect();
+        let _ = mapped_tables;
+        Ok((Pool { first_slot, free, total: POOL_PAGES }, heap_pages * PAGE))
+    }
+    pub fn cap(&self, index: u32) -> u32 {
+        self.first_slot + index
+    }
+    pub fn available(&self) -> usize {
+        self.free.len()
+    }
+    /// A zeroed page.
+    pub fn take(&mut self) -> Option<u32> {
+        let index = self.free.pop()?;
+        unsafe { core::ptr::write_bytes(page_va(index) as *mut u8, 0, PAGE) };
+        Some(index)
+    }
+    /// The `count` highest pages, which the linear map makes one contiguous
+    /// range; they are never returned. For the unpacked file system image.
+    pub fn take_top(&mut self, count: usize) -> Option<usize> {
+        if count == 0 || count > self.free.len() || self.free[0] as usize != POOL_PAGES - 1 {
+            return None;
+        }
+        let first = self.free[count - 1];
+        if self.free[0] - first != count as u32 - 1 {
+            return None;
+        }
+        self.free.drain(..count);
+        Some(page_va(first))
+    }
+    pub fn give_back(&mut self, index: u32) {
+        self.free.push(index);
+    }
+}
