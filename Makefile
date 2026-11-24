@@ -82,6 +82,10 @@ test-open: qemu-image
 	$(PYTHON) targets/qemu/test_open.py
 
 .PHONY: test-open-apps
+.PHONY: test-wifi-app
+test-wifi-app: qemu-image
+	$(PYTHON) targets/qemu/test_wifi_app.py
+
 test-open-apps: qemu-image
 	$(PYTHON) targets/qemu/test_open_apps.py
 	@mkdir -p build/tests

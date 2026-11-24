@@ -132,9 +132,31 @@ pub fn region(who: u32) -> u32 {
     }
 }
 
+/// GET SCAN i: the i-th network of the last scan. value is its profile ID (0 past
+/// the end), the text its SSID, and arg its channel in the low byte plus the
+/// SCAN_* security flags.
 pub const SCAN: u32 = 26;
+/// WPA2-Personal (PSK with CCMP): join it with its pairwise master key.
+pub const SCAN_WPA2: u32 = 1 << 16;
+/// No security: join it without a key.
+pub const SCAN_OPEN: u32 = 1 << 17;
 
+/// GET: value is the joined profile ID (0 for none). EXECUTE ID joins that
+/// network; for a WPA2 network data[..32] may carry its pairwise master key
+/// (PBKDF2-SHA1 of the passphrase and SSID), which Radio keeps for this boot.
+/// Without one, Radio uses the profile provisioned over USB. EXECUTE 0 leaves.
+/// A failed join answers OFFLINE or INVALID with one of the JOIN_* reasons in value.
 pub const PROFILE: u32 = 27;
+/// The network is no longer in range (or was not in the last scan).
+pub const JOIN_NOT_FOUND: u32 = 49;
+/// No access point with that name answered association.
+pub const JOIN_NO_ANSWER: u32 = 47;
+/// The WPA2 handshake failed: almost always a wrong password.
+pub const JOIN_AUTH: u32 = 52;
+/// Joined, but no address came from DHCP.
+pub const JOIN_NO_ADDRESS: u32 = 53;
+/// No key: neither one in the request nor a provisioned profile.
+pub const JOIN_NO_KEY: u32 = 50;
 
 /// Phone internet: Radio hosts a Wi-Fi network for a phone running Violet Relay.
 /// GET: value is RELAY_OFF..=RELAY_ONLINE, arg the last failure code.

@@ -917,6 +917,11 @@ impl Runtime {
                 },
                 None => String::from("error usage: launch PATH\n"),
             },
+            // Wi-Fi: scan, list, join and leave (runtime/open/wifi.rs).
+            Some("wifi") => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                self.wifi.command(&path, &mut words)
+            }
             Some("log") => {
                 let rest: Vec<&str> = words.collect();
                 crate::log!("{}", rest.join(" "));

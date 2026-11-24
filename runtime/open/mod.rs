@@ -22,6 +22,7 @@ pub mod pool;
 pub mod procmgr;
 pub mod syscall;
 pub mod sys;
+pub mod wifi;
 
 use crate::protocol::*;
 use alloc::rc::Rc;
@@ -186,6 +187,8 @@ pub struct Runtime {
     pub last_touch_ns: u64,
     pub tx_stats: Vec<Option<TxStat>>,
     last_sentinel: u64,
+    /// The "wifi" commands' running Radio requests.
+    pub wifi: wifi::Wifi,
 }
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
@@ -279,6 +282,7 @@ impl Runtime {
             last_touch_ns: 0,
             tx_stats: (0..net::SLOTS).map(|_| None).collect(),
             last_sentinel: 0,
+            wifi: wifi::Wifi::default(),
             // Requests made before this boot are not repeated.
             usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
         })

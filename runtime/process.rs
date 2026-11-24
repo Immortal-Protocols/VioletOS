@@ -164,6 +164,10 @@ impl Runtime {
                 self.forward(who, 7, m)
             }
             (GET, SCAN) if who == WIFI => self.forward(who, 7, m),
+            // The Open Runtime's Wi-Fi settings (the "wifi" commands in
+            // /dev/violet/sys, which only /apps/wifi may use to join or leave).
+            (GET, SCAN | PROFILE) | (EXECUTE, PROFILE) if who == OPEN_APPS => self.forward(who, 7, m),
+            (EXECUTE, RADIO) if who == OPEN_APPS && m.value == 1 => self.forward(who, 7, m),
             (GET, RADIO) => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
             (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),

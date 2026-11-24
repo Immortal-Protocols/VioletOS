@@ -5,6 +5,7 @@ pub mod canvas;
 pub mod device;
 pub mod http;
 pub mod text;
+pub mod wifi;
 
 pub use canvas::{mix, rgb, Canvas, Color, Rect};
 pub use device::{events, fields, home, log, sys, Event, Events, Screen, H, W};

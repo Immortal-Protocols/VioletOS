@@ -53,6 +53,7 @@ fn main() {
     let mut s = ui::State {
         now: None, online: false, battery: -1, volume: 0, phones: false,
         temp: String::new(), sky: String::new(), city: String::new(), running: Default::default(), pressed: None, shield: Default::default(),
+        wifi: String::new(),
     };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
@@ -68,6 +69,17 @@ fn main() {
         s.battery = f.get("battery").and_then(|v| v.parse().ok()).filter(|b| (0..=100).contains(b)).unwrap_or(-1);
         s.volume = f.get("volume").and_then(|v| v.parse().ok()).unwrap_or(0);
         s.phones = f.get("headphones").is_some_and(|v| v == "1");
+        let w = violet::wifi::state();
+        s.wifi = if w.hosting {
+            "Phone Internet".to_string()
+        } else if w.connected != 0 {
+            String::from_utf8_lossy(&w.ssid).into_owned()
+        } else {
+            String::new()
+        };
+        if w.connected != 0 && s.wifi.is_empty() {
+            s.wifi = "Connected".to_string();
+        }
         s.running = violet::sys("running").split_whitespace().map(String::from).collect();
         let sh = violet::fields(&violet::sys("shield"));
         s.shield = ui::Shield {
@@ -101,7 +113,8 @@ fn main() {
                 }
             }
             Ok(e) if e.kind == TOUCH_DOWN => {
-                s.pressed = ui::tile_at(e.x, e.y);
+                // usize::MAX: the Wi-Fi bar.
+                s.pressed = ui::tile_at(e.x, e.y).or(ui::WIFI_BAR.contains(e.x, e.y).then_some(usize::MAX));
                 if s.pressed.is_some() {
                     draw(&mut c, &mut s, &glance, &mut screen);
                 }
@@ -109,11 +122,14 @@ fn main() {
             Ok(e) if e.kind == TOUCH_UP => {
                 if let Some(i) = s.pressed.take() {
                     draw(&mut c, &mut s, &glance, &mut screen);
-                    let t = &ui::TILES[i];
-                    println!("home: opening {}", t.name);
-                    let answer = violet::sys(t.command);
+                    let (name, command) = match ui::TILES.get(i) {
+                        Some(t) => (t.name, t.command),
+                        None => ("wifi", ui::WIFI_COMMAND),
+                    };
+                    println!("home: opening {}", name);
+                    let answer = violet::sys(command);
                     if answer != "ok" {
-                        println!("home: {} -> {}", t.command, answer);
+                        println!("home: {} -> {}", command, answer);
                     }
                 }
             }
@@ -143,10 +159,10 @@ fn main() {
         }
         if last_status.elapsed() > Duration::from_secs(2) {
             last_status = Instant::now();
-            let (b, v, p, r, sh) = (s.battery, s.volume, s.phones, s.running.clone(), s.shield.clone());
+            let (b, v, p, r, sh, w) = (s.battery, s.volume, s.phones, s.running.clone(), s.shield.clone(), s.wifi.clone());
             status(&mut s);
             let minute = glance.as_ref().and_then(|g| g.now()).map(|t| t.minute);
-            if minute != shown_minute || (b, v, p) != (s.battery, s.volume, s.phones) || r != s.running || sh != s.shield {
+            if minute != shown_minute || (b, v, p) != (s.battery, s.volume, s.phones) || r != s.running || sh != s.shield || w != s.wifi {
                 shown_minute = minute;
                 draw(&mut c, &mut s, &glance, &mut screen);
             }
@@ -165,7 +181,7 @@ mod preview {
         let s = super::ui::State {
             now: g.now(), online: true, battery: 82, volume: 8, phones: false, temp: g.temp.clone(), sky: g.sky.clone(),
             city: g.city.clone(), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
-            shield: Default::default(),
+            shield: Default::default(), wifi: "LouieDog".into(),
         };
         let mut c = violet::Canvas::new(violet::W, violet::H);
         super::ui::draw(&mut c, &violet::Fonts::load(), &s);

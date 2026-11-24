@@ -6,6 +6,7 @@ description = "The /dev/violet devices, drawing, text and HTTPS for VioletOS ope
 
 [dependencies]
 libc = "0.2"
+ring = "0.17"
 fontdue = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
