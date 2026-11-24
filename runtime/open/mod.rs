@@ -561,7 +561,11 @@ impl Runtime {
                 handled += 1;
             }
             let now = sys::now_ns();
-            if now.wrapping_sub(self.last_poll) >= 4_000_000 {
+            // Poll Runtime often while an app runs or the app list is on screen;
+            // otherwise rarely, so an idle Open Runtime costs the other processes little.
+            let busy = self.focused || self.apps.iter().any(|a| a.is_some());
+            let interval = if busy { 4_000_000 } else { 50_000_000 };
+            if now.wrapping_sub(self.last_poll) >= interval {
                 self.last_poll = now;
                 self.poll_runtime();
             }
