@@ -59,6 +59,8 @@ extern "C" {
     pub fn ticks() -> u32;
     pub static ticks_per_ms: u32;
     pub fn delay_ms(ms: u32);
+    /// Radio only: run above every other thread (1) or as before (0); see transport.c.
+    pub fn hold_cpu(on: u32);
 }
 pub const SERVER: u32 = 1;
 pub const LAUNCHER: u32 = 1;

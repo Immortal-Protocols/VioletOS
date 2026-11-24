@@ -56,5 +56,13 @@ void delay_ms(unsigned ms) {
     seL4_Yield();
 }
 
+/* Radio's WMT handshake polls the connectivity chip's UART, which has a small
+   FIFO and no flow control: a thread that preempts Radio mid-exchange (the
+   Open Runtime wakes at priority 150) makes it lose bytes. Radio holds the
+   CPU above it while the exchange runs, then returns to 100. Slot 12 is
+   Radio's own TCB (supervisor.c); no other process calls this. */
+enum { SELF_TCB_SLOT = 12 };
+void hold_cpu(unsigned on) { seL4_TCB_SetPriority(SELF_TCB_SLOT, SELF_TCB_SLOT, on ? 160 : 100); }
+
 void worker_signal(unsigned cap) { seL4_Signal(cap); }
 void worker_wait(unsigned cap) { seL4_Wait(cap, 0); }

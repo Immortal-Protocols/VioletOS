@@ -864,6 +864,10 @@ static void wire(void) {
   check(seL4_ARM_Page_Map(spm_copy, procs[RADIO].task.pd, 0x09000000,
                           seL4_CanRead, seL4_ARM_ExecuteNever));
   grant(&procs[RADIO].task, 7, life, RADIO, false);
+  // Radio's own thread, allowed up to 160, for its WMT handshake (transport.c, hold_cpu).
+  check(seL4_TCB_SetMCPriority(procs[RADIO].task.thread, seL4_CapInitThreadTCB, 160));
+  check(seL4_CNode_Copy(procs[RADIO].task.caps, 12, CAP_BITS, seL4_CapInitThreadCNode,
+                        procs[RADIO].task.thread, 32, seL4_AllRights));
   board_device(TOUCH, 0x10007000, 0x09005000, 0x09703000);
   device(POWER, 0x1000d000, 0x09000000, 12);
   if (procs[AUDIO].package) {
