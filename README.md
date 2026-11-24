@@ -1,6 +1,9 @@
 # VioletOS
 
-VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and QEMU. The Rust stopwatch and touch driver have been tested on the Moto and in QEMU. On the phone, tapping **Stopwatch → Start** exercises the panel, touch controller, driver and UI. On the Mac, the emulator shows the pixels drawn by the guest and sends mouse clicks back through its touch driver.
+VioletOS is a smartphone operating system built on the seL4 microkernel. It runs on the Moto G Pure (XT2163DL) and in QEMU on a Mac, with no Linux kernel anywhere. Drivers and services are separate seL4 processes, mostly written in Rust. Apps come in two kinds:
+
+- **Built-in apps** (Home, Stopwatch, Wi-Fi Setup, Sounds, Weather) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
+- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -8,104 +11,189 @@ VioletOS is a seL4 smartphone operating system for the Moto G Pure XT2163DL and 
 
 | Command | What you get |
 | --- | --- |
-| `make emulator` | A clickable seL4 window. Open **Stopwatch**, click **Start**, then try **Pause** and **Reset**. Close the window or press Escape to quit. |
+| `make emulator` | A clickable seL4 window. Home lists the built-in apps; **/APPS** opens the open apps. **Sounds** plays through the Mac's speakers and records from its microphone; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering stopwatch behavior, touch transfer failures, recovery and watchdog handling. The tests read the guest's rendered pixels. |
 | `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
-| `make test-apps` | Installs a separately built fourth app, reads its file after reboot, uninstalls it, and recovers from a stalled service update. |
+| `make test-apps` | Installs a separately built app, reads its file after reboot, uninstalls it, and recovers from a stalled service update. |
+| `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
+| `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
+| `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
+| `make test-wifi-live` | Validates the certificate in the guest and reads a live UUID from a public HTTPS endpoint. |
 | `make test-power` | Verifies guest-driven VM pause, resume and shutdown. |
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds app, then checks the PCM, the recording and the on-screen volume. |
 | `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. |
-| `make test-wifi-live` | Validates the certificate in the guest and reads the live UUID from the framebuffer. |
-| `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
-| `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
-| `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
-| `make moto-debug` | Read handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
-| `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally. Installing it is a separate operation. |
+| `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
+| `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
 
-On an Apple Silicon Mac, install the Xcode command-line tools, Python 3, and the Homebrew packages below. The simulator needs only the host C toolchain, Make and SDL2.
+### Prerequisites
+
+On an Apple Silicon Mac, install the Xcode command-line tools, Python 3 and these Homebrew packages. The native simulator needs only the host C toolchain, Make and SDL2.
 
 ```sh
 brew install qemu sdl2 cmake ninja dtc
 ```
 
-For either seL4 target, install the [Rust toolchain](#rust-toolchain) and Android NDK **28.2.13676358** for its ARM cross-compiler. The build looks under `~/Library/Android/sdk/ndk/28.2.13676358`. Set `ANDROID_NDK_HOME` if it lives elsewhere. The first build downloads pinned seL4, libfdt and QEMU radio TLS sources, checks their SHA-256 hashes and installs the Python build dependencies in a local virtual environment. QEMU can build and run without a handset or factory files. The interactive launcher has been tested on this Mac.
+Both seL4 targets need Rust 1.91.1 with the `armv7a-none-eabi` target and Android NDK **28.2.13676358** for its ARM cross-compiler. The build looks under `~/Library/Android/sdk/ndk/28.2.13676358`; set `ANDROID_NDK_HOME` if it lives elsewhere. Put `rustc` on PATH (or set `RUSTC`). The first build downloads pinned seL4, libfdt and TLS sources, checks their SHA-256 hashes and installs the Python build dependencies in a local virtual environment. QEMU builds and runs without a handset or factory files.
 
-## Continuous integration
+The open apps in [`apps/open`](apps/open) need their own toolchains. Each is optional: a program whose toolchain is missing is left out of the image, and `make test-open` reports it as skipped.
 
-[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the seL4 image and tests the stopwatch logic. The macOS job compiles the SDL simulator, emulator viewer and both USB clients, then runs the headless QEMU suites for touch, isolation, storage, app lifecycle, updates, Wi-Fi and power.
+| For | Install |
+| --- | --- |
+| Rust `std` programs | `rustup target add armv7-unknown-linux-musleabihf` |
+| Go programs | `brew install go` |
+| C programs | `python3 tools/build_python.py musl` (builds a musl sysroot with the NDK's clang) |
+| `/bin/python3` | `brew install python@3.12`, then `python3 tools/build_python.py python` (cross-builds CPython 3.12 with zlib) |
 
-The Moto image and Moto supervisor tests require local factory files. Physical USB and Wi-Fi tests run on the handset. The public HTTPS endpoint test is available separately as `make test-wifi-live`.
+## Architecture
 
-## How the layers fit together
+![The open VioletOS stack: apps and the Open Runtime above Rust services, all on seL4, on QEMU and the Moto G Pure.](docs/open-violetos-app-stack.png)
 
-The layer cake shows the services above seL4 and the three environments below. USB Diagnostics runs on the Moto and serves developer tools connected from a Mac.
+From the bottom up:
 
-![Proposed architecture with the shared UI above Rust services and Microkit and seL4, followed by the Mac simulator, QEMU and Moto G Pure targets.](docs/proposed-violetos-stack.png)
+1. **seL4 kernel** ([kernel/sel4](kernel/sel4/README.md)). A pinned upstream seL4 for AArch32, built per target with the [board configuration](platform/sel4/board/). The [loader](boot/loader/README.md) checks the handset's live memory map, stages the kernel and first task, and enters seL4.
+2. **Supervisor** ([system/supervisor](system/supervisor/README.md)). The first task. It reads the package catalog, builds every process's address space and capabilities, maps each device into exactly one process, starts everything, and restarts the group or rolls back to the previous catalog after a fault or stall. The [package manager](system/package-manager/README.md) installs and removes components.
+3. **Services**, one process per device or function. Only the service that owns a device can touch it.
+4. **Two app interfaces.** [Runtime](runtime/README.md) gives built-in apps Subscribe, Get and Execute operations over a 14-word IPC message, decides which app is in front, and routes requests to services through worker threads. The [Open Runtime](runtime/open/README.md) gives open apps the Linux ARM system call interface plus `/dev/violet/{screen,events,sys,audio}`, and is itself one of Runtime's clients.
+5. **Apps.** Built-in apps draw into a private 240 × 400 surface that Display scales to the screen. Open apps `mmap` a full 720 × 1600 buffer.
 
-**What runs today.** In QEMU, the launcher, stopwatch, Wi-Fi Setup, Runtime, touch, display, storage, radio, power, audio and catalog manager are separate seL4 processes. Tap **/APPS** on Home for open apps: unmodified Rust, C, Go and Python programs that run under the [Open Runtime](runtime/open/README.md). In `make emulator`, **Sounds** plays through the Mac's speakers and records from its microphone; the arrow keys are the volume buttons and **H** plugs in headphones. The supervisor starts them from packages and grants their memory and communication rights. The Moto has run the shared launcher, Runtime and stopwatch with physical touch, including switching Home and reopening a running timer. The handset has also persisted stopwatch data across a reboot and fetched a UUID over Wi-Fi. The Mac simulator runs its native SDL UI.
+USB Diagnostics runs only on the handset and serves developer tools on a connected Mac. The [iPhone companion](companion/ios/README.md) relays the handset's traffic over cellular data (Phone Internet).
 
-Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. Choose a virtual access point with **Next Network**. The guest checks the gateway, verifies the HTTPS certificate, and prints the UUID. The Mac relays TCP bytes. [Wi-Fi Setup](apps/wifi/README.md)
+### Components
 
-In QEMU, start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance. Reopening it restores the last saved checkpoint. On Home, **Radio** toggles the virtual modem and **Sleep** pauses QEMU until the next tap. **Apps → Off → Confirm** shuts the VM down. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
+Each component is a package in the [catalog](image/catalog/components.json); its number is also its identity to the supervisor.
 
-## Proposed components and interfaces
+| ID | Component | Role |
+| --- | --- | --- |
+| 1 | [Launcher](apps/launcher/README.md) | Home: status, app list, Wi-Fi or Phone Internet, sleep, the **/APPS** button. |
+| 2 | [Stopwatch](apps/stopwatch/README.md) | The first app; keeps its time across reboots. |
+| 3 | [Runtime](runtime/README.md) | The built-in app interface, focus and routing. |
+| 4 | [Touch](services/touch/README.md) | Novatek touch controller over SPI. |
+| 5 | [Display](services/display/README.md) | Presents built-in apps' surfaces to the screen. The Open Runtime draws there itself while an open app is in front. |
+| 6 | [Storage](services/storage/README.md) | Checkpoints, per-app files and the package catalog on disk (virtio in QEMU, eMMC on the handset). |
+| 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets. |
+| 8 | [Power](services/power/README.md) | Battery, sleep and shutdown; brokers the PMIC for Audio. |
+| 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
+| 10 | [Wi-Fi Setup](apps/wifi/README.md) | Chooses a network and tests the connection. |
+| 11, 12 | Library apps | Free slots for separately installed apps. |
+| 13 | [Sounds](apps/sounds/process.rs) | Volume, built-in sounds, tones and microphone recording. |
+| 14 | [Weather](apps/weather/process.rs) | Current conditions for twenty cities from wttr.in over HTTPS, fetched by Radio. |
+| 15–20 | Runtime workers | Runtime's per-service request threads. |
+| 21 | [USB Diagnostics](services/usb-diagnostics/README.md) | Handset only: status, package staging, flashing and test requests from the Mac. |
+| 22 | [Audio](services/audio/README.md) | Speaker, headphones, jack, volume buttons, microphone, and open apps' PCM. |
+| 24 | [Open Runtime](runtime/open/README.md) | Runs Linux ARM programs from `/apps`. |
 
-These three design-review slides describe the planned architecture. The component READMEs below identify current implementations and proposed behavior.
+Slot 23 is reserved for a Bluetooth service.
 
-![Proposed VioletOS processes, services, kernel, boot and recovery components across the three environments.](docs/violetos-complete-lifecycle-stack.png)
+### What runs today
 
-![Component directories, the Moto USB Diagnostics process and the Mac diagnostic tools.](docs/violetos-folders-layer-cake.png)
+| | QEMU on a Mac | Moto G Pure |
+| --- | --- | --- |
+| Boot, supervisor, recovery and rollback | Yes | Yes, from slot B, with Android kept on slot A |
+| Touch and display | Mouse clicks become touch reports | Novatek touch on either DJN panel |
+| Storage | Virtual disks | eMMC volume inside boot B; stopwatch time survives reboot |
+| Wi-Fi | Virtual access points; HTTPS through the Mac | WPA2-Personal, provisioned per boot over USB; HTTPS UUID and Weather |
+| Phone Internet | — | Hosts a Wi-Fi network for the iPhone relay; traffic leaves over cellular |
+| Audio | Mac speakers and microphone | Speaker, headphones, jack, Volume Down and microphone (Volume Up not yet) |
+| Open apps | Rust, C, Go and Python, with screen, touch, audio and TCP | Rust, C, Go and Python; PCM audio; TCP over Wi-Fi |
 
-![Proposed Subscribe, Get and Execute operations and independent component update rules.](docs/violetos-runtime-contract-updates.png)
+On the handset, apps are started from Home by touch, or from the Mac over USB (for example `build/moto-package open-run=/apps/hello` and `build/moto-package open-log`).
 
-- **Image and apps** — [App packages](image/packages/README.md), [Built-in app catalog](image/catalog/README.md), [Launcher](apps/launcher/README.md), [Stopwatch](apps/stopwatch/README.md).
-- **Runtime and services** — [Runtime](runtime/README.md), [Open Runtime](runtime/open/README.md), [Touch service](services/touch/README.md), [Display service](services/display/README.md), [Storage service](services/storage/README.md), [Radio service](services/radio/README.md), [Power service](services/power/README.md), [Audio service](services/audio/README.md), [USB Diagnostics](services/usb-diagnostics/README.md).
-- **Kernel, boot and recovery** — [seL4 kernel](kernel/sel4/README.md), [Bootloader](boot/loader/README.md), [Process supervisor](system/supervisor/README.md), [Package manager](system/package-manager/README.md).
-- **Targets** — [Mac simulator](targets/mac-simulator/README.md), [QEMU emulator](targets/qemu/README.md), [Moto G Pure](targets/moto-g-pure/README.md).
+## Code organization
+
+```
+apps/                 Built-in apps (no_std Rust) and open apps
+  launcher/ stopwatch/ wifi/ sounds/ weather/   one process.rs each; drawing.rs is shared
+  open/               Linux programs for /apps, one folder each (main.rs, main.go, main.c or a script)
+  examples/           Sketches from the open app model RFC
+runtime/              Runtime: protocol.rs (wire format and keys), process.rs, lanes.rs (workers), sdk.rs (app side)
+  open/               Open Runtime: syscalls, devices, sockets, file system, memory pool
+services/             One folder per service: touch, display, storage, radio, power, audio, usb-diagnostics
+system/
+  supervisor/         The first task (supervisor.c) and the open apps' process manager (procmgr.rs)
+  package-manager/    Catalog transactions on the device and manage.py on the Mac
+image/                Component catalog and the package format and builder
+kernel/sel4/          seL4 download, patches and build
+platform/sel4/        Board configuration, shared headers, the loader and image build
+boot/loader/          The loader that runs before seL4
+targets/
+  qemu/               QEMU backends (audio, power, touch fixture) and the QEMU test suites
+  moto-g-pure/        Handset backends: Wi-Fi driver, lwIP and WPA2, audio, eMMC, power; handset tests
+  mac-simulator/      The native SDL simulator
+tools/                Build and run on the Mac: run.py, the emulator viewer, image builders, network and USB helpers
+companion/ios/        Violet Relay, the iPhone app for Phone Internet
+docs/                 Architecture slides, the open app model RFC and the relay plan
+spikes/               Earlier experiments and the handset bring-up log
+src/, include/        The native simulator's UI, the bitmap font and shared headers
+```
+
+Code that differs between QEMU and the handset lives under `targets/` behind a common interface. For example, Audio builds [services/audio/process.rs](services/audio/process.rs) with either [targets/qemu/audio.rs](targets/qemu/audio.rs) or [targets/moto-g-pure/audio.rs](targets/moto-g-pure/audio.rs).
 
 ## Where to change the code
 
 | If you want to change… | Start here | Where it runs |
 | --- | --- | --- |
-| A button, stopwatch timing or framebuffer drawing | [Shared stopwatch app](apps/stopwatch/process.rs) draws the screen on both targets. [stopwatch.rs](apps/stopwatch/state.rs) owns the state transitions. The renderer uses the [bitmap font](src/glyphs.h). | Moto and QEMU userspace |
-| How the first task obtains device mappings | [Shared supervisor](system/supervisor/supervisor.c), [Moto register map](targets/moto-g-pure/spi_mmio.c) and [platform.h](platform/sel4/include/platform.h) | Moto and QEMU userspace |
-| How a touch becomes a tap | [touch.rs](services/touch/touch.rs) initializes the Novatek controller and decodes contacts. [spi.rs](services/touch/spi.rs) drives each transfer. [spi_mmio.c](targets/moto-g-pure/spi_mmio.c) accesses real registers, while [fixture.c](targets/qemu/fixture.c) models them. | Shared driver with one backend per target |
-| How touch events cross address spaces | [events.c](services/touch/events.c) handles the request and reply. The supervisor grants Runtime access to the QEMU touch endpoint. | Moto and QEMU |
-| Durable stopwatch checkpoints | [storage.rs](services/storage/storage.rs) handles load and save requests, [journal.rs](services/storage/journal.rs) selects the latest valid record, and [block.rs](services/storage/block.rs) drives the virtual disk. | QEMU storage task |
-| Watchdog behavior | [watchdog.c](platform/sel4/board/watchdog.c) | Moto and QEMU userspace |
-| Where seL4 comes from and how it boots | [Kernel build](kernel/sel4/build.py) pins and fetches upstream seL4, applies the [board configuration](platform/sel4/board/) and builds a kernel per target. The [loader](boot/loader/) prepares memory and transfers control to the kernel. | Build host and early ARM boot |
-| The Moto image layout | [loader/build.py](platform/sel4/loader/build.py) links the payload. [phone_image.py](tools/phone_image.py) reads and packages the Android v2 boot format. | Build host |
-| How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU. [viewer.c](tools/emulator/viewer.c) displays its 720 × 1600 framebuffer and translates mouse events into touch reports. [test_guest.py](targets/qemu/test_guest.py) checks the driver and rendered output. | Mac host |
-| The native simulator | [screen.c](src/screen.c) owns its UI and state. [simulator.c](targets/mac-simulator/simulator.c) supplies SDL input, display and time. | Native host process |
+| A built-in app's screen or behavior | Its `process.rs` under [apps/](apps/), drawing with [drawing.rs](apps/drawing.rs) and the [bitmap font](src/glyphs.h). The stopwatch's state machine is [state.rs](apps/stopwatch/state.rs). | Moto and QEMU |
+| What built-in apps can ask for | [protocol.rs](runtime/protocol.rs) defines the keys; [process.rs](runtime/process.rs) decides who may use them and routes them. | Moto and QEMU |
+| Which Linux calls open apps get | [syscall.rs](runtime/open/syscall.rs), with [sockets.rs](runtime/open/sockets.rs), [device.rs](runtime/open/device.rs) for `/dev/violet` and the app list, and [fs.rs](runtime/open/fs.rs) for files. | Moto and QEMU |
+| How open apps are loaded and paged | [procmgr.rs](system/supervisor/procmgr.rs) and [pool.rs](runtime/open/pool.rs). | Moto and QEMU |
+| What goes into `/apps` | [build_initfs.py](tools/build_initfs.py); Python itself comes from [build_python.py](tools/build_python.py). | Build host |
+| Which process gets which device, memory or endpoint | [supervisor.c](system/supervisor/supervisor.c) and [platform.h](platform/sel4/include/platform.h). | Moto and QEMU |
+| How a touch becomes a tap | [touch.rs](services/touch/touch.rs) and [spi.rs](services/touch/spi.rs); [spi_mmio.c](targets/moto-g-pure/spi_mmio.c) accesses real registers, [fixture.c](targets/qemu/fixture.c) models them, and [events.c](services/touch/events.c) carries events to Runtime. | Shared driver, one backend per target |
+| Durable app data | [storage.rs](services/storage/storage.rs), [files.rs](services/storage/files.rs), [journal.rs](services/storage/journal.rs); [block.rs](services/storage/block.rs) (virtio) or [emmc.rs](targets/moto-g-pure/emmc.rs). | Moto and QEMU |
+| Wi-Fi, TCP and TLS on the handset | [radio.rs](targets/moto-g-pure/radio.rs) (Radio's event loop), [wlan_axi.rs](targets/moto-g-pure/wlan_axi.rs) (the chip), [wpa.rs](targets/moto-g-pure/wpa.rs), and lwIP glue in [ip/](targets/moto-g-pure/ip/) ([sockets.c](targets/moto-g-pure/ip/sockets.c) serves open apps). | Moto |
+| Networking in QEMU | [services/radio](services/radio/README.md) with the Mac-side [emulator_endpoint.py](tools/emulator_endpoint.py) and, for open apps' sockets, [net_relay.py](tools/net_relay.py). | QEMU and the Mac |
+| Sound and the microphone | [services/audio](services/audio/README.md) and the board backend under `targets/`. | Moto and QEMU |
+| Watchdog behavior | [watchdog.c](platform/sel4/board/watchdog.c) | Moto and QEMU |
+| Where seL4 comes from and how it boots | [kernel/sel4/build.py](kernel/sel4/build.py), the [board configuration](platform/sel4/board/) and the [loader](boot/loader/). | Build host and early ARM boot |
+| The handset image layout | [loader/build.py](platform/sel4/loader/build.py) links the payload; [phone_image.py](tools/phone_image.py) writes the Android v2 boot format, with the `/apps` image as its ramdisk. | Build host |
+| How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU and the Mac-side helpers; [viewer.c](tools/emulator/viewer.c) shows the 720 × 1600 framebuffer, plays and records sound, and turns mouse events into touch reports. | Mac |
+| The native simulator | [screen.c](src/screen.c) and [simulator.c](targets/mac-simulator/simulator.c). | Native host process |
 
-For example, change the **Start** label in `apps/stopwatch/process.rs` to update both seL4 targets. Change `spi_mmio.c` and only the Moto build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
+For example, change the **Start** label in `apps/stopwatch/process.rs` to update both seL4 targets. Change `spi_mmio.c` and only the handset build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
 
-## Try persistence in QEMU
+## Try it in QEMU
 
-Open **Stopwatch → Start → Pause** and note the displayed time. Close the emulator, run `make emulator` again, and open **Stopwatch**. The paused time returns. **Reset** saves zero. Closing while the timer runs restores the last saved checkpoint on the next boot.
+Start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance; reopening it restores the last saved checkpoint. **Radio** toggles the virtual modem, **Sleep** pauses QEMU until the next tap, and **Apps → Off → Confirm** shuts the VM down. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
 
-QEMU uses a dedicated 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest allocates two alternating 512-byte sectors per app. Each holds a version marker, generation number, elapsed tenths and CRC. The storage service acknowledges a save after the device flush completes. On startup it chooses the newest valid record. The screen shows **DISK READY** when the service is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails.
+Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint, or **Weather** for a city's current conditions. The guest verifies the certificate; the Mac only relays TCP bytes.
 
-Runtime identifies the requesting app and selects its private checkpoint. The stopwatch saves elapsed time and the launcher saves its radio preference. Apps can also use named files in a private directory. A separate 4 MiB package disk holds the installed catalog and rollback copy. The Moto build uses the same file and checkpoint code with an MSDC0 block driver. See the [handset storage layout and validation steps](targets/moto-g-pure/README.md#handset-storage). The isolation tests cover CPU access to the mapped regions. The QEMU block driver is trusted to program DMA addresses correctly.
+Tap **/APPS** for the open apps. `hello`, `chello`, `gohello` and `pyhello` print to the Open Runtime's log; `canvas` and `pypaint` draw and answer taps; `pytone` plays a chord; `pynet` and `gonet` fetch a web page.
 
-## Handset build and validation
+### Persistence
 
-The supported handset is **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2**. Units with either DJN NT36525B panel revision (`djn_nt36525b_a` or `djn_nt36525b`) are supported: the loader reads the panel the bootloader lit, and touch uploads the matching firmware. Supply the stock boot image and both panel firmware files below. Next to the stock boot image, create a `wifi/` folder containing the files listed in the [radio firmware manifest](targets/moto-g-pure/wifi_firmware.py), copied from the factory vendor image’s firmware directory. The build verifies each input against its pinned SHA-256 digest.
+Open **Stopwatch → Start → Pause** and note the time. Close the emulator, run `make emulator` again, and open **Stopwatch**: the paused time returns. **Reset** saves zero. Closing while the timer runs restores the last saved checkpoint on the next boot.
+
+QEMU uses a 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest keeps two alternating 512-byte sectors per app, each with a version marker, generation number, value and CRC. Storage acknowledges a save after the device flush completes and, on startup, chooses the newest valid record. The screen shows **DISK READY** when storage is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails. Runtime selects each app's private checkpoint and private files. A separate 4 MiB package disk holds the installed catalog and its rollback copy. The handset uses the same code with an MSDC0 block driver; see the [handset storage layout](targets/moto-g-pure/README.md#handset-storage). Open apps' writes stay in memory for now.
+
+## Handset
+
+The supported handset is the **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2**, on either DJN NT36525B panel revision: the loader reads which panel the bootloader lit, and Touch loads the matching firmware. Supply the stock boot image and both panel firmware files. Next to the stock boot image, create a `wifi/` folder with the files listed in the [radio firmware manifest](targets/moto-g-pure/wifi_firmware.py), copied from the factory vendor image's firmware directory. The build checks each input against its pinned SHA-256 digest.
 
 ```sh
 export VIOLET_STOCK_BOOT=/path/to/exact-factory/boot.img
 export VIOLET_TOUCH_FW=/path/to/djn_nt36525b_a_novatek_ts_fw.bin
 make moto
-shasum -a 256 build/sel4/moto/boot.img
 ```
 
-The previous single-task handset baseline has SHA-256 `19377b26ea4c304b612599baf7d09ad9a19cc7371e8432a2dddb98a8bc44188d`. On the unlocked test handset, the baseline image booted from slot B, displayed **TOUCH READY** and accepted taps to open and start the stopwatch. Android occupied slot A. QEMU exercises the same touch protocol with synthetic firmware and modeled registers. Physical panel initialization, electrical behavior and bootloader slot selection still require a handset.
+VioletOS boots from slot B and leaves Android on slot A. With USB connected, `services/usb-diagnostics/host/moto-flash build/sel4/moto/boot.img` reaches fastboot without touching the phone, flashes slot B and waits for VioletOS to answer. The boot image carries the loader, seL4, the first task and its catalog, the Wi-Fi firmware and, in place of Android's ramdisk, the compressed `/apps` image. A 1 MiB storage volume and the catalog banks follow it in the partition.
 
-In one slot B trial, the Rust handset image displayed **TOUCH READY** and **RAM ONLY**. Physical taps opened the stopwatch, started it, paused it and reset it to zero. The storage candidate adds a marked 1 MiB volume inside boot B. Wi-Fi and power management are also planned. The [Rust isolation experiment](spikes/sel4-isolation/) explores separating services. The [handset bring-up log](spikes/sel4-ellis/) records the hardware trials. The [original architecture deck](docs/VioletOS-architecture.pdf) documents the earlier Linux prototype.
+Useful tools on the Mac:
 
-### Rust toolchain
+- `build/moto-debug` prints a status snapshot; `build/moto-package` stages packages, reboots, plays sounds, reads the Open Runtime's log and starts open apps. See [USB Diagnostics](services/usb-diagnostics/README.md).
+- `services/usb-diagnostics/host/moto-wifi-profile` provisions a WPA2 network for the current boot (it asks for the password privately), then `build/moto-package join-wifi` joins it and fetches a UUID over HTTPS.
+- `services/usb-diagnostics/host/moto-relay` hosts the Phone Internet network for [Violet Relay](companion/ios/README.md) on an iPhone.
 
-The stopwatch state machine builds with Rust 1.91.1 and the `armv7a-none-eabi` target. Install the target with `rustup target add armv7a-none-eabi` and put `rustc` on PATH (or set `RUSTC`). Run its host tests with `rustc --edition=2021 --test apps/stopwatch/state.rs -o build/state-tests && build/state-tests`.
+The [handset README](targets/moto-g-pure/README.md) records the bring-up and each validation. The [handset bring-up log](spikes/sel4-ellis/) covers the first trials, and the [original architecture deck](docs/VioletOS-architecture.pdf) the earlier Linux prototype.
 
-On the development Mac a single warm QEMU image build took 0.98 s before this port and 1.50 s afterward. The QEMU payload grew from 239,912 to 240,488 bytes. Android boot-image padding kept the Moto package at 12,109,824 bytes. These measurements concern the state-machine port alone.
+## Continuous integration
+
+[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the QEMU image and runs the stopwatch's unit tests. The macOS job builds the simulator, emulator viewer and USB clients, the musl sysroot and the Rust and Go open apps, then runs the QEMU suites for touch, storage, isolation, app lifecycle, updates, Wi-Fi, power, audio and open apps. CI does not build Python, so `make test-open` skips the Python apps there.
+
+The handset image and handset tests need the factory files and run locally. The public HTTPS endpoint test is separate: `make test-wifi-live`.
+
+## Design documents
+
+- [Open app model RFC](docs/open-app-model-rfc.md), with its implementation status.
+- [Cellular relay plan](docs/cellular-relay-plan.md) for Phone Internet.
+- The original design-review slides: [complete lifecycle stack](docs/violetos-complete-lifecycle-stack.png), [folders and layers](docs/violetos-folders-layer-cake.png), [Runtime contract and updates](docs/violetos-runtime-contract-updates.png) and the [earlier proposed stack](docs/proposed-violetos-stack.png).
