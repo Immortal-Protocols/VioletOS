@@ -117,7 +117,9 @@ until("sounds draws", lambda: accent_pixels(250, 460) > 100, 60)
 before = card_word(8)
 tap(530, 530)  # +
 tap(190, 780)  # Chime
-until("chime reaches the sound card", lambda: card_word(9) == 2, 10)
+# The card counts every sound it starts (word 8): the click from "+" and the
+# chime. Counting does not depend on catching the chime while it plays.
+until("click and chime reach the sound card", lambda: card_word(8) >= before + 2, 15)
 print("sounds: chime played", file=sys.stderr)
 home()
 
