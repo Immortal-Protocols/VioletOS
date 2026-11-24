@@ -8,6 +8,15 @@ use crate::{
 const SLOTS: usize = 4;
 const PAGES: usize = 8;
 const MAX: usize = PAGES * 512;
+/// All open apps share one owner (protocol::region(OPEN_APPS)), so it gets more
+/// files: its first four keep their old place, the rest follow every owner's
+/// fixed slots (sectors 608 to 1112 of the 2048-sector volume).
+const OPEN_APPS: u32 = 7;
+const OPEN_SLOTS: usize = 32;
+const EXTRA: usize = 32 + 8 * SLOTS * 2 * (PAGES + 1);
+fn slots(owner: u32) -> usize {
+    if owner == OPEN_APPS { OPEN_SLOTS } else { SLOTS }
+}
 #[derive(Clone, Copy, Default)]
 struct Entry {
     generation: u32,
@@ -19,6 +28,9 @@ fn u32at(bytes: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(bytes[n..n + 4].try_into().unwrap())
 }
 fn base(owner: u32, slot: usize, bank: usize) -> usize {
+    if slot >= SLOTS {
+        return EXTRA + ((slot - SLOTS) * 2 + bank) * (PAGES + 1);
+    }
     32 + ((owner as usize * SLOTS + slot) * 2 + bank) * (PAGES + 1)
 }
 fn read_entry(d: &mut Disk, sector: usize) -> Result<Option<Entry>, u32> {
@@ -90,8 +102,11 @@ pub fn dispatch(d: &mut Disk, owner: u32, m: Message) -> Result<Message, u32> {
     }
     let mut empty = None;
     let mut found = None;
-    for slot in 0..SLOTS {
+    for slot in 0..slots(owner) {
         let loc = base(owner, slot, 0);
+        if loc + 2 * (PAGES + 1) > d.sectors {
+            break; // a small disk holds fewer files
+        }
         let (bank, e) = current(d, loc)?;
         if m.key == FILE_LIST && slot == m.value as usize {
             let mut r = Message::result(e.len as u32);

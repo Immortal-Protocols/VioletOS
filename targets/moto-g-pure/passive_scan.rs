@@ -30,6 +30,8 @@ pub struct AccessPoint {
     pub rates: [u8; 16],
     pub rate_count: usize,
     pub wpa2_psk_ccmp: bool,
+    /// No security: no RSN or WPA element and the privacy bit clear.
+    pub open: bool,
     pub rsne: [u8; 257],
     pub rsne_len: usize,
 }
@@ -44,6 +46,7 @@ impl Default for AccessPoint {
             rates: [0; 16],
             rate_count: 0,
             wpa2_psk_ccmp: false,
+            open: false,
             rsne: [0; 257],
             rsne_len: 0,
         }
@@ -86,11 +89,14 @@ fn psk_ccmp(rsn: &[u8]) -> Option<bool> {
     Some(ccmp && psk && caps & (1 << 6) == 0)
 }
 
+/// Access points one scan keeps. Busy buildings show dozens.
+pub const MAX_APS: usize = 32;
+
 #[derive(Default)]
 pub struct Results {
     pub preferred_ssid: [u8; 32],
     pub preferred_len: usize,
-    pub aps: [AccessPoint; 8],
+    pub aps: [AccessPoint; MAX_APS],
     pub ap_count: usize,
     pub frames: u32,
     pub name: [u8; 32],
@@ -98,12 +104,23 @@ pub struct Results {
     pub channels: u8,
 }
 impl Results {
+    /// Empty the results in place (they are too large to rebuild on the stack).
+    pub fn clear(&mut self) {
+        self.preferred_ssid = [0; 32];
+        self.preferred_len = 0;
+        self.ap_count = 0;
+        self.frames = 0;
+        self.name = [0; 32];
+        self.name_len = 0;
+        self.channels = 0;
+    }
     pub fn frame(&mut self, frame: &[u8]) {
         if frame.len() < 36 || !matches!(frame[0], 0x80 | 0x50) || frame[1] & 3 != 0 {
             return;
         }
         let mut ap = AccessPoint::default();
         ap.bssid.copy_from_slice(&frame[16..22]);
+        let mut wpa_element = false;
         let mut tags = &frame[36..];
         while !tags.is_empty() {
             let Some(h) = tags.get(..2) else { return };
@@ -128,6 +145,8 @@ impl Results {
                         ap.rate_count += 1;
                     }
                 }
+                // Vendor element: Microsoft's WPA (00-50-f2 type 1).
+                221 if v.starts_with(&[0, 0x50, 0xf2, 1]) => wpa_element = true,
                 3 if len == 1 => ap.channel = v[0],
                 61 if len >= 1 => ap.channel = v[0],
                 48 => {
@@ -143,6 +162,7 @@ impl Results {
             }
             tags = &tags[2 + len..];
         }
+        ap.open = ap.rsne_len == 0 && !wpa_element && frame[34] & 0x10 == 0;
         self.frames = self.frames.saturating_add(1);
         if ap.ssid[..ap.ssid_len].iter().all(|&b| b == 0) {
             return;

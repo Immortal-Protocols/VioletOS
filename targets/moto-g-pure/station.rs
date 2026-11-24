@@ -1,4 +1,5 @@
-//! Infrastructure station management frames for a WPA2-Personal CCMP network.
+//! Infrastructure station management frames for a WPA2-Personal CCMP network
+//! or an open one.
 use super::passive_scan::AccessPoint;
 
 pub const RSN: &[u8] = &[
@@ -15,7 +16,8 @@ pub fn request(ap: &AccessPoint, station: [u8; 6], associate: bool, out: &mut [u
         out[26] = 1; // Open System transaction 1 precedes WPA2 key negotiation.
         return 30;
     }
-    out[24..26].copy_from_slice(&0x11u16.to_le_bytes()); // infrastructure, privacy
+    // Infrastructure, plus privacy for WPA2.
+    out[24..26].copy_from_slice(&(if ap.open { 0x01u16 } else { 0x11 }).to_le_bytes());
     out[26..28].copy_from_slice(&10u16.to_le_bytes());
     let mut pos = 28;
     let mut ie = |tag, data: &[u8]| {
@@ -30,6 +32,9 @@ pub fn request(ap: &AccessPoint, station: [u8; 6], associate: bool, out: &mut [u
     ie(1, &rates[..basic]);
     if rates.len() > basic {
         ie(50, &rates[basic..]);
+    }
+    if ap.open {
+        return pos;
     }
     out[pos..pos + RSN.len()].copy_from_slice(RSN);
     pos + RSN.len()
@@ -119,7 +124,10 @@ pub fn firmware_peer(ap: &AccessPoint, aid: u16) -> ([u8; 116], [u8; 168]) {
     bss[44..46].copy_from_slice(&allowed.to_le_bytes());
     bss[46..48].copy_from_slice(&basic.to_le_bytes());
     bss[50] = basic_rate(ap);
-    bss[52..56].copy_from_slice(&[phy, 7, 6, 1 << phy]);
+    // Basic PHY type, then gen4m's auth mode and encryption status:
+    // WPA2-PSK (7) with AES (6), or open (0) with encryption disabled (1).
+    let (auth, enc) = if ap.open { (0, 1) } else { (7, 6) };
+    bss[52..56].copy_from_slice(&[phy, auth, enc, 1 << phy]);
     bss[58] = 2;
     bss[69..71].copy_from_slice(&[if ap.channel > 14 { 2 } else { 1 }, ap.channel]);
     bss[82] = 1;
@@ -175,12 +183,13 @@ pub fn eapol<'a>(packet: &'a [u8], mac: &[u8; 6], ap: &[u8; 6]) -> Option<&'a [u
     body.get(..4 + len)
 }
 
-pub fn ethernet(packet: &[u8], mac: &[u8; 6], ap: &[u8; 6], out: &mut [u8]) -> Option<usize> {
+/// `open`: the link is an open network, whose frames carry no cipher.
+pub fn ethernet(packet: &[u8], mac: &[u8; 6], ap: &[u8; 6], out: &mut [u8], open: bool) -> Option<usize> {
     if packet.len() < 16
         || packet[3] >> 5 != 2
         || packet[10] & 0xfe != 0
         || packet[11] & 1 != 0
-        || packet[9] >> 4 != 4
+        || (!open && packet[9] >> 4 != 4)
         || !matches!(packet[8], 1 | 2)
         || packet[7] & 3 != 0
     {
@@ -197,7 +206,7 @@ pub fn ethernet(packet: &[u8], mac: &[u8; 6], ap: &[u8; 6], out: &mut [u8]) -> O
     }
     if f.len() < 32
         || f[0] & 0x0f != 8
-        || f[1] & 0x43 != 0x42
+        || f[1] & 0x43 != if open { 0x02 } else { 0x42 }
         || f[10..16] != *ap
         || !target(&f[4..10])
     {

@@ -153,8 +153,13 @@ pub const PROFILE: u32 = 27;
 pub const JOIN_NOT_FOUND: u32 = 49;
 /// No access point with that name answered association.
 pub const JOIN_NO_ANSWER: u32 = 47;
-/// The WPA2 handshake failed: almost always a wrong password.
+/// The access point did not accept our answer in the WPA2 handshake (it
+/// repeated its first message, or the supplicant rejected a frame): usually a
+/// wrong key, but a lost frame looks the same, so a saved key is kept.
 pub const JOIN_AUTH: u32 = 52;
+/// The WPA2 handshake did not finish, but nothing shows the key is wrong (no
+/// answer, or a lost frame). A saved key stays saved.
+pub const JOIN_HANDSHAKE_TIMEOUT: u32 = 57;
 /// Joined, but no address came from DHCP.
 pub const JOIN_NO_ADDRESS: u32 = 53;
 /// No key: neither one in the request nor a provisioned profile.

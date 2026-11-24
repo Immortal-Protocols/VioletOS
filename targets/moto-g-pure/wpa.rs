@@ -125,25 +125,32 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
     }
     radio_io::trace(4, u32::from(rc == 0));
     if rc != 0 {
-        return Err(52);
+        return Err(JOIN_HANDSHAKE_TIMEOUT);
     }
     let start = radio_io::now();
     let mut frame = [0; 1536];
+    // EAPOL frames from the access point. With a wrong key it never sends
+    // message 3: it keeps repeating message 1 after our message 2. Only that
+    // (message 1 at least three times) is reported as JOIN_AUTH, which makes
+    // the Wi-Fi app ask for the password again; silence or one lost frame is
+    // JOIN_HANDSHAKE_TIMEOUT. Neither costs a saved key.
+    let mut received = 0u32;
     let result = (|| {
         while !radio_io::expired(start, 8000) {
             unsafe { station_wpa_poll() };
             let n = axi.receive_eapol(&mut frame)?;
             if n != 0 {
+                received += 1;
                 let result = unsafe { station_wpa_rx(frame.as_ptr(), n) };
                 radio_io::trace(4, 0x10000 | ((result as u32 & 0xff) << 8) | u32::from(frame[6]));
                 match result {
                     1 => return Ok(()),
-                    -1 => return Err(52),
+                    -1 => return Err(JOIN_AUTH),
                     _ => {}
                 }
             }
         }
-        Err(52)
+        Err(if received >= 3 { JOIN_AUTH } else { JOIN_HANDSHAKE_TIMEOUT })
     })();
     if result.is_err() {
         unsafe { station_wpa_close() };
@@ -163,6 +170,7 @@ pub fn leased() -> bool {
 pub unsafe fn close_net() {
     station_net_close();
     LINK_ERROR = false;
+    TX_FAILURES = 0;
 }
 extern "C" {
     fn ap_wpa_start(radio: *mut core::ffi::c_void, aa: *const u8, spa: *const u8, pmk: *const u8) -> i32;
@@ -223,12 +231,23 @@ extern "C" {
 }
 static mut DEVICE: *mut Axi = core::ptr::null_mut();
 static mut LINK_ERROR: bool = false;
+/// Transmit failures in a row. One full TX ring is not a dead link: lwIP
+/// retransmits. Only a run of them (or a deauthentication) ends the link.
+static mut TX_FAILURES: u32 = 0;
+const TX_FAILURE_LIMIT: u32 = 32;
 #[no_mangle]
 unsafe extern "C" fn radio_l2_send(p: *const u8, n: usize) -> i32 {
-    if DEVICE.is_null() || (*DEVICE).send_ip(slice::from_raw_parts(p, n)).is_err() {
-        LINK_ERROR = true;
+    if DEVICE.is_null() {
         return -1;
     }
+    if (*DEVICE).send_ip(slice::from_raw_parts(p, n)).is_err() {
+        TX_FAILURES += 1;
+        if TX_FAILURES >= TX_FAILURE_LIMIT || !(*DEVICE).link_keyed() {
+            LINK_ERROR = true;
+        }
+        return -1;
+    }
+    TX_FAILURES = 0;
     0
 }
 #[no_mangle]
@@ -289,6 +308,7 @@ extern "C" fn radio_unix_time() -> u32 {
 pub unsafe fn join_ip(dev: *mut Axi) -> bool {
     DEVICE = dev;
     LINK_ERROR = false;
+    TX_FAILURES = 0;
     let mac = (*dev).station;
     station_net_join(mac.as_ptr()) != 0 && !LINK_ERROR
 }
@@ -297,6 +317,7 @@ pub unsafe fn close() {
     station_wpa_close();
     DEVICE = core::ptr::null_mut();
     LINK_ERROR = false;
+    TX_FAILURES = 0;
 }
 pub unsafe fn poll() -> bool {
     station_wpa_poll();

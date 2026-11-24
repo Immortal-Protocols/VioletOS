@@ -5,12 +5,14 @@ emulator's three networks (tools/run.py: two open, VIOLET HOME with WPA2).
 Choosing VIOLET HOME asks for its password; a wrong one is refused by Radio,
 the right one ("violet-home", typed on the on-screen keyboard, symbols page
 included) joins it. Then an open network is chosen, which leaves VIOLET HOME
-and joins that one. Second boot on the same disk: VIOLET HOME joins with one
-tap, from the key saved in the app's /data.
+and joins that one. Second boot on the same disk: the runtime rejoins that
+open network by itself (the most recently joined saved network), and VIOLET
+HOME then joins with one tap, from the key saved in the app's /data.
 """
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import os
 import sys
 
@@ -107,11 +109,40 @@ until("scan finds the three networks", lambda: "wifi: found 3 networks" in every
 time.sleep(.5)
 
 if STAGE == "second":
-    if "wifi: ready, 1 saved networks" not in everything():
-        fail("VIOLET HOME's key was not kept in /data")
+    if "wifi: ready, 2 saved networks" not in everything():
+        fail("the joined networks were not kept in /data")
+    # Nobody taps anything: the runtime rejoins the most recently joined saved
+    # network (the open VIOLET LAB) by itself, a few seconds after boot.
+    lab = "VIOLET LAB".encode().hex()
+    until("VIOLET LAB rejoins on its own", lambda: f"wifi: auto-join {lab} result 0" in everything(), 40)
+    print("wifi: VIOLET LAB rejoined by itself after a restart", file=sys.stderr)
+    time.sleep(1.5)  # the app notices and shows the list again
     tap(360, ROW(2))
-    until("VIOLET HOME joins with its saved key", lambda: "wifi: joined VIOLET HOME" in everything(), 20)
+    until("VIOLET HOME joins with its saved key", lambda: "wifi: joined VIOLET HOME" in everything(), 30)
     print("wifi: VIOLET HOME joined with one tap after a restart", file=sys.stderr)
+    time.sleep(1.5)
+    sys.exit(0)
+
+if STAGE == "weak":
+    # VIOLET HOME's handshake now times out (a weak signal): the saved key must
+    # survive the failure, and the app must not ask for the password.
+    if "wifi: ready, 2 saved networks" not in everything():
+        fail("the saved networks were lost before the weak-signal boot")
+    home = "VIOLET HOME".encode().hex()
+    lab = "VIOLET LAB".encode().hex()
+    until("VIOLET HOME (most recent) is tried on its own", lambda: f"wifi: auto-join {home} result 57" in everything(), 40)
+    until("then the next saved network, VIOLET LAB", lambda: f"wifi: auto-join {lab} result 0" in everything(), 20)
+    time.sleep(1.5)
+    tap(360, ROW(2))
+    until("a timeout is reported", lambda: "wifi: joining VIOLET HOME failed (57)" in everything(), 30)
+    time.sleep(1.5)
+    print("wifi: a handshake timeout kept VIOLET HOME's key", file=sys.stderr)
+    sys.exit(0)
+
+if STAGE == "after":
+    if "wifi: ready, 2 saved networks" not in everything():
+        fail("a handshake timeout lost a saved network")
+    print("wifi: both saved networks are still there", file=sys.stderr)
     sys.exit(0)
 
 tap(360, ROW(2))  # VIOLET HOME (WPA2): asks for the password
@@ -146,10 +177,13 @@ with TemporaryDirectory() as tmp:
     for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):
         (image / name).symlink_to(original / name)
     run.IMAGE = image
-    os.environ.pop("VIOLET_NETWORKS", None)
-    for stage in ("first", "second"):
+    for stage in ("first", "second", "weak", "after"):
+        os.environ.pop("VIOLET_NETWORKS", None)
+        if stage == "weak":
+            os.environ["VIOLET_NETWORKS"] = json.dumps(
+                [n if n != run.DEFAULT_NETWORKS[2] else dict(n, stalls=True) for n in run.DEFAULT_NETWORKS])
         os.environ["WIFI_STAGE"] = stage
         status = run.main(str(viewer))
         if status != 0:
             raise SystemExit(f"Wi-Fi app test failed in the {stage} boot (viewer status {status})")
-    print("Wi-Fi app verified: scan, wrong and right WPA2 password, switching networks, saved key after a restart")
+    print("Wi-Fi app verified: scan, wrong and right WPA2 password, switching networks, rejoining by itself, the saved key after a restart and after a handshake timeout")
