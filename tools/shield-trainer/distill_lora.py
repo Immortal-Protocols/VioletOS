@@ -93,10 +93,13 @@ def train_and_export(cfg: TrainConfig, dataset: list[TeacherLabel]) -> tuple[Pat
       3. Merge LoRA (`W' = W + (alpha/r) * B @ A`) and re-export quantized ANE pkg.
     """
     assert len(VERDICTS) == 4 and len(ACTIONS) == 4 and len(THREAT_TAGS) == 8
-    _ = dataset
-    raise NotImplementedError(
-        f"RFC skeleton ({cfg.stage}): export -> {cfg.output_embedder}, {cfg.output_head}"
-    )
+    if cfg.stage != "frozen_head":
+        raise NotImplementedError("Stage 2 (LoRA) is not built yet; see docs/violet-shield-poc.md")
+    # Stage 1 is implemented in train.py (its own generator stands in for `dataset`).
+    import train
+
+    train.main()
+    return train.OUT / "VioletShieldEmbedder.mlpackage", train.OUT / "VioletShieldHead.mlpackage"
 
 
 if __name__ == "__main__":

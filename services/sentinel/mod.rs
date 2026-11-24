@@ -1,125 +1,637 @@
-//! Isolated seL4 `Sentinel` service — VioletOS's tamper-resistant observability
-//! and signed-Shield verification daemon (Shirudo's runtime/attestation analog).
+//! Sentinel: Violet Shield's observability link and signed-Shield verifier
+//! (docs/violet-shield-rfc.md, docs/violet-shield-poc.md).
 //!
-//! Runs in its own seL4 TCB & address space, completely inaccessible to open apps:
-//! - Reads `TelemetryEvent`s from the one-way shared ring written by `OpenRuntime`.
-//! - Buffers events locally in `OfflineEventRing` when the iPhone relay is disconnected.
-//! - Maintains a boot-to-now SHA-256 `MeasurementChain` (Shirudo TPM PCR analog)
-//!   covering the boot catalog, `OpenRuntime`, and every Shield load/unload.
-//! - Connects to `sentinel.violet` on the iPhone companion (or Mac fallback on home Wi-Fi).
-//! - Verifies P-256 ECDSA signatures (`VSH1`) via BearSSL against the paired iPhone
-//!   Secure Enclave public key (reusing `supervisor.c`'s P-256 verifier) before
-//!   installing a Shield into `OpenRuntime`, with automatic trial-and-rollback.
+//! It runs inside the Open Runtime's seL4 process, which apps cannot reach:
+//! they hold no capability to it and their only way in is a trapped system
+//! call. (The RFC puts it in a process of its own; that split is future work.)
+//!
+//! - Drains `TelemetryEvent`s from `ShieldPolicy` and sends them, as
+//!   `violet-log-v1` records, to `sentinel.violet` on the iPhone companion over
+//!   the same TCP path as app traffic (SOCKS5 through the companion). While
+//!   the companion is away it keeps them in a bounded offline ring.
+//! - Keeps a per-boot SHA-256 measurement chain over every program started and
+//!   every Shield loaded or removed, and reports it in heartbeats.
+//! - Verifies `VSH1` envelopes: magic, version, signing tier, TTL bounds,
+//!   anti-replay sequence number, and a P-256 ECDSA signature by the pinned
+//!   companion key (BearSSL, as the supervisor verifies catalogs). Only then
+//!   does it hand the runtime a `Command`.
+use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
-/// Wire magic for signed Violet Shield envelopes (`"VSH1"`).
+#[cfg(not(test))]
+use super::net::{self, Net};
+use super::policy::AppId;
+use super::shield::{EventKind, RuleMatcher, ShieldRule, ShieldVerdict, TelemetryEvent};
+
+extern "C" {
+    fn sentinel_sha256(data: *const u8, len: usize, out: *mut u8);
+    fn sentinel_p256_verify(key: *const u8, hash: *const u8, sig: *const u8, sig_len: usize) -> i32;
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    unsafe { sentinel_sha256(data.as_ptr(), data.len(), out.as_mut_ptr()) };
+    out
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// Wire magic for signed Violet Shield envelopes.
 pub const SHIELD_MAGIC: [u8; 4] = *b"VSH1";
+pub const HEADER_LEN: usize = 32;
+/// The companion endpoint, answered by the iPhone's SOCKS5 relay itself.
+pub const ENDPOINT: &str = "sentinel.violet";
+pub const PORT: u16 = 7000;
+/// Longest containment the companion may sign without the owner.
+pub const MAX_AUTO_TTL_SECS: u32 = 3600;
 
-/// Signing tier distinguishing automated local containment from permanent policies.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SigningTier {
-    /// iPhone companion key: permitted to push observability probes and reversible,
-    /// TTL-bounded containment shields (e.g. max 1 hour `DENY` or `FREEZE_APP`).
+    /// The companion's key: reversible, TTL-bounded containment only.
     CompanionAuto = 1,
-    /// Hardware-gated owner key (iPhone Face ID Secure Enclave or Mac developer key):
-    /// required for permanent rules (`ttl_secs == 0`) or system-wide policies.
+    /// Owner key (Face ID-gated Secure Enclave or the Mac developer key):
+    /// permanent rules. Not provisioned in this proof of concept.
     OwnerConfirmed = 2,
 }
 
-/// Fixed header of a signed Violet Shield pushed over `sentinel.violet`.
-/// Signature covers `magic .. payload_len + payload` using P-256 ECDSA (SHA-256),
-/// matching `br_ecdsa_i31_vrfy_asn1` in `system/supervisor/supervisor.c`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Install = 1,
+    Revoke = 2,
+    Unfreeze = 3,
+    Kill = 4,
+    Freeze = 5,
+}
+
+/// Parsed `VSH1` header (little endian):
+/// `magic[4] version:u16 tier:u8 op:u8 shield_id:u32 seq:u64 ttl_secs:u32
+///  target_pid:u32 payload_len:u16 sig_len:u16`, then the payload, then the
+/// DER signature over everything before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignedShieldHeader {
-    pub magic: [u8; 4],        // "VSH1"
-    pub version: u16,          // 1
-    pub tier: u8,              // SigningTier
-    pub op: u8,                // 1 = install, 2 = revoke, 3 = unfreeze_app, 4 = kill_app
+    pub version: u16,
+    pub tier: u8,
+    pub op: u8,
     pub shield_id: u32,
-    pub seq_no: u64,           // monotonic anti-replay sequence number
-    pub ttl_secs: u32,         // mandatory non-zero cap for CompanionAuto
-    pub payload_len: u32,
-    pub sig_len: u16,          // ASN.1 DER P-256 signature length (<= 72)
-    pub _reserved: u16,
-    pub signature: [u8; 72],
-}
-
-/// Shirudo-style per-boot measurement chain (software PCR analog when no discrete
-/// TPM 2.0 is exposed to seL4 on Moto G Pure).
-///
-/// Extended on boot with the verified catalog digest, and on every Shield load/unload:
-///   `chain_new = SHA256(chain_old || event_tag || digest)`
-#[derive(Clone, Copy, Debug)]
-pub struct MeasurementChain {
-    pub boot_id: [u8; 16],      // random per-boot nonce from hardware/virtio RNG
-    pub seq: u64,               // incremented on every state transition or heartbeat
-    pub chain_digest: [u8; 32], // running SHA-256 PCR value
-    pub active_shield_count: u16,
-}
-
-impl MeasurementChain {
-    pub fn extend(&mut self, _tag: u8, _item_digest: &[u8; 32]) {
-        self.seq = self.seq.wrapping_add(1);
-        // TODO: BearSSL br_sha256_init/update(chain_digest, tag, item_digest)/out.
-    }
-}
-
-/// Signed heartbeat sent periodically over `sentinel.violet` so the iPhone checker
-/// immediately detects silent telemetry loss, shield rollbacks, or unexpected reboots.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct AttestedHeartbeat {
-    pub boot_id: [u8; 16],
-    pub uptime_ms: u64,
-    pub seq: u64,
-    pub chain_digest: [u8; 32],
-    pub dropped_events: u32,
-    pub active_shields: u16,
-    pub frozen_apps: u16,
-}
-
-/// Trial-and-rollback safety guard (mirroring `usb_trial_timeout_ms` in `supervisor.c`).
-/// If a newly installed Shield breaks `Sentinel`'s own heartbeat or triggers a fault
-/// before `confirm_deadline_ms`, `Sentinel` automatically revokes it.
-#[derive(Clone, Copy, Debug)]
-pub struct PendingTrial {
-    pub shield_id: u32,
-    pub confirm_deadline_ms: u64,
-}
-
-/// Core `Sentinel` service interface wired to `OpenRuntime`, `Supervisor`, and `Radio`.
-pub trait SentinelService {
-    /// Drain the one-way ring from `OpenRuntime`, drop local noise, and enqueue
-    /// high-signal transitions into `OfflineEventRing`.
-    fn poll_telemetry_ring(&mut self, now_ms: u64);
-
-    /// Verify P-256 signature, anti-replay `seq_no`, and `SigningTier` TTL bounds,
-    /// extend `MeasurementChain`, and push the rule into `OpenRuntime::ShieldPolicy`.
-    fn verify_and_apply_shield(
-        &mut self,
-        header: &SignedShieldHeader,
-        payload: &[u8],
-        now_ms: u64,
-    ) -> Result<(), SentinelErr>;
-
-    /// Request Supervisor to suspend (`seL4_TCB_Suspend`) or resume an app mid-syscall.
-    fn set_app_frozen(&mut self, app_id: u32, frozen: bool) -> Result<(), SentinelErr>;
-
-    /// Respond to a read-only forensic query from the iPhone checker (e.g., SHA-256
-    /// or bounded snippet of a newly dropped `.py` script, open FD list, or VMA map).
-    fn handle_forensic_query(&mut self, app_id: u32, query_kind: u8) -> Result<usize, SentinelErr>;
-
-    /// Flush buffered events and `AttestedHeartbeat` over `sentinel.violet` when online.
-    fn sync_companion(&mut self, now_ms: u64);
+    pub seq_no: u64,
+    pub ttl_secs: u32,
+    pub target_pid: u32,
+    pub payload_len: u16,
+    pub sig_len: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SentinelErr {
     BadMagic,
+    BadVersion,
+    Truncated,
     BadSignature,
     ReplaySequence,
     TtlRequiredForAutoTier,
+    OwnerKeyNotProvisioned,
+    BadOp,
+    BadRule,
     RuleTableFull,
-    CompanionOffline,
+    NoSuchApp,
+}
+
+impl SentinelErr {
+    pub fn name(self) -> &'static str {
+        match self {
+            SentinelErr::BadMagic => "bad-magic",
+            SentinelErr::BadVersion => "bad-version",
+            SentinelErr::Truncated => "truncated",
+            SentinelErr::BadSignature => "bad-signature",
+            SentinelErr::ReplaySequence => "replayed-sequence",
+            SentinelErr::TtlRequiredForAutoTier => "ttl-out-of-bounds",
+            SentinelErr::OwnerKeyNotProvisioned => "owner-key-not-provisioned",
+            SentinelErr::BadOp => "bad-op",
+            SentinelErr::BadRule => "bad-rule",
+            SentinelErr::RuleTableFull => "rule-table-full",
+            SentinelErr::NoSuchApp => "no-such-app",
+        }
+    }
+}
+
+/// What the runtime must do after a verified Shield.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    Install(ShieldRule),
+    Revoke(u32),
+    Freeze { pid: u32, until_ns: u64, shield_id: u32 },
+    Unfreeze { pid: u32 },
+    Kill { pid: u32, shield_id: u32 },
+}
+
+pub fn parse_header(b: &[u8]) -> Result<SignedShieldHeader, SentinelErr> {
+    if b.len() < HEADER_LEN {
+        return Err(SentinelErr::Truncated);
+    }
+    if b[..4] != SHIELD_MAGIC {
+        return Err(SentinelErr::BadMagic);
+    }
+    let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+    let h = SignedShieldHeader {
+        version: u16_at(4),
+        tier: b[6],
+        op: b[7],
+        shield_id: u32_at(8),
+        seq_no: u64::from_le_bytes(b[12..20].try_into().unwrap()),
+        ttl_secs: u32_at(20),
+        target_pid: u32_at(24),
+        payload_len: u16_at(28),
+        sig_len: u16_at(30),
+    };
+    if h.version != 1 {
+        return Err(SentinelErr::BadVersion);
+    }
+    if b.len() != HEADER_LEN + h.payload_len as usize + h.sig_len as usize || h.sig_len > 72 {
+        return Err(SentinelErr::Truncated);
+    }
+    Ok(h)
+}
+
+/// Rule payload: `matcher:u8 verdict:u8 flags:u8 len:u8 text[len]`.
+/// matcher 1 path prefix (flags bit 0: writes only, bit 1: other apps' folders only), 2 host suffix
+/// (text "host" or "host:port"), 3 W+X memory, 4 binary SHA-256 prefix (hex);
+/// verdict 1 log, 2 deny, 3 freeze, 4 kill.
+pub fn parse_rule(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result<ShieldRule, SentinelErr> {
+    if payload.len() < 4 || payload.len() != 4 + payload[3] as usize {
+        return Err(SentinelErr::BadRule);
+    }
+    let text = core::str::from_utf8(&payload[4..]).map_err(|_| SentinelErr::BadRule)?;
+    let app = if h.target_pid == 0 { None } else { Some(AppId(h.target_pid)) };
+    let id = h.shield_id;
+    let on_match = match payload[1] {
+        1 => ShieldVerdict::LogAlert { shield_id: id },
+        2 => ShieldVerdict::Deny { shield_id: id },
+        3 => ShieldVerdict::FreezeApp { shield_id: id },
+        4 => ShieldVerdict::KillApp { shield_id: id },
+        _ => return Err(SentinelErr::BadRule),
+    };
+    let matcher = match payload[0] {
+        1 if text.starts_with('/') => RuleMatcher::PathPrefix {
+            app,
+            prefix: String::from(text),
+            write_only: payload[2] & 1 != 0,
+            cross_app_only: payload[2] & 2 != 0,
+        },
+        2 => {
+            let (host, port) = match text.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().map_err(|_| SentinelErr::BadRule)?),
+                None => (text, 0),
+            };
+            RuleMatcher::NetTarget { app, host_suffix: String::from(host), port }
+        }
+        3 => RuleMatcher::WriteExecMemory { app },
+        4 if text.len() == 8 => {
+            let mut p = [0u8; 4];
+            for k in 0..4 {
+                p[k] = u8::from_str_radix(&text[2 * k..2 * k + 2], 16).map_err(|_| SentinelErr::BadRule)?;
+            }
+            RuleMatcher::BinaryHash { sha256_prefix: p }
+        }
+        _ => return Err(SentinelErr::BadRule),
+    };
+    let expires_at_ns = if h.ttl_secs == 0 { 0 } else { now_ns + u64::from(h.ttl_secs) * 1_000_000_000 };
+    Ok(ShieldRule { shield_id: id, expires_at_ns, matcher, on_match })
+}
+
+/// Per-boot software PCR: `chain = SHA256(chain || tag || digest)`.
+#[derive(Clone, Copy, Debug)]
+pub struct MeasurementChain {
+    pub boot_id: [u8; 16],
+    pub seq: u64,
+    pub chain_digest: [u8; 32],
+}
+
+pub const MEASURE_BOOT: u8 = 1;
+pub const MEASURE_EXEC: u8 = 2;
+pub const MEASURE_SHIELD_LOAD: u8 = 3;
+pub const MEASURE_SHIELD_UNLOAD: u8 = 4;
+pub const MEASURE_KEY: u8 = 5;
+
+impl MeasurementChain {
+    pub fn new(boot_id: [u8; 16]) -> MeasurementChain {
+        let mut m = MeasurementChain { boot_id, seq: 0, chain_digest: [0; 32] };
+        let id = sha256(&boot_id);
+        m.extend(MEASURE_BOOT, &id);
+        m
+    }
+    pub fn extend(&mut self, tag: u8, item_digest: &[u8; 32]) {
+        let mut buf = [0u8; 65];
+        buf[..32].copy_from_slice(&self.chain_digest);
+        buf[32] = tag;
+        buf[33..].copy_from_slice(item_digest);
+        self.chain_digest = sha256(&buf);
+        self.seq = self.seq.wrapping_add(1);
+    }
+}
+
+/// Verifies `VSH1` envelopes against the pinned key and tracks anti-replay state.
+pub struct Verifier {
+    pub companion_key: [u8; 65],
+    pub last_seq: u64,
+}
+
+impl Verifier {
+    pub fn verify<'a>(&mut self, envelope: &'a [u8]) -> Result<(SignedShieldHeader, &'a [u8]), SentinelErr> {
+        let h = parse_header(envelope)?;
+        let signed_len = HEADER_LEN + h.payload_len as usize;
+        let digest = sha256(&envelope[..signed_len]);
+        let sig = &envelope[signed_len..];
+        let ok = unsafe { sentinel_p256_verify(self.companion_key.as_ptr(), digest.as_ptr(), sig.as_ptr(), sig.len()) };
+        if ok != 1 {
+            return Err(SentinelErr::BadSignature);
+        }
+        match h.tier {
+            t if t == SigningTier::CompanionAuto as u8 => {
+                if h.ttl_secs == 0 || h.ttl_secs > MAX_AUTO_TTL_SECS {
+                    if matches!(h.op, 1 | 5) {
+                        return Err(SentinelErr::TtlRequiredForAutoTier);
+                    }
+                }
+            }
+            // A signature by the companion key never carries owner authority.
+            _ => return Err(SentinelErr::OwnerKeyNotProvisioned),
+        }
+        if h.seq_no <= self.last_seq {
+            return Err(SentinelErr::ReplaySequence);
+        }
+        self.last_seq = h.seq_no;
+        Ok((h, &envelope[HEADER_LEN..signed_len]))
+    }
+}
+
+/// Turn a verified envelope into a runtime command.
+pub fn command_for(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result<Command, SentinelErr> {
+    Ok(match h.op {
+        1 => Command::Install(parse_rule(h, payload, now_ns)?),
+        2 => Command::Revoke(h.shield_id),
+        3 => Command::Unfreeze { pid: h.target_pid },
+        4 => Command::Kill { pid: h.target_pid, shield_id: h.shield_id },
+        5 => Command::Freeze { pid: h.target_pid, until_ns: now_ns + u64::from(h.ttl_secs) * 1_000_000_000, shield_id: h.shield_id },
+        _ => return Err(SentinelErr::BadOp),
+    })
+}
+
+// ---- link framing: [type:u8][len:u32 LE][payload] ----
+pub const FRAME_HELLO: u8 = 0x01;
+pub const FRAME_EVENTS: u8 = 0x02;
+pub const FRAME_HEARTBEAT: u8 = 0x03;
+pub const FRAME_RESULT: u8 = 0x04;
+pub const FRAME_SHIELD: u8 = 0x10;
+
+pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(5 + payload.len());
+    f.push(kind);
+    f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Split complete frames off the front of `buf`.
+pub fn take_frames(buf: &mut Vec<u8>) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    loop {
+        if buf.len() < 5 {
+            break;
+        }
+        let len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+        if len > 4096 {
+            // Nothing the companion sends is this large; drop the stream.
+            buf.clear();
+            break;
+        }
+        if buf.len() < 5 + len {
+            break;
+        }
+        out.push((buf[0], buf[5..5 + len].to_vec()));
+        buf.drain(..5 + len);
+    }
+    out
+}
+
+/// What the Sentinel knows about a running program, for its records.
+#[derive(Clone, Debug)]
+pub struct AppInfo {
+    pub name: String,
+    pub sha8: String,
+}
+
+/// One `violet-log-v1` record line, tab separated:
+/// `t_ms pid app sha8 kind flags idle_s detail target`.
+pub fn record_line(ev: &TelemetryEvent, info: Option<&AppInfo>, idle_s: u32) -> String {
+    let kind = kind_from(ev.kind).map(|k| k.name()).unwrap_or("?");
+    let (name, sha) = info.map_or(("?", "00000000"), |i| (i.name.as_str(), i.sha8.as_str()));
+    let detail = ev.detail_str();
+    let target = match kind_from(ev.kind) {
+        Some(EventKind::NetConnect) => format!("{}:{}", detail, ev.port),
+        _ => String::new(),
+    };
+    let detail = match kind_from(ev.kind) {
+        Some(EventKind::NetConnect) => target.clone(),
+        Some(EventKind::NetTxSummary) => format!("{}B", ev.aux_u32),
+        _ => String::from(detail),
+    };
+    let target = match kind_from(ev.kind) {
+        Some(EventKind::NetTxSummary) => format!("{}:{}", ev.detail_str(), ev.port),
+        _ => target,
+    };
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        ev.timestamp_us / 1000,
+        ev.app_id,
+        name,
+        sha,
+        kind,
+        ev.flags,
+        idle_s,
+        detail.replace('\t', " ").replace('\n', " "),
+        target
+    )
+}
+
+pub fn kind_from(k: u8) -> Option<EventKind> {
+    use EventKind::*;
+    Some(match k {
+        1 => Exec,
+        2 => OpenRead,
+        3 => NetConnect,
+        4 => NetTxSummary,
+        5 => MemoryWx,
+        6 => SpawnThread,
+        7 => SysControl,
+        8 => Exit,
+        9 => ShieldTriggered,
+        10 => OpenWrite,
+        11 => Frozen,
+        12 => Thawed,
+        _ => return None,
+    })
+}
+
+const OFFLINE_CAPACITY: usize = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    Down { retry_at_ns: u64 },
+    Connecting { slot: usize, since_ns: u64 },
+    Up { slot: usize },
+}
+
+pub struct Sentinel {
+    pub verifier: Verifier,
+    pub chain: MeasurementChain,
+    /// pid -> program, newest last (a few apps run at once).
+    pub apps: Vec<(u32, AppInfo)>,
+    /// Lines waiting for the companion (bounded; oldest go first).
+    offline: VecDeque<String>,
+    pub dropped: u32,
+    rx: Vec<u8>,
+    tx: Vec<u8>,
+    link: Link,
+    last_heartbeat_ns: u64,
+    pub accepted: u32,
+    pub rejected: u32,
+    pub frozen_apps: u16,
+    pub connected_once: bool,
+}
+
+#[cfg(not(test))]
+impl Sentinel {
+    pub fn new(companion_key: [u8; 65], boot_id: [u8; 16]) -> Sentinel {
+        let mut chain = MeasurementChain::new(boot_id);
+        chain.extend(MEASURE_KEY, &sha256(&companion_key));
+        Sentinel {
+            verifier: Verifier { companion_key, last_seq: 0 },
+            chain,
+            apps: Vec::new(),
+            offline: VecDeque::new(),
+            dropped: 0,
+            rx: Vec::new(),
+            tx: Vec::new(),
+            link: Link::Down { retry_at_ns: 2_000_000_000 },
+            last_heartbeat_ns: 0,
+            accepted: 0,
+            rejected: 0,
+            frozen_apps: 0,
+            connected_once: false,
+        }
+    }
+
+    pub fn note_exec(&mut self, pid: u32, name: &str, program_digest: &[u8; 32]) {
+        self.chain.extend(MEASURE_EXEC, program_digest);
+        self.apps.retain(|(p, _)| *p != pid);
+        if self.apps.len() >= 32 {
+            self.apps.remove(0);
+        }
+        self.apps.push((pid, AppInfo { name: String::from(name), sha8: hex(&program_digest[..4]) }));
+    }
+
+    pub fn queue(&mut self, events: &[TelemetryEvent], idle_s: u32) {
+        for ev in events {
+            let info = self.apps.iter().find(|(p, _)| *p == ev.app_id).map(|(_, i)| i);
+            let line = record_line(ev, info, idle_s);
+            if self.offline.len() >= OFFLINE_CAPACITY {
+                self.offline.pop_front();
+                self.dropped = self.dropped.wrapping_add(1);
+            }
+            self.offline.push_back(line);
+        }
+    }
+
+    pub fn online(&self) -> bool {
+        matches!(self.link, Link::Up { .. })
+    }
+
+    fn heartbeat(&self, now_ns: u64, active: usize, telemetry_dropped: u32) -> String {
+        format!(
+            "{} {} {} {} {} {} {} {}",
+            now_ns / 1_000_000,
+            self.chain.seq,
+            hex(&self.chain.chain_digest),
+            self.dropped.wrapping_add(telemetry_dropped),
+            active,
+            self.frozen_apps,
+            self.accepted,
+            self.rejected
+        )
+    }
+
+    fn result(&mut self, text: &str) {
+        let f = frame(FRAME_RESULT, text.as_bytes());
+        self.tx.extend_from_slice(&f);
+    }
+
+    /// Move the link along; returns verified commands for the runtime.
+    pub fn tick(&mut self, net: &mut Net, now_ns: u64, active_shields: usize, telemetry_dropped: u32) -> Vec<Command> {
+        let mut commands = Vec::new();
+        match self.link {
+            Link::Down { retry_at_ns } => {
+                if now_ns >= retry_at_ns && net.online() != 0 {
+                    let ip = net.address_for(ENDPOINT);
+                    match net.connect(ip, PORT) {
+                        Ok(slot) => self.link = Link::Connecting { slot, since_ns: now_ns },
+                        Err(_) => self.link = Link::Down { retry_at_ns: now_ns + 5_000_000_000 },
+                    }
+                }
+            }
+            Link::Connecting { slot, since_ns } => match net.state(slot) {
+                (net::OPEN, _) => {
+                    self.link = Link::Up { slot };
+                    self.connected_once = true;
+                    self.rx.clear();
+                    self.tx.clear();
+                    let hello = format!("VSL1 boot={} chain={} key={}", hex(&self.chain.boot_id), hex(&self.chain.chain_digest),
+                                        hex(&sha256(&self.verifier.companion_key)[..8]));
+                    self.tx.extend_from_slice(&frame(FRAME_HELLO, hello.as_bytes()));
+                    self.last_heartbeat_ns = 0;
+                    crate::log!("sentinel: linked to {}", ENDPOINT);
+                }
+                (net::CONNECTING, _) if now_ns - since_ns < 10_000_000_000 => {}
+                _ => {
+                    net::close(slot);
+                    self.link = Link::Down { retry_at_ns: now_ns + 5_000_000_000 };
+                }
+            },
+            Link::Up { slot } => {
+                let (state, _) = net.state(slot);
+                if state != net::OPEN {
+                    net::close(slot);
+                    crate::log!("sentinel: link to {} lost", ENDPOINT);
+                    self.link = Link::Down { retry_at_ns: now_ns + 3_000_000_000 };
+                    return commands;
+                }
+                let incoming = net.recv(slot, 8192);
+                self.rx.extend_from_slice(&incoming);
+                for (kind, payload) in take_frames(&mut self.rx) {
+                    if kind != FRAME_SHIELD {
+                        continue;
+                    }
+                    match self.verifier.verify(&payload).and_then(|(h, body)| Ok((h, command_for(&h, body, now_ns)?))) {
+                        Ok((h, cmd)) => {
+                            self.accepted += 1;
+                            self.chain.extend(MEASURE_SHIELD_LOAD, &sha256(&payload));
+                            crate::log!("sentinel: shield {} op {} seq {} accepted", h.shield_id, h.op, h.seq_no);
+                            self.result(&format!("ok {} {} {}", h.seq_no, h.op, h.shield_id));
+                            commands.push(cmd);
+                        }
+                        Err(e) => {
+                            self.rejected += 1;
+                            let seq = parse_header(&payload).map(|h| h.seq_no).unwrap_or(0);
+                            crate::log!("sentinel: shield rejected: {}", e.name());
+                            self.result(&format!("err {} {}", seq, e.name()));
+                        }
+                    }
+                }
+                // Events: as many whole lines as fit.
+                if !self.offline.is_empty() && self.tx.len() < 4096 {
+                    let mut text = String::new();
+                    while let Some(line) = self.offline.front() {
+                        if text.len() + line.len() + 1 > 3000 {
+                            break;
+                        }
+                        text.push_str(line);
+                        text.push('\n');
+                        self.offline.pop_front();
+                    }
+                    if !text.is_empty() {
+                        self.tx.extend_from_slice(&frame(FRAME_EVENTS, text.as_bytes()));
+                    }
+                }
+                if now_ns.wrapping_sub(self.last_heartbeat_ns) >= 2_000_000_000 {
+                    self.last_heartbeat_ns = now_ns;
+                    let hb = self.heartbeat(now_ns, active_shields, telemetry_dropped);
+                    self.tx.extend_from_slice(&frame(FRAME_HEARTBEAT, hb.as_bytes()));
+                }
+                if !self.tx.is_empty() {
+                    let n = net.send(slot, &self.tx);
+                    self.tx.drain(..n);
+                }
+            }
+        }
+        commands
+    }
+
+    pub fn note_unload(&mut self, shield_id: u32) {
+        self.chain.extend(MEASURE_SHIELD_UNLOAD, &sha256(&shield_id.to_le_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn le16(v: u16) -> [u8; 2] {
+        v.to_le_bytes()
+    }
+
+    /// Envelope fixtures signed by tools/shield-trainer/vsh1.py (see test_sentinel.py).
+    fn fixtures() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        let text = std::fs::read_to_string(std::env::var("VSH1_FIXTURES").unwrap()).unwrap();
+        let mut key = Vec::new();
+        let mut cases = Vec::new();
+        for line in text.lines() {
+            let (name, hexs) = line.split_once(' ').unwrap();
+            let bytes: Vec<u8> = (0..hexs.len() / 2).map(|i| u8::from_str_radix(&hexs[2 * i..2 * i + 2], 16).unwrap()).collect();
+            if name == "key" {
+                key = bytes;
+            } else {
+                cases.push((String::from(name), bytes));
+            }
+        }
+        (key, cases)
+    }
+
+    #[test]
+    fn verifies_signed_shields_and_rejects_the_rest() {
+        let (key, cases) = fixtures();
+        let mut v = Verifier { companion_key: key.try_into().unwrap(), last_seq: 0 };
+        for (name, env) in &cases {
+            let r = v.verify(env).map(|(h, body)| command_for(&h, body, 1_000));
+            let expect = name.split(':').nth(1).unwrap();
+            match (expect, &r) {
+                ("ok", Ok(Ok(_))) => {}
+                ("ok", other) => panic!("{}: {:?}", name, other),
+                (e, Err(err)) => assert_eq!(err.name(), e, "{}", name),
+                (e, Ok(Ok(_))) => panic!("{} should fail with {}", name, e),
+                (e, Ok(Err(err))) => assert_eq!(err.name(), e, "{}", name),
+            }
+        }
+        let _ = le16(0);
+    }
+
+    #[test]
+    fn measurement_chain_is_order_sensitive() {
+        let mut a = MeasurementChain::new([1; 16]);
+        let mut b = MeasurementChain::new([1; 16]);
+        a.extend(MEASURE_EXEC, &[2; 32]);
+        a.extend(MEASURE_SHIELD_LOAD, &[3; 32]);
+        b.extend(MEASURE_SHIELD_LOAD, &[3; 32]);
+        b.extend(MEASURE_EXEC, &[2; 32]);
+        assert_ne!(a.chain_digest, b.chain_digest);
+        assert_eq!(a.seq, 3);
+        assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn frames_split_across_reads() {
+        let mut buf = frame(FRAME_SHIELD, b"hello");
+        buf.extend_from_slice(&frame(FRAME_HELLO, b"x")[..3]);
+        let got = take_frames(&mut buf);
+        assert_eq!(got, alloc::vec![(FRAME_SHIELD, b"hello".to_vec())]);
+        assert_eq!(buf.len(), 3);
+    }
 }

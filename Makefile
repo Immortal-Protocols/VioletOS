@@ -133,3 +133,27 @@ build/moto-package: services/usb-diagnostics/host/moto_package.c
 moto-component: setup
 	@test -n "$(NAME)" || (echo "Set NAME to the Moto component (e.g. radio)"; exit 1)
 	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py moto
+
+# Violet Shield (docs/violet-shield-poc.md).
+SHIELD_PY := build/shield/venv/bin/python
+SHIELD_SIM ?= D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA
+.PHONY: shield-setup shield-train shield-companion test-shield-unit test-shield test-shield-ios shield-demo
+$(SHIELD_PY):
+	$(PYTHON) -m venv build/shield/venv
+	$(SHIELD_PY) -m pip install -q torch "transformers>=5.24" sentence-transformers coremltools numpy cryptography pillow
+shield-setup: $(SHIELD_PY)
+shield-train: $(SHIELD_PY)
+	$(SHIELD_PY) tools/shield-trainer/train.py
+shield-companion:
+	cd companion/ios && xcodegen generate -q && xcodebuild -project VioletRelay.xcodeproj -scheme VioletRelay \
+	  -destination 'platform=iOS Simulator,id=$(SHIELD_SIM)' -derivedDataPath ../../build/dd-sim CODE_SIGN_IDENTITY=- -quiet build
+	xcrun simctl install $(SHIELD_SIM) build/dd-sim/Build/Products/Debug-iphonesimulator/VioletRelay.app
+test-shield-unit: $(SHIELD_PY)
+	SHIELD_PYTHON=$(SHIELD_PY) HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_unit.sh
+test-shield: qemu-image $(SHIELD_PY)
+	$(SHIELD_PY) targets/qemu/test_shield.py --companion sim
+test-shield-ios: qemu-image shield-companion
+	VIOLET_SIM=$(SHIELD_SIM) $(SHIELD_PY) targets/qemu/test_shield.py --companion ios
+shield-demo: qemu-image shield-companion
+	VIOLET_SIM=$(SHIELD_SIM) $(SHIELD_PY) targets/qemu/test_shield.py --companion ios --record build/shield/demo
+	$(SHIELD_PY) tools/shield-trainer/make_video.py build/shield/demo

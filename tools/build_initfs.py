@@ -136,8 +136,10 @@ def main(out, python=True, compress=False, skip=()):
     work = out.parent / "initfs-build"
     work.mkdir(parents=True, exist_ok=True)
     files = {}
+    # VIOLET_OPEN_APPS_DIR picks another folder of apps (the Violet Shield demo uses apps/shield-demo).
+    apps_dir = Path(os.environ.get("VIOLET_OPEN_APPS_DIR", ROOT / "apps/open"))
     cargo_out = None
-    for app in sorted((ROOT / "apps/open").iterdir()):
+    for app in sorted(apps_dir.iterdir()):
         if not app.is_dir() or app.name in skip:
             continue
         if (app / "Cargo.toml").exists():
@@ -182,7 +184,7 @@ def main(out, python=True, compress=False, skip=()):
                 rel = f"apps/{app.name}/{path.relative_to(app)}"
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
     # Apps with an app.txt are listed first, under their titles, by the shell.
-    titles = [f"{a.name}\t{(a / 'app.txt').read_text().strip()}" for a in sorted((ROOT / "apps/open").iterdir())
+    titles = [f"{a.name}\t{(a / 'app.txt').read_text().strip()}" for a in sorted(apps_dir.iterdir())
               if (a / "app.txt").exists() and f"apps/{a.name}" in files]
     files["apps/.home"] = ("\n".join(titles).encode() + b"\n", 0o100644)
     # Name lookups go to the Open Runtime's own DNS answerer; certificates for TLS.

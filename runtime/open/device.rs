@@ -99,6 +99,18 @@ pub const BG: u32 = 0xff191620;
 pub const PANEL: u32 = 0xff302a39;
 pub const INK: u32 = 0xffeeeaf8;
 pub const ACCENT: u32 = 0xffd1b0fe;
+pub const ALERT: u32 = 0xffff5a5f;
+pub const OK_GREEN: u32 = 0xff6ee7a8;
+
+/// Drawn over a frozen app's last frame while it is on screen.
+pub fn frozen_banner(on: bool) {
+    if !on {
+        return;
+    }
+    fill(0, 0, WIDTH, 150, ALERT);
+    text(36, 30, "FROZEN BY VIOLET SHIELD", 4, 0xff1a0b0d);
+    text(36, 90, "SIGNED BY YOUR IPHONE - MEMORY KEPT", 2, 0xff1a0b0d);
+}
 
 fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
     let fb = FRAMEBUFFER as *mut u32;
@@ -233,8 +245,13 @@ impl Runtime {
             fill(42, y, WIDTH - 84, ROW_H - 12, if title.is_some() { PANEL } else { BG_ROW });
             let shown: String = title.as_deref().unwrap_or(name).chars().take(16).collect();
             text(72, y + 16, &shown, if title.is_some() { 5 } else { 4 }, INK);
-            if self.apps.iter().flatten().any(|a| a.path == *path) {
-                text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT);
+            match self.apps.iter().flatten().find(|a| a.path == *path) {
+                Some(a) if a.frozen.is_some() => {
+                    fill(42, y, 10, ROW_H - 12, ALERT);
+                    text(72, y + 52, "FROZEN BY VIOLET SHIELD", 2, ALERT);
+                }
+                Some(_) => text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT),
+                None => {}
             }
         }
         if !self.shell.message.is_empty() {
@@ -243,7 +260,23 @@ impl Runtime {
         }
         fill(42, HOME_Y, WIDTH - 84, 150, PANEL);
         text(78, HOME_Y + 54, "HOME", 7, INK);
+        self.draw_shield_status();
         sys::clean_framebuffer(0, HEIGHT);
+    }
+
+    /// One line under the title: the companion link and the live Shields.
+    pub fn draw_shield_status(&mut self) {
+        fill(42, 190, WIDTH - 84, 40, BG);
+        let linked = self.sentinel.online();
+        let frozen = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).count();
+        let line = alloc::format!(
+            "SHIELD {} - {} RULE{} - {} FROZEN",
+            if linked { "LINKED" } else { "OFFLINE" },
+            self.shield.active(),
+            if self.shield.active() == 1 { "" } else { "S" },
+            frozen
+        );
+        text(42, 196, &line, 3, if frozen > 0 { ALERT } else if linked { OK_GREEN } else { ACCENT });
     }
 
     fn shell_tap(&mut self, x: i32, y: i32) {
@@ -283,6 +316,7 @@ impl Runtime {
 
     /// A touch change from Runtime, in screen pixels.
     pub fn touch(&mut self, x: i32, y: i32, down: bool) {
+        self.last_touch_ns = sys::now_ns();
         if !self.shell.armed {
             self.shell.armed = !down;
             self.shell.held = down;
@@ -414,7 +448,7 @@ impl Runtime {
     /// Whether a wait can finish now, and with what result.
     pub fn ready(&mut self, i: usize, wait: &Wait) -> Option<i32> {
         match wait {
-            Wait::Futex { .. } | Wait::Sleep => None,
+            Wait::Futex { .. } | Wait::Sleep | Wait::Frozen => None,
             Wait::Audio { fd, buf, len } => {
                 let r = self.write_audio(i, *fd, *buf, *len);
                 (r != 0).then_some(r)

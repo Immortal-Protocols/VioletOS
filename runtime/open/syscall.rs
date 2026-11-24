@@ -85,7 +85,12 @@ impl Runtime {
         saved[8] = mrs[MR_FAULT_IP].wrapping_add(4);
         let number = mrs[7];
         self.stats.count(number);
-        let outcome = self.dispatch(i, slot, number, mrs);
+        // A frozen app's thread that reached here before it was suspended waits too.
+        let outcome = if self.apps[i].as_ref().map_or(false, |a| a.frozen.is_some()) {
+            Block(Wait::Frozen, None)
+        } else {
+            self.dispatch(i, slot, number, mrs)
+        };
         match outcome {
             Done(r) => {
                 saved[0] = r as u32;
@@ -304,6 +309,14 @@ impl Runtime {
                 Done(0)
             }
             125 => {
+                if a[2] & 6 == 6 {
+                    match self.gate(i, &Action::MapWriteExec { addr: a[0], len: a[1] }) {
+                        super::Gate::Allow => {}
+                        super::Gate::Deny => return Done(EACCES),
+                        super::Gate::Frozen => return Block(Wait::Frozen, None),
+                        super::Gate::Killed => return Gone,
+                    }
+                }
                 let end = a[0].saturating_add(align_up(a[1], 4096));
                 let app = self.apps[i].as_mut().unwrap();
                 if app.space.protect(a[0], end, a[2] & 7) {
@@ -842,6 +855,13 @@ impl Runtime {
         if self.policy.check(app_id, &Action::OpenPath { path: &path, mode }) != Decision::Allow {
             return Done(EACCES);
         }
+        // Violet Shield sees the same private copy of the path that is opened below.
+        match self.gate(i, &Action::OpenPath { path: &path, mode }) {
+            super::Gate::Allow => {}
+            super::Gate::Deny => return Done(EACCES),
+            super::Gate::Frozen => return Block(Wait::Frozen, None),
+            super::Gate::Killed => return Gone,
+        }
         let kind = match path.as_str() {
             "/dev/violet/screen" => {
                 if let Err(e) = self.surface(i) {
@@ -1060,6 +1080,14 @@ impl Runtime {
     fn mmap(&mut self, i: usize, addr: u32, len: u32, prot: u32, flags: u32, fd: i32, offset: u32) -> Outcome {
         if len == 0 || len > 0x8000_0000 {
             return Done(EINVAL);
+        }
+        if prot & 6 == 6 {
+            match self.gate(i, &Action::MapWriteExec { addr, len }) {
+                super::Gate::Allow => {}
+                super::Gate::Deny => return Done(EACCES),
+                super::Gate::Frozen => return Block(Wait::Frozen, None),
+                super::Gate::Killed => return Gone,
+            }
         }
         let len = align_up(len, 4096);
         let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;

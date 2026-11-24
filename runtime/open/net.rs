@@ -45,6 +45,11 @@ fn rx(slot: usize) -> *const u8 {
 /// Slots in use, one bit each. The Open Runtime is single-threaded.
 static USED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The slot holds a connection that has not been closed.
+pub fn in_use(slot: usize) -> bool {
+    USED.load(core::sync::atomic::Ordering::SeqCst) & (1 << slot) != 0
+}
+
 /// Close a connection; called when the last descriptor for it closes.
 pub fn close(slot: usize) {
     set(slot, 1, CMD_CLOSE);
@@ -86,6 +91,13 @@ impl Net {
             }
         };
         FAKE_BASE + 1 + index as u32
+    }
+    /// The name behind a stand-in address, or the address in dotted form.
+    pub fn host_for(&self, ip: u32) -> String {
+        match self.name_for(ip) {
+            Some(n) => String::from(n),
+            None => alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255),
+        }
     }
     fn name_for(&self, ip: u32) -> Option<&str> {
         if ip & FAKE_MASK != FAKE_BASE {

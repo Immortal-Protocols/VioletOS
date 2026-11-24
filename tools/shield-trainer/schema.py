@@ -11,6 +11,16 @@ from dataclasses import dataclass, field
 import math
 from typing import Iterable
 
+# The window the student sees. Fewer events than the RFC's 48: the exported
+# embedder takes a fixed 384 tokens and an event line costs about 25. If a
+# window is still too long, `fit_text` drops its oldest events until it fits
+# (ShieldWindows.swift does the same). See docs/violet-shield-poc.md.
+MAX_EVENTS = 16
+SEQ_LEN = 384
+MAX_SOCKS_ONLY = 6
+# EmbeddingGemma 2's prefix for symmetric classification tasks.
+TASK_PREFIX = "task: classification | query: "
+
 VERDICTS = (
     "benign",
     "suspicious",
@@ -37,6 +47,10 @@ THREAT_TAGS = (
 )
 
 
+def _bytes(detail: str) -> int | None:
+    return int(detail[:-1]) if detail.endswith("B") and detail[:-1].isdigit() else None
+
+
 @dataclass
 class TraceEvent:
     dt_ms: int
@@ -58,20 +72,46 @@ class TelemetryWindow:
     events: list[TraceEvent]
     socks5_only_flows: list[tuple[str, int, int]] = field(default_factory=list)
 
-    def to_canonical_text(self) -> str:
-        """Compact ~200-400 token representation for EmbeddingGemma 2 (8K ctx)."""
+    def display_events(self) -> list[TraceEvent]:
+        """The events a window shows: consecutive SOCK_TX merged into one running
+        total (so a flood of sends cannot push earlier evidence out of the
+        window), then the newest MAX_EVENTS."""
+        merged: list[TraceEvent] = []
+        for ev in self.events:
+            prev = merged[-1] if merged else None
+            if ev.kind == "SOCK_TX" and prev is not None and prev.kind == "SOCK_TX" and _bytes(ev.detail) is not None and _bytes(prev.detail) is not None:
+                seen = None if prev.socks5_seen is None and ev.socks5_seen is None else bool(prev.socks5_seen) and bool(ev.socks5_seen)
+                merged[-1] = TraceEvent(prev.dt_ms, "SOCK_TX", f"{_bytes(prev.detail) + _bytes(ev.detail)}B", False, seen)
+            else:
+                merged.append(ev)
+        return merged[-MAX_EVENTS:]
+
+    def fit_text(self, count_tokens) -> str:
+        """The canonical text with the oldest events dropped until
+        `count_tokens(TASK_PREFIX + text)` fits SEQ_LEN."""
+        skip = 0
+        while True:
+            text = self.to_canonical_text(skip)
+            if count_tokens(TASK_PREFIX + text) <= SEQ_LEN or skip >= MAX_EVENTS:
+                return text
+            skip += 1
+
+    def to_canonical_text(self, skip: int = 0) -> str:
+        """Compact representation for EmbeddingGemma 2; `skip` drops that many of the oldest shown events."""
         header = (
             f"APP={self.app_path} SHA={self.sha_prefix} "
             f"NEW_HASH={int(self.new_hash)} BG={int(self.background)} "
             f"USER_IDLE={self.user_idle_sec}s DEV_PUSH={int(self.dev_push_recent)}"
         )
         lines = [header, "KNOWN_HOSTS=" + ",".join(self.known_hosts[:8])]
-        for ev in self.events[-48:]:
+        shown = self.display_events()[skip:]
+        base = shown[0].dt_ms if shown else 0
+        for ev in shown:
             suffix = " CROSS_APP=1" if ev.cross_app else ""
             if ev.socks5_seen is not None:
                 suffix += f" SOCKS5_SEEN={int(ev.socks5_seen)}"
-            lines.append(f"[+{ev.dt_ms}ms] {ev.kind} {ev.detail}{suffix}")
-        for target, tx_b, rx_b in self.socks5_only_flows[-12:]:
+            lines.append(f"[+{ev.dt_ms - base}ms] {ev.kind} {ev.detail}{suffix}")
+        for target, tx_b, rx_b in self.socks5_only_flows[-MAX_SOCKS_ONLY:]:
             lines.append(f"[SOCKS5_ONLY] UNREPORTED_CONN {target} TX={tx_b}B RX={rx_b}B")
         return "\n".join(lines)
 
@@ -80,13 +120,16 @@ class TelemetryWindow:
         EmbeddingGemma 2's 768-dim embedding before the Hybrid MLP decision head.
         Matches `StructuredWindowFeatures.vector` in `ShieldChecker.swift`.
         """
-        cross_app_count = sum(1 for ev in self.events if ev.cross_app)
-        mismatch_count = len(self.socks5_only_flows) + sum(
-            1 for ev in self.events if ev.socks5_seen is False
+        # Counted over what the window shows, so both sides agree exactly.
+        events = self.display_events()
+        flows = self.socks5_only_flows[-MAX_SOCKS_ONLY:]
+        cross_app_count = sum(1 for ev in events if ev.cross_app)
+        mismatch_count = len(flows) + sum(
+            1 for ev in events if ev.socks5_seen is False
         )
-        wx_count = sum(1 for ev in self.events if ev.kind == "MEM_WX")
-        tx_bytes = sum(tx_b for _, tx_b, _ in self.socks5_only_flows)
-        for ev in self.events:
+        wx_count = sum(1 for ev in events if ev.kind == "MEM_WX")
+        tx_bytes = sum(tx_b for _, tx_b, _ in flows)
+        for ev in events:
             if ev.kind == "SOCK_TX" and ev.detail.endswith("B") and ev.detail[:-1].isdigit():
                 tx_bytes += int(ev.detail[:-1])
         return [

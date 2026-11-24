@@ -1,6 +1,7 @@
 # RFC: Violet Shield — Local AI Threat Monitoring & Signed Live Shields on Pure seL4
 
 **Status:** Draft RFC (code skeleton — assumes [PR #14 (`rfc/open-app-model`)](https://github.com/Immortal-Protocols/VioletOS/pull/14) is in; intentionally not wired into the build yet)  
+**Proof of concept:** [violet-shield-poc.md](violet-shield-poc.md) — built and tested in QEMU and the iOS Simulator (`make test-shield-ios`).  
 **Inspiration:** [Shirudo](https://github.com/shirudo-dev/shirudo) (signed live runtime shields + tamper-resistant observability), adapted to VioletOS's pure-seL4 Open Runtime and iPhone companion relay — **with no Linux kernel, no cloud server, and no API key required**.
 
 ## Motivation

@@ -3,6 +3,10 @@ options:
   bundleIdPrefix: com.immortal.violet
   deploymentTarget:
     iOS: "26.0"
+packages:
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    exactVersion: 1.3.5
 settings:
   DEVELOPMENT_TEAM: 3UGCLFLDJ6
   CODE_SIGN_STYLE: Automatic
@@ -11,7 +15,22 @@ targets:
   VioletRelay:
     type: application
     platform: iOS
-    sources: [App]
+    sources:
+      - App
+      - Shield
+      # Built by tools/shield-trainer/train.py; without them the Shield runs Tier 0 only.
+      - path: ../../build/shield/VioletShieldEmbedder.mlpackage
+        optional: true
+      - path: ../../build/shield/VioletShieldHead.mlpackage
+        optional: true
+      - path: ../../build/shield/ShieldTokenizer
+        type: folder
+        optional: true
+      - path: ../../build/shield/ShieldFixtures.json
+        optional: true
+    dependencies:
+      - package: swift-transformers
+        product: Tokenizers
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.immortal.violet.relay
       CODE_SIGN_ENTITLEMENTS: App/VioletRelay.entitlements
