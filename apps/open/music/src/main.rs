@@ -75,6 +75,7 @@ fn main() {
     play(&mut player, 0); // start the album right away
 
     let mut last_log = Instant::now();
+    let mut last_look = None;
     loop {
         match events.recv_timeout(Duration::from_millis(100)) {
             Ok(e) if e.focus_gained() => shown = None,
@@ -119,6 +120,14 @@ fn main() {
         let current = (current >= 0).then_some(current as usize);
         let art = current.unwrap_or(0);
         want_cover(art, &mut requested);
+        if last_log.elapsed() > Duration::from_secs(10) {
+            if let Some(i) = current {
+                last_log = Instant::now();
+                let paused = if player.paused.load(Relaxed) { " (paused)" } else { "" };
+                let p = player.position() as u32;
+                println!("music: {} at {}:{:02}{}", catalog.tracks[i].title, p / 60, p % 60, paused);
+            }
+        }
         let full = shown != Some(current);
         if full {
             ui::draw_static(&mut layer, &fonts, &catalog, covers.get(&art), current);
@@ -127,19 +136,24 @@ fn main() {
         }
         let pal = covers.get(&art).map_or(ui::Palette::default(), |c| c.palette);
         let status = player.failure.lock().unwrap().clone();
+        // Redraw the lower band only when what it shows changes: the second,
+        // the waveform's progress, the spectrum (in 1/32 steps), play or pause.
+        let look = (
+            (player.position() * 4.0) as u32,
+            player.bands().map(|v| (v * 32.0) as u8),
+            player.paused.load(Relaxed),
+            current,
+            status.clone(),
+        );
+        if !full && last_look.as_ref() == Some(&look) {
+            continue;
+        }
+        last_look = Some(look);
         ui::draw_dynamic(&mut frame, &layer, &fonts, &catalog, &player, pal, &status);
         if full {
             screen.show_all(&frame);
         } else {
             screen.show(&frame, ui::DYNAMIC);
-        }
-        if last_log.elapsed() > Duration::from_secs(10) {
-            if let Some(i) = current {
-                last_log = Instant::now();
-                let paused = if player.paused.load(Relaxed) { " (paused)" } else { "" };
-                let p = player.position() as u32;
-                println!("music: {} at {}:{:02}{}", catalog.tracks[i].title, p / 60, p % 60, paused);
-            }
         }
     }
 }

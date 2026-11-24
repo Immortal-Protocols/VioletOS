@@ -43,10 +43,12 @@ pub struct OpenFile {
     pub kind: Kind,
     pub offset: u64,
     pub flags: u32,
+    /// SO_RCVTIMEO in nanoseconds; 0 waits forever.
+    pub recv_timeout: u64,
 }
 impl OpenFile {
     pub fn new(kind: Kind, flags: u32) -> Self {
-        Self { kind, offset: 0, flags }
+        Self { kind, offset: 0, flags, recv_timeout: 0 }
     }
 }
 impl Drop for OpenFile {

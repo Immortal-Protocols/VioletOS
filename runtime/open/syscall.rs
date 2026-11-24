@@ -902,7 +902,13 @@ impl Runtime {
         if nonblock {
             return Done(EAGAIN);
         }
-        Block(Wait::Read { fd, buf, len }, None)
+        Block(Wait::Read { fd, buf, len }, self.recv_deadline(i, fd))
+    }
+
+    /// When a blocking read of fd gives up (its SO_RCVTIMEO), if ever.
+    pub fn recv_deadline(&self, i: usize, fd: i32) -> Option<u64> {
+        let t = self.file(i, fd)?.borrow().recv_timeout;
+        (t > 0).then(|| sys::now_ns() + t)
     }
 
     fn write(&mut self, i: usize, fd: i32, buf: u32, len: u32, at: Option<u64>) -> i32 {

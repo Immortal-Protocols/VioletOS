@@ -143,3 +143,22 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod preview {
+    /// HOME_PREVIEW=path cargo test -p home writes Home as raw 720x1600 RGBA.
+    #[test]
+    fn preview() {
+        let Ok(out) = std::env::var("HOME_PREVIEW") else { return };
+        let t = super::clock::parse_http_date("Tue, 24 Nov 2026 02:47:33 GMT");
+        let g = super::Glance { utc: t, offset: -8 * 3600, at: std::time::Instant::now(), temp: "54°F".into(), sky: "Partly cloudy".into(), city: "Oakland".into() };
+        let s = super::ui::State {
+            now: g.now(), online: true, battery: 82, volume: 8, phones: false, temp: g.temp.clone(), sky: g.sky.clone(),
+            city: g.city.clone(), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
+        };
+        let mut c = violet::Canvas::new(violet::W, violet::H);
+        super::ui::draw(&mut c, &violet::Fonts::load(), &s);
+        let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
+        std::fs::write(out, bytes).unwrap();
+    }
+}
