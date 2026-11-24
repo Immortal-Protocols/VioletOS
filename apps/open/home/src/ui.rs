@@ -19,7 +19,13 @@ pub struct State {
     pub running: HashSet<String>,
     pub pressed: Option<usize>,
     pub shield: Shield,
+    /// The joined Wi-Fi network's name ("" for none), or Phone Internet.
+    pub wifi: String,
 }
+
+/// The Wi-Fi bar under the weather; a tap opens the Wi-Fi app.
+pub const WIFI_BAR: Rect = Rect::new(40, 660, W as i32 - 40, 720);
+pub const WIFI_COMMAND: &str = "open /apps/wifi";
 
 /// Violet Shield as the Open Runtime reports it ("shield" in /dev/violet/sys).
 #[derive(Clone, Default, PartialEq)]
@@ -83,7 +89,7 @@ pub fn draw(c: &mut Canvas, f: &Fonts, s: &State) {
         }
         None => {
             f.bold(168.0).draw(c, "Violet", 56, 360, INK);
-            body.draw(c, if s.online { "Starting…" } else { "Offline – Wi-Fi is in System" }, 62, 430, DIM);
+            body.draw(c, if s.online { "Starting…" } else { "Offline – choose a Wi-Fi network below" }, 62, 430, DIM);
         }
     }
     // The weather glance.
@@ -99,11 +105,32 @@ pub fn draw(c: &mut Canvas, f: &Fonts, s: &State) {
     } else {
         f.medium(26.0).draw(c, "Weather appears here when online", 186, 580, DIM);
     }
+    wifi_bar(c, f, s);
     for (i, t) in TILES.iter().enumerate() {
         tile(c, f, i, t, s.running.contains(&format!("/apps/{}", t.name)), s.pressed == Some(i));
     }
     shield(c, f, &s.shield);
     f.regular(21.0).centered(c, "Hold the top edge in any app to come back here", 0, W as i32, 1530, rgb(0x6c, 0x63, 0x84));
+}
+
+fn wifi_bar(c: &mut Canvas, f: &Fonts, s: &State) {
+    let r = WIFI_BAR;
+    c.round_rect(r, 30.0, if s.pressed == Some(usize::MAX) { rgb(0x3a, 0x2c, 0x55) } else { CARD });
+    let on = !s.wifi.is_empty();
+    let ink = if on { INK } else { DIM };
+    let (cx, cy) = (86.0, (r.y0 + 44) as f32);
+    c.circle(cx, cy, 4.0, ink);
+    for rad in [14.0, 24.0] {
+        c.arc(cx, cy, rad, 5.0, PI / 4.0, 3.0 * PI / 4.0, ink);
+    }
+    let label = f.medium(28.0);
+    let x = label.draw(c, "Wi-Fi", 126, r.y0 + 40, INK);
+    let text = if on { s.wifi.as_str() } else { "Not connected" };
+    let value = f.regular(27.0);
+    value.draw(c, &value.fit(text, r.x1 - 70 - (x + 24)), x + 24, r.y0 + 40, DIM);
+    let (ax, ay) = ((r.x1 - 40) as f32, (r.y0 + r.height() / 2) as f32);
+    c.line(ax - 6.0, ay - 11.0, ax + 4.0, ay, 4.0, DIM);
+    c.line(ax + 4.0, ay, ax - 6.0, ay + 11.0, 4.0, DIM);
 }
 
 const ALERT: Color = rgb(0xf0, 0x60, 0x60);

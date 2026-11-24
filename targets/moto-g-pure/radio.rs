@@ -275,6 +275,11 @@ pub fn run() -> ! {
             if matches.next().is_some() || !ap.wpa2_psk_ccmp {
                 return Message::error(INVALID);
             }
+            // A key from the app (Settings derives it from the password) is kept for
+            // this boot, for this join and for rejoining after a link failure.
+            if m.data != [0; 32] {
+                wpa::remember_key(&ap.ssid[..ap.ssid_len], &m.data);
+            }
             join_target = Some(ap);
             probed = false;
         }
@@ -532,6 +537,14 @@ pub fn run() -> ! {
             } else {
                 Message::error(OFFLINE)
             };
+            if joining && probe_status != 43 {
+                // Why the join failed (JOIN_* in protocol.rs).
+                reply.value = probe_status;
+            } else if joining {
+                // The scan worked, but nothing was joined.
+                reply = Message::error(OFFLINE);
+                reply.value = JOIN_NOT_FOUND;
+            }
             if retain {
                 reply.arg = RADIO_RETAIN_POWER;
             }
@@ -856,7 +869,7 @@ fn scan_entry(scan: &passive_scan::Results, index: u32) -> Message {
     if let Some(ap) = scan.aps[..scan.ap_count].get(index as usize) {
         // Persist an identifier for the AP, never its position in a scan.
         reply.value = ap.profile_id();
-        reply.arg = ap.channel as u32;
+        reply.arg = ap.channel as u32 | if ap.wpa2_psk_ccmp { SCAN_WPA2 } else { 0 };
         reply.put_text(&ap.ssid[..ap.ssid_len]);
     }
     reply

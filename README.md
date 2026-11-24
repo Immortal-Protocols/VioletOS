@@ -3,7 +3,7 @@
 VioletOS is a smartphone operating system built on the seL4 microkernel. It runs on the Moto G Pure (XT2163DL) and in QEMU on a Mac, with no Linux kernel anywhere. Drivers and services are separate seL4 processes, mostly written in Rust. Apps come in two kinds:
 
 - **System components** (the classic launcher, Wi-Fi Setup, and the Stopwatch package used by the package-system tests) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
-- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Music, Weather, Stopwatch, Sounds) are open apps written in Rust. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
+- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Wi-Fi, Music, Weather, Stopwatch, Sounds) are open apps written in Rust. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -23,6 +23,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 | `make test-power` | Verifies guest-driven VM pause, resume and shutdown. |
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds app, then checks the PCM, the recording and the on-screen volume. |
 | `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. |
+| `make test-wifi-app` | Drives the Wi-Fi app by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
 | `make test-open-apps` | Drives the built-in apps: Stopwatch's time in `/data` across a restart, Sounds, and live Weather. |
 | `make test-shield` | Violet Shield end to end: the Sentinel streams telemetry to a companion that scores it with EmbeddingGemma 2 and freezes a data-stealing app with a signed Shield. `make test-shield-ios` uses the real app in the iOS Simulator. See [the proof of concept](docs/violet-shield-poc.md). |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
@@ -92,7 +93,7 @@ Slot 23 is reserved for a Bluetooth service.
 | Boot, supervisor, recovery and rollback | Yes | Yes, from slot B, with Android kept on slot A |
 | Touch and display | Mouse clicks become touch reports | Novatek touch on either DJN panel |
 | Storage | Virtual disks | eMMC volume inside boot B; stopwatch time survives reboot |
-| Wi-Fi | Virtual access points; HTTPS through the Mac | WPA2-Personal, provisioned per boot over USB; HTTPS UUID |
+| Wi-Fi | Virtual access points, open and WPA2; HTTPS through the Mac | Scan, choose and type the password in the Wi-Fi app (WPA2-Personal), or provision over USB; HTTPS UUID |
 | Phone Internet | — | Hosts a Wi-Fi network for the iPhone relay; traffic leaves over cellular |
 | Audio | Mac speakers and microphone | Speaker, headphones, jack, Volume Down and microphone (Volume Up not yet) |
 | Open apps | Rust, C, Go and Python, with screen, touch, audio and TCP | Rust, C, Go and Python; PCM audio; TCP over Wi-Fi |

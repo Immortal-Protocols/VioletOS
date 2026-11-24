@@ -5,6 +5,7 @@ from emulator_endpoint import endpoint_peer
 from net_relay import Relay as NetRelay
 import os
 import binascii
+import hashlib
 import json
 import re
 import selectors
@@ -20,6 +21,8 @@ sys.path.insert(0,str(ROOT/"system/package-manager"))
 from manage import launch_catalogs, acknowledge_rollback
 
 RAM_SIZE = 1024**3
+# The emulator's Wi-Fi: two open networks and a WPA2 one (password "violet-home").
+DEFAULT_NETWORKS = ["VIOLET LAB", "GUEST WIFI", {"name": "VIOLET HOME", "password": "violet-home"}]
 
 def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None),peer=None):
     network="guestport" if peer is not None else "wifi"
@@ -64,13 +67,25 @@ def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,N
             if path.stat().st_size>1024**2:raise ValueError("catalog exceeds boot window")
             cmd+=["-device",f"loader,file={str(path).replace(',', ',,')},addr={address},force-raw=on"]
     # Discoverable virtual access points. Profile keys survive scan reordering.
-    names=json.loads(os.environ.get("VIOLET_NETWORKS",'["VIOLET LAB","GUEST WIFI"]'))
-    if not isinstance(names,list) or len(names)>8 or any(not isinstance(n,str) or not re.fullmatch(r"[A-Z0-9 -]{1,16}",n) for n in names):
+    # An entry is a name (an open network) or {"name": ..., "password": ...} (WPA2).
+    networks=json.loads(os.environ.get("VIOLET_NETWORKS",json.dumps(DEFAULT_NETWORKS)))
+    if not isinstance(networks,list) or len(networks)>8:
+        raise ValueError("VIOLET_NETWORKS must list up to eight networks")
+    names=[n["name"] if isinstance(n,dict) else n for n in networks]
+    if any(not isinstance(n,str) or not re.fullmatch(r"[A-Z0-9 -]{1,16}",n) for n in names):
         raise ValueError("VIOLET_NETWORKS must contain up to eight displayable SSIDs")
     ids=[binascii.crc32(n.encode()) or 2 for n in names]
     if len(set(ids))!=len(ids) or 1 in ids:raise ValueError("duplicate or reserved network identity")
-    for i,(name,identity) in enumerate(zip(names,ids)):
+    for i,(network,name,identity) in enumerate(zip(networks,names,ids)):
         record=identity.to_bytes(4,"little")+name.encode().ljust(16,b"\0")
+        password=network.get("password") if isinstance(network,dict) else None
+        if password is not None:
+            if not 8<=len(password)<=63:raise ValueError(f"{name}: a WPA2 password has 8 to 63 characters")
+            pmk=hashlib.pbkdf2_hmac("sha1",password.encode(),name.encode(),4096,32)
+            key=(1).to_bytes(4,"little")+pmk
+            for offset in range(0,36,4):
+                value=int.from_bytes(key[offset:offset+4],"little")
+                cmd+=["-device",f"loader,addr={0x49001200+i*36+offset},data={value},data-len=4"]
         for offset in range(0,20,4):
             value=int.from_bytes(record[offset:offset+4],"little")
             cmd+=["-device",f"loader,addr={0x49001100+i*20+offset},data={value},data-len=4"]

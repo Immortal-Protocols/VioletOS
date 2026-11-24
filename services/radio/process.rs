@@ -1,6 +1,19 @@
 use crate::protocol::*;
 #[path = "gateway.rs"]
 mod gateway;
+/// A virtual network's WPA2 key: after the eight 20-byte records, eight
+/// 36-byte entries of a flags word (bit 0: WPA2) and the PMK (tools/run.py).
+fn security(i: u32) -> Option<[u8; 32]> {
+    let base = (0x09000200 + i * 36) as *const u32;
+    if i >= 8 || unsafe { base.read_volatile() } & 1 == 0 {
+        return None;
+    }
+    let mut pmk = [0u8; 32];
+    for (j, b) in pmk.iter_mut().enumerate() {
+        *b = unsafe { (base as *const u8).add(4 + j).read_volatile() };
+    }
+    Some(pmk)
+}
 pub fn run() -> ! {
     let regs = 0x09000000 as *mut u32;
     let scan = |i: u32| {
@@ -16,6 +29,7 @@ pub fn run() -> ! {
                 *b = unsafe { base.add(4 + j).read_volatile() };
             }
             r.put_text(&name);
+            r.arg = if security(i).is_some() { SCAN_WPA2 } else { SCAN_OPEN };
         }
         r
     };
@@ -55,7 +69,18 @@ pub fn run() -> ! {
                 if (m.value != 0 && target == 0)
                     || target != 0 && !(0..8).any(|i| scan(i).value == target)
                 {
-                    return Message::error(OFFLINE);
+                    let mut r = Message::error(OFFLINE);
+                    r.value = JOIN_NOT_FOUND;
+                    return r;
+                }
+                // A secured network needs its key, unless it is the one already joined.
+                let slot = (0..8).find(|&i| scan(i).value == target);
+                if let Some(pmk) = slot.and_then(security) {
+                    if target != associated && m.data != pmk {
+                        let mut r = Message::error(INVALID);
+                        r.value = if m.data == [0; 32] { JOIN_NO_KEY } else { JOIN_AUTH };
+                        return r;
+                    }
                 }
                 associated = target;
                 Message::result(if m.key == NETWORK {

@@ -71,12 +71,37 @@ unsafe extern "C" fn radio_set_ccmp(
     }
 }
 
+/// A network's key from an app (SSID, its length, PMK), kept for this boot only.
+static mut APP_KEY: ([u8; 32], usize, [u8; 32]) = ([0; 32], 0, [0; 32]);
+
+/// Keep `pmk` for `ssid`; it wins over the USB-provisioned profile for that name.
+pub fn remember_key(ssid: &[u8], pmk: &[u8; 32]) {
+    let n = ssid.len().min(32);
+    unsafe {
+        let key = &mut *core::ptr::addr_of_mut!(APP_KEY);
+        key.0 = [0; 32];
+        key.0[..n].copy_from_slice(&ssid[..n]);
+        key.1 = n;
+        key.2 = *pmk;
+    }
+}
+
+fn app_key(ssid: &[u8]) -> Option<[u8; 32]> {
+    let key = unsafe { &*core::ptr::addr_of!(APP_KEY) };
+    (key.1 != 0 && key.1 == ssid.len() && key.0[..key.1] == *ssid).then_some(key.2)
+}
+
 pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
-    let mut q = Message::new(GET, 0x405d, ap.ssid_len as u32);
-    q.put_text(&ap.ssid[..ap.ssid_len]);
-    let mut profile = q.call(7);
-    if profile.op != OK {
-        return Err(50);
+    let mut profile = Message::result(0);
+    if let Some(pmk) = app_key(&ap.ssid[..ap.ssid_len]) {
+        profile.data = pmk;
+    } else {
+        let mut q = Message::new(GET, 0x405d, ap.ssid_len as u32);
+        q.put_text(&ap.ssid[..ap.ssid_len]);
+        profile = q.call(7);
+        if profile.op != OK {
+            return Err(50);
+        }
     }
     let mac = axi.station;
     let rc = unsafe {

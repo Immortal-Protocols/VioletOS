@@ -123,7 +123,7 @@ pub fn sys(line: &str) -> String {
         return String::new();
     };
     let _ = f.write_all(format!("{line}\n").as_bytes());
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 4096];
     let n = f.read(&mut buf).unwrap_or(0);
     String::from_utf8_lossy(&buf[..n]).trim().to_string()
 }
