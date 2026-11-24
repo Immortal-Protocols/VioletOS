@@ -1,0 +1,16 @@
+# The built-in open apps (Rust), built by tools/build_initfs.py for
+# armv7-unknown-linux-musleabihf. Each runs under the Open Runtime as an
+# ordinary Linux program; lib/violet is their shared crate.
+[workspace]
+resolver = "2"
+members = ["lib/violet", "open/home", "open/music", "open/sounds", "open/stopwatch", "open/weather"]
+
+[workspace.dependencies]
+violet = { path = "lib/violet" }
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

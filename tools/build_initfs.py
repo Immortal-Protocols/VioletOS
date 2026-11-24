@@ -38,6 +38,33 @@ def build_rust(source, out):
                     "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
 
 
+def build_cargo(work):
+    """The Cargo workspace in apps/ (the built-in apps and their shared crate),
+    for ARMv7 musl. ring, under rustls, compiles a little C with the NDK's clang."""
+    import shutil
+    rustc, lld = toolchain()
+    cargo = rustc.parent / "cargo"
+    if not cargo.exists():
+        cargo = Path(shutil.which("cargo") or "cargo")
+    ndk = Path(os.environ.get("ANDROID_NDK_HOME", Path.home() / "Library/Android/sdk/ndk/28.2.13676358"))
+    bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
+    if not bins:
+        raise SystemExit("Install the Android NDK (its clang builds ring for the Rust apps)")
+    key = TARGET.replace("-", "_")
+    env = dict(os.environ, **{
+        f"CC_{key}": str(bins[0] / "clang"),
+        f"AR_{key}": str(bins[0] / "llvm-ar"),
+        f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
+        f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": "-C linker-flavor=ld.lld",
+        "CARGO_TARGET_DIR": str(ROOT / "build/open-cargo"),
+        "RUSTC": str(rustc),
+    })
+    env.setdefault("CARGO_HOME", str(ROOT / "build/cargo-home"))
+    subprocess.run([cargo, "build", "--release", "--target", TARGET, "--workspace"], cwd=ROOT / "apps", env=env, check=True)
+    return ROOT / "build/open-cargo" / TARGET / "release"
+
+
 def build_go(folder, out):
     """A standard Go program for linux/arm (ARMv7, hard float), statically linked."""
     import shutil
@@ -109,8 +136,19 @@ def main(out, python=True, compress=False, skip=()):
     work = out.parent / "initfs-build"
     work.mkdir(parents=True, exist_ok=True)
     files = {}
+    cargo_out = None
     for app in sorted((ROOT / "apps/open").iterdir()):
         if not app.is_dir() or app.name in skip:
+            continue
+        if (app / "Cargo.toml").exists():
+            if cargo_out is None:
+                try:
+                    cargo_out = build_cargo(work)
+                except (SystemExit, subprocess.CalledProcessError) as e:
+                    print(f"skipping the Rust apps: {e}", file=sys.stderr)
+                    cargo_out = False
+            if cargo_out:
+                files[f"apps/{app.name}"] = ((cargo_out / app.name).read_bytes(), 0o100755)
             continue
         if (app / "main.go").exists():
             binary = work / app.name
