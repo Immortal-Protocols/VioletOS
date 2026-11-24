@@ -682,13 +682,26 @@ impl Runtime {
         let end = name.iter().position(|&b| b == 0).unwrap_or(32);
         let name = String::from_utf8_lossy(&name[..end]).into_owned();
         let path = alloc::format!("/apps/{}", name);
+        // Blocks go to a hidden staging file; an empty block at the end swaps
+        // it into place, so a push that fails leaves the working copy alone.
+        let staged = alloc::format!("/apps/.{}.part", name);
         let data = unsafe { core::slice::from_raw_parts(0x0950_1000 as *const u8, len.min(65536)) };
-        let ok = !name.is_empty() && !name.contains('/') && match self.fs.writable(&path, true, offset == 0, 0) {
+        let valid = !name.is_empty() && !name.contains('/') && !name.starts_with('.');
+        if valid && len == 0 && offset > 0 {
+            let ok = self.fs.contents(&staged).map_or(false, |d| d.len() == offset) && self.fs.rename(&staged, &path).is_ok();
+            if ok {
+                log!("installed {} ({} bytes)", path, offset);
+                self.shell.dirty = true;
+            }
+            unsafe {
+                control.add(2).write_volatile(if ok { 0 } else { 1 });
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                control.add(1).write_volatile(commit);
+            }
+            return;
+        }
+        let ok = valid && match self.fs.writable(&staged, true, offset == 0, 0) {
             Some(file) => {
-                if offset == 0 {
-                    // Free the old copy before the new one grows.
-                    *file = Vec::new();
-                }
                 if file.len() < offset {
                     false
                 } else {
@@ -710,7 +723,6 @@ impl Runtime {
         };
         if ok && offset == 0 {
             log!("installing {}", path);
-            self.shell.dirty = true;
         }
         unsafe {
             control.add(2).write_volatile(if ok { 0 } else { 1 });

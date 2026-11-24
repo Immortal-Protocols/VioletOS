@@ -187,6 +187,9 @@ SECTIONS {
                 "-Cpanic=abort",
                 # The Open Runtime (with the Sentinel) is optimised for size to fit the 0x3e000-byte window.
                 "-Copt-level=z" if name == "open" else "-Copt-level=s",
+                # One codegen unit: smaller code, which also helps the Open Runtime
+                # stay inside the 0x3E000-byte package window.
+                "-Ccodegen-units=1",
                 *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,

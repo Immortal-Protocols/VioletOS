@@ -189,14 +189,16 @@ int main(int argc,char **argv) {
             size_t size=fread(file,1,sizeof file,stdin);
             rc=nl<1||nl>31||!size||size==sizeof file;
             if (rc) fputs("open-push=NAME < FILE (a name of 1-31 characters, under 64 MiB)\n",stderr);
-            for (size_t at=0; !rc && at<size; at+=65536) {
-                size_t block=size-at<65536?size-at:65536;
+            // Blocks of up to 64 KiB, then an empty block at the end, which
+            // swaps the staged copy into place: a failed push changes nothing.
+            for (size_t at=0; !rc; at+=65536) {
+                size_t block=at>=size?0:size-at<65536?size-at:65536;
                 for (size_t pos=0; !rc && pos<block; pos+=4096) {
                     uint16_t count=block-pos<4096?(uint16_t)(block-pos):4096;
                     rc=transfer(chosen,0x40,0x4a,(uint32_t)pos,file+at+pos,count);
                 }
                 unsigned char commit[40]={0}, state[12];
-                uint32_t fields[2]={(uint32_t)at,(uint32_t)block};
+                uint32_t fields[2]={(uint32_t)(block?at:size),(uint32_t)block};
                 memcpy(commit,fields,8);
                 memcpy(commit+8,name,nl);
                 if (rc || libusb_control_transfer(chosen,0xc0,0x48,0,0,state,12,3000)!=12) { rc=1; break; }
@@ -210,6 +212,7 @@ int main(int argc,char **argv) {
                     if (tries>2000) { fputs("The Open Runtime did not take the block\n",stderr); rc=1; }
                     usleep(2000);
                 }
+                if (!block) break;
                 fprintf(stderr,"\r%zu of %zu KiB",(at+block)>>10,size>>10);
             }
             if (!rc) printf("\nInstalled /apps/%s (%zu bytes) until the next restart.\n",name,size);
