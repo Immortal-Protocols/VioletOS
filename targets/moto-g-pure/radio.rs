@@ -651,6 +651,8 @@ pub fn run() -> ! {
         fn open_sockets_poll(base: *mut u8, online: u32);
     }
     const SOCKETS: *mut u8 = 0x0b00_0000 as *mut u8;
+    let (mut relink_failures, mut relink_last) = (0u32, 0u32);
+    let relink_wait = |failures: u32| (2000u32 << failures.min(5)).min(60_000);
     loop {
         let mut m = Message::default();
         wpa::tick_clock();
@@ -688,17 +690,27 @@ pub fn run() -> ! {
                 // A station link that failed (deauthentication or a driver error):
                 // associate again, redo the handshake and DHCP, with the firmware
                 // still running. Apps' connections reset and they reconnect.
+                // Three attempts in a row, as before; after a burst fails, wait
+                // 2 s, then 4, 8... up to a minute (out of range) before the next.
                 if !alive && !relaying {
                     if let Some(ap) = joined.get() {
-                        for attempt in 0..3 {
-                            stage(70 + attempt);
-                            if unsafe { relink(dev, &ap) } {
-                                stage(73);
-                                break;
+                        if relink_failures == 0 || radio_io::expired(relink_last, relink_wait(relink_failures)) {
+                            let mut ok = false;
+                            for attempt in 0..3 {
+                                stage(70 + attempt);
+                                if unsafe { relink(dev, &ap) } {
+                                    stage(73);
+                                    ok = true;
+                                    break;
+                                }
+                                unsafe { delay_ms(500) };
                             }
-                            unsafe { delay_ms(500) };
+                            relink_last = radio_io::now();
+                            relink_failures = if ok { 0 } else { relink_failures.saturating_add(1) };
                         }
                     }
+                } else if alive {
+                    relink_failures = 0;
                 }
                 unsafe { delay_ms(1) };
                 continue;

@@ -6,12 +6,7 @@ use std::time::Duration;
 
 use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
 
-const CITIES: [&str; 20] = [
-    "San Francisco", "Oakland", "Los Angeles", "Seattle", "New York",
-    "Chicago", "Austin", "Miami", "Denver", "Boston",
-    "Honolulu", "Anchorage", "Mexico City", "London", "Paris",
-    "Berlin", "Tokyo", "Sydney", "Mumbai", "Cairo",
-];
+use violet::CITIES;
 const GRID_TOP: i32 = 800;
 const ROW_H: i32 = 66;
 const ROWS: i32 = 10;

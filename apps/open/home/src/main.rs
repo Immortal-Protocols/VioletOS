@@ -10,12 +10,7 @@ use std::time::{Duration, Instant};
 use clock::Glance;
 use violet::{device::{TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen, H, W};
 
-const CITIES: [&str; 20] = [
-    "San Francisco", "Oakland", "Los Angeles", "Seattle", "New York",
-    "Chicago", "Austin", "Miami", "Denver", "Boston",
-    "Honolulu", "Anchorage", "Mexico City", "London", "Paris",
-    "Berlin", "Tokyo", "Sydney", "Mumbai", "Cairo",
-];
+use violet::CITIES;
 
 /// The city chosen in Weather: the shared setting weather.city, not Weather's own
 /// files (reading another app's data and then going to the network is what data
@@ -89,17 +84,22 @@ fn main() {
     let mut last_fetch = Instant::now();
     let mut last_status = Instant::now();
     let mut shown_minute = None;
+    // Home polls and draws only while it is in front.
+    let mut focused = true;
     loop {
         match events.recv_timeout(Duration::from_secs(1)) {
             Ok(e) if e.focus_gained() => {
+                focused = true;
                 s.pressed = None;
                 status(&mut s);
                 draw(&mut c, &mut s, &glance, &mut screen);
-                if last_fetch.elapsed() > Duration::from_secs(120) {
+                // Weather may have switched cities while Home was away.
+                if last_fetch.elapsed() > Duration::from_secs(120) || (s.online && city() != s.city) {
                     last_fetch = Instant::now();
                     refresh();
                 }
             }
+            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
             Ok(e) if e.kind == TOUCH_DOWN => {
                 s.pressed = ui::tile_at(e.x, e.y);
                 if s.pressed.is_some() {
@@ -135,7 +135,12 @@ fn main() {
                     s.online = false;
                 }
             }
-            draw(&mut c, &mut s, &glance, &mut screen);
+            if focused {
+                draw(&mut c, &mut s, &glance, &mut screen);
+            }
+        }
+        if !focused {
+            continue;
         }
         if last_fetch.elapsed() > Duration::from_secs(if s.online { 900 } else { 60 }) {
             last_fetch = Instant::now();

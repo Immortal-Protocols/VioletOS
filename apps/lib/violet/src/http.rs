@@ -8,6 +8,9 @@ use std::time::Duration;
 
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+/// The largest response body read into memory.
+const MAX_BODY: usize = 32 << 20;
+
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -43,8 +46,13 @@ fn pool() -> &'static Mutex<HashMap<String, BufReader<Tls>>> {
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn connect(host: &str) -> io::Result<BufReader<Tls>> {
-    let sock = TcpStream::connect((host, 443))?;
+fn connect(authority: &str) -> io::Result<BufReader<Tls>> {
+    // "host" or "host:port".
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?),
+        None => (authority, 443),
+    };
+    let sock = TcpStream::connect((host, port))?;
     // Not every system call is supported; a missing timeout is not fatal.
     let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
     let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -116,6 +124,9 @@ fn exchange(conn: &mut BufReader<Tls>, host: &str, path: &str, headers: &[(&str,
     let mut body = Vec::new();
     let reusable;
     if let Some(n) = find("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if n > MAX_BODY {
+            return Err(io::Error::other(format!("response of {n} bytes is too large")));
+        }
         body.resize(n, 0);
         conn.read_exact(&mut body)?;
         reusable = !close;
@@ -125,9 +136,17 @@ fn exchange(conn: &mut BufReader<Tls>, host: &str, path: &str, headers: &[(&str,
             conn.read_line(&mut line)?;
             let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or("0"), 16).map_err(io::Error::other)?;
             if size == 0 {
-                line.clear();
-                conn.read_line(&mut line)?;
+                // Trailer fields, if any, end with an empty line.
+                loop {
+                    line.clear();
+                    if conn.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
+                        break;
+                    }
+                }
                 break;
+            }
+            if body.len() + size > MAX_BODY {
+                return Err(io::Error::other("response is too large"));
             }
             let at = body.len();
             body.resize(at + size, 0);

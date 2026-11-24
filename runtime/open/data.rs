@@ -65,7 +65,8 @@ pub fn load(fs: &mut Fs) {
         }
         let path = alloc::format!("{}/{}", DIR, name);
         if let Some(f) = fs.writable(&path, true, true, 0) {
-            *f = data;
+            *f = data.clone();
+            fs.stored.insert(path, data);
             count += 1;
         }
     }
@@ -73,42 +74,54 @@ pub fn load(fs: &mut Fs) {
     log!("/data: {} saved files", count);
 }
 
-/// Write back files in /data that changed (or delete the ones removed).
+/// Write back a file in /data that changed (or delete one that was removed).
+/// One file per call, so a save holds the runtime only briefly. Only the
+/// 24-byte pieces that differ from what Storage holds are written, and a file
+/// that shrank is truncated last, after its new bytes are in place.
 pub fn flush(fs: &mut Fs) {
-    if fs.changed.is_empty() {
+    let Some(path) = fs.changed.iter().next().cloned() else { return };
+    fs.changed.remove(&path);
+    let Some(name) = key(&path) else {
+        log!("{} is not kept across restarts (names in /data: up to 16 of A-Z a-z 0-9 . _ -)", path);
         return;
-    }
-    let changed = core::mem::take(&mut fs.changed);
-    for path in changed {
-        let Some(name) = key(&path) else {
-            log!("{} is not kept across restarts (names in /data: up to 16 of A-Z a-z 0-9 . _ -)", path);
-            continue;
-        };
-        match fs.contents(&path).map(|d| d.to_vec()) {
-            None => {
-                file(EXECUTE, FILE_DELETE, name, 0, &[]);
+    };
+    let name = String::from(name);
+    let now = fs.contents(&path).map(|d| d.to_vec());
+    let old = fs.stored.get(&path).cloned();
+    match (now, old) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            file(EXECUTE, FILE_DELETE, &name, 0, &[]);
+            fs.stored.remove(&path);
+        }
+        (Some(data), _) if data.len() > MAX => log!("{} is over 4 KiB and is not kept", path),
+        (Some(data), old) if old.as_ref() == Some(&data) => {} // opened, not changed
+        (Some(data), old) => {
+            let known = old.is_some();
+            let old = old.unwrap_or_default();
+            let mut ok = true;
+            if old.is_empty() && data.is_empty() {
+                ok = file(EXECUTE, FILE_WRITE, &name, 0, &[]).op == OK;
             }
-            Some(data) if data.len() > MAX => log!("{} is over 4 KiB and is not kept", path),
-            Some(data) => {
-                let old = file(GET, FILE_READ, name, 0, &[]);
-                // Rewrite only what differs; truncate first if it shrank.
-                if old.op == OK && (old.arg as usize) > data.len() {
-                    file(EXECUTE, FILE_TRUNCATE, name, data.len() as u32, &[]);
+            for (i, chunk) in data.chunks(24).enumerate() {
+                let at = i * 24;
+                if old.get(at..at + chunk.len()) == Some(chunk) {
+                    continue;
                 }
-                let mut ok = true;
-                for (i, chunk) in data.chunks(24).enumerate() {
-                    let r = file(EXECUTE, FILE_WRITE, name, (i * 24) as u32, chunk);
-                    if r.op != OK {
-                        ok = false;
-                        break;
-                    }
+                if file(EXECUTE, FILE_WRITE, &name, at as u32, chunk).op != OK {
+                    ok = false;
+                    break;
                 }
-                if data.is_empty() && old.op != OK {
-                    ok = file(EXECUTE, FILE_WRITE, name, 0, &[]).op == OK;
-                }
-                if !ok {
-                    log!("could not save {} (Storage keeps four files for open apps)", path);
-                }
+            }
+            if ok && (!known || old.len() > data.len()) {
+                ok = file(EXECUTE, FILE_TRUNCATE, &name, data.len() as u32, &[]).op == OK;
+            }
+            if ok {
+                fs.stored.insert(path, data);
+            } else {
+                // What Storage holds is unknown now: rewrite all of it next time.
+                fs.stored.remove(&path);
+                log!("could not save {} (Storage keeps four files for open apps)", path);
             }
         }
     }

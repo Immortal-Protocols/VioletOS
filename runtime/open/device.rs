@@ -223,7 +223,7 @@ impl Runtime {
         match self.launch(super::HOME_APP, &[]) {
             Ok(i) => {
                 self.home = Some(i);
-                self.foreground = Some(i);
+                self.set_foreground(Some(i));
             }
             Err(e) => crate::log!("could not start Home: {}", e),
         }
@@ -233,7 +233,7 @@ impl Runtime {
         match self.home {
             Some(h) if self.apps[h].is_some() => {
                 if self.foreground != Some(h) {
-                    self.foreground = Some(h);
+                    self.set_foreground(Some(h));
                     self.refresh(h);
                     self.lifecycle(h, LIFECYCLE_FOCUS_GAINED);
                 }
@@ -309,7 +309,7 @@ impl Runtime {
         let row = (y - ROW_Y) / ROW_H;
         let Some(path) = self.app_entries().into_iter().nth(row) else { return };
         if let Some(i) = (0..MAX_APPS).find(|&i| self.apps[i].as_ref().map_or(false, |a| a.path == path)) {
-            self.foreground = Some(i);
+            self.set_foreground(Some(i));
             self.refresh(i);
             self.lifecycle(i, LIFECYCLE_FOCUS_GAINED);
             return;
@@ -317,7 +317,7 @@ impl Runtime {
         match self.launch(&path, &[]) {
             Ok(i) => {
                 self.shell.message.clear();
-                self.foreground = Some(i);
+                self.set_foreground(Some(i));
                 fill(0, 0, WIDTH, HEIGHT, 0xff000000);
             }
             Err(e) => {
@@ -373,6 +373,19 @@ impl Runtime {
                 app.events.push_back(e);
             }
         }
+    }
+    /// Make `next` the app in front (None: the app list). The app that was in
+    /// front hears FOCUS_LOST, so it stops drawing and recording.
+    pub fn set_foreground(&mut self, next: Option<usize>) {
+        if self.foreground == next {
+            return;
+        }
+        if let Some(f) = self.foreground {
+            if self.apps[f].is_some() {
+                self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
+            }
+        }
+        self.foreground = next;
     }
     pub fn lifecycle(&mut self, i: usize, value: i32) {
         let now = sys::now_ns() / 1000;
@@ -750,10 +763,7 @@ impl Runtime {
             }
             // The list of every program in /apps.
             Some("apps") => {
-                if let Some(f) = self.foreground {
-                    self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
-                }
-                self.foreground = None;
+                self.set_foreground(None);
                 self.shell.dirty = true;
                 String::from("ok\n")
             }
@@ -767,10 +777,7 @@ impl Runtime {
                 Some(path) => {
                     if let Some(n) = (0..MAX_APPS).find(|&n| self.apps[n].as_ref().map_or(false, |a| a.path == path)) {
                         if self.foreground != Some(n) {
-                            if let Some(f) = self.foreground {
-                                self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
-                            }
-                            self.foreground = Some(n);
+                            self.set_foreground(Some(n));
                             self.refresh(n);
                             self.lifecycle(n, LIFECYCLE_FOCUS_GAINED);
                         }
@@ -778,10 +785,7 @@ impl Runtime {
                     }
                     match self.launch(path, &[]) {
                         Ok(n) => {
-                            if let Some(f) = self.foreground {
-                                self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
-                            }
-                            self.foreground = Some(n);
+                            self.set_foreground(Some(n));
                             fill(0, 0, WIDTH, HEIGHT, 0xff000000);
                             String::from("ok\n")
                         }
@@ -910,7 +914,7 @@ impl Runtime {
             Some("launch") => match words.next() {
                 Some(path) => match self.launch(path, &[]) {
                     Ok(n) => {
-                        self.foreground = Some(n);
+                        self.set_foreground(Some(n));
                         String::from("ok\n")
                     }
                     Err(e) => alloc::format!("error {}\n", e),

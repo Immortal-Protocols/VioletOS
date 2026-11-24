@@ -28,6 +28,8 @@ pub struct Fs {
     hidden: BTreeSet<String>,
     /// Paths under /data written, removed or renamed since the last save.
     pub changed: BTreeSet<String>,
+    /// What Storage holds for each file in /data, to write only what differs.
+    pub stored: BTreeMap<String, Vec<u8>>,
     /// Every directory, from the image, the layer and the parents of files.
     dirs: BTreeSet<String>,
 }
@@ -93,6 +95,7 @@ impl Fs {
             layer: BTreeMap::new(),
             hidden: BTreeSet::new(),
             changed: BTreeSet::new(),
+            stored: BTreeMap::new(),
             dirs: BTreeSet::new(),
         };
         for d in ["/", "/apps", "/bin", "/lib", "/tmp", "/data", "/dev", "/dev/violet", "/proc", "/proc/self"] {
@@ -229,12 +232,18 @@ impl Fs {
         Ok(())
     }
     pub fn rename(&mut self, from: &str, to: &str) -> Result<(), i32> {
-        let data = self.contents(from).ok_or(super::syscall::ENOENT)?.to_vec();
-        let mode = self.stat(from).map(|s| s.mode).unwrap_or(S_IFREG | 0o644);
+        if self.contents(from).is_none() {
+            return Err(super::syscall::ENOENT);
+        }
         if !self.dirs.contains(parent(to)) {
             return Err(super::syscall::ENOENT);
         }
-        self.layer.remove(from);
+        let mode = self.stat(from).map(|s| s.mode).unwrap_or(S_IFREG | 0o644);
+        // Move a file from the layer without copying it (installs are megabytes).
+        let data = match self.layer.remove(from) {
+            Some(l) => l.data,
+            None => self.contents(from).unwrap_or(&[]).to_vec(),
+        };
         self.hidden.insert(String::from(from));
         self.hidden.remove(to);
         self.layer.insert(String::from(to), Layer { data, mode, mtime: 0 });

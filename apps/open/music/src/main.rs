@@ -22,29 +22,59 @@ fn main() {
     let splash = |screen: &mut Screen, frame: &mut Canvas, line: &str| {
         let b = frame.bounds();
         frame.fill(b, rgb(20, 14, 30));
+        frame.round_rect_alpha(ui::HOME, 29.0, rgb(255, 255, 255), 0.13);
+        fonts.medium(23.0).draw(frame, "‹  Home", ui::HOME.x0 + 28, ui::HOME.y0 + 38, rgb(245, 240, 250));
         fonts.bold(38.0).centered(frame, "Rose Music", 0, W as i32, 760, rgb(0xe6, 0x8c, 0xc8));
         fonts.regular(28.0).centered(frame, line, 0, W as i32, 820, rgb(0xee, 0xea, 0xf8));
         screen.show_all(frame);
     };
-    splash(&mut screen, &mut frame, "Connecting to the library…");
-    let catalog = loop {
+    // Until something can play, the splash answers Home and focus changes.
+    let wait_on_splash = |screen: &mut Screen, frame: &mut Canvas, line: &str, timeout: Duration| {
+        let mut line = line.to_string();
+        splash(screen, frame, &line);
+        let deadline = Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match events.recv_timeout(left) {
+                Ok(e) if e.focus_gained() => splash(screen, frame, &line),
+                Ok(e) if e.kind == TOUCH_DOWN && ui::HOME.inset(-12).contains(e.x, e.y) => violet::home(),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+                    }
+    };
+    // The catalog loads on its own thread, retrying while offline.
+    let (catalog_tx, catalog_rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
         match player::catalog() {
-            Ok(c) => break c,
+            Ok(c) => {
+                let _ = catalog_tx.send(Ok(c));
+                return;
+            }
             Err(e) => {
-                println!("music: catalog: {e}");
-                splash(&mut screen, &mut frame, "Waiting for the network…");
+                let _ = catalog_tx.send(Err(e));
                 std::thread::sleep(Duration::from_secs(3));
             }
         }
+    });
+    let mut line = "Connecting to the library…".to_string();
+    let catalog = loop {
+        match catalog_rx.try_recv() {
+            Ok(Ok(c)) => break c,
+            Ok(Err(e)) => {
+                println!("music: catalog: {e}");
+                line = "Waiting for the network…".into();
+            }
+            Err(_) => {}
+        }
+        wait_on_splash(&mut screen, &mut frame, &line, Duration::from_millis(500));
     };
     println!("music: {}, {} songs", catalog.album, catalog.tracks.len());
     let mut player = match player::Player::new() {
         Ok(p) => p,
         Err(e) => {
             println!("music: no audio: {e}");
-            splash(&mut screen, &mut frame, &format!("No audio: {e}"));
             loop {
-                std::thread::sleep(Duration::from_secs(3600));
+                wait_on_splash(&mut screen, &mut frame, &format!("No audio: {e}"), Duration::from_secs(3600));
             }
         }
     };
@@ -78,9 +108,17 @@ fn main() {
     let mut last_look: Option<(u32, [u8; player::BANDS], bool, Option<usize>, String)> = None;
     let mut last_frame = Instant::now();
     let (mut draw_us, mut show_us, mut frames) = (0u64, 0u64, 0u32);
+    // Drawing stops while another app (or Home) is in front; playing goes on.
+    let mut focused = true;
     loop {
-        match events.recv_timeout(Duration::from_millis(100)) {
-            Ok(e) if e.focus_gained() => shown = None,
+        let wait = Duration::from_millis(if focused { 100 } else { 1000 });
+        match events.recv_timeout(wait) {
+            Ok(e) if e.focus_gained() => {
+                focused = true;
+                shown = None;
+                last_look = None;
+            }
+            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
             Ok(e) if e.kind == TOUCH_DOWN => {
                 let current = player.track.load(Relaxed);
                 match ui::hit(e.x, e.y, catalog.tracks.len()) {
@@ -132,6 +170,9 @@ fn main() {
                     draw_us * 100 / secs, frames, show_us * 100 / secs, player::DECODE_US.swap(0, Relaxed) * 100 / secs);
                 (draw_us, show_us, frames) = (0, 0, 0);
             }
+        }
+        if !focused {
+            continue;
         }
         let full = shown != Some(current);
         if full {

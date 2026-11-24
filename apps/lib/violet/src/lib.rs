@@ -20,6 +20,15 @@ pub mod colors {
     pub const ACCENT: Color = rgb(0xe6, 0x8c, 0xc8);
 }
 
+/// The cities Weather offers (and Home shows the weather for); Weather keeps
+/// the chosen index in /data/weather.
+pub const CITIES: [&str; 20] = [
+    "San Francisco", "Oakland", "Los Angeles", "Seattle", "New York",
+    "Chicago", "Austin", "Miami", "Denver", "Boston",
+    "Honolulu", "Anchorage", "Mexico City", "London", "Paris",
+    "Berlin", "Tokyo", "Sydney", "Mumbai", "Cairo",
+];
+
 /// Where every app draws its "‹ Home" button.
 pub const HOME_BOX: Rect = Rect::new(28, 34, 188, 92);
 
