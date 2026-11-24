@@ -66,6 +66,10 @@ impl Face {
         g
     }
 
+    pub fn size(&self) -> f32 {
+        self.size
+    }
+
     pub fn ascent(&self) -> i32 {
         self.family.font.horizontal_line_metrics(self.size).map_or(self.size * 0.8, |m| m.ascent).round() as i32
     }

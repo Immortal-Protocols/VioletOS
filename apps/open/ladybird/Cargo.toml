@@ -1,0 +1,29 @@
+# Ladybird for VioletOS: Ladybird's HTML tokenizer and tree builder (Rust,
+# from the pinned checkout that tools/fetch_ladybird.py makes in
+# build/ladybird) under a small Rust DOM, style, layout and paint, as an open
+# app. It is its own workspace because Ladybird needs a newer Rust than the
+# other apps; tools/build_initfs.py builds it.
+[workspace]
+
+[package]
+name = "ladybird"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+violet = { path = "../../lib/violet" }
+ak = { path = "../../../build/ladybird/AK/Rust" }
+libweb_html_tokenizer = { path = "../../../build/ladybird/Libraries/LibWeb/HTML/Parser/Rust" }
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Build scripts run on the Mac; stripping them needs rust-objcopy, which is not
+# always runnable outside rustup's proxy.
+[profile.release.build-override]
+strip = false
