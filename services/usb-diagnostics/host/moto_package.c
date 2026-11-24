@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | stopwatch | provision-wpa2 | join-wifi | weather=CITY | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | open-push=NAME | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -178,6 +178,38 @@ int main(int argc,char **argv) {
                     fprintf(stderr,"First reservation in the window: %#010x, %#x bytes; ramdisk %#010x-%#010x\n",
                             word(fault+40),word(fault+44),word(fault+48),word(fault+52));
             }
+        } else if (!strncmp(argv[1],"open-push=",10)) {
+            // open-push=NAME reads the program from standard input into /apps/NAME.
+            const char *name=argv[1]+10;
+            size_t nl=strlen(name);
+            static unsigned char file[64<<20];
+            size_t size=fread(file,1,sizeof file,stdin);
+            rc=nl<1||nl>31||!size||size==sizeof file;
+            if (rc) fputs("open-push=NAME < FILE (a name of 1-31 characters, under 64 MiB)\n",stderr);
+            for (size_t at=0; !rc && at<size; at+=65536) {
+                size_t block=size-at<65536?size-at:65536;
+                for (size_t pos=0; !rc && pos<block; pos+=40) {
+                    uint16_t count=block-pos<40?(uint16_t)(block-pos):40;
+                    rc=transfer(chosen,0x40,0x4a,(uint32_t)pos,file+at+pos,count);
+                }
+                unsigned char commit[40]={0}, state[12];
+                uint32_t fields[2]={(uint32_t)at,(uint32_t)block};
+                memcpy(commit,fields,8);
+                memcpy(commit+8,name,nl);
+                if (rc || libusb_control_transfer(chosen,0xc0,0x48,0,0,state,12,3000)!=12) { rc=1; break; }
+                uint32_t serial=word(state)+1;
+                rc=transfer(chosen,0x40,0x49,0,commit,(uint16_t)(8+nl));
+                for (int tries=0; !rc; tries++) {
+                    if (libusb_control_transfer(chosen,0xc0,0x48,0,0,state,12,3000)==12 && word(state+4)==serial) {
+                        rc=word(state+8)!=0;
+                        break;
+                    }
+                    if (tries>200) { fputs("The Open Runtime did not take the block\n",stderr); rc=1; }
+                    usleep(20000);
+                }
+                fprintf(stderr,"\r%zu of %zu KiB",(at+block)>>10,size>>10);
+            }
+            if (!rc) printf("\nInstalled /apps/%s (%zu bytes) until the next restart.\n",name,size);
         } else if (!strncmp(argv[1],"open-run=",9)) {
             size_t n=strlen(argv[1]+9);
             rc=n<1||n>40||transfer(chosen,0x40,0x4c,0,(unsigned char *)argv[1]+9,(uint16_t)n);

@@ -505,8 +505,54 @@ impl Runtime {
     #[cfg(not(moto_board))]
     fn usb_requests(&mut self) {}
 
+    /// Installs over USB (handset): append the 64 KiB window to /apps/NAME.
+    /// Control words: 0 commit serial (USB), 1 done serial, 2 result; file
+    /// offset at byte 16, length at 20, the name from byte 24.
+    #[cfg(moto_board)]
+    fn usb_installs(&mut self) {
+        let control = 0x0950_0000 as *mut u32;
+        let (commit, done) = unsafe { (control.read_volatile(), control.add(1).read_volatile()) };
+        if commit == done {
+            return;
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let (offset, len) = unsafe { (control.add(4).read_volatile() as usize, control.add(5).read_volatile() as usize) };
+        let mut name = [0u8; 32];
+        for (i, b) in name.iter_mut().enumerate() {
+            *b = unsafe { (0x0950_0018 as *const u8).add(i).read_volatile() };
+        }
+        let end = name.iter().position(|&b| b == 0).unwrap_or(32);
+        let name = String::from_utf8_lossy(&name[..end]).into_owned();
+        let path = alloc::format!("/apps/{}", name);
+        let data = unsafe { core::slice::from_raw_parts(0x0950_1000 as *const u8, len.min(65536)) };
+        let ok = !name.is_empty() && !name.contains('/') && match self.fs.writable(&path, true, offset == 0, 0) {
+            Some(file) => {
+                if file.len() < offset {
+                    false
+                } else {
+                    file.truncate(offset);
+                    file.extend_from_slice(data);
+                    true
+                }
+            }
+            None => false,
+        };
+        if ok && offset == 0 {
+            log!("installing {}", path);
+            self.shell.dirty = true;
+        }
+        unsafe {
+            control.add(2).write_volatile(if ok { 0 } else { 1 });
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            control.add(1).write_volatile(commit);
+        }
+    }
+    #[cfg(not(moto_board))]
+    fn usb_installs(&mut self) {}
+
     fn poll_runtime(&mut self) {
         self.usb_requests();
+        self.usb_installs();
         let focus = request(GET, FOCUS, 0);
         let focused = focus.op == OK && focus.value == OPEN_APPS;
         if focused != self.focused {

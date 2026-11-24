@@ -245,6 +245,29 @@ pub fn run() -> ! {
             // 0x4c: a program for the Open Runtime to start, as a path.
             let ok=if key==0x4c {
                 open_request(&bytes[..n])
+            } else if key==0x4a {
+                // Install data: bytes for the window at `offset`.
+                let at = offset as usize;
+                if at + n <= 65536 {
+                    for (i, b) in bytes[..n].iter().enumerate() {
+                        unsafe { ((0x09211000 + at + i) as *mut u8).write_volatile(*b) };
+                    }
+                    true
+                } else { false }
+            } else if key==0x49 {
+                // Install commit: file offset, length, name; then bump the serial.
+                let control = 0x09210000 as *mut u32;
+                unsafe {
+                    for (i, b) in bytes[..n].iter().enumerate() {
+                        ((0x09210000 + 16 + i) as *mut u8).write_volatile(*b);
+                    }
+                    for i in n..40 {
+                        ((0x09210000 + 16 + i) as *mut u8).write_volatile(0);
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    control.write_volatile(control.read_volatile().wrapping_add(1));
+                }
+                true
             } else {
                 upload_request(key,offset,&bytes[..n])
             };
@@ -330,7 +353,15 @@ pub fn run() -> ! {
                 put_half(CSR, 0x48);
             }
             (0xc0, 0x62, 0, 0) if configuration==1 => send(&package_status(),len),
-            (0x40, key @ (0x4c|0x60|0x61|0x66|0x67|0x6a|0x6b), lo, hi) if configuration==1
+            // An install's state: commit serial, done serial, result.
+            (0xc0, 0x48, 0, 0) => {
+                let mut out = [0; 12];
+                for (i, dest) in out.chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { (0x09210000 as *const u32).add(i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
+            (0x40, key @ (0x49|0x4a|0x4c|0x60|0x61|0x66|0x67|0x6a|0x6b), lo, hi) if configuration==1
                 && (if key==0x60 {len==4} else {(1..=40).contains(&len)}) => {
                 pending_out=Some((u32::from(key),u32::from(lo)|(u32::from(hi)<<16),usize::from(len)));
                 put_half(CSR,0x40);

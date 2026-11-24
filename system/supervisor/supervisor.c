@@ -661,6 +661,13 @@ static void open_runtime(void) {
     map_shared(frame, &procs[RADIO].task, 0x0b000000 + i * PAGE, seL4_AllRights);
     map_shared(frame, t, 0x09400000 + i * PAGE, seL4_AllRights);
   }
+  // Installs over USB: a control page and a 64 KiB data window, written by USB
+  // Diagnostics at 0x09210000 and appended to /apps by the Open Runtime at 0x09500000.
+  for (unsigned i = 0; i < 17; i++) {
+    unsigned frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(frame, &procs[USB_DIAG].task, 0x09210000 + i * PAGE, seL4_AllRights);
+    map_shared(frame, t, 0x09500000 + i * PAGE, seL4_AllRights);
+  }
   // USB Diagnostics reads the Open Runtime's log and passes launch requests.
   unsigned log_frame = create(ram, seL4_ARM_SmallPageObject);
   map_shared(log_frame, t, 0x09000000, seL4_AllRights);

@@ -1,10 +1,14 @@
 # Open Runtime
 
+**Music** is the first real app in this model: an ordinary Go program ([apps/open/music](../../apps/open/music)) that streams the *Glass Orchard* album from the Rose Music library over HTTPS, decodes its MP3s itself and plays 48 kHz PCM through `/dev/violet/audio`, with a full-resolution player drawn into `/dev/violet/screen`. On the Moto G Pure (November 24, 2026) it played the album over Wi-Fi in real time. Nothing about it lives in an OS service: no URL, decoder or playback state.
+
 The Open Runtime runs ordinary Linux ARM programs on VioletOS, with no Linux kernel anywhere. A static binary built for `armv7-unknown-linux-musleabihf`, a Go program built with `GOOS=linux GOARCH=arm GOARM=7`, or a Python script with a `#!/bin/python3` line goes into `/apps` and runs as it is. It implements the [open app model RFC](../../docs/open-app-model-rfc.md).
 
 ## Try it
 
 Run `make emulator` and tap **/APPS** on Home. The list shows every program in `/apps`; tap one to run it. Programs that print go to the Open Runtime's log. In QEMU the log is a page of guest memory at `0x49220000`; on the handset, `build/moto-package open-log` prints it, and `build/moto-package open-run=/apps/NAME` starts a program over USB.
+
+On the handset, `build/moto-package open-push=NAME < FILE` installs a program into `/apps` over USB without a reboot (about 50 KB/s; it lasts until the next restart), so the phone keeps its Wi-Fi connection while you iterate.
 
 `make test-open` starts each test program and checks its output, the frames drawn through `/dev/violet/screen`, taps, the PCM it plays and the trip to Home and back.
 

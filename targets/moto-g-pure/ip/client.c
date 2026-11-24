@@ -224,7 +224,8 @@ int station_net_join(const unsigned char *mac) {
   netif_set_link_up(&iface);
   unsigned start = sys_now();
   if (dhcp_start(&iface) == ERR_OK) {
-    while (!failed && sys_now() - start < 15000) {
+    // Some networks take well over 15 s to offer an address.
+    while (!failed && sys_now() - start < 30000) {
       station_net_poll();
       if (!failed && dhcp_supplied_address(&iface))
         return 1;
