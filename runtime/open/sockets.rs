@@ -66,7 +66,27 @@ impl Runtime {
                 }
                 Done(0)
             }
-            294 => Done(if self.is_socket(i, a[0] as i32) { 0 } else { EBADF }),
+            294 => {
+                let Some(f) = self.socket_file(i, a[0] as i32) else { return Done(EBADF) };
+                // SOL_SOCKET SO_RCVTIMEO: struct timeval with 32-bit (20) or
+                // 64-bit (66, musl's time64 form) fields. Other options are accepted.
+                if a[1] == 1 && (a[2] == 20 || a[2] == 66) {
+                    let wide = a[2] == 66;
+                    let mut tv = [0u8; 16];
+                    let n = if wide { 16 } else { 8 };
+                    let app = self.apps[i].as_mut().unwrap();
+                    if !app.space.read(&mut self.k, &mut self.pool, a[3], &mut tv[..n]) {
+                        return Done(EFAULT);
+                    }
+                    let (sec, usec) = if wide {
+                        (i64::from_le_bytes(tv[..8].try_into().unwrap()), i64::from_le_bytes(tv[8..16].try_into().unwrap()))
+                    } else {
+                        (i32::from_le_bytes(tv[..4].try_into().unwrap()) as i64, i32::from_le_bytes(tv[4..8].try_into().unwrap()) as i64)
+                    };
+                    f.borrow_mut().recv_timeout = (sec.max(0) as u64) * 1_000_000_000 + (usec.max(0) as u64) * 1000;
+                }
+                Done(0)
+            }
             295 => self.getsockopt(i, a[0] as i32, a[1], a[2], a[3], a[4]),
             296 | 297 => self.message_call(i, a[0] as i32, a[1], a[2], n == 296),
             288 => Done(EOPNOTSUPP),
@@ -186,6 +206,14 @@ impl Runtime {
     }
 
     pub fn socket_send(&mut self, i: usize, fd: i32, buf: u32, len: u32, to: Option<(u32, u16)>) -> i32 {
+        let r = self.socket_send_now(i, fd, buf, len, to);
+        if r == EAGAIN {
+            self.epoll_rearm(i, fd);
+        }
+        r
+    }
+
+    fn socket_send_now(&mut self, i: usize, fd: i32, buf: u32, len: u32, to: Option<(u32, u16)>) -> i32 {
         let Some(f) = self.socket_file(i, fd) else { return EBADF };
         let data = {
             let app = self.apps[i].as_mut().unwrap();
@@ -244,7 +272,7 @@ impl Runtime {
         let nonblock = flags & MSG_DONTWAIT != 0
             || self.socket_file(i, fd).map_or(true, |f| f.borrow().flags & O_NONBLOCK != 0);
         if r == EAGAIN && !nonblock {
-            return Block(Wait::Read { fd, buf, len }, None);
+            return Block(Wait::Read { fd, buf, len }, self.recv_deadline(i, fd));
         }
         Done(r)
     }

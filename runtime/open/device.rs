@@ -28,7 +28,9 @@ pub enum Kind {
     Log,
     Null,
     Random,
-    Epoll { interest: Vec<(i32, u32, u64)> },
+    /// Interest: (fd, events, data). `reported` holds, for edge-triggered
+    /// entries (EPOLLET), the readiness last reported, so only changes wake.
+    Epoll { interest: Vec<(i32, u32, u64)>, reported: Vec<(i32, u32)> },
     EventFd { count: u64 },
     Pipe { buffer: Rc<RefCell<VecDeque<u8>>>, write: bool, peer_open: Rc<RefCell<u32>> },
     /// A TCP socket: its slot once connect was called, and the peer.
@@ -41,10 +43,12 @@ pub struct OpenFile {
     pub kind: Kind,
     pub offset: u64,
     pub flags: u32,
+    /// SO_RCVTIMEO in nanoseconds; 0 waits forever.
+    pub recv_timeout: u64,
 }
 impl OpenFile {
     pub fn new(kind: Kind, flags: u32) -> Self {
-        Self { kind, offset: 0, flags }
+        Self { kind, offset: 0, flags, recv_timeout: 0 }
     }
 }
 impl Drop for OpenFile {
@@ -103,6 +107,9 @@ fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
             unsafe { fb.add(row * WIDTH + col).write_volatile(color) };
         }
     }
+    if w == WIDTH && h == HEIGHT {
+        sys::clean_framebuffer(0, HEIGHT); // a screen cleared outside draw_shell
+    }
 }
 fn text(x: usize, y: usize, s: &str, scale: usize, color: u32) {
     for (n, c) in s.bytes().enumerate() {
@@ -155,18 +162,58 @@ pub fn audio_write(channels: u32, pending: &mut Vec<u8>, data: &[u8]) -> usize {
 }
 
 pub const ROW_Y: usize = 260;
-pub const ROW_H: usize = 110;
+pub const ROW_H: usize = 80;
+const ROWS: usize = (HOME_Y - 40 - ROW_Y) / ROW_H;
+const BG_ROW: u32 = 0xff231d2e;
 pub const HOME_Y: usize = 1380;
 
 impl Runtime {
-    /// Programs under /apps: files, or folders with a main or main.py.
-    pub fn app_entries(&self) -> Vec<String> {
-        self.fs
-            .list("/apps")
-            .into_iter()
-            .filter(|(name, _)| !name.starts_with('.'))
-            .map(|(name, _)| alloc::format!("/apps/{}", name))
+    /// Titles from /apps/.home ("name<TAB>title" lines), for the apps that have one.
+    fn titles(&self) -> Vec<(String, String)> {
+        let Some(home) = self.fs.contents("/apps/.home") else { return Vec::new() };
+        core::str::from_utf8(home)
+            .unwrap_or("")
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(n, t)| (String::from(n), String::from(t)))
             .collect()
+    }
+    /// Programs under /apps: titled apps first, then the rest, each sorted.
+    pub fn app_entries(&self) -> Vec<String> {
+        let titled: Vec<String> = self.titles().into_iter().map(|(n, _)| n).collect();
+        let others = self.fs.list("/apps").into_iter().map(|(n, _)| n)
+            .filter(|n| !n.starts_with('.') && !titled.contains(n) && alloc::format!("/apps/{}", n) != super::HOME_APP);
+        titled.iter().cloned().filter(|n| self.fs.stat(&alloc::format!("/apps/{}", n)).is_some())
+            .chain(others)
+            .map(|n| alloc::format!("/apps/{}", n))
+            .collect()
+    }
+
+    /// Start the Home app, if there is one. It stays running; "home" shows it.
+    pub fn start_home(&mut self) {
+        if self.fs.stat(super::HOME_APP).is_none() {
+            return;
+        }
+        match self.launch(super::HOME_APP, &[]) {
+            Ok(i) => {
+                self.home = Some(i);
+                self.foreground = Some(i);
+            }
+            Err(e) => crate::log!("could not start Home: {}", e),
+        }
+    }
+    /// Show the Home app when nothing else is in front (or the list without one).
+    pub fn show_home(&mut self) {
+        match self.home {
+            Some(h) if self.apps[h].is_some() => {
+                if self.foreground != Some(h) {
+                    self.foreground = Some(h);
+                    self.refresh(h);
+                    self.lifecycle(h, LIFECYCLE_FOCUS_GAINED);
+                }
+            }
+            _ => self.shell.dirty = true,
+        }
     }
 
     pub fn draw_shell(&mut self) {
@@ -178,14 +225,17 @@ impl Runtime {
         if entries.is_empty() {
             text(42, ROW_Y, "NO APPS IN /APPS", 4, INK);
         }
-        for (i, path) in entries.iter().take(10).enumerate() {
+        let titles = self.titles();
+        for (i, path) in entries.iter().take(ROWS).enumerate() {
             let y = ROW_Y + i * ROW_H;
-            fill(42, y, WIDTH - 84, ROW_H - 14, PANEL);
             let name = path.trim_start_matches("/apps/");
-            let shown: String = name.chars().take(18).collect();
-            text(72, y + 14, &shown, 5, INK);
-            let running = self.apps.iter().flatten().any(|a| a.path == *path);
-            text(72, y + 66, if running { "RUNNING" } else { "TAP TO OPEN" }, 2, ACCENT);
+            let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_uppercase());
+            fill(42, y, WIDTH - 84, ROW_H - 12, if title.is_some() { PANEL } else { BG_ROW });
+            let shown: String = title.as_deref().unwrap_or(name).chars().take(16).collect();
+            text(72, y + 16, &shown, if title.is_some() { 5 } else { 4 }, INK);
+            if self.apps.iter().flatten().any(|a| a.path == *path) {
+                text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT);
+            }
         }
         if !self.shell.message.is_empty() {
             let m: String = self.shell.message.chars().take(36).collect();
@@ -193,12 +243,17 @@ impl Runtime {
         }
         fill(42, HOME_Y, WIDTH - 84, 150, PANEL);
         text(78, HOME_Y + 54, "HOME", 7, INK);
+        sys::clean_framebuffer(0, HEIGHT);
     }
 
     fn shell_tap(&mut self, x: i32, y: i32) {
         let y = y as usize;
         if (HOME_Y..HOME_Y + 150).contains(&y) {
-            request(EXECUTE, OPEN, LAUNCHER);
+            if self.home.is_some() {
+                self.show_home();
+            } else {
+                request(EXECUTE, OPEN, LAUNCHER);
+            }
             return;
         }
         if y < ROW_Y || x < 42 || x > (WIDTH - 42) as i32 {
@@ -256,7 +311,7 @@ impl Runtime {
                 self.shell.down_at = None;
                 self.lifecycle(i, LIFECYCLE_FOCUS_LOST);
                 self.foreground = None;
-                self.shell.dirty = true;
+                self.show_home();
                 return;
             }
         }
@@ -273,6 +328,10 @@ impl Runtime {
     }
     pub fn lifecycle(&mut self, i: usize, value: i32) {
         let now = sys::now_ns() / 1000;
+        if value == LIFECYCLE_FOCUS_LOST && self.audio {
+            // An app that leaves the front stops recording, as with any app.
+            request(EXECUTE, MICROPHONE, MIC_OFF);
+        }
         self.event(i, InputEvent { timestamp_us: now, kind: EVENT_LIFECYCLE, code: 0, x: 0, y: 0, value });
     }
 
@@ -311,6 +370,7 @@ impl Runtime {
                 dst += n;
             }
         }
+        sys::clean_framebuffer(y0, y1);
     }
 
     /// The app's screen surface, created on first open.
@@ -433,16 +493,29 @@ impl Runtime {
             let Some(Some(f)) = app.fds.get(epfd as usize) else { return super::syscall::EBADF };
             let f = f.borrow();
             match &f.kind {
-                Kind::Epoll { interest } => interest.clone(),
+                Kind::Epoll { interest, .. } => interest.clone(),
                 _ => return super::syscall::EINVAL,
             }
         };
+        const EPOLLET: u32 = 1 << 31;
         let mut n = 0u32;
+        let mut edges: Vec<(i32, u32)> = Vec::new();
         for (fd, mask, data) in interest {
             if n >= max {
                 break;
             }
-            let rev = self.poll_mask(i, fd) & (mask | 0x18);
+            let ready = self.poll_mask(i, fd) & (mask | 0x18);
+            let mut rev = ready;
+            if mask & EPOLLET != 0 {
+                // Edge-triggered writability: an idle socket stays writable, and
+                // Go's poller would wake for it forever. EPOLLOUT is reported
+                // once, and again after a write would block (epoll_rearm). Input
+                // stays level-triggered: readers drain until EAGAIN.
+                const EPOLLOUT: u32 = 4;
+                let last = self.epoll_reported(i, epfd, fd);
+                rev = ready & !(last & EPOLLOUT);
+                edges.push((fd, ready & EPOLLOUT));
+            }
             if rev == 0 {
                 continue;
             }
@@ -454,7 +527,38 @@ impl Runtime {
             app.space.write(&mut self.k, &mut self.pool, events + 16 * n, &bytes);
             n += 1;
         }
+        if !edges.is_empty() {
+            if let Some(Some(f)) = self.apps[i].as_ref().unwrap().fds.get(epfd as usize) {
+                if let Kind::Epoll { reported, .. } = &mut f.borrow_mut().kind {
+                    for (fd, ready) in edges {
+                        match reported.iter_mut().find(|r| r.0 == fd) {
+                            Some(r) => r.1 = ready,
+                            None => reported.push((fd, ready)),
+                        }
+                    }
+                }
+            }
+        }
         n as i32
+    }
+
+    /// A write to fd would block: report its writability again when it returns.
+    pub fn epoll_rearm(&mut self, i: usize, fd: i32) {
+        for f in self.apps[i].as_ref().unwrap().fds.iter().flatten() {
+            if let Ok(mut f) = f.try_borrow_mut() {
+                if let Kind::Epoll { reported, .. } = &mut f.kind {
+                    reported.retain(|r| r.0 != fd);
+                }
+            }
+        }
+    }
+
+    fn epoll_reported(&self, i: usize, epfd: i32, fd: i32) -> u32 {
+        let Some(Some(f)) = self.apps[i].as_ref().unwrap().fds.get(epfd as usize) else { return 0 };
+        match &f.borrow().kind {
+            Kind::Epoll { reported, .. } => reported.iter().find(|r| r.0 == fd).map_or(0, |r| r.1),
+            _ => 0,
+        }
     }
 
     /// Read without blocking; EAGAIN when nothing is available yet.
@@ -579,7 +683,16 @@ impl Runtime {
     pub fn system(&mut self, i: usize, line: &str) -> String {
         let mut words = line.split_whitespace();
         match words.next() {
+            // Back to the Home app (or, without one, the classic launcher).
             Some("home") => {
+                if self.home.is_some() && self.home != Some(i) {
+                    if self.foreground == Some(i) {
+                        self.lifecycle(i, LIFECYCLE_FOCUS_LOST);
+                    }
+                    self.foreground = None;
+                    self.show_home();
+                    return String::from("ok\n");
+                }
                 if self.foreground == Some(i) {
                     self.foreground = None;
                     self.shell.dirty = true;
@@ -587,10 +700,52 @@ impl Runtime {
                 request(EXECUTE, OPEN, LAUNCHER);
                 String::from("ok\n")
             }
+            // The list of every program in /apps.
             Some("apps") => {
+                if let Some(f) = self.foreground {
+                    self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
+                }
                 self.foreground = None;
                 self.shell.dirty = true;
                 String::from("ok\n")
+            }
+            // System settings: Wi-Fi, Phone Internet, packages and power.
+            Some("system") => {
+                request(EXECUTE, OPEN, LAUNCHER);
+                String::from("ok\n")
+            }
+            // Bring an app to the front, starting it if it is not running.
+            Some("open") => match words.next() {
+                Some(path) => {
+                    if let Some(n) = (0..MAX_APPS).find(|&n| self.apps[n].as_ref().map_or(false, |a| a.path == path)) {
+                        if self.foreground != Some(n) {
+                            if let Some(f) = self.foreground {
+                                self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
+                            }
+                            self.foreground = Some(n);
+                            self.refresh(n);
+                            self.lifecycle(n, LIFECYCLE_FOCUS_GAINED);
+                        }
+                        return String::from("ok\n");
+                    }
+                    match self.launch(path, &[]) {
+                        Ok(n) => {
+                            if let Some(f) = self.foreground {
+                                self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
+                            }
+                            self.foreground = Some(n);
+                            fill(0, 0, WIDTH, HEIGHT, 0xff000000);
+                            String::from("ok\n")
+                        }
+                        Err(e) => alloc::format!("error {}\n", e),
+                    }
+                }
+                None => String::from("error usage: open PATH\n"),
+            },
+            // The programs running now, as paths.
+            Some("running") => {
+                let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
+                alloc::format!("{}\n", paths.join(" "))
             }
             Some("status") => {
                 let power = request(GET, POWER, 0);
@@ -603,10 +758,73 @@ impl Runtime {
                     (self.focused && self.foreground == Some(i)) as u32
                 )
             }
+            Some("volume") if line.split_whitespace().nth(1).map_or(false, |w| w == "up" || w == "down") => {
+                let step = if words.next() == Some("up") { VOLUME_UP } else { VOLUME_DOWN };
+                let r = request(EXECUTE, VOLUME, step);
+                if r.op == OK { alloc::format!("volume={}\n", r.value) } else { String::from("error\n") }
+            }
             Some("volume") => {
                 let level = words.next().and_then(|w| w.parse::<u32>().ok()).unwrap_or(u32::MAX);
                 let r = request(EXECUTE, VOLUME, level);
                 if r.op == OK { alloc::format!("volume={}\n", r.value) } else { String::from("error\n") }
+            }
+            // Audio state in one line: output, volume, playback and microphone.
+            Some("audio") => {
+                let volume = request(GET, VOLUME, 0);
+                let playback = request(GET, PLAYBACK, 0);
+                let mic = request(GET, MICROPHONE, 0);
+                if volume.op != OK {
+                    return String::from("error no audio\n");
+                }
+                let f = volume.arg;
+                let outcome = match playback.arg & PLAYBACK_OUTCOME {
+                    PLAYBACK_PLAYED => "played",
+                    PLAYBACK_STOPPED => "stopped",
+                    PLAYBACK_NO_OUTPUT => "no-output",
+                    _ => "ready",
+                };
+                let mode = match mic.arg & MIC_MODE {
+                    MIC_LISTEN => "listen",
+                    MIC_RECORD => "record",
+                    _ => "off",
+                };
+                alloc::format!(
+                    "volume={} max={} headphones={} speaker={} headphone_out={} mic={} playing={} outcome={} mic_mode={} mic_level={} recording_ms={}\n",
+                    volume.value, VOLUME_MAX, (f & AUDIO_HEADPHONES != 0) as u32, (f & AUDIO_SPEAKER_OUT != 0) as u32,
+                    (f & AUDIO_HEADPHONE_OUT != 0) as u32, (f & AUDIO_MIC != 0) as u32,
+                    if playback.op == OK { sound_name(playback.value) } else { "none" }, outcome, mode,
+                    if mic.op == OK { mic.value } else { 0 },
+                    if mic.op == OK { (mic.arg >> 16) * 10 } else { 0 }
+                )
+            }
+            // "sound chime", "sound tone 440 1500", "sound recording", "sound stop".
+            Some("sound") => {
+                let name = words.next().unwrap_or("");
+                let sound = match name {
+                    "stop" => SOUND_STOP,
+                    "click" => SOUND_CLICK,
+                    "chime" => SOUND_CHIME,
+                    "alert" => SOUND_ALERT,
+                    "tone" => SOUND_TONE,
+                    "recording" => SOUND_RECORDING,
+                    _ => return String::from("error usage: sound stop|click|chime|alert|tone HZ MS|recording\n"),
+                };
+                let hz = words.next().and_then(|w| w.parse::<u32>().ok()).unwrap_or(440).min(0xffff);
+                let ms = words.next().and_then(|w| w.parse::<u32>().ok()).unwrap_or(1500).min(0xffff);
+                let arg = if sound == SOUND_TONE { hz | ms << 16 } else { 0 };
+                let r = super::request_with(EXECUTE, PLAYBACK, sound, arg);
+                if r.op == OK { String::from("ok\n") } else { alloc::format!("error {}\n", r.op) }
+            }
+            // "mic record" (up to four seconds), "mic listen", "mic off".
+            Some("mic") => {
+                let mode = match words.next() {
+                    Some("record") => MIC_RECORD,
+                    Some("listen") => MIC_LISTEN,
+                    Some("off") => MIC_OFF,
+                    _ => return String::from("error usage: mic record|listen|off\n"),
+                };
+                let r = request(EXECUTE, MICROPHONE, mode);
+                if r.op == OK { String::from("ok\n") } else { alloc::format!("error {}\n", r.op) }
             }
             Some("launch") => match words.next() {
                 Some(path) => match self.launch(path, &[]) {
@@ -631,4 +849,16 @@ impl Runtime {
 #[allow(dead_code)]
 fn _size_check() {
     let _: [u8; 24] = unsafe { core::mem::transmute(InputEvent::default()) };
+}
+
+fn sound_name(sound: u32) -> &'static str {
+    match sound {
+        SOUND_CLICK => "click",
+        SOUND_CHIME => "chime",
+        SOUND_ALERT => "alert",
+        SOUND_TONE => "tone",
+        SOUND_RECORDING => "recording",
+        SOUND_STREAM => "stream",
+        _ => "none",
+    }
 }

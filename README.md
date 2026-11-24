@@ -2,8 +2,8 @@
 
 VioletOS is a smartphone operating system built on the seL4 microkernel. It runs on the Moto G Pure (XT2163DL) and in QEMU on a Mac, with no Linux kernel anywhere. Drivers and services are separate seL4 processes, mostly written in Rust. Apps come in two kinds:
 
-- **Built-in apps** (Home, Stopwatch, Wi-Fi Setup, Sounds, Weather) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
-- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
+- **System components** (the classic launcher, Wi-Fi Setup, and the Stopwatch package used by the package-system tests) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
+- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Music, Weather, Stopwatch, Sounds) are open apps written in Rust. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -11,7 +11,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 
 | Command | What you get |
 | --- | --- |
-| `make emulator` | A clickable seL4 window. Home lists the built-in apps; **/APPS** opens the open apps. **Sounds** plays through the Mac's speakers and records from its microphone; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
+| `make emulator` | A clickable seL4 window. The classic launcher starts; **APPS** opens Home and the open apps. **Sounds** plays through the Mac's speakers and records from its microphone; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering stopwatch behavior, touch transfer failures, recovery and watchdog handling. The tests read the guest's rendered pixels. |
 | `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
@@ -23,6 +23,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 | `make test-power` | Verifies guest-driven VM pause, resume and shutdown. |
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds app, then checks the PCM, the recording and the on-screen volume. |
 | `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. |
+| `make test-open-apps` | Drives the built-in apps: Stopwatch's time in `/data` across a restart, Sounds, and live Weather. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
 
@@ -76,8 +77,6 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
 | 10 | [Wi-Fi Setup](apps/wifi/README.md) | Chooses a network and tests the connection. |
 | 11, 12 | Library apps | Free slots for separately installed apps. |
-| 13 | [Sounds](apps/sounds/process.rs) | Volume, built-in sounds, tones and microphone recording. |
-| 14 | [Weather](apps/weather/process.rs) | Current conditions for twenty cities from wttr.in over HTTPS, fetched by Radio. |
 | 15–20 | Runtime workers | Runtime's per-service request threads. |
 | 21 | [USB Diagnostics](services/usb-diagnostics/README.md) | Handset only: status, package staging, flashing and test requests from the Mac. |
 | 22 | [Audio](services/audio/README.md) | Speaker, headphones, jack, volume buttons, microphone, and open apps' PCM. |
@@ -92,7 +91,7 @@ Slot 23 is reserved for a Bluetooth service.
 | Boot, supervisor, recovery and rollback | Yes | Yes, from slot B, with Android kept on slot A |
 | Touch and display | Mouse clicks become touch reports | Novatek touch on either DJN panel |
 | Storage | Virtual disks | eMMC volume inside boot B; stopwatch time survives reboot |
-| Wi-Fi | Virtual access points; HTTPS through the Mac | WPA2-Personal, provisioned per boot over USB; HTTPS UUID and Weather |
+| Wi-Fi | Virtual access points; HTTPS through the Mac | WPA2-Personal, provisioned per boot over USB; HTTPS UUID |
 | Phone Internet | — | Hosts a Wi-Fi network for the iPhone relay; traffic leaves over cellular |
 | Audio | Mac speakers and microphone | Speaker, headphones, jack, Volume Down and microphone (Volume Up not yet) |
 | Open apps | Rust, C, Go and Python, with screen, touch, audio and TCP | Rust, C, Go and Python; PCM audio; TCP over Wi-Fi |
@@ -104,7 +103,8 @@ On the handset, apps are started from Home by touch, or from the Mac over USB (f
 ```
 apps/                 Built-in apps (no_std Rust) and open apps
   launcher/ stopwatch/ wifi/ sounds/ weather/   one process.rs each; drawing.rs is shared
-  open/               Linux programs for /apps, one folder each (main.rs, main.go, main.c or a script)
+  open/               Linux programs for /apps, one folder each (a Cargo crate, main.rs, main.go, main.c or a script)
+  lib/violet/         the built-in apps' shared Rust crate: devices, drawing, text, HTTPS
   examples/           Sketches from the open app model RFC
 runtime/              Runtime: protocol.rs (wire format and keys), process.rs, lanes.rs (workers), sdk.rs (app side)
   open/               Open Runtime: syscalls, devices, sockets, file system, memory pool
@@ -156,7 +156,7 @@ For example, change the **Start** label in `apps/stopwatch/process.rs` to update
 
 Start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance; reopening it restores the last saved checkpoint. **Radio** toggles the virtual modem, **Sleep** pauses QEMU until the next tap, and **Apps → Off → Confirm** shuts the VM down. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
 
-Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint, or **Weather** for a city's current conditions. The guest verifies the certificate; the Mac only relays TCP bytes.
+Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. The guest verifies the certificate; the Mac only relays TCP bytes. The **Weather** open app fetches wttr.in with its own TLS.
 
 Tap **/APPS** for the open apps. `hello`, `chello`, `gohello` and `pyhello` print to the Open Runtime's log; `canvas` and `pypaint` draw and answer taps; `pytone` plays a chord; `pynet` and `gonet` fetch a web page.
 

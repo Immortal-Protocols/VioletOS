@@ -73,7 +73,7 @@ fn page(d: &mut Disk, offset: usize, e: Entry, i: usize) -> Result<Sector, u32> 
     Ok(b)
 }
 pub fn dispatch(d: &mut Disk, owner: u32, m: Message) -> Result<Message, u32> {
-    if owner >= 7 {
+    if owner >= 8 {
         return Err(DENIED);
     }
     let bytes = m.text();

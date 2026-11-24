@@ -25,6 +25,19 @@ extern "C" {
     fn open_reply(mrs: *const u32, length: u32);
     fn open_send(cap: u32, mrs: *const u32, length: u32);
     fn open_yield();
+    fn open_clean(pd: u32, start: u32, end: u32) -> i32;
+}
+
+/// Write the rows y0..y1 of scanout (mapped cached) back to memory, so the
+/// display engine sees them. Cleaned one 64 KiB frame at a time.
+pub fn clean_framebuffer(y0: usize, y1: usize) {
+    let stride = 720 * 4;
+    let (mut a, end) = (FRAMEBUFFER + y0 * stride, FRAMEBUFFER + y1.min(1600) * stride);
+    while a < end {
+        let next = ((a & !0xffff) + 0x10000).min(end);
+        unsafe { open_clean(SLOT_PD, a as u32, next as u32) };
+        a = next;
+    }
 }
 
 /// Capability slots the supervisor fills (see open_runtime() in supervisor.c).

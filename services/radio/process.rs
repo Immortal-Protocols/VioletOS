@@ -75,16 +75,6 @@ pub fn run() -> ! {
                     Message::result(2)
                 }
             }
-            (EXECUTE, WEATHER) if online && associated != 0 => {
-                match gateway::endpoint_weather(m.value as usize) {
-                    Some((text, n)) => {
-                        let mut response = Message::result(1);
-                        response.put_text(&text[..n]);
-                        response
-                    }
-                    None => Message::result(2),
-                }
-            }
             _ => Message::error(OFFLINE),
         }
     })

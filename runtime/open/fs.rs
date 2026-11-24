@@ -26,6 +26,8 @@ pub struct Fs {
     image: BTreeMap<String, ImageEntry>,
     layer: BTreeMap<String, Layer>,
     hidden: BTreeSet<String>,
+    /// Paths under /data written, removed or renamed since the last save.
+    pub changed: BTreeSet<String>,
     /// Every directory, from the image, the layer and the parents of files.
     dirs: BTreeSet<String>,
 }
@@ -90,6 +92,7 @@ impl Fs {
             image: BTreeMap::new(),
             layer: BTreeMap::new(),
             hidden: BTreeSet::new(),
+            changed: BTreeSet::new(),
             dirs: BTreeSet::new(),
         };
         for d in ["/", "/apps", "/bin", "/lib", "/tmp", "/data", "/dev", "/dev/violet", "/proc", "/proc/self"] {
@@ -167,6 +170,9 @@ impl Fs {
     }
     /// A writable copy of a file, created empty (or copied up from the image).
     pub fn writable(&mut self, path: &str, create: bool, truncate: bool, now: u32) -> Option<&mut Vec<u8>> {
+        if path.starts_with("/data/") {
+            self.changed.insert(String::from(path));
+        }
         if !self.layer.contains_key(path) {
             let existing = if self.hidden.contains(path) { None } else { self.image.get(path) };
             let (data, mode) = match existing {
@@ -208,6 +214,9 @@ impl Fs {
             return Err(super::syscall::ENOTEMPTY);
         }
         self.layer.remove(path);
+        if path.starts_with("/data/") {
+            self.changed.insert(String::from(path));
+        }
         if dir {
             self.dirs.remove(path);
         }
@@ -224,6 +233,11 @@ impl Fs {
         self.hidden.insert(String::from(from));
         self.hidden.remove(to);
         self.layer.insert(String::from(to), Layer { data, mode, mtime: 0 });
+        for p in [from, to] {
+            if p.starts_with("/data/") {
+                self.changed.insert(String::from(p));
+            }
+        }
         Ok(())
     }
     /// Names directly inside a directory, with whether each is a directory.

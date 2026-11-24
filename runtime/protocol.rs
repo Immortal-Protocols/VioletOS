@@ -127,46 +127,12 @@ pub fn region(who: u32) -> u32 {
         WATCH => 0,
         LAUNCHER => 1,
         WIFI..=APP_LAST => who - 8,
+        OPEN_APPS => 7,
         _ => u32::MAX,
     }
 }
 
 pub const SCAN: u32 = 26;
-
-/// Fetch one line of current weather for `CITIES[value]` over HTTPS (wttr.in).
-pub const WEATHER: u32 = 28;
-/// The built-in Weather app's catalog slot; only it may issue WEATHER.
-pub const WEATHER_APP: u32 = 14;
-pub const CITIES: [&[u8]; 20] = [
-    b"SAN FRANCISCO", b"OAKLAND", b"LOS ANGELES", b"SEATTLE", b"NEW YORK",
-    b"CHICAGO", b"AUSTIN", b"MIAMI", b"DENVER", b"BOSTON",
-    b"HONOLULU", b"ANCHORAGE", b"MEXICO CITY", b"LONDON", b"PARIS",
-    b"BERLIN", b"TOKYO", b"SYDNEY", b"MUMBAI", b"CAIRO",
-];
-/// Build the wttr.in request path for a city: "/San+Francisco?format=%t;%C&u" + NUL.
-pub fn weather_path(city: usize, out: &mut [u8; 64]) -> Option<usize> {
-    let name = CITIES.get(city)?;
-    let mut n = 0;
-    let mut push = |b: u8, n: &mut usize| {
-        out[*n] = b;
-        *n += 1;
-    };
-    push(b'/', &mut n);
-    let mut word_start = true;
-    for &c in name.iter() {
-        if c == b' ' {
-            push(b'+', &mut n);
-            word_start = true;
-        } else {
-            push(if word_start { c } else { c.to_ascii_lowercase() }, &mut n);
-            word_start = false;
-        }
-    }
-    for &c in b"?format=%t;%C&u\0".iter() {
-        push(c, &mut n);
-    }
-    Some(n - 1)
-}
 
 pub const PROFILE: u32 = 27;
 

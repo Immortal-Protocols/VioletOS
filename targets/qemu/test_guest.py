@@ -14,7 +14,7 @@ parser.add_argument("--expect",type=int, default=0)
 parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer","radio","radio-dma"])
 parser.add_argument("--stack",choices=["handset-ui","lifecycle","removed","recovered","save-radio","restore-radio"])
 parser.add_argument("--library",choices=["install","open","remove","absent","radio-install","radio-rollback","radio-reboot","install-second"])
-parser.add_argument("--wifi",choices=["exercise","save","restore","live","async","weather"])
+parser.add_argument("--wifi",choices=["exercise","save","restore","live","async"])
 parser.add_argument("--state-dir",type=Path)
 parser.add_argument("--fault-id",type=int,default=7)
 args=parser.parse_args()
@@ -41,7 +41,7 @@ def untrusted_transport():
     server.shutdown(socket.SHUT_WR)
     resources.callback(server.close)
     return client
-peer=resources.enter_context(endpoint_peer(connect_endpoint if args.wifi in ("live","weather") else untrusted_transport)) if args.wifi else None
+peer=resources.enter_context(endpoint_peer(connect_endpoint if args.wifi=="live" else untrusted_transport)) if args.wifi else None
 cmd=machine(peer=peer,catalogs=catalogs,image=image,watchdog=enabled, scenario=modes.index(args.spi), disk=args.disk)+["-serial","pty","-qmp","stdio"]
 if args.stack=="recovered" or args.library=="radio-rollback":
     cmd+=["-device","loader,addr=0x49300014,data=1,data-len=4"]
@@ -116,7 +116,7 @@ try:
             assert actual==expected,(expected,actual)
         if args.library:
             def library():
-                tap(260,560)
+                tap(400,560)  # Home's SYSTEM button
                 check_label(48,"INSTALLED",0xffd1b0fe)
             if args.library.startswith("radio-"):
                 def status():
@@ -186,25 +186,6 @@ try:
         tap(820)
         check_label(130,"CONNECTED",ink)
         if args.wifi=="save": sys.exit(0)
-        if args.wifi=="weather":
-            # Home -> Applications -> NEXT past WATCH, WIFI and SOUNDS (empty slots are skipped) -> Open.
-            tap(1340); time.sleep(.3)
-            tap(260,560); time.sleep(.3)
-            for _ in range(3): tap(440)
-            time.sleep(.3)
-            assert read_label(62,7,ink,2)=="WEATHER",read_label(62,7,ink,2)
-            tap(650); time.sleep(.5)
-            check_label(14,"WEATHER",accent)
-            tap((118+22+6)*4,150)  # OAKLAND: second row, first column
-            for _ in range(150):
-                if read_label(104,17,accent)=="LIVE FROM WTTR.IN": break
-                time.sleep(.1)
-            check_label(104,"LIVE FROM WTTR.IN",accent)
-            assert read_label(26,7,ink,2)=="OAKLAND"
-            temperature=read_label(48,4,ink,4).strip("? ")
-            assert temperature.endswith("F") and temperature[:-1].lstrip("-").isdigit(),temperature
-            print("Live Oakland weather from guest-verified TLS:",temperature,read_label(82,18,ink,2).rstrip("? "))
-            sys.exit(0)
         test_start=time.monotonic()
         tap(1080)
         if args.wifi=="async":
@@ -278,13 +259,6 @@ try:
         if args.stack=="recovered":
             if args.fault_id in (2,10):
                 tap(680 if args.fault_id==10 else 920)  # The stopwatch loads on demand.
-            if args.fault_id in (13,14):
-                # Sounds and Weather load on demand too: Apps -> NEXT past STOPWATCH
-                # and WI-FI (and Sounds, for Weather) -> OPEN.
-                tap(260,560); time.sleep(.3)
-                for _ in range(2 if args.fault_id==13 else 3): tap(440)
-                time.sleep(.3)
-                tap(650)
             for _ in range(140):
                 if words(0x49300008,3)==(2,2,args.fault_id): break
                 time.sleep(.05)

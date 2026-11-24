@@ -148,6 +148,12 @@ def main():
             if snapshot and snapshot.get("runtime_ready"):
                 keys = ("generation", "disk_ready", "startup_status", "previous_boot_stage")
                 log("VioletOS answered: " + json.dumps({k: snapshot.get(k) for k in keys}))
+                # The Wi-Fi profile lasts one boot: provision the one saved on this Mac.
+                profile = Path(__file__).with_name("moto-wifi-profile")
+                if (Path.home() / ".config/violetos/wifi-profile.json").exists():
+                    result = ok(profile, "--saved", timeout=30)
+                    log("Saved Wi-Fi profile provisioned" if result and result.returncode == 0
+                        else "Could not provision the saved Wi-Fi profile")
                 return
             if in_android():
                 break

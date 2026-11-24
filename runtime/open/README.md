@@ -1,10 +1,16 @@
 # Open Runtime
 
+The built-in apps are open apps, written in Rust: **Home**, **Music**, **Weather**, **Stopwatch** and **Sounds** ([apps/open](../../apps/open), sharing the [violet](../../apps/lib/violet) crate for the devices, drawing, text and HTTPS with rustls). Music streams the *Glass Orchard* album from the Rose Music library over HTTPS, decodes its MP3s itself (symphonia) and plays 48 kHz PCM through `/dev/violet/audio`, with a full-resolution player drawn into `/dev/violet/screen`. Weather and Home fetch wttr.in themselves; no URL, decoder or playback state lives in an OS service. On the handset, Home is the main screen; the classic launcher is **System** (Wi-Fi, Phone Internet, packages and power).
+
 The Open Runtime runs ordinary Linux ARM programs on VioletOS, with no Linux kernel anywhere. A static binary built for `armv7-unknown-linux-musleabihf`, a Go program built with `GOOS=linux GOARCH=arm GOARM=7`, or a Python script with a `#!/bin/python3` line goes into `/apps` and runs as it is. It implements the [open app model RFC](../../docs/open-app-model-rfc.md).
 
 ## Try it
 
-Run `make emulator` and tap **/APPS** on Home. The list shows every program in `/apps`; tap one to run it. Programs that print go to the Open Runtime's log. In QEMU the log is a page of guest memory at `0x49220000`; on the handset, `build/moto-package open-log` prints it, and `build/moto-package open-run=/apps/NAME` starts a program over USB.
+Run `make emulator` and tap **APPS** on the classic launcher (the handset starts in Home directly). Home shows a tile for each app; **Programs** lists every program in `/apps`, and tapping one runs it. Programs that print go to the Open Runtime's log. In QEMU the log is a page of guest memory at `0x49220000`; on the handset, `build/moto-package open-log` prints it, and `build/moto-package open-run=/apps/NAME` starts a program over USB.
+
+On the handset, `build/moto-package open-push=NAME < FILE` installs a program into `/apps` over USB without a reboot (about 400 KB/s; it lasts until the next restart), so the phone keeps its Wi-Fi connection while you iterate. `open-run` of a program that is already running replaces it.
+
+`make test-open-apps` drives the built-in apps: Stopwatch keeps its time in `/data` across a restart, Sounds plays the chime, and Weather fetches live conditions (skipped offline).
 
 `make test-open` starts each test program and checks its output, the frames drawn through `/dev/violet/screen`, taps, the PCM it plays and the trip to Home and back.
 
@@ -26,9 +32,11 @@ On the Moto G Pure (November 23, 2026), hello, chello, gohello, pyhello and pyto
 
 [tools/build_initfs.py](../../tools/build_initfs.py) builds the image from `apps/open`. Each folder becomes `/apps/NAME`:
 
-- `main.rs`: built as a static Rust `std` program. Needs `rustup target add armv7-unknown-linux-musleabihf`.
+- `Cargo.toml`: a member of the Cargo workspace in [apps/Cargo.toml](../../apps/Cargo.toml), built with crates for `armv7-unknown-linux-musleabihf` (ring, under rustls, compiles a little C with the NDK's clang).
+- `main.rs`: built as a static Rust `std` program with `rustc` alone. Needs `rustup target add armv7-unknown-linux-musleabihf`.
 - `main.go`: built with Go for `linux/arm`, `GOARM=7`, `CGO_ENABLED=0`.
 - `main.c`: built against musl with the NDK's clang. Build the musl sysroot once with `python3 tools/build_python.py musl`.
+- An `app.txt` names the app; titled apps come first in the list. The handset image leaves out Python and the network test programs (`HANDSET_SKIP`) to fit its boot partition.
 - Anything else is copied as it is. A file starting with `#!` runs under the named interpreter; a `.py` file without one runs under `/bin/python3`; a folder runs its `main` or `main.py`.
 
 `python3 tools/build_python.py python` cross-builds CPython 3.12 statically against musl (with zlib) and the image picks it up as `/bin/python3` and `/lib/python3.12`. It needs Homebrew's `python@3.12` on the Mac. Downloads are pinned by SHA-256.
@@ -50,17 +58,19 @@ QEMU loads the image uncompressed at `0x4a000000`. The handset carries it gzip-c
 - **System calls.** seL4's system calls use negative numbers in `r7`; Linux's are positive, so a Linux `svc #0` reaches the Open Runtime as an unknown-syscall fault carrying `r0`–`r7`. The reply sets `r0` and moves the restart address past the `svc`. Calls that must wait (futexes, `read` of events, `poll`, `epoll_wait`, `nanosleep`, a full audio ring) keep the thread's reply capability and answer later. About 150 calls are handled; [syscall.rs](syscall.rs) lists them.
 - **Memory.** Pages are 64 KiB, mapped on first touch. Regions still start on any 4 KiB boundary, as Linux allows. `mmap`, `munmap`, `mprotect` and `brk` maintain the regions; every pool page stays mapped in the Open Runtime as well, so reading app memory is a plain load.
 - **Threads.** `clone` makes an seL4 thread in the same address space. The thread pointer is `TPIDRURO`, as on Linux; the kernel is built with `KernelArmTLSReg=tpidruro` and the Open Runtime sets it with `seL4_TCB_SetTLSBase`. seL4 clears the Thumb bit whenever registers are written, so new threads start at a one-instruction ARM trampoline (`ldr pc, [pc, #-4]`) that jumps to the Thumb or ARM target.
-- **Screen and touch.** The Open Runtime is Runtime's client 9. Home's **/APPS** button gives it focus; it then draws the app list or the app in front directly to the framebuffer, and receives every touch change (down, move, up). An app's surface is two 720 × 1600 BGRA8888 buffers that the app maps with `mmap`; `write` of a `PresentRect` copies rows to the screen. Holding the top edge for a second, or writing `home` to `/dev/violet/sys`, leaves the app running in the background.
+- **Screen and touch.** The Open Runtime is Runtime's client 9. The launcher's **APPS** button (or, on the handset, the hand-over at start) gives it focus; it then draws the app list or the app in front directly to the framebuffer, and receives every touch change (down, move, up). An app's surface is two 720 × 1600 BGRA8888 buffers that the app maps with `mmap`; `write` of a `PresentRect` copies rows to the screen. Holding the top edge for a second, or writing `home` to `/dev/violet/sys`, leaves the app running in the background.
 - **Sound.** `/dev/violet/audio` takes 48 kHz s16 PCM (stereo, or mono with `AUDIO_IOC_CONFIG`). It fills a 64 KiB ring shared with the [Audio service](../../services/audio/README.md), which plays it at the shared volume through the speaker or headphones. Built-in sounds take precedence while they play.
 - **Network.** TCP sockets use eight slots in pages shared with Radio, which runs them on its lwIP stack from its event loop ([sockets.c](../../targets/moto-g-pure/ip/sockets.c)): directly on a joined network, or through the phone's SOCKS5 relay in Phone Internet mode. DNS queries (UDP to port 53) never leave the phone: the Open Runtime answers each name with an address in `198.18.0.0/15`, and a connect to one hands Radio the name, which it resolves (or the relay does). `/etc/resolv.conf`, `/etc/hosts` and the build machine's root certificates are in the image. In QEMU, [tools/net_relay.py](../../tools/net_relay.py) serves the same pages with the Mac's sockets; `VIOLET_NET_HOSTS` can point names elsewhere for tests.
-- **Files.** `/apps`, `/bin` and `/lib` come from the image. Writes go to an in-memory layer over it (`/tmp`, `/data` or anywhere else) and are lost at restart.
+- **Files.** `/apps`, `/bin` and `/lib` come from the image. Writes go to an in-memory layer over it. Files directly in `/data` (names of up to 16 letters, digits, `.`, `_` or `-`, up to 4 KiB) are kept across restarts by the Storage service ([data.rs](data.rs)): the Open Runtime loads them at start and writes one back after it changes. Storage keeps four such files for all open apps; everything else is lost at restart.
+- **Home and /dev/violet/sys.** `/apps/home` starts the first time the open apps come to the front and stays running. `home` brings it back; `open PATH` brings an app to the front or starts it; `apps` shows the list of programs; `system` opens the classic launcher; `running` lists running programs; `status`, `audio`, `volume N|up|down`, `sound NAME`, `mic record|listen|off` and `log TEXT` cover the rest. An app leaving the front stops the microphone.
 - **Policy.** Every `open` passes through [policy.rs](policy.rs); the default `OpenPolicy` allows everything.
 
 ## Not done yet
 
 - Listening sockets, general UDP and IPv6. TCP clients work; `listen`/`accept` return `EOPNOTSUPP`, and UDP serves only DNS.
-- Persistent files. `/data` lives in memory; Storage still offers only its small per-app files.
+- Larger persistent files. `/data` keeps four files of up to 4 KiB.
 - Signals are accepted but never delivered, so Go runs with `GODEBUG=asyncpreemptoff=1` and a fault ends the app.
 - `fork` and `execve`. Programs can start threads but not other processes; `/dev/violet/sys` can `launch` another app.
 - Dynamic linking. Programs must be static (static PIE works).
-- One CPU, and up to three apps at once.
+- One CPU, and up to six apps at once.
+- Runtime asks Audio for its state synchronously, so a request that reaches Audio between its hardware polls can hold other Runtime clients for up to about 40 ms on the handset.
