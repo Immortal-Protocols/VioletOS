@@ -111,11 +111,16 @@ def build_target(target,out):
     kernel=out/"kernel"
     run("cmake","-GNinja","-S",src,"-B",kernel,"-DCMAKE_TOOLCHAIN_FILE="+str(src/"llvm.cmake"),
         "-DTRIPLE=arm-none-eabi","-DPYTHON3="+str(py),"-DKernelPlatform=ellis",
-        "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS=OFF","-DKernelPrinting=OFF",
+        "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS="+("OFF" if os.environ.get("VIOLET_MCS")=="0" else "ON"),"-DKernelPrinting=OFF",
         "-DKernelDebugBuild=OFF","-DKernelVerificationBuild=OFF","-DKernelArmExportVCNTUser=ON",
+        # MCS: scheduling contexts give the app in front a budget above the
+        # services (docs/8ms-frame-pipeline-rfc.md). VIOLET_MCS=0 builds without.
         # The Open Runtime programs the physical timer (PPI 30) to wake itself,
         # so it can block between events (docs/8ms-frame-pipeline-rfc.md).
         "-DKernelArmExportPTMRUser=ON",
+        # Cores 0-3 of cluster 0 (the kernel numbers cores by MPIDR's low
+        # byte, so the second cluster would alias the first). VIOLET_CORES=1 for one.
+        "-DKernelMaxNumNodes="+os.environ.get("VIOLET_CORES","4"),
         # Linux ARM programs read their thread pointer from TPIDRURO; the Open Runtime sets it.
         "-DKernelArmTLSReg=tpidruro")
     generated=["include/sel4/"+f for f in ["shared_types_gen.h","syscall.h","invocation.h"]]

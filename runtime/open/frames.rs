@@ -61,6 +61,9 @@ impl Histogram {
 pub struct Bench {
     pub x: i32,
     pub y: i32,
+    /// A drag of this many pixels (0: a press).
+    pub dy: i32,
+    pub step: i32,
     pub left: u32,
     pub next_ns: u64,
     pub pressed: bool,
@@ -89,6 +92,11 @@ pub struct Frames {
     /// Focus handed to the app in front until its next present (a full redraw).
     pub redraw: Histogram,
     pub focus_at: Option<u64>,
+    /// Touch's interrupt read the report until the Open Runtime passed it on.
+    pub touch_irq: Histogram,
+    /// Time between consecutive presents less than 100 ms apart (animation cadence).
+    pub cadence: Histogram,
+    last_end: u64,
 }
 
 impl Frames {
@@ -96,6 +104,10 @@ impl Frames {
         self.present.add(end_ns.wrapping_sub(start_ns));
         self.present_pixels += pixels;
         self.flips += 1;
+        if self.last_end != 0 && end_ns - self.last_end < 100_000_000 {
+            self.cadence.add(end_ns - self.last_end);
+        }
+        self.last_end = end_ns;
         // An input the app ignored is not answered by a frame a second later.
         if let Some(at) = self.input_at.take().filter(|&at| end_ns.wrapping_sub(at) < 1_000_000_000) {
             self.input.add(end_ns.wrapping_sub(at));
@@ -118,7 +130,7 @@ impl Frames {
     pub fn report(&mut self, now_ns: u64) -> String {
         let secs_x10 = now_ns.wrapping_sub(self.since_ns) / 100_000_000;
         let s = alloc::format!(
-            "window_ms={} {} present_mpix={} clean_ms={} {} {} {} {}\n",
+            "window_ms={} {} present_mpix={} clean_ms={} {} {} {} {} {} {}\n",
             secs_x10 * 100,
             self.present.report("present"),
             self.present_pixels / 1_000_000,
@@ -126,6 +138,8 @@ impl Frames {
             self.waited.report("wait"),
             self.input.report("input"),
             self.redraw.report("redraw"),
+            self.touch_irq.report("touch"),
+            self.cadence.report("cadence"),
             self.poll_gap.report("poll"),
         );
         let bench = self.bench;

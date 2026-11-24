@@ -152,3 +152,8 @@ unsigned spi_read(unsigned offset) {
     test[VIOLATIONS]++;
     return 0;
 }
+
+/* No interrupt line in the fixture: touch stays polled. */
+bool touch_irq_start(void) { return false; }
+bool touch_irq_take(void) { return false; }
+void touch_irq_stop(void) {}

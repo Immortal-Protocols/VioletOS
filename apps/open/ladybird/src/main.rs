@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use layout::{Item, Layout};
 use url::Url;
 use violet::device::{TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP};
-use violet::{colors, mix, rgb, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors, compositor, mix, rgb, Canvas, Compositor, Fonts, Rect, Screen, H, W};
 
 const TOOLBAR: i32 = 124;
 const BACK_BOX: Rect = Rect::new(200, 34, 284, 92);
@@ -32,7 +32,6 @@ const PROGRESS: Rect = Rect::new(0, TOOLBAR - 6, W as i32, TOOLBAR);
 const KEY_H: i32 = 96;
 const KEYBOARD_TOP: i32 = H as i32 - 5 * KEY_H - 16;
 const KEY_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl:", "zxcvbnm.-/"];
-const DRAG_SLOP: i32 = 18;
 
 const START_PAGE: &str = r#"<!doctype html>
 <html><head><title>Ladybird</title>
@@ -143,6 +142,8 @@ struct Browser {
     status: String,
     editing: Option<String>,
     tx: mpsc::Sender<Loaded>,
+    /// Counts pages shown, so the compositor's layer is repainted for a new one.
+    serial: u64,
 }
 
 fn viewport() -> i32 {
@@ -225,6 +226,7 @@ impl Browser {
             None => 0,
         };
         self.page = Some(Shown { location, layout });
+        self.serial += 1;
         self.status.clear();
         self.clamp_scroll();
     }
@@ -305,42 +307,75 @@ impl Browser {
 
     // Drawing.
 
+    /// The page's items between content rows top and bottom, shifted by dy.
+    fn paint_items(c: &mut Canvas, fonts: &Fonts, l: &Layout, dy: i32, top: i32, bottom: i32) {
+        for item in &l.items {
+            match item {
+                Item::Fill { r, color } => {
+                    if r.y1 >= top && r.y0 <= bottom {
+                        c.fill(r.offset(0, dy), *color);
+                    }
+                }
+                Item::Text { x, baseline, text, size, bold, color } => {
+                    if *baseline >= top && *baseline <= bottom {
+                        let face = if *bold { fonts.bold(*size) } else { fonts.regular(*size) };
+                        face.draw(c, text, *x, baseline + dy, *color);
+                    }
+                }
+                Item::Dot { cx, cy, radius, color } => {
+                    if *cy >= top && *cy <= bottom {
+                        c.circle(*cx as f32, (cy + dy) as f32, *radius, *color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The page under the toolbar at the current scroll (the Mac preview;
+    /// on the phone the compositor shows the page).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn draw_page(&mut self) {
         let Some(page) = &self.page else {
             self.c.fill(Rect::new(0, TOOLBAR, W as i32, H as i32), rgb(0xff, 0xff, 0xff));
             return;
         };
         let l = &page.layout;
+        self.c.set_clip(Rect::new(0, TOOLBAR, W as i32, H as i32));
         self.c.fill(Rect::new(0, TOOLBAR, W as i32, H as i32), l.background);
-        let dy = TOOLBAR - self.scroll;
-        let (top, bottom) = (self.scroll - 200, self.scroll + viewport() + 200);
-        for item in &l.items {
-            match item {
-                Item::Fill { r, color } => {
-                    if r.y1 >= top && r.y0 <= bottom {
-                        self.c.fill(r.offset(0, dy).intersect(Rect::new(0, TOOLBAR, W as i32, H as i32)), *color);
-                    }
-                }
-                Item::Text { x, baseline, text, size, bold, color } => {
-                    if *baseline >= top && *baseline <= bottom {
-                        let face = if *bold { self.fonts.bold(*size) } else { self.fonts.regular(*size) };
-                        face.draw(&mut self.c, text, *x, baseline + dy, *color);
-                    }
-                }
-                Item::Dot { cx, cy, radius, color } => {
-                    if *cy >= top && *cy <= bottom {
-                        self.c.circle(*cx as f32, (cy + dy) as f32, *radius, *color);
-                    }
-                }
-            }
-        }
-        // A scroll indicator when the page is taller than the screen.
+        Self::paint_items(&mut self.c, &self.fonts, l, TOOLBAR - self.scroll, self.scroll - 200, self.scroll + viewport() + 200);
+        self.c.reset_clip();
         if l.height > viewport() {
             let track = viewport() - 20;
             let thumb = (track * viewport() / l.height).max(40);
             let at = TOOLBAR + 10 + (track - thumb) * self.scroll / (l.height - viewport() + 40).max(1);
             self.c.round_rect(Rect::new(W as i32 - 10, at, W as i32 - 4, at + thumb), 3.0, mix(l.background, rgb(0, 0, 0), 0.35));
         }
+    }
+
+    /// How far the page scrolls, with the keyboard up or not.
+    fn max_scroll(&self) -> i32 {
+        let height = self.page.as_ref().map_or(0, |p| p.layout.height);
+        let room = if self.editing.is_some() { KEYBOARD_TOP - TOOLBAR } else { viewport() };
+        (height - room + 40).max(0)
+    }
+
+    /// A band of the page around scroll `around` for the compositor to scroll
+    /// through: up to four screens, painted here on the main thread while the
+    /// compositor keeps scrolling the band it has.
+    fn band(&self, around: i32) -> (Canvas, i32) {
+        let room = viewport();
+        let content = self.max_scroll() + room;
+        let band_h = (4 * room).min(content).max(room);
+        let origin = (around - (band_h - room) / 2).clamp(0, (content - band_h).max(0));
+        let mut c = Canvas::new(W, band_h as usize);
+        match &self.page {
+            None => c.fill(c.bounds(), rgb(0xff, 0xff, 0xff)),
+            Some(page) => {
+                c.fill(c.bounds(), page.layout.background);
+                Self::paint_items(&mut c, &self.fonts, &page.layout, -origin, origin - 200, origin + band_h + 200);
+            }
+        }
+        (c, origin)
     }
 
     fn draw_toolbar(&mut self) {
@@ -427,10 +462,22 @@ impl Browser {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn draw(&mut self) {
         self.draw_page();
         self.draw_toolbar();
         self.draw_keyboard();
+    }
+
+    /// The toolbar and, while typing, the keyboard: drawn on the screen
+    /// around the compositor's page view. Returns the area drawn.
+    fn draw_chrome(&mut self, screen: &mut Canvas) -> Rect {
+        std::mem::swap(&mut self.c, screen);
+        self.draw_toolbar();
+        self.draw_keyboard();
+        std::mem::swap(&mut self.c, screen);
+        let bottom = if self.editing.is_some() { H as i32 } else { TOOLBAR };
+        Rect::new(0, 0, W as i32, TOOLBAR).union(Rect::new(0, KEYBOARD_TOP, W as i32, bottom))
     }
 
     // Input.
@@ -502,7 +549,7 @@ pub fn register_names() {
 #[cfg(target_os = "macos")]
 fn render_to_file(input: &str, output: &str, scroll: i32) {
     let (tx, _rx) = mpsc::channel::<Loaded>();
-    let mut b = Browser { fonts: Fonts::load(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, tx };
+    let mut b = Browser { fonts: Fonts::load(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, tx, serial: 0 };
     let body = std::fs::read(input).expect("input");
     let url = Url::parse("http://localhost/").unwrap();
     let sheets: Vec<String> = std::env::args().skip(5).map(|p| std::fs::read_to_string(p).expect("style sheet")).collect();
@@ -528,12 +575,16 @@ fn main() {
             return;
         }
     }
-    let mut screen = Screen::open().expect("no screen");
-    let events = violet::events().expect("no events");
+    let screen = Screen::open().expect("no screen");
+    // The compositor (violet::compositor) owns the screen: it scrolls the page
+    // at the panel's rate, from the touch stream, while this thread lays out
+    // pages and paints bands of them. The toolbar and keyboard are chrome.
+    let (comp, events) = Compositor::start(screen).expect("no events");
+    let view = comp.add_view(Rect::new(0, TOOLBAR, W as i32, H as i32));
     let (tx, results) = mpsc::channel::<Loaded>();
     let mut b = Browser {
         fonts: Fonts::load(),
-        c: screen.canvas(),
+        c: Canvas::new(1, 1), // swapped for the screen while chrome is drawn
         page: None,
         scroll: 0,
         history: Vec::new(),
@@ -542,40 +593,38 @@ fn main() {
         status: String::new(),
         editing: None,
         tx,
+        serial: 0,
     };
     println!("ladybird: starting (Ladybird HTML parser {})", env!("LADYBIRD_COMMIT"));
     b.navigate(Location::Start, false);
-    b.draw();
-    screen.show_all(&b.c);
 
-    let mut touch: Option<(i32, i32, i32, bool)> = None; // start x, y, scroll, dragging
-    let mut dirty = false;
-    let mut last_frame = Instant::now();
+    // What the compositor's layer shows: page, scroll it was painted around, typing.
+    let mut synced: Option<(u64, i32, bool)> = None;
+    let mut press: Option<(i32, i32)> = None; // a press that may become a tap
+    let mut chrome = true;
     loop {
         let wait = if b.loading.is_some() { 60 } else { 250 };
+        let mut band_at = None;
         match events.recv_timeout(Duration::from_millis(wait)) {
-            Ok(e) if e.focus_gained() => dirty = true,
-            Ok(e) if e.kind == TOUCH_DOWN => touch = Some((e.x, e.y, b.scroll, false)),
-            Ok(e) if e.kind == TOUCH_MOVE => {
-                if let Some((x0, y0, s0, dragging)) = touch.as_mut() {
-                    if !*dragging && ((e.y - *y0).abs() > DRAG_SLOP || (e.x - *x0).abs() > DRAG_SLOP) && *y0 >= TOOLBAR {
-                        *dragging = true;
-                    }
-                    if *dragging {
-                        b.scroll = *s0 - (e.y - *y0);
-                        b.clamp_scroll();
-                        dirty = true;
-                    }
+            Ok(e) if e.focus_gained() => {
+                chrome = true;
+                synced = None;
+            }
+            Ok(e) if e.kind == compositor::SCROLL => {
+                b.scroll = e.value;
+                println!("ladybird: scrolled to {}", b.scroll);
+                if let Some(s) = synced.as_mut() {
+                    s.1 = b.scroll;
                 }
             }
+            Ok(e) if e.kind == compositor::BAND => band_at = Some(e.value),
+            Ok(e) if e.kind == TOUCH_DOWN => press = Some((e.x, e.y)),
+            Ok(e) if e.kind == TOUCH_MOVE && e.code == compositor::SCROLLING => press = None,
             Ok(e) if e.kind == TOUCH_UP => {
-                if let Some((x0, y0, _, dragging)) = touch.take() {
-                    if dragging {
-                        println!("ladybird: scrolled to {}", b.scroll);
-                    } else {
-                        b.tap(x0, y0);
-                    }
-                    dirty = true;
+                if let Some((x, y)) = press.take().filter(|_| e.code != compositor::SCROLLING) {
+                    b.scroll = comp.scroll(view);
+                    b.tap(x, y);
+                    chrome = true;
                 }
             }
             Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -583,17 +632,28 @@ fn main() {
         }
         while let Ok(r) = results.try_recv() {
             b.loaded(r);
-            dirty = true;
+            chrome = true;
         }
-        if b.loading.is_some() {
-            dirty = true;
+        if chrome || b.loading.is_some() {
+            comp.chrome(|c| b.draw_chrome(c));
+            chrome = false;
         }
-        // While dragging, draw at most every 40 ms and only once the queue is empty.
-        if dirty && (touch.is_none() || last_frame.elapsed() >= Duration::from_millis(40)) {
-            b.draw();
-            screen.show_all(&b.c);
-            dirty = false;
-            last_frame = Instant::now();
+        let editing = b.editing.is_some();
+        let key = (b.serial, b.scroll, editing);
+        if synced != Some(key) || band_at.is_some() {
+            if synced.map_or(true, |s| s.2 != editing) {
+                let bottom = if editing { KEYBOARD_TOP } else { H as i32 };
+                comp.set_viewport(view, Rect::new(0, TOOLBAR, W as i32, bottom));
+            }
+            let around = band_at.unwrap_or(b.scroll);
+            let (layer, origin) = b.band(around);
+            comp.set_layer(view, layer, origin, b.max_scroll());
+            if band_at.is_none() {
+                comp.set_scroll(view, b.scroll);
+            }
+            let ink = b.page.as_ref().map(|p| mix(p.layout.background, rgb(0, 0, 0), 0.35));
+            comp.set_indicator(view, ink);
+            synced = Some(key);
         }
     }
 }

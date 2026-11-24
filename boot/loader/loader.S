@@ -78,6 +78,21 @@ copy_kernel:
     bne 1b
 #endif
     dsb sy
+#if VIOLET_CORES > 1
+    // Start cores 1 to VIOLET_CORES-1 of cluster 0 with PSCI CPU_ON (SMC to
+    // the firmware, or to QEMU). Each enters the kernel through `secondary`
+    // below, which waits there until this core has initialised it.
+    mov r6, #1
+start_core:
+    ldr r0, =0x84000003         // CPU_ON
+    mov r1, r6                  // MPIDR: cluster 0, core r6
+    adr r2, secondary
+    mov r3, r6                  // context: the core number, in r0 at entry
+    smc #0
+    add r6, r6, #1
+    cmp r6, #VIOLET_CORES
+    blt start_core
+#endif
     mov r0, #0
     mcr p15, 0, r0, c7, c5, 0
     mcr p15, 0, r0, c8, c7, 0
@@ -101,4 +116,67 @@ copy_kernel:
     ldr r3, =0x00100000
     ldr pc, =0xe0000000
     .ltorg
+
+#if VIOLET_CORES > 1
+// A secondary core, started by PSCI with the MMU and caches off: r0 is its
+// number. From HYP, drop to SVC as the boot core did; then the boot core's
+// translation table, a small stack of its own, and the kernel entry with
+// the same arguments. The kernel picks the core's own stacks by MPIDR.
+secondary:
+    cpsid if
+    mov r9, r0
+    mrs r4, cpsr
+    and r4, r4, #31
+    cmp r4, #0x1a
+    bne secondary_svc
+    mov r1, #0
+    mcr p15, 4, r1, c1, c1, 0   // stage 2 off, no EL1 traps
+    mov r1, #3
+    mcr p15, 4, r1, c14, c1, 0  // EL1 timer access
+    mrc p15, 4, r1, c12, c9, 5
+    orr r1, r1, #9              // allow EL1 GIC system registers
+    mcr p15, 4, r1, c12, c9, 5
+    isb
+    mov r1, #0xd3
+    msr spsr_hyp, r1
+    adr r1, secondary_svc
+    msr elr_hyp, r1
+    eret
+secondary_svc:
+#ifdef VIOLET_QEMU
+    // As qemu-entry.S does for core 0: this core's SGIs and PPIs in
+    // nonsecure Group 1 (its redistributor's SGI frame, 128 KiB apart).
+    ldr r0, =0x080b0080
+    mov r1, #0x20000
+    mla r0, r1, r9, r0
+    mvn r1, #0
+    str r1, [r0]
+    dsb sy
+#endif
+    ldr sp, =0x43080000
+    sub sp, sp, r9, lsl #12     // 4 KiB below the boot core's stack each
+    mov r0, #0
+    mcr p15, 0, r0, c7, c5, 0
+    mcr p15, 0, r0, c8, c7, 0
+    mcr p15, 0, r0, c2, c0, 2
+    mcr p15, 0, r0, c13, c0, 1
+    ldr r1, =0x43004000
+    mcr p15, 0, r1, c2, c0, 0
+    mov r1, #1
+    mcr p15, 0, r1, c3, c0, 0
+    dsb sy
+    isb
+    mrc p15, 0, r1, c1, c0, 0
+    orr r1, r1, #1
+    mcr p15, 0, r1, c1, c0, 0
+    isb
+    push {r0,r1}
+    str r0, [sp,#4]
+    ldr r0, =0x40200000
+    ldr r1, =0x40200000 + ROOT_BYTES
+    ldr r2, =0x40100000
+    ldr r3, =0x00100000
+    ldr pc, =0xe0000000
+    .ltorg
+#endif
 trampoline_end:

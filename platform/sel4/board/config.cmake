@@ -17,7 +17,16 @@ if(KernelPlatformEllis)
     else()
         add_sources(DEP "KernelPlatformEllis" ASMFILES src/plat/ellis/wifi/monitor.S)
     endif()
+    # MCS converts timer ticks to microseconds as (ticks * CLK_MAGIC) >> CLK_SHIFT.
+    if(VioletQemuBoard)
+        set(violet_clk_magic 4611686019llu)  # 1 / 62.5 MHz, as qemu-arm-virt
+        set(violet_clk_shift 58u)
+    else()
+        set(violet_clk_magic 330382100llu)   # 2^32 / 13 MHz
+        set(violet_clk_shift 32u)
+    endif()
     declare_default_headers(TIMER_FREQUENCY ${violet_timer_hz} MAX_IRQ 1019 NUM_PPI 32
-        TIMER drivers/timer/arm_generic.h INTERRUPT_CONTROLLER arch/machine/gic_v3.h)
+        TIMER drivers/timer/arm_generic.h INTERRUPT_CONTROLLER arch/machine/gic_v3.h
+        CLK_MAGIC ${violet_clk_magic} CLK_SHIFT ${violet_clk_shift} KERNEL_WCET 10u)
 endif()
 add_sources(DEP "KernelPlatformEllis" CFILES src/arch/arm/machine/gic_v3.c src/arch/arm/machine/l2c_nop.c)
