@@ -14,7 +14,7 @@ const PLAY: Rect = Rect::new(380, 1150, 680, 1270);
 const LIVE: Rect = Rect::new(0, 200, W as i32, 470);
 const MIC: Rect = Rect::new(0, 1040, W as i32, 1140);
 const STATUS: Rect = Rect::new(0, 640, W as i32, 700);
-const PADS: [(&str, &str); 4] = [("Chime", "sound chime"), ("Alert", "sound alert"), ("Tone", "sound tone 440 1500"), ("Stop", "sound stop")];
+const PADS: [(&str, &str); 4] = [("Chime", "sound chime"), ("Alert", "sound alert"), ("Tone", "sound tone 440 3000"), ("Stop", "sound stop")];
 
 fn pad(i: usize) -> Rect {
     let (x, y) = (40 + (i as i32 % 2) * 340, 720 + (i as i32 / 2) * 150);
@@ -130,8 +130,13 @@ fn main() {
     let mut app = App { fonts: Fonts::load(), c: Canvas::new(W, H), s: violet::fields(&violet::sys("audio")) };
     app.draw();
     screen.show_all(&app.c);
+    let mut pending = None;
     loop {
-        match events.recv_timeout(Duration::from_millis(150)) {
+        let next_event = match pending.take() {
+            Some(e) => Ok(e),
+            None => events.recv_timeout(Duration::from_millis(150)),
+        };
+        match next_event {
             Ok(e) if e.focus_gained() => {
                 app.draw();
                 screen.show_all(&app.c);
@@ -155,6 +160,11 @@ fn main() {
             }
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return,
+        }
+        // Handle every waiting touch before asking for the audio state: that
+        // takes three trips to Runtime, and a tap should not wait behind them.
+        if events.try_recv().map(|e| pending = Some(e)).is_ok() {
+            continue;
         }
         let next = violet::fields(&violet::sys("audio"));
         if next != app.s {
