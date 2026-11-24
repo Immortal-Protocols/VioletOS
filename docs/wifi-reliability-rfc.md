@@ -1,6 +1,6 @@
 # RFC: Sticky, Reliable Wi-Fi & Persistent Credentials on Pure seL4
 
-**Status:** Draft RFC (code skeleton — intentionally not wired into the build yet)  
+**Status:** Phase 1 and parts of phases 2 and 3 implemented (see [Implementation status](#implementation-status)). The handset changes build but have not run on the XT2163DL yet.  
 **Targets:** Moto G Pure (`XT2163DL`, MT6765 Gen4m/Connac WLAN + lwIP) and QEMU.
 
 ## Motivation
@@ -34,6 +34,8 @@ Today, Wi-Fi on the handset regularly drops connections, refuses to reconnect, l
 
 ## Architecture
 
+The target design. Its file names are the draft's: the auto-connector lives in `runtime/open/wifi.rs` and the radio changes in `radio.rs`, `wlan_axi.rs`, `passive_scan.rs` and `station.rs` (see [Implementation status](#implementation-status)).
+
 ```text
   /apps/wifi (UI)          Home / Other Open Apps (read-only state & diagnostics)
         │ join / forget / list                 │ state / RSSI / reason
@@ -63,18 +65,29 @@ Today, Wi-Fi on the handset regularly drops connections, refuses to reconnect, l
   └───────────────────────────────────┴───────────────────────────────────────┘
 ```
 
-## Skeleton Map
+## Implementation status
 
-| File | Role |
-| --- | --- |
-| `targets/moto-g-pure/radio_fsm.rs` | Explicit `RadioState` FSM, `JoinFailure` taxonomy, `relink_reset()` contract, 64-bit `MonotonicMs`, keepalive, broadcast-deauth verification, warm firmware lifecycle |
-| `targets/moto-g-pure/scan_compat.rs` | 64-AP RSSI-sorted `ScanTable`, active+passive scan config (with DFS), Open + WPA2-CCMP + TKIP-group/PMF `SecurityKind`, and 802.11n HT/WMM IE builder |
-| `runtime/open/wifi_store.rs` | `VWIF1` persistent `SavedNetwork` + `DeviceIdentity` (stable MAC) store, boot `AutoConnector` with backoff, and safe auth-failure handling |
-| `targets/moto-g-pure/ip/async_sockets.rs` | Non-blocking per-slot socket & DHCP `INIT-REBOOT` state machine that never starves `station_wpa_poll()` |
+The draft's code skeletons (`radio_fsm.rs`, `scan_compat.rs`, `wifi_store.rs`, `ip/async_sockets.rs`) were never built; they are replaced by changes to the real code, listed here by root cause.
+
+| # | Root cause | Status | Where |
+| --- | --- | --- | --- |
+| 1 | Timeouts wipe saved passwords | **Done.** Radio reports `JOIN_AUTH` (52) only when the access point repeated message 1 after our message 2 (or the supplicant rejected a frame); silence or a single lost frame is the new `JOIN_HANDSHAKE_TIMEOUT` (57). The Wi-Fi app never deletes a saved key on a failure; after a 52 it asks for the password and replaces the key only once the new one works. | `wpa.rs::authorize`, `protocol.rs`, `apps/open/wifi` |
+| 2 | No boot auto-connect | **Done.** The Open Runtime's auto-connector scans and joins the most recently joined saved network in range 8 s after boot, tries the next one in range when one fails, backs off from 30 s to 10 min while none is in range, rechecks every 30 s, skips a network whose key was refused, and pauses after the user disconnects. Open networks are saved too. | `runtime/open/wifi.rs` |
+| 3 | 4-file `/data` cap; `moto-flash` wipes storage | **Done.** Open apps get 32 files (the extra 28 in the volume's unused sectors 608–1112; the first four stay where they were, so existing data is kept). `moto-flash` sends a sparse image that leaves the storage window alone (`--wipe-storage` for the old behavior). | `services/storage/files.rs`, `runtime/open/data.rs`, `moto-flash` |
+| 4 | One RAM key slot in Radio | Not needed now: the app sends the key with every join, and the auto-connector does the same. | |
+| 5 | `relink()` reuses the stale pairwise state | **Done.** `associate()` clears `pairwise_ready`, so the new handshake's message 2 goes out unencrypted; the firmware's station record is rewritten by `commit_peer` as before. Explicit WTBL key removal was not added (unverified firmware command). | `wlan_axi.rs` |
+| 6 | Home's status poll kills reconnects | **Done.** Only an explicit leave tears the link down. A failed link stays joined and reports `WIFI RECONNECTING`; the event loop makes one rejoin attempt per pass (500 ms apart three times, then 2 s doubling to 60 s) for as long as the network stays joined, answering requests in between. | `radio.rs` |
+| 7 | Hair-trigger drops, no keepalive, blocking sockets, timer wrap | **Partly done.** 32 failed transmits in a row (or any while unkeyed) end the link, not one. `station_net_poll()` now runs the supplicant's timers, so every blocking wait in `client.c` and `sockets.c` keeps them going. EAPOL frames, including group rekeys, were already handled inside those waits, so rekeys were not actually starved. The timer wrap is not a bug: `radio_monotonic_ms()` comes from a 64-bit millisecond count and `radio_io::expired()` is only used for windows well under the 5.5-minute wrap. **Deferred:** Null-Data keepalives and non-blocking sockets. | `wpa.rs`, `ip/client.c` |
+| 8 | 8-AP passive-only scan | **Partly done.** 32 access points per scan (kept in a static, not on Radio's stack). **Deferred:** active probes, DFS channels, RSSI ordering (the RX descriptor's RSSI field is not decoded yet). | `passive_scan.rs` |
+| 9 | Common routers rejected | **Partly done.** Open networks are recognised (no RSN or WPA element, privacy clear), reported with `SCAN_OPEN` and joined without a handshake: association without RSN, gen4m BSS auth mode open with encryption disabled, unprotected data frames. **Not yet tested on a real open network.** **Deferred:** TKIP group cipher, optional PMF, 802.11n HT/WMM. | `passive_scan.rs`, `station.rs`, `wlan_axi.rs`, `radio.rs` |
+| 10 | Cold chip per scan; random MAC | **Deferred.** Warm firmware across scans and a stable MAC need hardware sessions to develop. | |
+
+**Verified in QEMU:** `make test-wifi-app` (now four boots: wrong and right password, switching to an open network, rejoining by itself after a restart, one-tap rejoin with the saved key, and a handshake timeout that keeps the key, where the QEMU radio's `"stalls": true` network answers 57), `make test-wifi`, `make test-storage`, `make test-open-apps`, `make test-open`.
+**Built for the handset, not yet run on it:** everything in `targets/moto-g-pure` and the sparse `moto-flash`. The Open Runtime package is close to its 0x3e000-byte limit (about 750 bytes of code room left).
 
 ## Phased Milestones
 
-1. **Phase 1 — Immediate stability fixes:** Reset `pairwise_ready` & WTBL in `associate()`/`relink()`, stop `dispatch()` from tearing down the chip on `!alive`, split `BadPassword` vs. `HandshakeTimeout` so saved PMKs aren't wiped, and add boot auto-connect in Open Runtime.
+1. **Phase 1 — Immediate stability fixes (done):** Reset `pairwise_ready` & WTBL in `associate()`/`relink()`, stop `dispatch()` from tearing down the chip on `!alive`, split `BadPassword` vs. `HandshakeTimeout` so saved PMKs aren't wiped, and add boot auto-connect in Open Runtime.
 2. **Phase 2 — Durable credential & MAC storage:** Give Wi-Fi profiles a dedicated journaled bank (or raise `services/storage/files.rs::SLOTS` from 4 → 32+ with 512-byte transfers), persist a stable device MAC, and preserve storage across `moto-flash` unless `--wipe` is passed.
 3. **Phase 3 — Warm chip, non-blocking sockets, and router compatibility:** Keep firmware warm in `WarmIdle`, replace blocking loops in `ip/sockets.c` with `async_sockets`, move `radio_io` to 64-bit ms + 30 s Null-Data keepalives, expand scan table to 64 APs with active probes, and enable Open networks, TKIP group cipher, optional PMF, and 802.11n HT/WMM.
 4. **Phase 4 — Mesh roaming, sleep/wake, & diagnostics:** Multi-BSSID RSSI roaming, firmware PS mode across screen sleep with cached-BSSID + DHCP `INIT-REBOOT` resume, and per-network diagnostics (deauth reason, RSSI, channel, GTK rekey count) in `/apps/wifi` and `moto-debug`.

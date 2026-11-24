@@ -783,6 +783,7 @@ impl Runtime {
     fn poll_runtime(&mut self) {
         let t0 = sys::now_ns();
         data::flush(&mut self.fs);
+        self.wifi.tick(&self.fs, t0);
         self.usb_requests();
         self.usb_installs();
         let t1 = sys::now_ns();
