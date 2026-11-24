@@ -80,17 +80,19 @@ impl Face {
     /// Draw s with its baseline at y; returns the x where it ended.
     pub fn draw(&self, c: &mut Canvas, s: &str, x: i32, y: i32, color: Color) -> i32 {
         let mut pen = x as f32;
+        let clip = c.clip();
+        // A line wholly above or below the clip only needs its advance.
+        let (top, bottom) = (y - (self.size * 1.5) as i32, y + (self.size * 0.6) as i32 + 1);
+        let visible = bottom > clip.y0 && top < clip.y1;
         for ch in s.chars() {
             let g = self.glyph(ch);
             let m = &g.metrics;
             let gx = (pen + m.xmin as f32).round() as i32;
             let gy = y - m.ymin - m.height as i32;
-            for row in 0..m.height {
-                for col in 0..m.width {
-                    let a = g.coverage[row * m.width + col];
-                    if a != 0 {
-                        c.blend(gx + col as i32, gy + row as i32, color, a as f32 / 255.0);
-                    }
+            let r = crate::canvas::Rect::new(gx, gy, gx + m.width as i32, gy + m.height as i32);
+            if visible && r.touches(clip) {
+                for row in 0..m.height {
+                    c.blend_row(gx, gy + row as i32, &g.coverage[row * m.width..(row + 1) * m.width], color);
                 }
             }
             pen += m.advance_width;

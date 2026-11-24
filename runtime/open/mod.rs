@@ -6,11 +6,15 @@
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
 pub mod data;
+#[cfg(moto_board)]
+pub mod display;
 pub mod device;
+pub mod frames;
 pub mod fs;
 pub mod heap;
 pub mod inflate;
 pub mod net;
+pub mod scanout;
 pub mod sockets;
 pub mod policy;
 pub mod shield;
@@ -91,6 +95,11 @@ pub enum Wait {
     Send { fd: i32, buf: u32, len: u32 },
     /// Held by a Violet Shield freeze; answered with EACCES when the app thaws.
     Frozen,
+    /// A present waiting for the panel to scan past its rows (scanout.rs);
+    /// answers the write with `result`.
+    Present { result: i32 },
+    /// SCREEN_IOC_WAIT_VSYNC: until a frame after `after` starts; VsyncInfo to `ptr`.
+    Vsync { after: u64, ptr: u32 },
 }
 
 /// The outcome of the Shield check at the choke point.
@@ -189,6 +198,10 @@ pub struct Runtime {
     last_sentinel: u64,
     /// The "wifi" commands' running Radio requests.
     pub wifi: wifi::Wifi,
+    /// Present cost, input-to-frame latency and touch polling (frames.rs).
+    pub frames: frames::Frames,
+    /// The panel's scan line and frame count (scanout.rs).
+    pub beam: scanout::Beam,
 }
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
@@ -206,7 +219,7 @@ pub fn request_with(op: u32, key: u32, value: u32, arg: u32) -> Message {
         if p.op != BUSY {
             return p;
         }
-        sys::yield_now();
+        sys::pause();
     }
 }
 
@@ -283,6 +296,8 @@ impl Runtime {
             tx_stats: (0..net::SLOTS).map(|_| None).collect(),
             last_sentinel: 0,
             wifi: wifi::Wifi::default(),
+            frames: frames::Frames::default(),
+            beam: scanout::Beam::default(),
             // Requests made before this boot are not repeated.
             usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
         })
@@ -305,6 +320,8 @@ impl Runtime {
     /// Start a program from the file system. Scripts name their interpreter
     /// on a "#!" line; a ".py" file without one runs under /bin/python3.
     pub fn launch(&mut self, path: &str, args: &[String]) -> Result<usize, String> {
+        // Loading a program can take a while; Audio and Radio keep running.
+        let _lowered = sys::Lowered::new();
         let st = self.fs.stat(path).ok_or_else(|| alloc::format!("{} not found", path))?;
         let mut program = String::from(path);
         let mut argv: Vec<String> = Vec::new();
@@ -582,6 +599,8 @@ impl Runtime {
                         Wait::Read { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
                         Wait::Connect { .. } => -110,
                         Wait::Frozen => syscall::EACCES,
+                        Wait::Present { result } => result,
+                        Wait::Vsync { .. } => 0,
                     };
                     self.wake(index, slot, result);
                 }
@@ -606,6 +625,29 @@ impl Runtime {
         let path = String::from_utf8_lossy(&bytes[..len]).into_owned();
         if let Some(args) = path.strip_prefix("@shot") {
             self.usb_shot(args);
+            return;
+        }
+        // The panel's scan line, sampled for 200 ms (frames seen, period).
+        if path == "@sys beam" {
+            log!("{}", display::sample_beam(200));
+            return;
+        }
+        // "@sys disp BLOCK FROM TO" (hex offsets): the display engine's non-zero
+        // registers in a short range, as the log is 4 KiB.
+        if let Some(args) = path.strip_prefix("@sys disp ") {
+            let mut n = args.split_whitespace().map(|w| usize::from_str_radix(w, 16).unwrap_or(0));
+            let (b, from, to) = (n.next().unwrap_or(0), n.next().unwrap_or(0), n.next().unwrap_or(0x100));
+            if b < display::BLOCKS.len() {
+                log!("disp {}", display::dump(b, from, to));
+            }
+            return;
+        }
+        // "@sys frames" or "@sys bench tap X Y N": measurements, answered in the log.
+        if let Some(line) = path.strip_prefix("@sys ") {
+            if line.starts_with("frames") || line.starts_with("bench ") {
+                let answer = self.system(self.foreground.unwrap_or(0), line);
+                log!("{}: {}", line, answer.trim_end());
+            }
             return;
         }
         // A new build replaces the copy that is running.
@@ -677,6 +719,7 @@ impl Runtime {
         if commit == done {
             return;
         }
+        let _lowered = sys::Lowered::new();
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let (offset, len) = unsafe { (control.add(4).read_volatile() as usize, control.add(5).read_volatile() as usize) };
         let mut name = [0u8; 32];
@@ -772,8 +815,10 @@ impl Runtime {
         }
         self.focused = focused;
         if !focused {
+            self.frames.last_poll_ns = 0;
             return;
         }
+        self.frames.polled(t0);
         if self.contact.is_none() {
             let r = Message::new(SUBSCRIBE, CONTACT, 0).call(sys::SLOT_RUNTIME);
             if r.op == OK {
@@ -782,10 +827,19 @@ impl Runtime {
         }
         if let Some(stream) = self.contact {
             let t = sys::now_ns();
+            // Runtime answers a touch poll with the sample its worker read
+            // last and starts the next read; give that worker one turn so
+            // this poll delivers the current sample, not one a poll old.
+            let mut waited = false;
             for _ in 0..8 {
                 let e = Message::new(POLL, 0, stream).call(sys::SLOT_RUNTIME);
                 if e.op != OK {
-                    break;
+                    if waited {
+                        break;
+                    }
+                    waited = true;
+                    sys::pause();
+                    continue;
                 }
                 self.touch(e.value as i32, e.arg as i32, e.key != 0);
             }
@@ -796,6 +850,31 @@ impl Runtime {
         }
     }
 
+    /// Synthetic presses from `bench tap`: a touch down on the app in front,
+    /// then, 150 ms later, focus handed back so it drops the press.
+    fn bench_tick(&mut self, now: u64) {
+        let Some(mut b) = self.frames.bench else { return };
+        if now < b.next_ns {
+            return;
+        }
+        let Some(i) = self.foreground.filter(|_| self.focused) else {
+            self.frames.bench = None;
+            return;
+        };
+        if b.pressed {
+            self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
+            b.pressed = false;
+            b.left -= 1;
+            b.next_ns = now + 350_000_000;
+        } else {
+            let e = abi::InputEvent { timestamp_us: now / 1000, kind: abi::EVENT_TOUCH_DOWN, code: 0, x: b.x, y: b.y, value: 0 };
+            self.event(i, e);
+            b.pressed = true;
+            b.next_ns = now + 150_000_000;
+        }
+        self.frames.bench = (b.left > 0).then_some(b);
+    }
+
     fn run(&mut self) -> ! {
         loop {
             let mut handled = 0;
@@ -803,6 +882,10 @@ impl Runtime {
                 let r = sys::receive(false);
                 if r.badge == 0 {
                     break;
+                }
+                if r.badge & sys::TIMER_BADGE != 0 {
+                    sys::timer_disarm(); // an expiry that came while we worked
+                    continue;
                 }
                 self.handle_fault(r);
                 handled += 1;
@@ -822,12 +905,16 @@ impl Runtime {
                 calls.sort_by_key(|c| core::cmp::Reverse(c.1));
                 let top: Vec<String> = calls.iter().take(4).map(|(n, c)| alloc::format!("{}:{}/s", n, *c as u64 / secs)).collect();
                 log!(
-                    "stats: {} loops/s, {} faults/s [{}], slowest poll {} us (flush {} focus {} touch {}), slowest pass {} us, {} threads ({} waiting), heap {} free blocks {} KiB",
-                    self.stats.loops / secs, self.stats.faults / secs, top.join(" "), self.stats.slowest_poll / 1000,
+                    "stats: {} loops/s, asleep {}%, {} faults/s [{}], slowest poll {} us (flush {} focus {} touch {}), slowest pass {} us, {} threads ({} waiting), heap {} free blocks {} KiB",
+                    self.stats.loops / secs, self.stats.slept_ns / 10_000_000 / secs, self.stats.faults / secs, top.join(" "), self.stats.slowest_poll / 1000,
                     self.stats.slowest_step[0] / 1000, self.stats.slowest_step[1] / 1000, self.stats.slowest_step[2] / 1000,
                     self.stats.slowest_pass / 1000, threads, waiting, blocks, free / 1024
                 );
                 self.stats = Stats { since: now, ..Stats::default() };
+                if self.frames.present.count > 0 && self.frames.bench.is_none() {
+                    let report = self.frames.report(now);
+                    log!("frames: {}", report.trim_end());
+                }
             }
             if self.stats.pass_start != 0 {
                 self.stats.slowest_pass = self.stats.slowest_pass.max(now.wrapping_sub(self.stats.pass_start));
@@ -842,15 +929,73 @@ impl Runtime {
                 self.poll_runtime();
                 self.stats.slowest_poll = self.stats.slowest_poll.max(sys::now_ns().wrapping_sub(now));
             }
+            self.bench_tick(now);
+            self.beam.tick();
+            self.flush_presents();
             self.check_waiters();
             if now.wrapping_sub(self.last_sentinel) >= 100_000_000 {
                 self.last_sentinel = now;
                 self.shield_tick(now);
             }
             if handled == 0 {
-                sys::yield_now();
+                self.idle(now);
             }
         }
+    }
+
+    /// Nothing left to do this pass. With the timer, sleep until the next
+    /// Runtime poll, thread deadline or frame, or until an app calls; at
+    /// EVENT_PRIORITY the wake-up runs ahead of the polling services. Without
+    /// it, yield as before.
+    fn idle(&mut self, now: u64) {
+        if !sys::timer_ready() {
+            return sys::yield_now();
+        }
+        let sleep = self.next_wake(now).saturating_sub(sys::now_ns());
+        if sleep < 50_000 {
+            return;
+        }
+        sys::timer_arm(sleep);
+        let r = sys::receive(true);
+        sys::timer_disarm();
+        let woke = sys::now_ns();
+        self.stats.slept_ns += woke - now;
+        self.stats.pass_start = 0; // a pass measures work, not sleep
+        if r.badge != 0 && r.badge & sys::TIMER_BADGE == 0 {
+            self.handle_fault(r);
+        }
+    }
+
+    /// When the loop must run next: the Runtime poll (touch, focus), the
+    /// Shield tick, thread deadlines, presents waiting on the panel, frames
+    /// for VSync waiters, and a short interval while a thread waits on
+    /// something only polling notices (sockets, the audio ring, poll/epoll).
+    fn next_wake(&mut self, now: u64) -> u64 {
+        let busy = self.focused || self.apps.iter().any(|a| a.is_some());
+        let mut wake = self.last_poll + if busy { 4_000_000 } else { 50_000_000 };
+        wake = wake.min(self.last_sentinel + 100_000_000);
+        if let Some(b) = self.frames.bench {
+            wake = wake.min(b.next_ns);
+        }
+        let next_frame = self.beam.frame_ns + u64::from(self.beam.period_us()) * 1000 + 200_000;
+        for app in self.apps.iter().flatten() {
+            if let Some(([_, y0, _, y1], _)) = app.surface.as_ref().and_then(|s| s.pending) {
+                // Just as the beam leaves the rows.
+                wake = wake.min(now + self.beam.wait_ns(y0, y1).max(50_000));
+            }
+            for t in app.threads.iter().filter(|t| t.alive) {
+                let Some(w) = &t.wait else { continue };
+                if let Some(d) = t.deadline {
+                    wake = wake.min(d);
+                }
+                match w {
+                    Wait::Futex { .. } | Wait::Sleep | Wait::Frozen | Wait::Present { .. } => {}
+                    Wait::Vsync { .. } => wake = wake.min(next_frame.max(now + 500_000)),
+                    _ => wake = wake.min(now + 2_000_000),
+                }
+            }
+        }
+        wake.min(now + 50_000_000)
     }
 }
 
@@ -866,6 +1011,8 @@ pub struct Stats {
     slowest_poll: u64,
     slowest_pass: u64,
     pass_start: u64,
+    /// Time spent asleep waiting for events (with the timer).
+    slept_ns: u64,
 }
 
 impl Stats {
@@ -905,5 +1052,11 @@ pub fn run() -> ! {
         rt.pool.available() / 16
     );
     let _ = rt.policy.check(policy::AppId(0), &policy::Action::SpawnApp { path: "/apps" });
+    if sys::timer_selftest() {
+        sys::set_own_priority(sys::EVENT_PRIORITY);
+        log!("event-driven: the timer works; waiting for events at priority {}", sys::EVENT_PRIORITY);
+    } else {
+        log!("no timer: polling at priority {}", sys::PRIORITY);
+    }
     rt.run()
 }

@@ -3,14 +3,14 @@
 //! program, Home's, with its own hook.
 use std::time::Duration;
 
-use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
 const TARGET: &str = "/apps/home";
 
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let fonts = Fonts::load();
-    let mut c = Canvas::new(W, H);
+    let mut c = screen.canvas();
     let draw = |c: &mut Canvas, line: &str| {
         c.fill(c.bounds(), BACKGROUND);
         violet::header(c, &fonts, "Themes");

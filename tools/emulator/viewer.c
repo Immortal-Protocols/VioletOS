@@ -71,8 +71,9 @@ int main(int argc, char **argv) {
     if (fd < 0) { perror("guest RAM"); return 1; }
     // Align to host page size (16 KiB on Apple Silicon).
     off_t offset = 0x79450000 - 0x40000000;
-    const size_t length = PITCH * HEIGHT;
-    void *frame = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, offset);
+    // The frame, then the page after it, where the guest says which rows changed.
+    const size_t length = PITCH * HEIGHT + 4096;
+    void *frame = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
     sound = mmap(NULL, SOUND_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, SOUND_PAGE);
     close(fd);
     if (frame == MAP_FAILED || sound == MAP_FAILED) { perror("guest memory"); return 1; }
@@ -97,12 +98,18 @@ int main(int argc, char **argv) {
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH/2, HEIGHT/2,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!window) goto fail;
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, 0);
+    // Presents follow the Mac's display refresh rather than a fixed delay.
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer) renderer = SDL_CreateRenderer(window, -1, 0);
     if (!renderer || SDL_RenderSetLogicalSize(renderer, WIDTH, HEIGHT)) goto fail;
     SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
     if (!texture) goto fail;
     title(window);
+    // Dirty rows from the guest (runtime/open/scanout.rs): magic, first row,
+    // end row, a sequence number, and the sequence this viewer has copied.
+    volatile uint32_t *dirty = (volatile uint32_t *)((uint8_t *)frame + PITCH * HEIGHT);
+    Uint32 full_at = 0;
     int running = 1, held = 0;
     while (running) {
         SDL_Event e;
@@ -148,10 +155,31 @@ int main(int argc, char **argv) {
             silence((now - mic_clock) * 16);
             mic_clock = now;
         }
-        if (SDL_UpdateTexture(texture, NULL, frame, PITCH) ||
-            SDL_RenderClear(renderer) || SDL_RenderCopy(renderer, texture, NULL, NULL)) goto fail;
-        SDL_RenderPresent(renderer);
-        SDL_Delay(32);
+        // Upload only the rows the guest changed; every quarter second the
+        // whole frame too, for writers that do not report (the classic launcher).
+        Uint32 now = SDL_GetTicks();
+        int changed = 0;
+        if (now - full_at >= 250) {
+            full_at = now;
+            if (SDL_UpdateTexture(texture, NULL, frame, PITCH)) goto fail;
+            changed = 1;
+        } else if (dirty[0] == 0x54524944 && dirty[3] != dirty[4]) {
+            uint32_t seq = dirty[3];
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            uint32_t y0 = dirty[1], y1 = dirty[2];
+            dirty[4] = seq;
+            if (y0 < y1 && y1 <= HEIGHT) {
+                SDL_Rect rows = {0, (int)y0, WIDTH, (int)(y1 - y0)};
+                if (SDL_UpdateTexture(texture, &rows, (uint8_t *)frame + y0 * PITCH, PITCH)) goto fail;
+                changed = 1;
+            }
+        }
+        if (changed) {
+            if (SDL_RenderClear(renderer) || SDL_RenderCopy(renderer, texture, NULL, NULL)) goto fail;
+            SDL_RenderPresent(renderer); // waits for the Mac's VSync
+        } else {
+            SDL_Delay(2);
+        }
     }
     if (speaker) SDL_CloseAudioDevice(speaker);
     if (mic) SDL_CloseAudioDevice(mic);

@@ -17,7 +17,7 @@ fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
     let fonts = Fonts::load();
-    let mut frame = Canvas::new(W, H);
+    let mut frame = screen.canvas();
     let mut layer = Canvas::new(W, H);
     let splash = |screen: &mut Screen, frame: &mut Canvas, line: &str| {
         let b = frame.bounds();

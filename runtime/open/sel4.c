@@ -101,3 +101,49 @@ void open_yield(void) { seL4_Yield(); }
 int open_clean(unsigned pd, unsigned start, unsigned end) {
   return seL4_ARM_PageDirectory_Clean_Data(pd, start, end);
 }
+
+/* Copy n bytes (a multiple of 4, both pointers 4-byte aligned): 32 bytes per
+   ldm/stm pair, prefetching ahead. The Open Runtime is built for size, and
+   its memcpy moved about 350 MB/s on the handset, 13 ms per full frame. */
+void open_copy(void *dst, const void *src, unsigned n) {
+  unsigned *d = dst;
+  const unsigned *s = src;
+  unsigned blocks = n / 32;
+  if (blocks) {
+    __asm__ volatile("1:\n"
+                     "pld [%[s], #256]\n"
+                     "ldmia %[s]!, {r3, r4, r5, r6, r7, r8, r9, r10}\n"
+                     "stmia %[d]!, {r3, r4, r5, r6, r7, r8, r9, r10}\n"
+                     "subs %[b], %[b], #1\n"
+                     "bne 1b\n"
+                     : [d] "+r"(d), [s] "+r"(s), [b] "+r"(blocks)
+                     :
+                     : "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "memory", "cc");
+  }
+  for (n %= 32; n >= 4; n -= 4)
+    *d++ = *s++;
+}
+
+/* The Open Runtime's timer (see sys.rs): the nonsecure physical timer, which
+   the kernel exports to user mode, counting down `ticks` of the counter. */
+void open_timer_arm(unsigned ticks) {
+  __asm__ volatile("mcr p15, 0, %0, c14, c2, 0" ::"r"(ticks)); /* CNTP_TVAL */
+  __asm__ volatile("mcr p15, 0, %0, c14, c2, 1" ::"r"(1u));    /* CNTP_CTL: enabled */
+  __asm__ volatile("isb");
+}
+void open_timer_stop(void) {
+  __asm__ volatile("mcr p15, 0, %0, c14, c2, 1" ::"r"(0u));
+  __asm__ volatile("isb");
+}
+int open_irq_ack(unsigned handler) { return seL4_IRQHandler_Ack(handler); }
+/* Wait on the notification alone (app faults stay queued on the endpoint). */
+unsigned open_wait(unsigned notification) {
+  seL4_Word badge = 0;
+  seL4_Wait(notification, &badge);
+  return badge;
+}
+unsigned open_poll(unsigned notification) {
+  seL4_Word badge = 0;
+  seL4_Poll(notification, &badge);
+  return badge;
+}

@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
 const KEYS: &str = "weather_api_key=8f2b1c0e9a7d\nbank_pin_hint=dog's birthday\n";
 const TODO: &str = "buy milk\ncall mom\n";
@@ -24,7 +24,7 @@ fn sync() -> std::io::Result<String> {
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let fonts = Fonts::load();
-    let mut c = Canvas::new(W, H);
+    let mut c = screen.canvas();
     let draw = |c: &mut Canvas, notes: &[&str], status: &str| {
         c.fill(c.bounds(), BACKGROUND);
         violet::header(c, &fonts, "Notes");

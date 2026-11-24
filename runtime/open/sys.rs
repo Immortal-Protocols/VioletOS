@@ -26,6 +26,114 @@ extern "C" {
     fn open_send(cap: u32, mrs: *const u32, length: u32);
     fn open_yield();
     fn open_clean(pd: u32, start: u32, end: u32) -> i32;
+    fn open_copy(dst: *mut u8, src: *const u8, n: u32);
+    fn open_timer_arm(ticks: u32);
+    fn open_timer_stop();
+    fn open_irq_ack(handler: u32) -> i32;
+    fn open_wait(notification: u32) -> u32;
+    fn open_poll(notification: u32) -> u32;
+}
+
+/// The timer the supervisor wires to a notification bound to this thread
+/// (supervisor.c, open_runtime): an IRQ handler and that notification.
+pub const SLOT_TIMER: u32 = 10;
+pub const SLOT_WAKE: u32 = 11;
+const SLOT_PROBE: u32 = 12;
+/// The badge a timer expiry arrives with (fault badges are below 0x8000).
+pub const TIMER_BADGE: u32 = 1 << 27;
+/// Above the 100 every process runs at, while the timer works: the Open
+/// Runtime then sleeps between events and wakes ahead of polling services.
+pub const EVENT_PRIORITY: u32 = 150;
+
+static TIMER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn timer_ready() -> bool {
+    TIMER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the supervisor gave us the timer and it fires: arm it for a
+/// millisecond and watch the notification for up to 50.
+pub fn timer_selftest() -> bool {
+    for slot in [SLOT_TIMER, SLOT_WAKE] {
+        // An empty slot fails the copy; invoking it directly would fault.
+        if copy(SLOT_PROBE, slot).is_err() {
+            return false;
+        }
+        delete(SLOT_PROBE);
+    }
+    unsafe {
+        open_poll(SLOT_WAKE);
+        open_irq_ack(SLOT_TIMER);
+    }
+    let start = now_ns();
+    timer_arm(1_000_000);
+    let mut fired = false;
+    while now_ns() - start < 50_000_000 {
+        if unsafe { open_poll(SLOT_WAKE) } & TIMER_BADGE != 0 {
+            fired = true;
+            break;
+        }
+    }
+    timer_disarm();
+    TIMER.store(fired, core::sync::atomic::Ordering::Relaxed);
+    fired
+}
+
+/// Fire the timer `ns` from now (at most a second).
+pub fn timer_arm(ns: u64) {
+    let ticks = (ns.min(1_000_000_000) * counter_hz() / 1_000_000_000).max(1);
+    unsafe { open_timer_arm(ticks as u32) }
+}
+
+/// Stop the timer and take its interrupt again.
+pub fn timer_disarm() {
+    unsafe {
+        open_timer_stop();
+        open_irq_ack(SLOT_TIMER);
+    }
+}
+
+/// Let lower-priority threads run for a moment (half a millisecond with the
+/// timer: only it wakes this wait, app calls stay queued), so a Runtime
+/// worker can finish a request. Without the timer, yield.
+pub fn pause() {
+    if !timer_ready() {
+        return yield_now();
+    }
+    timer_arm(500_000);
+    unsafe { open_wait(SLOT_WAKE) };
+    timer_disarm();
+}
+
+/// Long work (starting an app, a USB install) runs at the priority every
+/// process has, so it cannot hold up Audio or Radio; restored on drop.
+pub struct Lowered(bool);
+impl Lowered {
+    pub fn new() -> Lowered {
+        let raised = timer_ready();
+        if raised {
+            set_own_priority(PRIORITY);
+        }
+        Lowered(raised)
+    }
+}
+impl Drop for Lowered {
+    fn drop(&mut self) {
+        if self.0 {
+            set_own_priority(EVENT_PRIORITY);
+        }
+    }
+}
+
+/// Set this thread's priority (EVENT_PRIORITY or PRIORITY).
+pub fn set_own_priority(priority: u32) {
+    unsafe { open_tcb_priority(SLOT_AUTHORITY, SLOT_AUTHORITY, priority) };
+}
+
+/// Copy n bytes between 4-byte aligned addresses (n a multiple of 4), 32
+/// bytes per load/store-multiple: several times the size-optimised memcpy.
+pub fn copy_words(dst: *mut u8, src: *const u8, n: usize) {
+    unsafe { open_copy(dst, src, n as u32) }
 }
 
 /// Write the rows y0..y1 of scanout (mapped cached) back to memory, so the

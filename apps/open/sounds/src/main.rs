@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
 const MINUS: Rect = Rect::new(40, 470, 340, 590);
 const PLUS: Rect = Rect::new(380, 470, 680, 590);
@@ -127,7 +127,7 @@ impl App {
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
-    let mut app = App { fonts: Fonts::load(), c: Canvas::new(W, H), s: violet::fields(&violet::sys("audio")) };
+    let mut app = App { fonts: Fonts::load(), c: screen.canvas(), s: violet::fields(&violet::sys("audio")) };
     app.draw();
     screen.show_all(&app.c);
     let mut pending = None;

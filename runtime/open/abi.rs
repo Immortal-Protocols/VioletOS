@@ -15,9 +15,14 @@ pub const DEV_SYS: &str = "/dev/violet/sys";
 // 2. ioctl(fd, SCREEN_IOC_INFO, &SurfaceInfo) -> learn width, height, stride, format.
 // 3. mmap(NULL, stride * height * buffers, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
 // 4. Draw directly into the mapped BGRA8888 pixels.
-// 5. write(fd, &PresentRect, sizeof(PresentRect)) -> Display copies changed rows.
+// 5. write(fd, &PresentRect, sizeof(PresentRect)) -> the Open Runtime copies the
+//    rectangle to scanout when the panel is not reading those rows (no tearing);
+//    the write returns once it is on its way to the panel.
 
 pub const SCREEN_IOC_INFO: u32 = 0x5601;
+/// Block until the panel starts its next frame; fills a VsyncInfo if the
+/// argument is not NULL. Presents are tear-free whether or not an app waits.
+pub const SCREEN_IOC_WAIT_VSYNC: u32 = 0x5604;
 pub const PIXEL_FORMAT_BGRA8888: u32 = 1;
 
 #[repr(C)]
@@ -29,6 +34,14 @@ pub struct SurfaceInfo {
     pub format: u32,       // PIXEL_FORMAT_BGRA8888
     pub buffers: u32,      // 2 (front/back)
     pub buffer_bytes: u32, // stride_bytes * height (page-aligned)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VsyncInfo {
+    pub seq: u32,          // frames since start
+    pub period_us: u32,    // measured frame period (16,7xx on the handset)
+    pub timestamp_us: u64, // when this frame began, CLOCK_MONOTONIC
 }
 
 #[repr(C)]

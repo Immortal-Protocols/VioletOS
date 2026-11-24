@@ -442,6 +442,11 @@ impl Runtime {
                 if blocking_socket {
                     return Block(Wait::Send { fd: a[0] as i32, buf: a[1], len: a[2] }, None);
                 }
+                // A present the panel is still reading answers once it is copied.
+                let screen = self.file(i, a[0] as i32).map_or(false, |f| matches!(f.borrow().kind, Kind::Screen));
+                if screen && r > 0 && self.present_pending(i) {
+                    return Block(Wait::Present { result: r }, None);
+                }
                 Done(r)
             }
             145 | 146 => {
@@ -1041,6 +1046,11 @@ impl Runtime {
                     b[k * 4..k * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
                 Done(if self.wr(i, arg, &b) { 0 } else { EFAULT })
+            }
+            // SCREEN_IOC_WAIT_VSYNC: until the next frame starts; VsyncInfo (16 bytes) to arg if not 0.
+            0x5604 if is_screen => {
+                let deadline = super::sys::now_ns() + 100_000_000;
+                Block(Wait::Vsync { after: self.beam.frame, ptr: arg }, Some(deadline))
             }
             // AUDIO_IOC_CONFIG: 48 kHz s16, one or two channels.
             0x5610 => {

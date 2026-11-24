@@ -42,9 +42,42 @@ fn component(key: u32) -> u32 {
         _ => 0,
     }
 }
-/// Audio answers between polls of its hardware, so Runtime calls it directly.
+/// Audio answers commands between polls of its hardware, so Runtime calls it
+/// directly. Its state (GET VOLUME, PLAYBACK, MICROPHONE) Runtime reads from
+/// the page Audio publishes it in, so a read never waits for Audio's loop.
 fn audio(m: Message) -> Message {
+    if m.op == GET {
+        if let Some(r) = audio_snapshot(m.key) {
+            return r;
+        }
+    }
     Message::new(m.op, m.key, m.value).with_arg(m.arg).call(AUDIO_SLOT)
+}
+/// Audio's published reply for key (services/audio/process.rs, Audio::snapshot),
+/// unless the page is missing or being rewritten.
+fn audio_snapshot(key: u32) -> Option<Message> {
+    let index = match key {
+        VOLUME => 0,
+        PLAYBACK => 1,
+        MICROPHONE => 2,
+        _ => return None,
+    };
+    let page = 0x0750_0000 as *const u32;
+    for _ in 0..4 {
+        unsafe {
+            let seq = page.read_volatile();
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            if seq & 1 != 0 || page.add(1).read_volatile() != 0x3154_5341 {
+                continue;
+            }
+            let r = (page.add(4) as *const Message).add(index).read_volatile();
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            if page.read_volatile() == seq {
+                return Some(r);
+            }
+        }
+    }
+    None
 }
 fn ticket(c: &mut Client) -> u32 {
     c.serial = c.serial.wrapping_add(1).max(1);

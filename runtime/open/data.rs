@@ -37,7 +37,7 @@ fn file(op: u32, key: u32, name: &str, offset: u32, data: &[u8]) -> Message {
         if p.op != BUSY {
             return p;
         }
-        super::sys::yield_now();
+        super::sys::pause();
     }
 }
 

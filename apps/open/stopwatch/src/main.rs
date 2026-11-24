@@ -2,7 +2,7 @@
 //! kept in /data/stopwatch, so a paused watch survives a restart.
 use std::time::{Duration, Instant};
 
-use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
 const SAVED: &str = "/data/stopwatch";
 const START: Rect = Rect::new(60, 1000, 660, 1130);
@@ -43,7 +43,7 @@ fn main() {
     let events = violet::events().expect("no events");
     let fonts = Fonts::load();
     let (big, huge) = (fonts.bold(38.0), fonts.bold(120.0));
-    let mut c = Canvas::new(W, H);
+    let mut c = screen.canvas();
     let mut w = Watch { base: load(), since: None };
     println!("stopwatch: starting at {}", format(w.base));
 
