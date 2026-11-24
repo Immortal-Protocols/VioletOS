@@ -69,6 +69,8 @@ All the hosts end in `.test`. The companion maps them to local servers on the Ma
 
 ## The model
 
+The trained model is published at [NateRunsA-LIST/violet-shield-embeddinggemma2](https://huggingface.co/NateRunsA-LIST/violet-shield-embeddinggemma2) on Hugging Face (CoreML embedder and head, PyTorch head, tokenizer, fixtures). `make shield-train` rebuilds it.
+
 Stage 1 of the RFC: frozen EmbeddingGemma 2 (text only, 270M parameters), a hybrid MLP head over `[768-d embedding | 9 side features]`, and per-app 256-d Matryoshka novelty.
 
 Results from `build/shield/report.json`, `make shield-train` on November 23, 2026:
