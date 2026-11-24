@@ -118,9 +118,9 @@ until("unplugging returns to the speaker", lambda: word(3) == 1)
 at_tap = word(11)
 tap(530, 930)  # Stop
 until("stop ends the tone early", lambda: word(9) == 0 and word(3) == 0, 2)
-# The tone is 1.5 s (72000 frames). STOP must end it promptly after the tap and
+# The tone is 3 s (144000 frames). STOP must end it promptly after the tap and
 # before it would have ended on its own, however long the steps before took.
-if word(11) - at_tap >= 0.8 * 48000 or word(11) >= 72000 - 480:
+if word(11) - at_tap >= 0.8 * 48000 or word(11) >= 144000 - 480:
     fail(f"tone was not stopped early: {at_tap} frames at the tap, {word(11)} when it stopped")
 hold(2, 0.12); until("buttons work inside an app", lambda: word(4) == 13 and bar(13))
 
