@@ -91,8 +91,11 @@ until("Home app", lambda: pixel(5, 5) == 0xff2a1740, 20)
 tap(138, 1141)  # Home's Sounds tile
 until("Sounds shows the volume bar", lambda: bar(15), 60)
 
+before = word(11)
 tap(190, 780)  # Chime
-until("chime starts", lambda: word(9) == 2 and word(8) == 1)
+# A slow runner can miss the 0.6 s chime mid-play (the tap alone takes 0.5 s), so a
+# chime that already finished since the tap counts as started too.
+until("chime starts", lambda: word(8) == 1 and (word(9) == 2 or (word(9) == 0 and word(11) not in (0, before))))
 until("chime finishes", lambda: word(9) == 0 and word(3) & 1 == 0, 4)
 frames = word(11)
 if not 0.55 * 48000 <= frames <= 0.75 * 48000: fail(f"chime length {frames} frames")
