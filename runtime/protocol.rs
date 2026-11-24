@@ -151,8 +151,9 @@ pub const PROFILE: u32 = 27;
 pub const JOIN_NOT_FOUND: u32 = 49;
 /// No access point with that name answered association.
 pub const JOIN_NO_ANSWER: u32 = 47;
-/// The access point refused the WPA2 handshake (it repeated its first message
-/// after our answer): the key or password is wrong.
+/// The access point did not accept our answer in the WPA2 handshake (it
+/// repeated its first message, or the supplicant rejected a frame): usually a
+/// wrong key, but a lost frame looks the same, so a saved key is kept.
 pub const JOIN_AUTH: u32 = 52;
 /// The WPA2 handshake did not finish, but nothing shows the key is wrong (no
 /// answer, or a lost frame). A saved key stays saved.

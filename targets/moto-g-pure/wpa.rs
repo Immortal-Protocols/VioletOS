@@ -130,10 +130,10 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
     let start = radio_io::now();
     let mut frame = [0; 1536];
     // EAPOL frames from the access point. With a wrong key it never sends
-    // message 3: it repeats message 1 after our message 2 (or gives up). Only
-    // that is reported as JOIN_AUTH, which makes the Wi-Fi app ask for the
-    // password again; silence or a lost frame is JOIN_HANDSHAKE_TIMEOUT, so a
-    // weak signal never costs a saved password.
+    // message 3: it keeps repeating message 1 after our message 2. Only that
+    // (message 1 at least three times) is reported as JOIN_AUTH, which makes
+    // the Wi-Fi app ask for the password again; silence or one lost frame is
+    // JOIN_HANDSHAKE_TIMEOUT. Neither costs a saved key.
     let mut received = 0u32;
     let result = (|| {
         while !radio_io::expired(start, 8000) {
@@ -150,7 +150,7 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
                 }
             }
         }
-        Err(if received >= 2 { JOIN_AUTH } else { JOIN_HANDSHAKE_TIMEOUT })
+        Err(if received >= 3 { JOIN_AUTH } else { JOIN_HANDSHAKE_TIMEOUT })
     })();
     if result.is_err() {
         unsafe { station_wpa_close() };

@@ -1,6 +1,6 @@
 # RFC: Sticky, Reliable Wi-Fi & Persistent Credentials on Pure seL4
 
-**Status:** Phase 1 and parts of phases 2 and 3 implemented (see [Implementation status](#implementation-status)). The handset changes build but have not run on the XT2163DL yet.  
+**Status:** Phase 1 and parts of phases 2 and 3 implemented (see [Implementation status](#implementation-status)). Auto-join and storage across flashes are confirmed on the XT2163DL; rejoining after a link drop and open networks are not yet tested there.  
 **Targets:** Moto G Pure (`XT2163DL`, MT6765 Gen4m/Connac WLAN + lwIP) and QEMU.
 
 ## Motivation
@@ -71,8 +71,8 @@ The draft's code skeletons (`radio_fsm.rs`, `scan_compat.rs`, `wifi_store.rs`, `
 
 | # | Root cause | Status | Where |
 | --- | --- | --- | --- |
-| 1 | Timeouts wipe saved passwords | **Done.** Radio reports `JOIN_AUTH` (52) only when the access point repeated message 1 after our message 2 (or the supplicant rejected a frame); silence or a single lost frame is the new `JOIN_HANDSHAKE_TIMEOUT` (57). The Wi-Fi app never deletes a saved key on a failure; after a 52 it asks for the password and replaces the key only once the new one works. | `wpa.rs::authorize`, `protocol.rs`, `apps/open/wifi` |
-| 2 | No boot auto-connect | **Done.** The Open Runtime's auto-connector scans and joins the most recently joined saved network in range 8 s after boot, tries the next one in range when one fails, backs off from 30 s to 10 min while none is in range, rechecks every 30 s, skips a network whose key was refused, and pauses after the user disconnects. Open networks are saved too. | `runtime/open/wifi.rs` |
+| 1 | Timeouts wipe saved passwords | **Done.** Radio reports `JOIN_AUTH` (52) only when the access point repeated message 1 at least three times (or the supplicant rejected a frame); silence or a single lost frame is the new `JOIN_HANDSHAKE_TIMEOUT` (57). The Wi-Fi app never deletes a saved key on a failure; after a 52 it asks for the password and replaces the key only once the new one works. | `wpa.rs::authorize`, `protocol.rs`, `apps/open/wifi` |
+| 2 | No boot auto-connect | **Done.** The Open Runtime's auto-connector scans and joins the most recently joined saved network in range 8 s after boot, tries the next one in range when one fails, backs off from 30 s to 10 min while none is in range, rechecks every 30 s, and pauses after the user disconnects. A 52 does not stop it retrying that network on later rounds: on the handset, a join with the right key after a warm reboot once got 47 and then 52. Open networks are saved too. | `runtime/open/wifi.rs` |
 | 3 | 4-file `/data` cap; `moto-flash` wipes storage | **Done.** Open apps get 32 files (the extra 28 in the volume's unused sectors 608–1112; the first four stay where they were, so existing data is kept). `moto-flash` sends a sparse image that leaves the storage window alone (`--wipe-storage` for the old behavior). | `services/storage/files.rs`, `runtime/open/data.rs`, `moto-flash` |
 | 4 | One RAM key slot in Radio | Not needed now: the app sends the key with every join, and the auto-connector does the same. | |
 | 5 | `relink()` reuses the stale pairwise state | **Done.** `associate()` clears `pairwise_ready`, so the new handshake's message 2 goes out unencrypted; the firmware's station record is rewritten by `commit_peer` as before. Explicit WTBL key removal was not added (unverified firmware command). | `wlan_axi.rs` |
@@ -83,7 +83,14 @@ The draft's code skeletons (`radio_fsm.rs`, `scan_compat.rs`, `wifi_store.rs`, `
 | 10 | Cold chip per scan; random MAC | **Deferred.** Warm firmware across scans and a stable MAC need hardware sessions to develop. | |
 
 **Verified in QEMU:** `make test-wifi-app` (now four boots: wrong and right password, switching to an open network, rejoining by itself after a restart, one-tap rejoin with the saved key, and a handshake timeout that keeps the key, where the QEMU radio's `"stalls": true` network answers 57), `make test-wifi`, `make test-storage`, `make test-open-apps`, `make test-open`.
-**Built for the handset, not yet run on it:** everything in `targets/moto-g-pure` and the sparse `moto-flash`. The Open Runtime package is close to its 0x3e000-byte limit (about 750 bytes of code room left).
+**On the XT2163DL (November 24, 2026, against LouieDog):**
+- The bootloader accepted the sparse `moto-flash` image, and `/data/networks` survived a reflash.
+- After seeding `/data/networks`, the auto-connector joined within 20 s with no reboot. After a cold boot, a reflash and three warm reboots, it rejoined by itself each time with no USB-provisioned profile, and HTTPS and Weather worked over the link.
+- After one warm reboot the first join got 47 and the second 52 with the right key, which is why the auto-connector no longer gives up on a 52 and Radio now needs three repeats of message 1.
+- One early warm reboot exhausted slot B's retries and fell back to Android A. Later warm reboots were fine, and the cause is unknown.
+- **Not yet tested on the handset:** rejoining after a deauthentication (that needs control of the access point) and joining an open network.
+
+The Open Runtime package is close to its 0x3e000-byte limit (about 750 bytes of code room left).
 
 ## Phased Milestones
 

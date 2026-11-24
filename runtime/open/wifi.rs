@@ -14,9 +14,8 @@
 //! /data/networks (most recently joined first), and the auto-connector here
 //! scans and joins the first one in range a few seconds after boot, and again
 //! with a growing wait (30 s up to 10 min) while none is in range or the link
-//! is gone. A leave from the Wi-Fi app pauses it until the app joins again; a
-//! refused key (JOIN_AUTH) skips that network for this boot. It never changes
-//! the saved keys: only the Wi-Fi app does.
+//! is gone. A leave from the Wi-Fi app pauses it until the app joins again.
+//! It never changes the saved keys: only the Wi-Fi app does.
 //!
 //! Radio's requests can take seconds on the handset (it boots the Wi-Fi chip,
 //! scans and runs the WPA2 handshake), so they run as Runtime tickets polled
@@ -79,9 +78,11 @@ struct Auto {
     tries: u32,
     /// The Wi-Fi app left the network on purpose: wait for it to join again.
     paused: bool,
-    /// Saved networks (SSID in hex) to pass over: those that failed since the
-    /// last scan round, and (true) those whose key Radio refused this boot.
-    skip: Vec<(String, bool)>,
+    /// Saved networks (SSID in hex) that failed since the last scan round.
+    /// A refused handshake (JOIN_AUTH) is retried on later rounds too: an access
+    /// point also repeats its first message when our answer was lost, so one 52
+    /// does not prove the key is wrong (seen on the handset after a reboot).
+    skip: Vec<String>,
     /// The network a running auto-join is for (its SSID in hex).
     target: String,
     /// An auto scan finished: choose a network on the next tick.
@@ -226,7 +227,7 @@ impl Wifi {
             let (ssid, key) = (w.next()?, w.next()?);
             let key = if key == "open" { None } else { Some(unhex(key)?) };
             let flag = if key.is_some() { SCAN_WPA2 } else { SCAN_OPEN };
-            if self.auto.skip.iter().any(|r| r.0 == ssid) {
+            if self.auto.skip.iter().any(|r| r == ssid) {
                 return None;
             }
             (0..SCAN_ROWS)
@@ -240,7 +241,7 @@ impl Wifi {
                 .map(|r| (r.value, ssid, key))
         });
         let Some((id, ssid, key)) = pick else {
-            self.auto.skip.retain(|r| r.1);
+            self.auto.skip.clear();
             self.auto.tries += 1;
             self.auto.next_ns = now + backoff_ns(self.auto.tries);
             return;
@@ -279,8 +280,7 @@ impl Wifi {
             return;
         }
         if step == Step::Join {
-            // A refused key stays skipped: the Wi-Fi app asks for the password.
-            self.auto.skip.push((name, reason == JOIN_AUTH));
+            self.auto.skip.push(name);
             // Try the next saved network the last scan found.
             self.auto.scanned = true;
             self.auto.next_ns = now;
