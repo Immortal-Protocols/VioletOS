@@ -75,6 +75,19 @@ const DIM: Color = rgb(0xb8, 0xae, 0xd2);
 const CARD: Color = rgb(0x24, 0x1b, 0x36);
 const WHITE: Color = rgb(0xff, 0xff, 0xff);
 
+/// What a press on tile i (or the Wi-Fi bar, usize::MAX) changes on screen.
+pub fn region(pressed: usize) -> Rect {
+    if pressed == usize::MAX { WIFI_BAR } else { tile_rect(pressed) }
+}
+
+/// Redraw only r (a pressed or released tile): the same scene, clipped, so
+/// it costs a fraction of a full redraw and only r needs presenting.
+pub fn draw_clipped(c: &mut Canvas, f: &Fonts, s: &State, r: Rect) {
+    c.set_clip(r);
+    draw(c, f, s);
+    c.reset_clip();
+}
+
 pub fn draw(c: &mut Canvas, f: &Fonts, s: &State) {
     let b = c.bounds();
     c.gradient(b, TOP, BOTTOM);

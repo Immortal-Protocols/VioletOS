@@ -49,6 +49,8 @@ import run  # noqa: E402
 SIM = os.environ.get("VIOLET_SIM", "D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA")
 BUNDLE = "com.immortal.violet.relay"
 # As the Programs list shows them: titled apps, sorted by folder name.
+# The shell lists titled apps first, in the order of the image's apps/.home
+# (read from the image this test builds; Ladybird, when built, comes first).
 APPS = ["music", "notes", "photosync", "sounds", "stopwatch", "themes", "weather"]
 # The test programs stay out of the demo image so the list fits on one screen.
 SKIP = "canvas,chello,gohello,gonet,hello,pyhello,pynet,pypaint,pytone"
@@ -273,6 +275,24 @@ def web_server():
 def build_image(out: Path):
     env = dict(os.environ, VIOLET_OPEN_EXTRA_APPS=str(ROOT / "apps/shield-demo"), VIOLET_OPEN_SKIP=SKIP)
     subprocess.run([sys.executable, str(ROOT / "tools/build_initfs.py"), str(out)], env=env, check=True)
+    titled = listed_titles(out.read_bytes())
+    if titled:
+        APPS[:] = titled
+
+
+def listed_titles(cpio: bytes):
+    """The app names in apps/.home of a newc archive, in the shell's order."""
+    at = 0
+    while cpio[at:at + 6] == b"070701":
+        size, namesize = int(cpio[at + 54:at + 62], 16), int(cpio[at + 94:at + 102], 16)
+        name = cpio[at + 110:at + 110 + namesize - 1]
+        data = ((at + 110 + namesize + 3) & ~3)
+        if name == b"apps/.home":
+            return [line.split("\t")[0] for line in cpio[data:data + size].decode().splitlines() if "\t" in line]
+        if name == b"TRAILER!!!":
+            break
+        at = (data + size + 3) & ~3
+    return []
 
 
 def start_ios(host_map, record_dir):

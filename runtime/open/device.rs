@@ -66,6 +66,9 @@ pub struct Surface {
     /// Pool pages: buffer 0 then buffer 1.
     pub pages: Vec<u32>,
     pub shown: u32,
+    /// Rows and columns presented but not yet copied, because the panel was
+    /// reading them (scanout.rs): x0, y0, x1, y1, and when it was first asked.
+    pub pending: Option<([u32; 4], u64)>,
 }
 impl Surface {
     fn byte(&self, offset: usize) -> *mut u8 {
@@ -81,6 +84,9 @@ pub struct Shell {
     pub armed: bool,
     held: bool,
     down_at: Option<(i32, i32, u64)>,
+    /// Where the finger was last reported, so a contact that has not moved
+    /// does not wake the app again.
+    last_xy: (i32, i32),
     pub message: String,
 }
 
@@ -113,15 +119,19 @@ pub fn frozen_banner(on: bool) {
 }
 
 fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
-    let fb = FRAMEBUFFER as *mut u32;
+    // Scanout is mapped cached, so plain stores (written back by the clean
+    // below or by the caller) are as visible as volatile ones, and a row is
+    // one fill instead of a store per pixel: the app list used to take long
+    // enough to draw that a short tap during it went unseen.
+    let (x0, x1) = (x.min(WIDTH), (x + w).min(WIDTH));
     for row in y..(y + h).min(HEIGHT) {
-        for col in x..(x + w).min(WIDTH) {
-            unsafe { fb.add(row * WIDTH + col).write_volatile(color) };
-        }
+        let line = unsafe { core::slice::from_raw_parts_mut((FRAMEBUFFER as *mut u32).add(row * WIDTH + x0), x1 - x0) };
+        line.fill(color);
     }
     if w == WIDTH && h == HEIGHT {
         sys::clean_framebuffer(0, HEIGHT); // a screen cleared outside draw_shell
     }
+    super::scanout::mark_dirty(y as u32, (y + h).min(HEIGHT) as u32);
 }
 fn text(x: usize, y: usize, s: &str, scale: usize, color: u32) {
     for (n, c) in s.bytes().enumerate() {
@@ -308,6 +318,7 @@ impl Runtime {
         }
         let row = (y - ROW_Y) / ROW_H;
         let Some(path) = self.app_entries().into_iter().nth(row) else { return };
+        crate::log!("app list: tap at {},{} -> {}", x, y, path);
         if let Some(i) = (0..MAX_APPS).find(|&i| self.apps[i].as_ref().map_or(false, |a| a.path == path)) {
             self.set_foreground(Some(i));
             self.refresh(i);
@@ -330,7 +341,10 @@ impl Runtime {
 
     /// A touch change from Runtime, in screen pixels.
     pub fn touch(&mut self, x: i32, y: i32, down: bool) {
-        self.last_touch_ns = sys::now_ns();
+        // A finger on the glass (the idle samples between touches do not count).
+        if down {
+            self.last_touch_ns = sys::now_ns();
+        }
         if !self.shell.armed {
             self.shell.armed = !down;
             self.shell.held = down;
@@ -348,11 +362,17 @@ impl Runtime {
         if down && !self.shell.held {
             self.shell.down_at = Some((x, y, now));
         }
+        // Touch is sampled continuously; only changes reach the app: a press,
+        // a finger that moved, a release. (Every idle sample used to arrive
+        // as another TOUCH_UP, waking the app in front ~250 times a second.)
         let kind = match (down, self.shell.held) {
             (true, false) => EVENT_TOUCH_DOWN,
-            (true, true) => EVENT_TOUCH_MOVE,
-            (false, _) => EVENT_TOUCH_UP,
+            (true, true) if (x, y) != self.shell.last_xy => EVENT_TOUCH_MOVE,
+            (true, true) => return,
+            (false, true) => EVENT_TOUCH_UP,
+            (false, false) => return,
         };
+        self.shell.last_xy = (x, y);
         if let (false, Some((_, sy, t))) = (down, self.shell.down_at) {
             if sy < 48 && now - t > 1_000_000_000 {
                 self.shell.held = false;
@@ -368,6 +388,12 @@ impl Runtime {
     }
 
     pub fn event(&mut self, i: usize, e: InputEvent) {
+        if self.foreground == Some(i) && matches!(e.kind, EVENT_TOUCH_DOWN | EVENT_TOUCH_UP) {
+            self.frames.input_delivered(sys::now_ns());
+        }
+        if self.foreground == Some(i) && e.kind == EVENT_LIFECYCLE && e.value == LIFECYCLE_FOCUS_GAINED {
+            self.frames.focus_at = Some(sys::now_ns());
+        }
         if let Some(app) = self.apps[i].as_mut() {
             if app.events.len() < 256 {
                 app.events.push_back(e);
@@ -411,27 +437,85 @@ impl Runtime {
         if r.buffer_index > 1 {
             return;
         }
+        if s.shown != r.buffer_index {
+            s.pending = None; // rows of the other buffer no longer matter
+        }
         s.shown = r.buffer_index;
         if !on_screen {
+            s.pending = None;
             return;
         }
-        let x0 = (r.x as usize).min(WIDTH);
-        let x1 = (r.x as usize + r.width as usize).min(WIDTH);
-        let y0 = (r.y as usize).min(HEIGHT);
-        let y1 = (r.y as usize + r.height as usize).min(HEIGHT);
-        let base = r.buffer_index as usize * BUFFER_BYTES;
-        for y in y0..y1 {
-            let mut off = base + y * STRIDE + x0 * 4;
-            let end = base + y * STRIDE + x1 * 4;
-            let mut dst = FRAMEBUFFER + y * STRIDE + x0 * 4;
-            while off < end {
-                let n = (PAGE - off % PAGE).min(end - off);
-                unsafe { core::ptr::copy_nonoverlapping(s.byte(off), dst as *mut u8, n) };
-                off += n;
-                dst += n;
+        let x0 = r.x.min(WIDTH as u32);
+        let x1 = r.x.saturating_add(r.width).min(WIDTH as u32);
+        let y0 = r.y.min(HEIGHT as u32);
+        let y1 = r.y.saturating_add(r.height).min(HEIGHT as u32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let now = sys::now_ns();
+        s.pending = Some(match s.pending {
+            Some((p, since)) => ([p[0].min(x0), p[1].min(y0), p[2].max(x1), p[3].max(y1)], since),
+            None => ([x0, y0, x1, y1], now),
+        });
+        self.flush_present(i);
+    }
+
+    /// Copy app i's pending rows to scanout if the panel is clear of them
+    /// (or has waited long enough). True when nothing is left pending.
+    pub fn flush_present(&mut self, i: usize) -> bool {
+        let on_screen = self.focused && self.foreground == Some(i);
+        let Some(s) = self.apps[i].as_mut().and_then(|a| a.surface.as_mut()) else { return true };
+        let Some(([x0, y0, x1, y1], since)) = s.pending else { return true };
+        if !on_screen {
+            s.pending = None;
+            return true;
+        }
+        let start = sys::now_ns();
+        if !self.beam.clear_of(y0, y1) && start - since < super::scanout::MAX_WAIT_NS {
+            return false;
+        }
+        s.pending = None;
+        let (x0, x1, y0, y1) = (x0 as usize, x1 as usize, y0 as usize, y1 as usize);
+        let base = s.shown as usize * BUFFER_BYTES;
+        let mut clean_ns = 0;
+        // Bands of rows, each written back to memory before the next, so the
+        // copy reaches DRAM well ahead of the panel.
+        for band in (y0..y1).step_by(16) {
+            let end_row = (band + 16).min(y1);
+            for y in band..end_row {
+                let mut off = base + y * STRIDE + x0 * 4;
+                let end = base + y * STRIDE + x1 * 4;
+                let mut dst = FRAMEBUFFER + y * STRIDE + x0 * 4;
+                while off < end {
+                    let n = (PAGE - off % PAGE).min(end - off);
+                    sys::copy_words(dst as *mut u8, s.byte(off), n);
+                    off += n;
+                    dst += n;
+                }
+            }
+            let t = sys::now_ns();
+            sys::clean_framebuffer(band, end_row);
+            clean_ns += sys::now_ns() - t;
+        }
+        super::scanout::mark_dirty(y0 as u32, y1 as u32);
+        let end = sys::now_ns();
+        self.frames.clean_ns += clean_ns;
+        self.frames.waited.add(start - since);
+        self.frames.presented(start, end, ((x1 - x0) * (y1 - y0)) as u64);
+        true
+    }
+
+    /// Presents waiting for the panel to move on.
+    pub fn flush_presents(&mut self) {
+        for i in 0..MAX_APPS {
+            if self.present_pending(i) {
+                self.flush_present(i);
             }
         }
-        sys::clean_framebuffer(y0, y1);
+    }
+
+    pub fn present_pending(&self, i: usize) -> bool {
+        self.apps[i].as_ref().and_then(|a| a.surface.as_ref()).map_or(false, |s| s.pending.is_some())
     }
 
     /// The app's screen surface, created on first open.
@@ -451,7 +535,7 @@ impl Runtime {
                 }
             }
         }
-        self.apps[i].as_mut().unwrap().surface = Some(Surface { pages, shown: 0 });
+        self.apps[i].as_mut().unwrap().surface = Some(Surface { pages, shown: 0, pending: None });
         Ok(())
     }
 
@@ -476,6 +560,18 @@ impl Runtime {
     pub fn ready(&mut self, i: usize, wait: &Wait) -> Option<i32> {
         match wait {
             Wait::Futex { .. } | Wait::Sleep | Wait::Frozen => None,
+            Wait::Present { result } => (!self.present_pending(i)).then_some(*result),
+            Wait::Vsync { after, ptr } => {
+                if self.beam.frame <= *after {
+                    return None;
+                }
+                let (ptr, info) = (*ptr, self.vsync_info());
+                if ptr != 0 {
+                    let app = self.apps[i].as_mut().unwrap();
+                    app.space.write(&mut self.k, &mut self.pool, ptr, &info);
+                }
+                Some(0)
+            }
             Wait::Audio { fd, buf, len } => {
                 let r = self.write_audio(i, *fd, *buf, *len);
                 (r != 0).then_some(r)
@@ -513,6 +609,16 @@ impl Runtime {
                 (n > 0).then_some(n)
             }
         }
+    }
+
+    /// VsyncInfo for SCREEN_IOC_WAIT_VSYNC: sequence, period in µs, and when
+    /// the frame started in µs of the monotonic clock.
+    pub fn vsync_info(&self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&(self.beam.frame as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&self.beam.period_us().to_le_bytes());
+        b[8..16].copy_from_slice(&(self.beam.frame_ns / 1000).to_le_bytes());
+        b
     }
 
     /// poll(2) bits for a descriptor: POLLIN 1, POLLOUT 4, POLLHUP 0x10, POLLNVAL 0x20.
@@ -794,6 +900,21 @@ impl Runtime {
                 }
                 None => String::from("error usage: open PATH\n"),
             },
+            // Frame-pipeline measurements since the last `frames` (frames.rs).
+            Some("frames") => self.frames.report(sys::now_ns()),
+            // `bench tap X Y N`: N synthetic presses on the app in front.
+            Some("bench") => {
+                let mut n = words.skip(1).map(|w| w.parse::<i32>().unwrap_or(-1));
+                match (n.next(), n.next(), n.next()) {
+                    (Some(x), Some(y), Some(count)) if x >= 0 && y >= 0 && count > 0 => {
+                        let now = sys::now_ns();
+                        self.frames.report(now);
+                        self.frames.bench = Some(super::frames::Bench { x, y, left: count as u32, next_ns: now + 300_000_000, pressed: false });
+                        String::from("ok\n")
+                    }
+                    _ => String::from("error usage: bench tap X Y N\n"),
+                }
+            }
             // The programs running now, as paths.
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();

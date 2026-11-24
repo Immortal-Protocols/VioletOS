@@ -14,7 +14,7 @@ use keyboard::{Key, Keyboard};
 use ui::{Hit, Page};
 use violet::device::{TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP};
 use violet::wifi::{self, Network, Security};
-use violet::{Canvas, Fonts, Screen, H, W};
+use violet::{Fonts, Screen};
 
 const SAVED: &str = "/data/networks";
 
@@ -390,7 +390,7 @@ fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
     let fonts = Fonts::load();
-    let mut c = Canvas::new(W, H);
+    let mut c = screen.canvas();
     let mut app = App {
         page: Page::List,
         nets: wifi::networks(),
@@ -490,7 +490,7 @@ mod preview {
         let mut joining = base(list);
         joining.state = &idle;
         joining.joining = Some(9);
-        let mut c = Canvas::new(W, H);
+        let mut c = violet::Canvas::new(violet::W, violet::H);
         for (name, v) in [("list", base(list)), ("joining", joining), ("password", base(pw)), ("details", base(details))] {
             ui::draw(&mut c, &fonts, &v);
             let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();

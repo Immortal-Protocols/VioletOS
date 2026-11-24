@@ -6,7 +6,7 @@ use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
 const TOTAL: usize = 4 * 1024 * 1024;
 
@@ -31,7 +31,7 @@ fn upload(loot: &[u8], sent: &mut usize) -> std::io::Result<()> {
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let fonts = Fonts::load();
-    let mut c = Canvas::new(W, H);
+    let mut c = screen.canvas();
     let draw = |c: &mut Canvas, line: &str, done: f32| {
         c.fill(c.bounds(), BACKGROUND);
         violet::header(c, &fonts, "PhotoSync");

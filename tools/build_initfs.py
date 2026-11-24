@@ -6,6 +6,7 @@ linux/arm (GOARM=7); any other files are copied as they are, so a script with
 a #! line runs without a build step.
 """
 from pathlib import Path
+import glob
 import os
 import stat
 import subprocess
@@ -21,6 +22,8 @@ def toolchain():
     import shutil
     candidates = [os.environ.get("VIOLET_HOST_RUSTC"), shutil.which("rustc"),
                   str(ROOT / "build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc")]
+    # Any rustup toolchain under build/ with the target (Ladybird's, for one).
+    candidates += sorted(glob.glob(str(ROOT / "build/*/rustup/toolchains/*/bin/rustc")))
     for rustc in filter(None, candidates):
         if not Path(rustc).exists():
             continue
@@ -28,13 +31,30 @@ def toolchain():
         host = next(line.split()[1] for line in subprocess.run([rustc, "-vV"], capture_output=True, text=True).stdout.splitlines()
                     if line.startswith("host:"))
         if (sysroot / "lib/rustlib" / TARGET).is_dir():
-            return Path(rustc), sysroot / "lib/rustlib" / host / "bin/rust-lld"
+            return Path(rustc), lld_for(sysroot, host)
     raise SystemExit(f"Install the Rust target first: rustup target add {TARGET}")
+
+
+def lld_for(sysroot, host):
+    """The toolchain's rust-lld. Newer toolchains link it against the
+    libLLVM.dylib in the sysroot's lib folder, which only rustc's own
+    invocations find, so add that folder to the dynamic loader's fallback path."""
+    lib = str(sysroot / "lib")
+    paths = [p for p in os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "").split(":") if p]
+    if lib not in paths:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(paths + [lib])
+    return sysroot / "lib/rustlib" / host / "bin/rust-lld"
+
+
+# Both phones' cores are Cortex-A53s (QEMU runs -cpu max): tune for them and
+# let rustc vectorize fills, copies and blends with NEON, which the
+# armv7-unknown-linux-musleabihf target leaves off (docs/8ms-frame-pipeline-rfc.md).
+CPU_FLAGS = ["-C", "target-cpu=cortex-a53", "-C", "target-feature=+neon"]
 
 
 def build_rust(source, out):
     rustc, lld = toolchain()
-    subprocess.run([rustc, "--edition=2021", "-O", "-C", "strip=symbols", "--target", TARGET,
+    subprocess.run([rustc, "--edition=2021", "-O", "-C", "strip=symbols", "--target", TARGET, *CPU_FLAGS,
                     "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
 
 
@@ -56,7 +76,7 @@ def build_cargo(work):
         f"AR_{key}": str(bins[0] / "llvm-ar"),
         f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": "-C linker-flavor=ld.lld",
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *CPU_FLAGS]),
         "CARGO_TARGET_DIR": str(ROOT / "build/open-cargo"),
         "RUSTC": str(rustc),
     })
@@ -85,7 +105,7 @@ def ladybird_toolchain(version):
         host = next((line.split()[1] for line in info.splitlines() if line.startswith("host:")), "")
         sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
         if have >= wanted and (sysroot / "lib/rustlib" / TARGET).is_dir():
-            return Path(rustc), sysroot / "lib/rustlib" / host / "bin/rust-lld"
+            return Path(rustc), lld_for(sysroot, host)
     raise SystemExit(f"Ladybird needs Rust {version} with the musl target: "
                      f"rustup toolchain install {version} --target {TARGET}")
 

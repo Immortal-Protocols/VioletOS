@@ -58,7 +58,13 @@ enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7, OPEN_RT = 
 // Runtime knows it as client 9, an identity no catalog app uses.
 enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
        OPEN_SLOT_RUNTIME = 2, OPEN_SLOT_CNODE = 3, OPEN_SLOT_PD = 4, OPEN_SLOT_ASID = 5,
-       OPEN_SLOT_KERNEL = 6, OPEN_SLOT_AUTHORITY = 7, OPEN_SLOT_POOL = 16, OPEN_KERNEL_BITS = 22 };
+       OPEN_SLOT_KERNEL = 6, OPEN_SLOT_AUTHORITY = 7, OPEN_SLOT_TIMER = 10, OPEN_SLOT_WAKE = 11,
+       OPEN_SLOT_POOL = 16, OPEN_KERNEL_BITS = 22,
+       // The Open Runtime's priority while it waits for events (it starts at the
+       // 100 every process runs at), and the badge its timer signals with.
+       OPEN_EVENT_PRIORITY = 150, OPEN_TIMER_BADGE = 1u << 27, OPEN_TIMER_IRQ = 30 };
+// The Open Runtime's timer interrupt handler, deleted before the system is rebuilt.
+static seL4_CPtr open_timer_handler;
 static struct process procs[TOTAL];
 static seL4_CPtr life, scratch_slot;
 static volatile unsigned *report;
@@ -627,9 +633,25 @@ static void open_runtime(void) {
   give_open(OPEN_SLOT_CNODE, t->caps);
   give_open(OPEN_SLOT_PD, t->pd);
   give_open(OPEN_SLOT_ASID, seL4_CapInitThreadASIDPool);
-  // Its own thread, allowed to give app threads the priority every process runs at.
-  check(seL4_TCB_SetMCPriority(t->thread, seL4_CapInitThreadTCB, 100));
+  // Its own thread, allowed to give app threads the priority every process
+  // runs at and to raise itself above it while it waits for events.
+  check(seL4_TCB_SetMCPriority(t->thread, seL4_CapInitThreadTCB, OPEN_EVENT_PRIORITY));
   give_open(OPEN_SLOT_AUTHORITY, t->thread);
+  // Its alarm clock: the nonsecure physical timer (PPI 30), which the kernel
+  // lets user mode program, signals a notification bound to its thread. It
+  // blocks between app calls and timer expiries instead of polling, and checks
+  // at start that the timer fires (docs/8ms-frame-pipeline-rfc.md).
+  seL4_CPtr wake = create(ram, seL4_NotificationObject);
+  seL4_CPtr badged = next_slot++, handler = next_slot++;
+  check(seL4_CNode_Mint(seL4_CapInitThreadCNode, badged, 32, seL4_CapInitThreadCNode, wake, 32,
+                        seL4_AllRights, OPEN_TIMER_BADGE));
+  if (!seL4_IRQControl_Get(seL4_CapIRQControl, OPEN_TIMER_IRQ, seL4_CapInitThreadCNode, handler, 32)) {
+    open_timer_handler = handler;
+    if (!seL4_IRQHandler_SetNotification(handler, badged) && !seL4_TCB_BindNotification(t->thread, wake)) {
+      give_open(OPEN_SLOT_TIMER, handler);
+      give_open(OPEN_SLOT_WAKE, wake);
+    }
+  }
   seL4_CPtr kernel_memory = spare_ram(seL4_UntypedObject, OPEN_KERNEL_BITS);
   if (kernel_memory) give_open(OPEN_SLOT_KERNEL, kernel_memory);
 #ifdef VIOLET_QEMU
@@ -765,6 +787,12 @@ static void wire(void) {
       if (procs[OPEN_RT].task.pd)
         map_shared(frame, &procs[OPEN_RT].task, 0x09100000 + i * PAGE, seL4_AllRights);
     }
+    // Audio's published state (services/audio/process.rs, Audio::snapshot):
+    // Runtime reads it instead of calling Audio, which answers only between
+    // hardware polls.
+    unsigned state_frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(state_frame, &procs[AUDIO].task, 0x09320000, seL4_AllRights);
+    map_shared(state_frame, &procs[RUNTIME].task, 0x07500000, seL4_CanRead);
   }
   for (unsigned id = 1; id < COUNT; id++)
     if ((id == LAUNCHER || id == WATCH || id >= WIFI) && procs[id].package)
@@ -856,6 +884,16 @@ static void wire(void) {
   board_device(STORAGE, 0x11230000, 0x0a000000, 0x0a000000);
   record_boot_stage(4);
   device(USB_DIAG, 0x11cc0000, 0x09001000, 12);
+  if (procs[OPEN_RT].package) {
+    // The display engine, read-only, for the Open Runtime's frame pipeline
+    // (docs/8ms-frame-pipeline-rfc.md): it reads the scan line from DISP_RDMA0.
+    // MMSYS config, DISP_MUTEX, DISP_OVL0, DISP_OVL0_2L, DISP_RDMA0 and DSI0,
+    // at 0x09800000 onwards (addresses from the phone's device tree).
+    mapping = &procs[OPEN_RT].task;
+    static const unsigned blocks[] = {0x14000000, 0x14001000, 0x1400b000, 0x1400c000, 0x1400d000, 0x14014000};
+    for (unsigned i = 0; i < sizeof(blocks) / sizeof(*blocks); i++)
+      map_device_rights(blocks[i], 0x09800000 + i * PAGE, 12, seL4_CanRead);
+  }
   board_device(RADIO, 0x18002000, 0x09015000, 0x09706000); // connectivity MCU and ROM mailbox
   device(RADIO, 0x18004000, 0x09011000, 12);
   device(RADIO,0x18006000,0x09014000,12); // WLAN DMA packet scheduler
@@ -913,6 +951,11 @@ static void dismantle(void) {
       check(seL4_TCB_Suspend(procs[i].task.thread));
   for (unsigned i = boot->untyped.start; i < boot->untyped.end; i++)
     check(seL4_CNode_Revoke(seL4_CapInitThreadCNode, i, 32));
+  // The last handler capability: the interrupt is free for the next build.
+  if (open_timer_handler) {
+    seL4_CNode_Delete(seL4_CapInitThreadCNode, open_timer_handler, 32);
+    open_timer_handler = 0;
+  }
 }
 unsigned ticks_per_ms;
 static unsigned long long ticks64(void) {

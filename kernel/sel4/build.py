@@ -113,6 +113,9 @@ def build_target(target,out):
         "-DTRIPLE=arm-none-eabi","-DPYTHON3="+str(py),"-DKernelPlatform=ellis",
         "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS=OFF","-DKernelPrinting=OFF",
         "-DKernelDebugBuild=OFF","-DKernelVerificationBuild=OFF","-DKernelArmExportVCNTUser=ON",
+        # The Open Runtime programs the physical timer (PPI 30) to wake itself,
+        # so it can block between events (docs/8ms-frame-pipeline-rfc.md).
+        "-DKernelArmExportPTMRUser=ON",
         # Linux ARM programs read their thread pointer from TPIDRURO; the Open Runtime sets it.
         "-DKernelArmTLSReg=tpidruro")
     generated=["include/sel4/"+f for f in ["shared_types_gen.h","syscall.h","invocation.h"]]

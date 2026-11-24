@@ -39,21 +39,31 @@ impl Screen {
         Ok(Screen { file, pix: map as *mut u32 })
     }
 
-    /// Copy a rectangle of the canvas to the screen and present those rows.
+    /// A canvas that draws straight into the screen surface, so `show` has
+    /// nothing to copy: only the rectangle is presented. Prefer it to
+    /// `Canvas::new(W, H)` for the frame an app shows.
+    pub fn canvas(&mut self) -> Canvas {
+        unsafe { Canvas::from_raw(self.pix, W, H) }
+    }
+
+    /// Present a rectangle of the canvas: copied to the screen surface first
+    /// unless the canvas is the surface itself (`Screen::canvas`).
     pub fn show(&mut self, c: &Canvas, r: Rect) {
         let r = r.intersect(Rect::new(0, 0, W as i32, H as i32));
         if r.is_empty() {
             return;
         }
-        for y in r.y0..r.y1 {
-            let row = y as usize * W;
-            let src = &c.px[row + r.x0 as usize..row + r.x1 as usize];
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), self.pix.add(row + r.x0 as usize), src.len());
+        if c.pixels_ptr() != self.pix as *const u32 {
+            for y in r.y0..r.y1 {
+                let row = y as usize * W;
+                let src = &c.px[row + r.x0 as usize..row + r.x1 as usize];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), self.pix.add(row + r.x0 as usize), src.len());
+                }
             }
         }
         // PresentRect: x, y, width, height, buffer, flags.
-        let words = [0u32, r.y0 as u32, W as u32, r.height() as u32, 0, 0];
+        let words = [r.x0 as u32, r.y0 as u32, r.width() as u32, r.height() as u32, 0, 0];
         let mut bytes = [0u8; 24];
         for (i, w) in words.iter().enumerate() {
             bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());

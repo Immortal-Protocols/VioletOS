@@ -4,7 +4,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use violet::{colors::*, Canvas, Fonts, Rect, Screen, H, W};
+use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
 use violet::CITIES;
 const GRID_TOP: i32 = 800;
@@ -103,7 +103,7 @@ fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
     let saved = violet::sys("get weather.city").parse::<usize>().ok().filter(|&n| n < CITIES.len());
-    let mut app = App { fonts: Fonts::load(), c: Canvas::new(W, H), city: None, shown: Report::default(), status: "Tap a city for live weather".into() };
+    let mut app = App { fonts: Fonts::load(), c: screen.canvas(), city: None, shown: Report::default(), status: "Tap a city for live weather".into() };
     let (tx, results) = mpsc::channel::<(usize, Result<Report, String>)>();
     let mut loading = false;
     let start = |app: &mut App, i: usize, loading: &mut bool| {

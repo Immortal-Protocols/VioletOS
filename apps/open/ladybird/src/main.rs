@@ -533,7 +533,7 @@ fn main() {
     let (tx, results) = mpsc::channel::<Loaded>();
     let mut b = Browser {
         fonts: Fonts::load(),
-        c: Canvas::new(W, H),
+        c: screen.canvas(),
         page: None,
         scroll: 0,
         history: Vec::new(),

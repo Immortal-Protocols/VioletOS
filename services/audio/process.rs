@@ -27,6 +27,9 @@ extern "C" {
     fn ipc_try_receive(slot: u32, m: &mut Message) -> u32;
 }
 
+/// The state page shared with Runtime (read-only there): see Audio::snapshot.
+const SNAPSHOT: *mut u32 = 0x0932_0000 as *mut u32;
+const SNAPSHOT_MAGIC: u32 = 0x3154_5341; // "AST1"
 // Volume buttons: one step per press, then repeats while held.
 const DEBOUNCE_MS: u32 = 20;
 const REPEAT_DELAY_MS: u32 = 500;
@@ -255,6 +258,26 @@ impl Audio {
             _ => Message::error(DENIED),
         }
     }
+    /// Publish the answers to GET VOLUME, PLAYBACK and MICROPHONE in the page
+    /// Runtime reads (SNAPSHOT), so its reads never wait for this loop: a
+    /// synchronous call could hold every Runtime client for up to ~40 ms on
+    /// the handset (docs/8ms-frame-pipeline-rfc.md). Word 0 is a sequence
+    /// number, odd while the page is being written.
+    fn snapshot(&self) {
+        let page = SNAPSHOT;
+        unsafe {
+            let seq = page.read_volatile().wrapping_add(1) | 1;
+            page.write_volatile(seq);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            page.add(1).write_volatile(SNAPSHOT_MAGIC);
+            let replies = [self.volume(), self.playback(), self.microphone()];
+            for (k, r) in replies.iter().enumerate() {
+                (page.add(4) as *mut Message).add(k).write_volatile(*r);
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            page.write_volatile(seq.wrapping_add(1));
+        }
+    }
     fn microphone(&self) -> Message {
         let level = if self.mic_mode == MIC_OFF { 0 } else { self.meter.level };
         let mut r = Message::result(level);
@@ -455,7 +478,10 @@ pub fn run() -> ! {
     loop {
         let mut m = Message::default();
         if unsafe { ipc_try_receive(SERVER, &mut m) } != 0 {
-            audio.handle(m).reply();
+            let r = audio.handle(m);
+            // A command's effect is visible to Runtime's next read at once.
+            audio.snapshot();
+            r.reply();
         }
         if let Some(request) = board::request() {
             audio.developer(request);
@@ -471,6 +497,7 @@ pub fn run() -> ! {
         );
         let m = audio.microphone();
         board::publish_mic(m.arg, m.value);
+        audio.snapshot();
         unsafe { delay_ms(1) };
     }
 }

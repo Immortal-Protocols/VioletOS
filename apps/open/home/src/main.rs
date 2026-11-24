@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clock::Glance;
-use violet::{device::{TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen, H, W};
+use violet::{device::{TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen};
 
 use violet::CITIES;
 
@@ -44,7 +44,7 @@ fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
     let fonts = Fonts::load();
-    let mut c = Canvas::new(W, H);
+    let mut c = screen.canvas();
     let mut s = ui::State {
         now: None, online: false, battery: -1, volume: 0, phones: false,
         temp: String::new(), sky: String::new(), city: String::new(), running: Default::default(), pressed: None, shield: Default::default(),
@@ -113,15 +113,19 @@ fn main() {
             }
             Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
             Ok(e) if e.kind == TOUCH_DOWN => {
-                // usize::MAX: the Wi-Fi bar.
+                // usize::MAX: the Wi-Fi bar. Only the pressed tile is redrawn.
                 s.pressed = ui::tile_at(e.x, e.y).or(ui::WIFI_BAR.contains(e.x, e.y).then_some(usize::MAX));
-                if s.pressed.is_some() {
-                    draw(&mut c, &mut s, &glance, &mut screen);
+                if let Some(i) = s.pressed {
+                    let r = ui::region(i);
+                    ui::draw_clipped(&mut c, &fonts, &s, r);
+                    screen.show(&c, r);
                 }
             }
             Ok(e) if e.kind == TOUCH_UP => {
                 if let Some(i) = s.pressed.take() {
-                    draw(&mut c, &mut s, &glance, &mut screen);
+                    let r = ui::region(i);
+                    ui::draw_clipped(&mut c, &fonts, &s, r);
+                    screen.show(&c, r);
                     let (name, command) = match ui::TILES.get(i) {
                         Some(t) => (t.name, t.command),
                         None => ("wifi", ui::WIFI_COMMAND),
@@ -177,6 +181,59 @@ fn main() {
 
 #[cfg(test)]
 mod preview {
+    fn state() -> super::ui::State {
+        let t = super::clock::parse_http_date("Tue, 24 Nov 2026 02:47:33 GMT");
+        let g = super::Glance { utc: t, offset: -8 * 3600, at: std::time::Instant::now(), temp: "54°F".into(), sky: "Partly cloudy".into(), city: "Oakland".into() };
+        super::ui::State {
+            now: g.now(), online: true, battery: 82, volume: 8, phones: false, temp: g.temp.clone(), sky: g.sky.clone(),
+            city: g.city.clone(), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
+            shield: super::ui::Shield { known: true, linked: true, rules: 3, frozen: vec![] }, wifi: "LouieDog".into(),
+        }
+    }
+
+    /// HOME_BENCH=1 cargo test -p home --release bench -- --nocapture: what a
+    /// full redraw and a pressed tile cost (run on the build machine; the
+    /// handset's Cortex-A53 is roughly 10-20x slower).
+    #[test]
+    fn bench() {
+        if std::env::var("HOME_BENCH").is_err() {
+            return;
+        }
+        let fonts = violet::Fonts::load();
+        let mut s = state();
+        let mut c = violet::Canvas::new(violet::W, violet::H);
+        super::ui::draw(&mut c, &fonts, &s); // rasterize the glyphs once
+        let n = 50;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            super::ui::draw(&mut c, &fonts, &s);
+        }
+        let full = t.elapsed() / n;
+        s.pressed = Some(0);
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            super::ui::draw_clipped(&mut c, &fonts, &s, super::ui::region(0));
+        }
+        let pressed = t.elapsed() / n;
+        println!("home bench: full redraw {full:?}, pressed tile {pressed:?}");
+    }
+
+    /// A pressed tile drawn alone matches the same tile in a full redraw.
+    #[test]
+    fn pressed_matches_full() {
+        let fonts = violet::Fonts::load();
+        let mut s = state();
+        let mut a = violet::Canvas::new(violet::W, violet::H);
+        super::ui::draw(&mut a, &fonts, &s);
+        s.pressed = Some(4);
+        let mut b = violet::Canvas::new(violet::W, violet::H);
+        b.px.copy_from_slice(&a.px);
+        super::ui::draw_clipped(&mut b, &fonts, &s, super::ui::region(4));
+        let mut full = violet::Canvas::new(violet::W, violet::H);
+        super::ui::draw(&mut full, &fonts, &s);
+        assert!(b.px[..] == full.px[..], "a pressed tile differs from a full redraw");
+    }
+
     /// HOME_PREVIEW=path cargo test -p home writes Home as raw 720x1600 RGBA.
     #[test]
     fn preview() {
