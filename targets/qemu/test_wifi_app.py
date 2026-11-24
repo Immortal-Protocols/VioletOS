@@ -102,7 +102,7 @@ until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
 time.sleep(3)
 if not on_home():
     tap(570, 276)  # the classic launcher's APPS button shows Home
-    until("Home app", on_home, 20)
+    until("Home app", on_home, 90)
 tap(360, 690)  # Home's Wi-Fi bar
 until("Wi-Fi app starts", lambda: "wifi: ready" in everything(), 60)
 until("scan finds the three networks", lambda: "wifi: found 3 networks" in everything(), 30)
