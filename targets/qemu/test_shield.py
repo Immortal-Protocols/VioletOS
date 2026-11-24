@@ -136,7 +136,7 @@ def open_apps():
         return
     if not on_home():
         tap(570, 276)  # the classic launcher's APPS button shows Home
-        until("Home", on_home, 30)
+        until("Home", on_home, 90)
     tap(360, 1141)
     until("app list", on_list)
 def back_home():

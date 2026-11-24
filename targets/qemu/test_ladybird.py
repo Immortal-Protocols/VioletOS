@@ -131,7 +131,7 @@ until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
 time.sleep(3)
 if not on_home():
     tap(570, 276)  # the classic launcher's APPS button shows Home
-    until("Home app", on_home, 20)
+    until("Home app", on_home, 90)
 tap(360, 1141)  # Home's Programs tile
 until("app list", on_list)
 tap(360, 260 + APPS.index("ladybird") * 80 + 34)

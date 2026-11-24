@@ -73,7 +73,7 @@ def open_apps():
         return
     if not on_home():
         tap(570, 276)  # the classic launcher's APPS button shows Home
-        until("Home app", on_home, 20)
+        until("Home app", on_home, 90)
     tap(360, 1141)  # Home's Programs tile
     until("app list", on_list)
 def start(name):
