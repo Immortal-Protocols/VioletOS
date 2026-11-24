@@ -101,7 +101,10 @@ final class StandIns {
         guard Date().timeIntervalSince(lastSave) > 0.5 else { return }
         lastSave = Date()
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("standins.json")
-        if let d = try? JSONSerialization.data(withJSONObject: ["received": received, "ports": ports]) { try? d.write(to: url) }
+        if let d = try? JSONSerialization.data(withJSONObject: ["received": received, "ports": ports]) {
+            try? d.write(to: url)
+            DemoReport.send("standins.json", d)
+        }
     }
 
     /// Write the totals now (the last few chunks may have arrived within the save interval).

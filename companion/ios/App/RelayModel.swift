@@ -239,6 +239,7 @@ final class RelayModel: ObservableObject {
         enc.dateEncodingStrategy = .iso8601
         if let data = try? enc.encode(status) {
             try? data.write(to: Self.statusURL, options: .atomic)
+            DemoReport.send("status.json", data)
         }
     }
 

@@ -306,6 +306,77 @@ def start_ios(host_map, record_dir):
     raise SystemExit("Violet Relay did not start listening with its model loaded in the Simulator")
 
 
+MAC_APP = ROOT / "build/mac-wrapper/VioletRelay.app"
+
+
+class MacCompanion:
+    """Violet Relay itself, running on this Mac as an iPhone app ("Designed for iPad").
+    macOS keeps its container private, so the app POSTs its status files and window
+    snapshots to a collector here (-demoReportURL)."""
+
+    def __init__(self, host_map, folder: Path, record_dir):
+        self.folder, self.record_dir = folder, record_dir
+        (folder / "snapshots").mkdir(parents=True, exist_ok=True)
+        root = folder
+
+        class Collect(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                data = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                name = self.path.lstrip("/")
+                if ".." not in name and (name.count("/") == 0 or name.startswith("snapshots/")):
+                    out = root / name
+                    out.with_suffix(".part").write_bytes(data)
+                    out.with_suffix(".part").replace(out)
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Collect)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        key = subprocess.check_output(["openssl", "pkcs8", "-topk8", "-nocrypt", "-in", str(ROOT / "build/shield/companion-signing.pem"), "-outform", "DER"])
+        self.stop()
+        subprocess.run(["open", "-n", str(MAC_APP), "--args", "-pairingSecret", "violet-dev", "-upstream", "any",
+                        "-shieldDevKey", base64.b64encode(key).decode(), "-shieldFreezeTTL", str(FREEZE_TTL),
+                        "-hostMapB64", base64.b64encode(json.dumps(host_map).encode()).decode(),
+                        "-demoReportURL", f"http://127.0.0.1:{self.server.server_address[1]}",
+                        "-shieldSnapshots", "1" if record_dir else "0"], check=True)
+
+    def wait(self):
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            try:
+                st = json.loads((self.folder / "status.json").read_text())
+                shield = json.loads((self.folder / "shield-status.json").read_text())
+                if st.get("listenerState") == "listening" and st.get("port") and "hybrid head" in shield.get("model", ""):
+                    return st["port"], self.folder / "shield-status.json", self
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.5)
+        raise SystemExit("Violet Relay on the Mac did not start listening with its model loaded")
+
+    def stop(self):
+        subprocess.run(["pkill", "-f", "Wrapper/VioletRelay.app/VioletRelay"], capture_output=True)
+
+    def finish(self):
+        time.sleep(2)
+        self.stop()
+        if self.record_dir:
+            shots = sorted((self.folder / "snapshots").glob("*.png"))
+            out = self.record_dir / "mac"
+            out.mkdir(exist_ok=True)
+            for p in shots:
+                (out / p.name).write_bytes(p.read_bytes())
+
+
+def start_mac(host_map, tmp: Path, record_dir):
+    if not (MAC_APP / "WrappedBundle").exists():
+        raise SystemExit("Build Violet Relay for the Mac first (make shield-mac-companion)")
+    return MacCompanion(host_map, tmp / "mac", record_dir).wait()
+
+
 def start_sim(host_map, tmp: Path):
     port = free_port()
     status = tmp / "shield-status.json"
@@ -332,7 +403,7 @@ def free_port():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--companion", choices=["ios", "sim"], default="ios")
+    ap.add_argument("--companion", choices=["ios", "sim", "mac"], default="ios")
     ap.add_argument("--record", help="directory for the demo recording (frames, captions, Simulator video)")
     args = ap.parse_args()
     original = ROOT / "build/sel4/qemu"
@@ -360,6 +431,8 @@ def main():
         helper = None
         if args.companion == "ios":
             port, status, helper = start_ios(host_map, record)
+        elif args.companion == "mac":
+            port, status, helper = start_mac(host_map, tmp, record)
         else:
             port, status, helper = start_sim(host_map, tmp)
         viewer = tmp / "viewer.py"
@@ -377,6 +450,8 @@ def main():
                 if args.companion == "ios":
                     helper.send_signal(2)
                     helper.wait(timeout=20)
+                elif args.companion == "mac":
+                    helper.finish()
                 else:
                     helper.terminate()
         st = json.loads(Path(status).read_text())

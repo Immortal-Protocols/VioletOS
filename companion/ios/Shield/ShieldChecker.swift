@@ -601,6 +601,7 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("shield-status.json")
         if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: url, options: .atomic)
+            DemoReport.send("shield-status.json", data)
         }
     }
 

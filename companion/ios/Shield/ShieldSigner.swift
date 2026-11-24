@@ -28,7 +28,7 @@ final class ShieldSigner {
     init() {
         if let provisioned = Self.provisionedKey() {
             key = .software(provisioned)
-            keyDescription = "software P-256 (Simulator dev key) " + Self.fingerprint(provisioned.publicKey.x963Representation)
+            keyDescription = (ProcessInfo.processInfo.isiOSAppOnMac ? "software P-256 (development key) " : "software P-256 (Simulator dev key) ") + Self.fingerprint(provisioned.publicKey.x963Representation)
         } else if SecureEnclave.isAvailable, let k = Self.enclaveKey() {
             key = .enclave(k)
             keyDescription = "Secure Enclave P-256 " + Self.fingerprint(k.publicKey.x963Representation)

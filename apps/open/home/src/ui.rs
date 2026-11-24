@@ -132,7 +132,7 @@ fn shield(c: &mut Canvas, f: &Fonts, s: &Shield) {
     } else {
         title.draw(c, "Violet Shield", x, 1368, INK);
         let state = if s.linked {
-            format!("On · linked to your iPhone · {} rule{}", s.rules, if s.rules == 1 { "" } else { "s" })
+            format!("On · guarded by your Mac at home · {} rule{}", s.rules, if s.rules == 1 { "" } else { "s" })
         } else {
             "Waiting for your iPhone".to_string()
         };

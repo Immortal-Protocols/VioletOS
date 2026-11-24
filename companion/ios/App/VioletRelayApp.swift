@@ -7,7 +7,10 @@ struct VioletRelayApp: App {
     var body: some Scene {
         WindowGroup {
             StatusView(model: model)
-                .onAppear { model.start() }
+                .onAppear {
+                    model.start()
+                    Snapshots.startIfAsked()
+                }
         }
     }
 }

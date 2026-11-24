@@ -157,6 +157,20 @@ test-shield-ios: qemu-image shield-companion
 shield-demo: qemu-image shield-companion
 	VIOLET_SIM=$(SHIELD_SIM) $(SHIELD_PY) targets/qemu/test_shield.py --companion ios --record build/shield/demo
 	$(SHIELD_PY) tools/shield-trainer/make_video.py build/shield/demo
+# The Mac at home as the companion: Violet Relay itself, run on this Mac as an iPhone
+# app ("Designed for iPad"), in the wrapper bundle macOS launches such apps from.
+.PHONY: shield-mac-companion test-shield-mac shield-mac-demo
+shield-mac-companion:
+	cd companion/ios && xcodegen generate -q && xcodebuild -project VioletRelay.xcodeproj -scheme VioletRelay \
+	  -destination 'platform=macOS,arch=arm64,variant=Designed for iPad' -derivedDataPath ../../build/dd-mac -allowProvisioningUpdates -quiet build
+	rm -rf build/mac-wrapper && mkdir -p build/mac-wrapper/VioletRelay.app/Wrapper
+	cp -c -R build/dd-mac/Build/Products/Debug-iphoneos/VioletRelay.app build/mac-wrapper/VioletRelay.app/Wrapper/
+	ln -s Wrapper/VioletRelay.app build/mac-wrapper/VioletRelay.app/WrappedBundle
+test-shield-mac: qemu-image shield-mac-companion
+	$(SHIELD_PY) targets/qemu/test_shield.py --companion mac
+shield-mac-demo: qemu-image shield-mac-companion
+	$(SHIELD_PY) targets/qemu/test_shield.py --companion mac --record build/shield/mac-demo
+	$(SHIELD_PY) tools/shield-trainer/make_mac_video.py build/shield/mac-demo
 # Real devices: the Moto image with the demo apps, then the run (see targets/moto-g-pure/test_shield_device.py).
 moto-shield: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto

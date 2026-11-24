@@ -38,7 +38,9 @@ struct ShieldSection: View {
         } header: {
             Text("Violet Shield")
         } footer: {
-            Text("Checks run on this iPhone. Containment is signed with this phone's key and expires on its own.")
+            Text(ProcessInfo.processInfo.isiOSAppOnMac
+                 ? "Checks run on this Mac, at home. Containment is signed with this Mac's key and expires on its own."
+                 : "Checks run on this iPhone. Containment is signed with this phone's key and expires on its own.")
         }
         if !s.decisions.isEmpty {
             Section("Verdicts") {
