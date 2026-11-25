@@ -2,8 +2,10 @@
 
 VioletOS is a smartphone operating system built on the seL4 microkernel. It runs on the Moto G Pure (XT2163DL) and in QEMU on a Mac, with no Linux kernel anywhere. Drivers and services are separate seL4 processes, mostly written in Rust. Apps come in two kinds:
 
-- **System components** (the classic launcher, Wi-Fi Setup, and the Stopwatch package used by the package-system tests) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
-- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Camera, Wi-Fi, Ladybird, Music, Weather, Stopwatch, Sounds, [bitchat](apps/open/bitchat/README.md)) are open apps written in Rust. [Ladybird](apps/open/ladybird/README.md) is a web browser built on the Ladybird project's own Rust HTML parser. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
+- **System components** (the boot [launcher](apps/launcher/README.md)) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
+- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The phone ships with [Home](apps/open/home), [Ladybird Browser](apps/open/ladybird/README.md), [Bitchat](apps/open/bitchat/README.md), [Violet Agent](apps/open/agent/README.md), Locomo Music and [Settings](apps/open/settings/README.md), all open apps written in Rust. Apps Violet Agent builds get their own icons on Home after these. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
+
+The look is dark layered paper with cream icons pressed into it ([paper.rs](apps/lib/violet/src/paper.rs)). Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone Internet), the clock's city and deleting Agent-built apps are all in Settings.
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -11,23 +13,16 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 
 | Command | What you get |
 | --- | --- |
-| `make emulator` | A clickable seL4 window. The classic launcher starts; **APPS** opens Home and the open apps. **Sounds** plays through the Mac's speakers and records from its microphone; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
+| `make emulator` | A clickable seL4 window that boots straight to Home. Sound plays through the Mac's speakers; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
-| `make test-emulator` | Eight QEMU scenarios covering stopwatch behavior, touch transfer failures, recovery and watchdog handling. The tests read the guest's rendered pixels. |
-| `make test-stack` | Exercises Home, Quit, relaunch, radio, sleep and wake, package removal, installation and crash rollback inside QEMU. |
-| `make test-apps` | Installs a separately built app, reads its file after reboot, uninstalls it, and recovers from a stalled service update. |
-| `make test-storage` | Boots seven QEMU guests against a disposable disk to check independent app data, durable reset and torn-sector recovery. |
+| `make test-emulator` | Eight QEMU scenarios covering touch transfer failures, controller recovery and watchdog handling; where touch works, a tap on Home must open Settings. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
-| `make test-wifi` | Checks connection, gateway replies, link failure, radio-off handling and saved network selection across QEMU boots. |
-| `make test-wifi-live` | Validates the certificate in the guest and reads a live UUID from a public HTTPS endpoint. |
-| `make test-power` | Verifies guest-driven VM pause, resume and shutdown. |
-| `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds app, then checks the PCM, the recording and the on-screen volume. |
-| `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. |
-| `make test-wifi-app` | Drives the Wi-Fi app by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
-| `make test-open-apps` | Drives the built-in apps: Stopwatch's time in `/data` across a restart, Sounds, and live Weather. |
+| `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds test program, then checks the PCM, the recording and the on-screen volume. |
+| `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime, started from their Home icons: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. The programs live in [targets/qemu/open-test-apps](targets/qemu/open-test-apps) and only this test's image carries them. |
+| `make test-wifi-app` | Drives Settings › Wi-Fi by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
+| `make test-open-apps` | Drives Home, Settings (a chosen city kept in `/data` across a restart, Wi-Fi, Agent Apps) and Music. |
 | `make test-shield` | Violet Shield end to end: the Sentinel streams telemetry to a companion that scores it with EmbeddingGemma 2 and freezes a data-stealing app with a signed Shield. `make test-shield-ios` uses the real app in the iOS Simulator. See [the proof of concept](docs/violet-shield-poc.md). |
-| `make test-agent` | The voice agent in QEMU with the real Mac app: QR pairing through a local relay, an encrypted install that survives a restart, reconnect and unpair. See [the agent](apps/open/agent/README.md) and [Violet Agent for macOS](companion/mac/README.md). |
-| `make test-camera` | Opens Camera from Home and checks the synthetic sensor's colour bars on screen, in order, and that the picture moves. |
+| `make test-agent` | The voice agent in QEMU with the real Mac app: QR pairing through a local relay, an encrypted install that survives a restart and gets a Home icon, deleting it from Settings, reconnect and unpair. See [the agent](apps/open/agent/README.md) and [Violet Agent for macOS](companion/mac/README.md). |
 | `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
@@ -75,8 +70,7 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 
 | ID | Component | Role |
 | --- | --- | --- |
-| 1 | [Launcher](apps/launcher/README.md) | Home: status, app list, Wi-Fi or Phone Internet, sleep, the **/APPS** button. |
-| 2 | [Stopwatch](apps/stopwatch/README.md) | The first app; keeps its time across reboots. |
+| 1 | [Launcher](apps/launcher/README.md) | The boot process: hands the screen to the Open Runtime, restores QEMU's radio choice, and starts the handset's USB Wi-Fi jobs. |
 | 3 | [Runtime](runtime/README.md) | The built-in app interface, focus and routing. |
 | 4 | [Touch](services/touch/README.md) | Novatek touch controller over SPI. |
 | 5 | [Display](services/display/README.md) | Presents built-in apps' surfaces to the screen. The Open Runtime draws there itself while an open app is in front. |
@@ -84,13 +78,11 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets and, on the handset, Bluetooth HCI. |
 | 8 | [Power](services/power/README.md) | Battery, sleep and shutdown; brokers the PMIC for Audio and Camera. |
 | 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
-| 10 | [Wi-Fi Setup](apps/wifi/README.md) | Chooses a network and tests the connection. |
-| 11, 12 | Library apps | Free slots for separately installed apps. |
 | 15–20 | Runtime workers | Runtime's per-service request threads. |
 | 21 | [USB Diagnostics](services/usb-diagnostics/README.md) | Handset only: status, package staging, flashing and test requests from the Mac. |
 | 22 | [Audio](services/audio/README.md) | Speaker, headphones, jack, volume buttons, microphone, and open apps' PCM. |
 | 24 | [Open Runtime](runtime/open/README.md) | Runs Linux ARM programs from `/apps`. |
-| 25 | [Camera](services/camera/README.md) | The rear camera's sensor, receiver and frames, for open apps' `/dev/violet/camera`. |
+| 25 | [Camera](services/camera/README.md) | The rear camera's sensor, receiver and frames, for open apps' `/dev/violet/camera` (no app uses it now). |
 
 Slot 23 is reserved for a Bluetooth service. Today Radio carries Bluetooth on the handset, since the controller shares the connectivity chip and its BTIF port with Wi-Fi ([bring-up notes](targets/moto-g-pure/bluetooth-bringup.md)).
 
@@ -100,12 +92,12 @@ Slot 23 is reserved for a Bluetooth service. Today Radio carries Bluetooth on th
 | --- | --- | --- |
 | Boot, supervisor, recovery and rollback | Yes | Yes, from slot B, with Android kept on slot A |
 | Touch and display | Mouse clicks become touch reports | Novatek touch on either DJN panel |
-| Storage | Virtual disks | eMMC volume inside boot B; stopwatch time survives reboot |
-| Wi-Fi | Virtual access points, open and WPA2; HTTPS through the Mac | Scan, choose and type the password in the Wi-Fi app (WPA2-Personal), or provision over USB; HTTPS UUID |
+| Storage | Virtual disks | eMMC volume inside boot B; app data survives reboot |
+| Wi-Fi | Virtual access points, open and WPA2; HTTPS through the Mac | Scan, choose and type the password in Settings › Wi-Fi (WPA2-Personal), or provision over USB; HTTPS UUID |
 | Phone Internet | — | Hosts a Wi-Fi network for the iPhone relay; traffic leaves over cellular |
 | Audio | Mac speakers and microphone | Speaker, headphones, jack, Volume Down and microphone (Volume Up not yet) |
 | Bluetooth LE | — (the app reports the controller off) | Raw HCI for open apps through `/dev/violet/hci` while Wi-Fi is joined; [bitchat](apps/open/bitchat/README.md) chats with the iOS app |
-| Camera | A synthetic sensor (colour bars) | Rear Hi-1336 at 1280 × 720, 30 frames per second; the Camera app shows about 19 |
+| Camera | A synthetic sensor (colour bars) | Rear Hi-1336 at 1280 × 720, 30 frames per second (the service; no app ships for it now) |
 | Open apps | Rust, C, Go and Python, with screen, touch, audio and TCP | Rust, C, Go and Python; PCM audio; TCP over Wi-Fi |
 
 On the handset, apps are started from Home by touch, or from the Mac over USB (for example `build/moto-package open-run=/apps/hello` and `build/moto-package open-log`).
@@ -114,9 +106,9 @@ On the handset, apps are started from Home by touch, or from the Mac over USB (f
 
 ```
 apps/                 Built-in apps (no_std Rust) and open apps
-  launcher/ stopwatch/ wifi/ sounds/ weather/   one process.rs each; drawing.rs is shared
-  open/               Linux programs for /apps, one folder each (a Cargo crate, main.rs, main.go, main.c or a script)
-  lib/violet/         the built-in apps' shared Rust crate: devices, drawing, text, HTTPS
+  launcher/           the boot process (no_std); drawing.rs is shared
+  open/               the phone's apps for /apps: home, settings, ladybird, bitchat, agent, music
+  lib/violet/         the open apps' shared Rust crate: devices, drawing, the paper look and icons, text, HTTPS
   examples/           Sketches from the open app model RFC
 runtime/              Runtime: protocol.rs (wire format and keys), process.rs, lanes.rs (workers), sdk.rs (app side)
   open/               Open Runtime: syscalls, devices, sockets, file system, memory pool
@@ -146,7 +138,7 @@ Code that differs between QEMU and the handset lives under `targets/` behind a c
 
 | If you want to change… | Start here | Where it runs |
 | --- | --- | --- |
-| A built-in app's screen or behavior | Its `process.rs` under [apps/](apps/), drawing with [drawing.rs](apps/drawing.rs) and the [bitmap font](src/glyphs.h). The stopwatch's state machine is [state.rs](apps/stopwatch/state.rs). | Moto and QEMU |
+| Home, Settings or another app's screen | Its folder under [apps/open](apps/open); the shared look (paper, icons, buttons) is [paper.rs](apps/lib/violet/src/paper.rs). `HOME_PREVIEW=out.raw cargo test -p home` and `SETTINGS_PREVIEW=dir cargo test -p settings` draw previews on the Mac. | Moto and QEMU |
 | What built-in apps can ask for | [protocol.rs](runtime/protocol.rs) defines the keys; [process.rs](runtime/process.rs) decides who may use them and routes them. | Moto and QEMU |
 | Which Linux calls open apps get | [syscall.rs](runtime/open/syscall.rs), with [sockets.rs](runtime/open/sockets.rs), [device.rs](runtime/open/device.rs) for `/dev/violet` and the app list, and [fs.rs](runtime/open/fs.rs) for files. | Moto and QEMU |
 | How open apps are loaded and paged | [procmgr.rs](system/supervisor/procmgr.rs) and [pool.rs](runtime/open/pool.rs). | Moto and QEMU |
@@ -164,21 +156,15 @@ Code that differs between QEMU and the handset lives under `targets/` behind a c
 | How the Mac window talks to the guest | [run.py](tools/run.py) starts QEMU and the Mac-side helpers; [viewer.c](tools/emulator/viewer.c) shows the 720 × 1600 framebuffer, plays and records sound, and turns mouse events into touch reports. | Mac |
 | The native simulator | [screen.c](src/screen.c) and [simulator.c](targets/mac-simulator/simulator.c). | Native host process |
 
-For example, change the **Start** label in `apps/stopwatch/process.rs` to update both seL4 targets. Change `spi_mmio.c` and only the handset build changes. To mirror a design change in the native simulator, edit `screen.c` as well.
+For example, change a label in `apps/open/settings/src/pages.rs` to update both seL4 targets. Change `spi_mmio.c` and only the handset build changes.
 
 ## Try it in QEMU
 
-Start the stopwatch, go **Home**, then reopen it to see the timer still running. **Quit** ends that instance; reopening it restores the last saved checkpoint. **Radio** toggles the virtual modem, **Sleep** pauses QEMU until the next tap, and **Apps → Off → Confirm** shuts the VM down. See the [package manager guide](system/package-manager/README.md) to replace a component independently.
-
-Open **Wi-Fi Setup → Connect → Test Radio** to display a fresh UUID from the configured HTTPS endpoint. The guest verifies the certificate; the Mac only relays TCP bytes. The **Weather** open app fetches wttr.in with its own TLS.
-
-Tap **/APPS** for the open apps. **Ladybird** opens a start page of links; tap the address bar to type any address. `hello`, `chello`, `gohello` and `pyhello` print to the Open Runtime's log; `canvas` and `pypaint` draw and answer taps; `pytone` plays a chord; `pynet` and `gonet` fetch a web page.
+`make emulator` boots to Home: the date, the Violet Shield pill, and an icon for each app. Tap an icon to open it; every app has a **‹ Home** button, and holding the top edge for a second also comes back. Tap **Settings** for Wi-Fi (the emulator offers three virtual networks), Bluetooth, Phone Link, Date & Time (the city whose date Home shows), Agent Apps and About. **Ladybird Browser** opens a start page of links; tap the address bar to type any address.
 
 ### Persistence
 
-Open **Stopwatch → Start → Pause** and note the time. Close the emulator, run `make emulator` again, and open **Stopwatch**: the paused time returns. **Reset** saves zero. Closing while the timer runs restores the last saved checkpoint on the next boot.
-
-QEMU uses a 1 MiB raw disk at `build/sel4/qemu/stopwatch.disk`. The guest keeps two alternating 512-byte sectors per app, each with a version marker, generation number, value and CRC. Storage acknowledges a save after the device flush completes and, on startup, chooses the newest valid record. The screen shows **DISK READY** when storage is available, **RAM ONLY** when it starts without usable storage, and **DISK ERROR** if a save fails. Runtime selects each app's private checkpoint and private files. A separate 4 MiB package disk holds the installed catalog and its rollback copy. The handset uses the same code with an MSDC0 block driver; see the [handset storage layout](targets/moto-g-pure/README.md#handset-storage). Open apps' writes stay in memory for now.
+Open apps keep files in `/data`, which the Open Runtime writes back to Storage and loads on the next boot: Settings' saved networks and Phone Internet code, the shared settings, and so on. QEMU keeps them on a 1 MiB raw disk in `build/sel4/qemu`; the handset uses the same code with an MSDC0 block driver (see the [handset storage layout](targets/moto-g-pure/README.md#handset-storage)). Apps Violet Agent installs live in their own extent of the disk and survive restarts too.
 
 ## Handset
 

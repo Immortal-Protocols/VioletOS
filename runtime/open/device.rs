@@ -1066,10 +1066,12 @@ impl Runtime {
                 self.shell.dirty = true;
                 String::from("ok\n")
             }
-            // System settings: Wi-Fi, Phone Internet, packages and power.
-            Some("system") => {
-                request(EXECUTE, OPEN, LAUNCHER);
-                String::from("ok\n")
+            // Bluetooth: whether the controller is on, and whether an app has its HCI open.
+            Some("bluetooth") => alloc::format!("on={} open={}\n", super::hci::up() as u32, super::hci::is_open() as u32),
+            // Phone Internet (runtime/open/wifi.rs).
+            Some("relay") => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                self.wifi.relay(&path, &mut words)
             }
             // Bring an app to the front, starting it if it is not running.
             Some("open") => match words.next() {
@@ -1118,10 +1120,11 @@ impl Runtime {
             // /apps/NAME, which the app wrote, across restarts and lists it under
             // TITLE; "uninstall NAME" removes it; "installed" lists them. Only the
             // agent (/apps/agent), which takes installs from the paired Mac, may
-            // change them.
+            // install them; the agent and Settings may remove them.
             Some(verb @ ("install" | "uninstall")) => {
                 let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
-                if path != super::appstore::INSTALLER {
+                let allowed = path == super::appstore::INSTALLER || (verb == "uninstall" && path == super::wifi::SETTINGS_APP);
+                if !allowed {
                     return String::from("error only the agent installs apps\n");
                 }
                 let Some(name) = words.next().filter(|n| super::appstore::valid_name(n)) else {
@@ -1138,6 +1141,11 @@ impl Runtime {
                 let r = if verb == "install" {
                     self.store.install(&mut self.fs, name, &title.join(" "), now).map(|n| alloc::format!("ok {}\n", n))
                 } else {
+                    // A running copy ends first.
+                    let running = alloc::format!("/apps/{}", name);
+                    if let Some(n) = (0..MAX_APPS).find(|&n| self.apps[n].as_ref().is_some_and(|a| a.path == running)) {
+                        self.reap(n);
+                    }
                     self.store.remove(&mut self.fs, name).map(|_| String::from("ok\n"))
                 };
                 self.shell.dirty = true;

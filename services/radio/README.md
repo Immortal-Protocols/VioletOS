@@ -1,6 +1,6 @@
 # Radio service
 
-Wi-Fi Setup and the [Wi-Fi app](../../apps/open/wifi/src/main.rs) scan the QEMU network profiles and select one by stable ID. By default there are two open networks and **VIOLET HOME**, a WPA2 network with the password `violet-home`. Set `VIOLET_NETWORKS='["VIOLET LAB",{"name":"HOME","password":"12345678"}]'` to change them. They are virtual access points sharing one Ethernet uplink; a WPA2 one accepts a join only with the right key.
+[Settings › Wi-Fi](../../apps/open/settings/src/wifi.rs) scans the QEMU network profiles and select one by stable ID. By default there are two open networks and **VIOLET HOME**, a WPA2 network with the password `violet-home`. Set `VIOLET_NETWORKS='["VIOLET LAB",{"name":"HOME","password":"12345678"}]'` to change them. They are virtual access points sharing one Ethernet uplink; a WPA2 one accepts a join only with the right key.
 
 A join (`EXECUTE PROFILE`) can carry the network's WPA2 key in its data. Radio keeps it for the boot, uses it in place of a USB-provisioned profile with that name, and answers a failed join with the reason (`JOIN_*` in [protocol.rs](../../runtime/protocol.rs)), for example 52 when the access point refused the handshake (a wrong key) and 57 when it did not finish for another reason (no answer, a lost frame), which must not cost a saved key. On the Moto, Radio controls the physical Wi-Fi chip and joins a provisioned WPA2 network. [USB Diagnostics](../usb-diagnostics/README.md) exposes its status and forwards scan and join requests from the Mac.
 

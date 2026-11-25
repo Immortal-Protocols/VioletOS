@@ -1,5 +1,5 @@
 # Launcher
 
-The [QEMU launcher process](process.rs) asks Runtime for the installed app, draws Home into its private surface, and opens the stopwatch on demand. It also displays virtual radio and battery status and issues radio and sleep commands. The first touch after sleep wakes the display.
+Component 1, the boot process. It has no screen: as soon as Runtime answers, it hands the screen to the [Open Runtime](../../runtime/open/README.md), which starts [Home](../open/home) and the other apps. It stays running to restore QEMU's saved virtual-radio choice and, on the handset, to start the Wi-Fi scans that USB `join-wifi` requests need (Radio takes those only through this process).
 
-Run `make emulator` to use it or `make test-stack` to exercise navigation and controls through guest input.
+Wi-Fi, Bluetooth, Phone Internet and the rest of the phone's settings are in the [Settings](../open/settings) app.

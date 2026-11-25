@@ -14,8 +14,8 @@ handset, and the Sentinel links to `sentinel.violet` on the companion.
                    PyTorch, for runs without Xcode.
 
 A scripted viewer taps through the demo and checks the Open Runtime's log:
-  1. notes, weather (the built-in app, live from wttr.in) and Home: ordinary
-     apps; nothing is blocked.
+  1. notes and Home (which asks wttr.in for the time): ordinary apps; nothing
+     is blocked.
   2. photosync: reads another app's secrets and uploads from the background; the
      model flags it, the relay cuts the upload, and VioletOS freezes it on a
      signed Shield, then thaws it when the Shield's TTL runs out.
@@ -44,16 +44,15 @@ from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "targets/qemu"))
+import home_grid  # noqa: E402
 import run  # noqa: E402
 
 SIM = os.environ.get("VIOLET_SIM", "D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA")
 BUNDLE = "com.immortal.violet.relay"
-# As the Programs list shows them: titled apps, sorted by folder name.
-# The shell lists titled apps first, in the order of the image's apps/.home
-# (read from the image this test builds; Ladybird, when built, comes first).
-APPS = ["music", "notes", "photosync", "sounds", "stopwatch", "themes", "weather"]
-# The test programs stay out of the demo image so the list fits on one screen.
-SKIP = "canvas,chello,gohello,gonet,hello,pyhello,pynet,pypaint,pytone"
+# The demo apps (apps/shield-demo) get icons on Home after the built-in ones.
+APPS = ["music", "notes", "photosync", "themes"]
+SKIP = ""
 FREEZE_TTL = 30
 
 SCRIPT = r'''#!PYTHON
@@ -120,35 +119,28 @@ def hold(seconds):
     while time.monotonic() < end:
         frame()
         time.sleep(0.04)
-def row_y(index, count):
-    h = 80 if count <= 13 else max(40, 1080 // count)
-    return 260 + index * h + (h - 12) // 2
 def tap(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
     hold(.15); os.write(1, bytes(6)); hold(.35)
 def pixel(x, y):
     return struct.unpack_from("<I", screen, (y * 720 + x) * 4)[0]
-def on_list():
-    return pixel(60, 300) == 0xff302a39 and pixel(5, 5) == 0xff191620
 def on_home():
-    # The Home app (apps/open/home): its gradient starts at 2a1740.
-    return pixel(5, 5) == 0xff2a1740
+    # Home logs each time it comes to the front.
+    return home_shown() > seen_home[0]
+seen_home = [0]
+def mark():
+    seen_home[0] = home_shown()
 def open_apps():
-    # Home's Programs tile shows the list of every program (with Shield's line).
-    if on_list():
-        return
-    if not on_home():
-        tap(570, 276)  # the classic launcher's APPS button shows Home
-        until("Home", on_home, 90)
-    tap(360, 1141)
-    until("app list", on_list)
+    pass
 def back_home():
     # Holding the top edge for a second leaves the app in front (even a frozen one).
+    mark()
     os.write(1, bytes([9, 360 >> 4, 20 >> 4, ((360 & 15) << 4) | (20 & 15), 1, 1]))
     hold(1.4); os.write(1, bytes(6)); hold(.5)
     until("Home", on_home, 10)
 def start(name):
-    tap(360, row_y(APPS.index(name), len(APPS)))
+    mark()
+    open_icon(name)
 def status():
     try:
         return json.load(open(STATUS))
@@ -173,15 +165,9 @@ start("notes")
 until("notes runs", lambda: "notes done" in everything(), 90)
 until("Home after notes", on_home, 15)
 open_apps()
-caption("weather: the built-in Weather app fetches live conditions from wttr.in")
-start("weather")
-hold(2)
-tap(195, 894)  # Oakland
-until("weather runs", lambda: "weather: Oakland" in everything(), 90)
-hold(2)
-back_home()
+caption("Home fetches the time for your city from wttr.in")
 caption("The companion scores each app's telemetry window on the phone: benign, nothing blocked")
-until("benign verdicts", lambda: decisions("notes") and decisions("weather"), 45)
+until("benign verdicts", lambda: decisions("notes") and decisions("home"), 90)
 hold(3)
 open_apps()
 
@@ -386,7 +372,8 @@ def main():
         else:
             port, status, helper = start_sim(host_map, tmp)
         viewer = tmp / "viewer.py"
-        viewer.write_text(SCRIPT.replace("#!PYTHON", "#!" + str(ROOT / "build/shield/venv/bin/python")))
+        script = SCRIPT.replace("#!PYTHON", "#!" + str(ROOT / "build/shield/venv/bin/python"))
+        viewer.write_text(home_grid.viewer(script, (image / "initfs.cpio").read_bytes()))
         viewer.chmod(0o755)
         os.environ.update(VIOLET_NET_SOCKS=f"127.0.0.1:{port}", VIOLET_NET_SOCKS_PASS="violet-dev", SHIELD_APPS=json.dumps(APPS),
                           SHIELD_STATUS=str(status), SHIELD_SOCKS_PORT=str(port), SHIELD_PASS="violet-dev", SHIELD_TTL=str(FREEZE_TTL))
@@ -413,7 +400,7 @@ def main():
     by_app = {}
     for d in st.get("decisions", []):
         by_app.setdefault(d["app"], []).append(d)
-    for benign in ("notes", "weather", "home"):
+    for benign in ("notes", "home"):
         if any(d.get("contained") for d in by_app.get(benign, [])):
             problems.append(f"{benign} was contained: {by_app[benign]}")
     if not any(d.get("contained") and d.get("tier") == "model" for d in by_app.get("photosync", [])):
