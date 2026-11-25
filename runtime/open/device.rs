@@ -41,8 +41,11 @@ pub enum Kind {
     Pipe { buffer: Rc<RefCell<VecDeque<u8>>>, write: bool, peer_open: Rc<RefCell<u32>> },
     /// A TCP socket: its slot once connect was called, and the peer.
     Tcp { slot: Option<usize>, peer: (u32, u16) },
-    /// A UDP socket. Only DNS (port 53) is served, by the Open Runtime itself.
-    Udp { peer: Option<(u32, u16)>, replies: VecDeque<Vec<u8>> },
+    /// A UDP socket: DNS questions to the runtime's resolver are answered here;
+    /// anything else goes through a Radio slot, opened on first use. `replies`
+    /// holds datagrams (source, payload) ready to read; `allowed` the
+    /// destinations the Shield has passed.
+    Udp { peer: Option<(u32, u16)>, replies: VecDeque<((u32, u16), Vec<u8>)>, slot: Option<usize>, allowed: Vec<(u32, u16)> },
 }
 
 pub struct OpenFile {
@@ -71,7 +74,7 @@ impl Drop for OpenFile {
         if let Kind::Hci = self.kind {
             super::hci::close();
         }
-        if let Kind::Tcp { slot: Some(slot), .. } = self.kind {
+        if let Kind::Tcp { slot: Some(slot), .. } | Kind::Udp { slot: Some(slot), .. } = self.kind {
             super::net::close(slot);
         }
     }
@@ -711,6 +714,10 @@ impl Runtime {
                 let r = self.read_now(i, *fd, *buf, *len);
                 (r != super::syscall::EAGAIN).then_some(r)
             }
+            Wait::RecvFrom { fd, buf, len, name, name_len } => {
+                let r = self.recv_from(i, *fd, *buf, *len, *name, *name_len);
+                (r != super::syscall::EAGAIN).then_some(r)
+            }
             Wait::Poll { fds, ptr, time64: _ } => {
                 let mut n = 0;
                 let mut out = Vec::new();
@@ -766,7 +773,7 @@ impl Runtime {
             Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i)) as u32,
             Kind::Mic { seen } => (mic::written() != *seen) as u32,
             Kind::Hci => super::hci::readable() as u32 | if super::hci::space() >= 1028 { 4 } else { 0 },
-            Kind::Udp { replies, .. } => 4 | (!replies.is_empty()) as u32,
+            Kind::Udp { replies, slot, .. } => 4 | (!replies.is_empty() || slot.is_some_and(|s| self.net.rx_ready(s) > 0)) as u32,
             Kind::Tcp { slot: None, .. } => 4,
             Kind::Tcp { slot: Some(slot), .. } => {
                 let net = &self.net;
@@ -921,9 +928,13 @@ impl Runtime {
                 }
                 got
             }
-            Kind::Udp { replies, .. } => {
-                let Some(mut r) = replies.pop_front() else { return EAGAIN };
+            Kind::Udp { replies, slot, .. } => {
+                if let Some(d) = slot.and_then(|s| self.net.recv_datagram(s)) {
+                    replies.push_back(d);
+                }
+                let Some((from, mut r)) = replies.pop_front() else { return EAGAIN };
                 r.truncate(len as usize);
+                self.net.last_from = from;
                 r
             }
             Kind::EventFd { count } => {

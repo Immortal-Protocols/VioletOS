@@ -21,6 +21,8 @@
 #define TCP_SND_QUEUELEN 16
 // Open apps' sockets (sockets.c) plus Radio's own HTTPS connection.
 #define MEMP_NUM_TCP_PCB 10
+// DHCP, DNS and open apps' UDP sockets.
+#define MEMP_NUM_UDP_PCB 8
 #define PBUF_POOL_SIZE 16
 #define LWIP_NETIF_HOSTNAME 0
 #define LWIP_NETIF_STATUS_CALLBACK 0

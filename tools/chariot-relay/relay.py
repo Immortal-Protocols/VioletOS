@@ -6,6 +6,11 @@ runs as a Chariot agent app (see deploy.sh) or locally:
     python3 tools/chariot-relay/relay.py --port 8787
 
 It never sees keys or plaintext; the two ends encrypt end to end.
+
+With --stun PORT it also answers STUN binding requests (RFC 5389) on UDP, the
+rendezvous the two ends use to learn their public addresses before they punch
+a direct path. A Chariot carries HTTPS only, so there the ends use public STUN
+servers instead; a relay on a host with UDP can be its own.
 """
 import argparse
 import base64
@@ -292,12 +297,28 @@ def serve(sock, addr):
     leave(conn)
 
 
+def stun_server(host, port):
+    """Answer STUN binding requests with the sender's address (XOR-MAPPED-ADDRESS)."""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind((host, port))
+    log(f"STUN on udp {host}:{port}")
+    while True:
+        data, (ip, p) = u.recvfrom(2048)
+        if len(data) < 20 or data[0:2] != b"\x00\x01" or data[4:8] != b"\x21\x12\xa4\x42":
+            continue
+        xip = struct.unpack(">I", socket.inet_aton(ip))[0] ^ 0x2112A442
+        attr = struct.pack(">HHBBHI", 0x0020, 8, 0, 1, p ^ 0x2112, xip)
+        u.sendto(struct.pack(">HH", 0x0101, len(attr)) + data[4:20] + attr, (ip, p))
+        stats["stun"] = stats.get("stun", 0) + 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8787")))
     ap.add_argument("--poll-only", action="store_true", help="refuse WebSockets, like a Chariot's proxy")
     ap.add_argument("--verbose", action="store_true", help="log every poll request")
+    ap.add_argument("--stun", type=int, default=0, metavar="PORT", help="also answer STUN on this UDP port")
     args = ap.parse_args()
     global POLL_ONLY, VERBOSE
     POLL_ONLY, VERBOSE = args.poll_only, args.verbose
@@ -307,6 +328,8 @@ def main():
     s.listen(64)
     log(f"Violet Agent relay on {args.host}:{args.port}")
     threading.Thread(target=reaper, daemon=True).start()
+    if args.stun:
+        threading.Thread(target=stun_server, args=(args.host, args.stun), daemon=True).start()
     while True:
         c, addr = s.accept()
         c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

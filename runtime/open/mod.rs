@@ -91,6 +91,8 @@ pub enum Wait {
     Poll { fds: Vec<(i32, i16)>, ptr: u32, time64: bool },
     Epoll { epfd: i32, events: u32, max: u32 },
     Read { fd: i32, buf: u32, len: u32 },
+    /// recvfrom/recvmsg: a read whose source address goes to `name`.
+    RecvFrom { fd: i32, buf: u32, len: u32, name: u32, name_len: u32 },
     /// A blocking write to /dev/violet/audio waiting for room in the ring.
     Audio { fd: i32, buf: u32, len: u32 },
     /// A blocking connect, or a send waiting for room in the socket's ring.
@@ -632,7 +634,7 @@ impl Runtime {
                     let result = match wait {
                         Wait::Futex { .. } => syscall::ETIMEDOUT,
                         Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Sleep => 0,
-                        Wait::Read { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
+                        Wait::Read { .. } | Wait::RecvFrom { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
                         Wait::Connect { .. } => -110,
                         Wait::Frozen => syscall::EACCES,
                         Wait::Present { result } => result,

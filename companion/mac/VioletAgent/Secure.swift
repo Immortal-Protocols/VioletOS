@@ -113,7 +113,10 @@ final class Session {
     private let send: SymmetricKey
     private let recv: SymmetricKey
     private var sent: UInt64 = 0
+    /// The highest counter received, and which of the 64 below it arrived:
+    /// records may cross when the path changes (relay and direct).
     private var received: UInt64 = 0
+    private var seen: UInt64 = 0
 
     /// Finish a handshake; `phone` and `mac` are the two Ed25519 keys.
     init?(ours: Offer, theirs: Hello, role: UInt8, room: Data, phone: Data, mac: Data) {
@@ -149,11 +152,20 @@ final class Session {
         let b = [UInt8](m)
         guard b.count >= 25, b[0] == Wire.record else { return nil }
         let counter = b[1..<9].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
-        guard counter > received else { return nil }
+        if counter <= received {
+            let back = received - counter
+            guard counter > 0, back > 0, back < 64, seen & (1 << (back - 1)) == 0 else { return nil }
+        }
         let body = Data(b[9...])
         guard let box = try? ChaChaPoly.SealedBox(nonce: Session.nonce(counter), ciphertext: body.dropLast(16), tag: body.suffix(16)),
               let plain = try? ChaChaPoly.open(box, using: recv) else { return nil }
-        received = counter
+        if counter > received {
+            let shift = counter - received
+            seen = shift >= 64 ? 0 : (seen << shift) | (received > 0 ? 1 << (shift - 1) : 0)
+            received = counter
+        } else {
+            seen |= 1 << (received - counter - 1)
+        }
         return plain
     }
 }
@@ -166,12 +178,25 @@ func proofOK(secret: Data, hello: Hello) -> Bool {
     return HMAC<SHA256>.isValidAuthenticationCode(p, authenticating: m, using: SymmetricKey(data: secret))
 }
 
-/// What a phone's QR code says.
+/// What a pairing code says: a phone's (`k` is the phone's key), or one this
+/// Mac shows (`o=m`, `k` is the Mac's key) for the phone's camera.
 struct Invitation {
     let relay: String
     let phoneKey: Data
     let secret: Data
     let name: String
+    var fromMac = false
+
+    /// The code this Mac shows: roles reversed, the phone proves it read `secret`.
+    static func macCode(relay: String, macKey: Data, secret: Data, name: String) -> String {
+        func b64(_ d: Data) -> String {
+            d.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        }
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        func q(_ s: String) -> String { s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s }
+        return "violet-agent:1?r=\(q(relay))&k=\(b64(macKey))&s=\(b64(secret))&n=\(q(name))&o=m"
+    }
 
     init?(_ text: String) {
         guard text.hasPrefix("violet-agent:1?"), let q = URLComponents(string: "x://y?" + text.dropFirst("violet-agent:1?".count))?.queryItems else { return nil }
@@ -182,5 +207,6 @@ struct Invitation {
         phoneKey = k
         secret = s
         name = item("n") ?? "Phone"
+        fromMac = item("o") == "m"
     }
 }

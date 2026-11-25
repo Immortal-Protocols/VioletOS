@@ -65,9 +65,12 @@ struct ContentView: View {
                 if let p = model.phone {
                     Pill(ok: model.online, text: model.online ? "\(p.name) is connected" : "Waiting for \(p.name)…")
                 } else {
-                    Pill(ok: false, text: "No phone paired. Open Agent on the phone and choose Pair a phone.")
+                    Pill(ok: false, text: "No phone paired. Choose Pair a phone…, then open Agent on the phone.")
                 }
                 Pill(ok: model.relayUp, text: model.relayUp ? "Relay connected" : "Relay not connected")
+                if model.online {
+                    Pill(ok: model.directPath != nil, text: model.directPath.map { "Direct path to the phone (\($0))" } ?? "Through the relay (no direct path)")
+                }
                 Pill(ok: model.codexState.hasPrefix("Codex ready"), text: model.codexState)
                 Pill(ok: model.speechState.hasPrefix("Speech recognition on"), text: model.speechState)
                 Pill(ok: model.workspaceState.hasPrefix("App workspace ready"), text: model.workspaceState)
@@ -104,9 +107,7 @@ struct ContentView: View {
         }
         .padding(22)
         .sheet(isPresented: $model.scanning) {
-            ScannerView(onCode: { s in
-                if let inv = Invitation(s) { model.pair(inv) } else { model.scanning = false }
-            }, onCancel: { model.scanning = false })
+            PairSheet().environmentObject(model)
         }
     }
 
@@ -115,5 +116,53 @@ struct ContentView: View {
         guard !t.isEmpty else { return }
         typed = ""
         model.userTurn(t)
+    }
+}
+
+/// Pairing: this Mac shows a code for the phone's camera, or reads the phone's.
+struct PairSheet: View {
+    @EnvironmentObject var model: AgentModel
+    @State private var scan = false
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Picker("", selection: $scan) {
+                Text("Show this Mac's code").tag(false)
+                Text("Scan the phone's code").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 420)
+            .padding(.top, 18)
+            if scan {
+                ScannerView(onCode: { s in
+                    if let inv = Invitation(s), !inv.fromMac { model.pair(inv) } else { model.scanning = false }
+                }, onCancel: { model.scanning = false })
+            } else {
+                CodeView().environmentObject(model)
+            }
+        }
+        .onChange(of: scan) { _, now in if now { model.cancelCode() } }
+        .onDisappear { model.cancelCode() }
+    }
+}
+
+struct CodeView: View {
+    @EnvironmentObject var model: AgentModel
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Scan this code with the phone").font(.title2.bold())
+            Text("Open Agent on the phone and tap Scan the Mac's code. The code works once.").foregroundStyle(.secondary)
+            if let code = model.showingCode, let png = qrPNG(code), let image = NSImage(data: png) {
+                Image(nsImage: image).interpolation(.none).resizable().frame(width: 420, height: 420)
+                    .padding(16).background(.white, in: RoundedRectangle(cornerRadius: 16))
+            } else {
+                ProgressView().frame(width: 420, height: 420)
+            }
+            Pill(ok: model.relayUp, text: model.relayUp ? "Waiting for the phone" : "Connecting to the relay…").frame(width: 300)
+            Button("Cancel") { model.scanning = false }.keyboardShortcut(.cancelAction)
+        }
+        .padding(24)
+        .onAppear { if model.showingCode == nil { model.showCode() } }
     }
 }

@@ -1,5 +1,5 @@
-// TCP sockets for open apps, served from Radio's event loop through a region
-// shared with the Open Runtime (runtime/open/net.rs has the same layout).
+// TCP and UDP sockets for open apps, served from Radio's event loop through a
+// region shared with the Open Runtime (runtime/open/net.rs has the same layout).
 //
 // Page 0: word 0 magic "NET1", word 1 how Radio is online (0 not, 1 on a
 // joined network, 2 through the phone's relay). Slots of 32 words follow from
@@ -9,15 +9,25 @@
 // sent and 10 bytes read (written by their consumers), 11 shut down sending;
 // bytes 64-127 a host name to resolve instead of the address. Each slot owns
 // an 8 KiB send ring and a 16 KiB receive ring from page 1 on.
+//
+// A UDP slot (command 3) carries datagrams in its rings: a little-endian u16
+// length of the rest, the IPv4 address (u32) and port (u16), a name length
+// (u8) and the name (sending only: a name is resolved instead of the
+// address), then the payload. Word 12 is the socket's local port and 13 the
+// address this phone has on the network. Through the phone's relay (SOCKS,
+// TCP only) a UDP slot fails with ENETUNREACH.
 #include "lwip/dns.h"
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
+#include "lwip/netif.h"
 #include "lwip/timeouts.h"
 #include <string.h>
 
 enum { SLOTS = 8, TX = 8192, RX = 16384, STRIDE = TX + RX };
-enum { CMD_CONNECT = 1, CMD_CLOSE = 2 };
+enum { CMD_CONNECT = 1, CMD_CLOSE = 2, CMD_UDP = 3 };
 enum { IDLE, CONNECTING, OPEN, PEER_CLOSED, FAILED };
-enum { E_RESET = 104, E_REFUSED = 111, E_TIMEOUT = 110, E_UNREACH = 113, E_NONAME = 2 };
+enum { E_RESET = 104, E_REFUSED = 111, E_TIMEOUT = 110, E_UNREACH = 113, E_NONAME = 2, E_NETUNREACH = 101 };
+enum { MAX_DATAGRAM = 1472 };
 
 struct slot {
   unsigned cmd_seq, cmd, done_seq, state, error, ip, port, tx_head, tx_tail, rx_head, rx_tail, shut;
@@ -30,6 +40,10 @@ static struct {
   struct pbuf *rx;
   int connected, failed, eof, resolving;
   ip_addr_t addr;
+  struct udp_pcb *udp;
+  // The last name a UDP slot sent to, and its address.
+  char cached[64];
+  ip_addr_t cached_addr;
 } s[SLOTS];
 extern void station_net_poll(void);
 extern unsigned radio_monotonic_ms(void);
@@ -69,6 +83,7 @@ static void on_resolved(const char *name, const ip_addr_t *addr, void *arg) {
 }
 
 static void drop(int i) {
+  if (s[i].udp) udp_remove(s[i].udp);
   if (s[i].pcb) {
     tcp_arg(s[i].pcb, NULL);
     tcp_recv(s[i].pcb, NULL);
@@ -192,6 +207,101 @@ static int direct_connect(int i, const char *name, unsigned ip, unsigned port) {
   return tcp_open(i, &s[i].addr, port);
 }
 
+static unsigned host_order(const ip_addr_t *a) { return __builtin_bswap32(ip4_addr_get_u32(ip_2_ip4(a))); }
+
+// A datagram for a UDP slot: straight into its receive ring, or dropped when
+// the ring is full (the app is not reading).
+static void on_datagram(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port) {
+  int i = (int)(uintptr_t)arg;
+  volatile struct slot *q = slot(i);
+  unsigned n = p->tot_len, in = q->rx_head, out = q->rx_tail;
+  if (n <= MAX_DATAGRAM && RX - (in - out) >= n + 9) {
+    unsigned char h[9];
+    unsigned ip = host_order(addr), body = n + 7;
+    h[0] = body; h[1] = body >> 8;
+    h[2] = ip; h[3] = ip >> 8; h[4] = ip >> 16; h[5] = ip >> 24;
+    h[6] = port; h[7] = port >> 8; h[8] = 0;
+    unsigned char *r = rx_ring(i);
+    for (unsigned k = 0; k < 9; k++) r[(in + k) % RX] = h[k];
+    in += 9;
+    for (struct pbuf *b = p; b; b = b->next)
+      for (unsigned k = 0; k < b->len; k++) r[(in++) % RX] = ((unsigned char *)b->payload)[k];
+    __asm__ volatile("dmb ish" ::: "memory");
+    q->rx_head = in;
+  }
+  pbuf_free(p);
+}
+
+static int udp_start(int i) {
+  s[i].udp = udp_new();
+  if (!s[i].udp) return 0;
+  if (udp_bind(s[i].udp, IP4_ADDR_ANY, 0) != ERR_OK) return 0;
+  udp_recv(s[i].udp, on_datagram, (void *)(uintptr_t)i);
+  slot(i)->reserved[0] = s[i].udp->local_port;
+  return 1;
+}
+
+// A name a UDP slot sends to, resolved (and remembered) by Radio.
+static int udp_resolve(int i, const char *name, ip_addr_t *to) {
+  unsigned n = strlen(name);
+  if (n < sizeof s[i].cached && s[i].cached[0] && !memcmp(s[i].cached, name, n + 1)) {
+    *to = s[i].cached_addr;
+    return 1;
+  }
+  s[i].resolving = 1;
+  s[i].failed = 0;
+  err_t rc = dns_gethostbyname(name, &s[i].addr, on_resolved, (void *)(uintptr_t)i);
+  if (rc == ERR_OK) s[i].resolving = 0;
+  else if (rc != ERR_INPROGRESS) return 0;
+  unsigned start = radio_monotonic_ms();
+  while (s[i].resolving && !s[i].failed && radio_monotonic_ms() - start < 5000) station_net_poll();
+  if (s[i].resolving || s[i].failed || !s[i].udp) {
+    s[i].resolving = 0;
+    s[i].failed = 0;
+    return 0;
+  }
+  if (n < sizeof s[i].cached) memcpy(s[i].cached, name, n + 1);
+  s[i].cached_addr = s[i].addr;
+  *to = s[i].addr;
+  return 1;
+}
+
+static void pump_udp(int i) {
+  volatile struct slot *q = slot(i);
+  if (netif_default) q->reserved[1] = host_order(&netif_default->ip_addr);
+  unsigned head = q->tx_head, tail = q->tx_tail;
+  static unsigned char f[7 + 64 + MAX_DATAGRAM];
+  const unsigned char *t = tx_ring(i);
+  while (head - tail >= 2 && s[i].udp) {
+    unsigned body = t[tail % TX] | t[(tail + 1) % TX] << 8;
+    if (body < 7 || body > sizeof f) {
+      tail = head;  // not a datagram: drop what is queued
+      break;
+    }
+    if (head - tail < body + 2) break;
+    for (unsigned k = 0; k < body; k++) f[k] = t[(tail + 2 + k) % TX];
+    tail += body + 2;
+    unsigned ip = f[0] | f[1] << 8 | f[2] << 16 | (unsigned)f[3] << 24, port = f[4] | f[5] << 8, nl = f[6];
+    if (7 + nl > body || nl > 63) continue;
+    ip_addr_t to;
+    if (nl) {
+      char name[64];
+      memcpy(name, f + 7, nl);
+      name[nl] = 0;
+      if (!udp_resolve(i, name, &to)) continue;
+    } else {
+      IP4_ADDR(ip_2_ip4(&to), ip >> 24, ip >> 16 & 255, ip >> 8 & 255, ip & 255);
+    }
+    unsigned n = body - 7 - nl;
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, n, PBUF_RAM);
+    if (!p) continue;
+    memcpy(p->payload, f + 7 + nl, n);
+    udp_sendto(s[i].udp, p, &to, port);
+    pbuf_free(p);
+  }
+  q->tx_tail = tail;
+}
+
 static void command(int i, unsigned online) {
   volatile struct slot *q = slot(i);
   unsigned cmd = q->cmd;
@@ -205,6 +315,16 @@ static void command(int i, unsigned online) {
   name[63] = 0;
   q->state = CONNECTING;
   q->error = 0;
+  if (cmd == CMD_UDP) {
+    if (online != 2 && udp_start(i)) {
+      q->state = OPEN;
+      return;
+    }
+    drop(i);
+    q->error = E_NETUNREACH;
+    q->state = FAILED;
+    return;
+  }
   int ok = online == 2 ? relay_connect(i, name, q->ip, q->port) : direct_connect(i, name, q->ip, q->port);
   if (ok) {
     q->state = OPEN;
@@ -219,6 +339,7 @@ static void command(int i, unsigned online) {
 static void pump(int i) {
   volatile struct slot *q = slot(i);
   if (q->state != OPEN && q->state != PEER_CLOSED) return;
+  if (s[i].udp) return pump_udp(i);
   if (!s[i].pcb) {
     q->state = FAILED;
     q->error = E_RESET;

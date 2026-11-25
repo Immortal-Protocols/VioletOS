@@ -1,6 +1,6 @@
 # Violet Agent for macOS
 
-The Mac half of the VioletOS voice agent. Open **Agent** on the phone, show its one-time code to this Mac's camera, and talk: the phone streams its microphone here, this app hears it with RoseOS's voice models, answers through Codex and speaks the reply on the phone in Rose's voice. Ask for an app ("Make me a simple scorekeeper") and Codex writes it, builds it in the app workspace and installs it on the phone, where it stays after a restart.
+The Mac half of the VioletOS voice agent. Choose **Pair a phone…**: either this Mac shows a one-time code and the phone reads it (**Scan the Mac's code** in Agent on the phone), or you show the phone's code to this Mac's camera. Then talk: the phone streams its microphone here, this app hears it with RoseOS's voice models, answers through Codex and speaks the reply on the phone in Rose's voice. Ask for an app ("Make me a simple scorekeeper") and Codex writes it, builds it in the app workspace and installs it on the phone, where it stays after a restart.
 
 ```sh
 cd companion/mac
@@ -27,9 +27,12 @@ It needs Codex signed in with ChatGPT (`codex login`), the build tools of this c
 | macOS speech, when RoseOS is not installed | [Voice.swift](VioletAgent/Voice.swift) |
 | Codex (`codex app-server`, sandboxed to the workspace) | [Codex.swift](VioletAgent/Codex.swift) |
 | Turns, barge-in, installs and timings | [AgentModel.swift](VioletAgent/AgentModel.swift) |
-| The camera scanner | [Scanner.swift](VioletAgent/Scanner.swift) |
+| The camera scanner, and the code this Mac shows | [Scanner.swift](VioletAgent/Scanner.swift), `PairSheet` in [VioletAgentApp.swift](VioletAgent/VioletAgentApp.swift) |
+| The direct UDP path (STUN, hole punching, ordered delivery) | [Direct.swift](VioletAgent/Direct.swift) |
 
 Codex works in `build/agent-workspace` ([tools/agent_build.py](../../tools/agent_build.py)): the recipe in [AGENTS.md](../../tools/agent-workspace/AGENTS.md), a working native example and `./build NAME`, which builds offline from a warm cache. Codex runs with the `workspace-write` sandbox and no approvals, and installs only through the `install_app` tool this app provides.
+
+**Direct path.** Once the phone is online the two look for a direct UDP path and use it when they find one; the window says *Direct path to the phone* or *Through the relay*. On a network that blocks UDP, or behind two strict NATs, everything keeps going through the relay. Details in [docs/agent-protocol.md](../../docs/agent-protocol.md#direct-path).
 
 **Interrupting.** Tap the circle on the phone to stop a reply. Talking over it works as in RoseOS: the voice ducks at once, pauses after 0.2 s of speech, and stops for real words or "wait"/"stop"; "mm-hmm", a cough or the agent's own voice coming back through the speakerphone let it carry on.
 
@@ -40,6 +43,10 @@ Codex works in `build/agent-workspace` ([tools/agent_build.py](../../tools/agent
 | Flag | |
 | --- | --- |
 | `--pair CODE` | pair with the code a phone printed (`agent: pairing code …` in its log) instead of the camera |
+| `--show-code` | show this Mac's code at once; it is also written to `pairing-code.txt` and `pairing-code.png` in the support folder until a phone pairs |
+| `--relay URL` | the relay this Mac's own code names (else `VIOLET_AGENT_RELAY`, else the Chariot) |
+| `--no-direct` | keep to the relay (`VIOLET_AGENT_STUN=off` does too; `VIOLET_AGENT_STUN=HOST:PORT` names another STUN server) |
+| `--wait-direct` | with `--install`, install once the direct path is open (or after 20 s) |
 | `--say TEXT` | send a typed request once the phone is online |
 | `--install NAME=PATH` | install a built program once online |
 | `--speak TEXT` | say a line on the phone |
