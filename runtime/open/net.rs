@@ -1,4 +1,4 @@
-//! TCP for open apps, through pages shared with Radio (on the handset) or with
+//! TCP and UDP for open apps, through pages shared with Radio (on the handset) or with
 //! the emulator's host relay (in QEMU). The layout matches
 //! targets/moto-g-pure/ip/sockets.c and tools/net_relay.py.
 //!
@@ -17,6 +17,13 @@ const STRIDE: usize = (TX + RX) as usize;
 const MAGIC: u32 = 0x3154_454e;
 pub const CMD_CONNECT: u32 = 1;
 pub const CMD_CLOSE: u32 = 2;
+/// Open a UDP socket: the rings then carry datagrams, each a little-endian
+/// u16 length of what follows, the IPv4 address (u32), the port (u16), a
+/// name length (u8, sending only) and name, then the payload. Radio puts the
+/// socket's local port in word 12 and the address it has on the network in 13.
+pub const CMD_UDP: u32 = 3;
+/// The largest UDP payload an app can send.
+pub const MAX_DATAGRAM: usize = 1472;
 pub const IDLE: u32 = 0;
 pub const CONNECTING: u32 = 1;
 pub const OPEN: u32 = 2;
@@ -62,10 +69,12 @@ pub struct Net {
     /// The pages are mapped (the board has a socket server).
     pub present: bool,
     names: Vec<String>,
+    /// The source of the datagram read last (for recvfrom).
+    pub last_from: (u32, u16),
 }
 impl Net {
     pub fn new(present: bool) -> Net {
-        Net { present, names: Vec::new() }
+        Net { present, names: Vec::new(), last_from: (0, 0) }
     }
     /// 0 offline, 1 joined network, 2 phone relay, 3 the emulator's host.
     pub fn online(&self) -> u32 {
@@ -99,6 +108,10 @@ impl Net {
             None => alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255),
         }
     }
+    /// An address the resolver handed out for a name.
+    pub fn is_stand_in(&self, ip: u32) -> bool {
+        ip & FAKE_MASK == FAKE_BASE
+    }
     fn name_for(&self, ip: u32) -> Option<&str> {
         if ip & FAKE_MASK != FAKE_BASE {
             return None;
@@ -107,6 +120,13 @@ impl Net {
     }
     /// Start a connection; returns the slot.
     pub fn connect(&mut self, ip: u32, port: u16) -> Result<usize, i32> {
+        self.start(CMD_CONNECT, ip, port)
+    }
+    /// Open a UDP socket; returns the slot.
+    pub fn udp_open(&mut self) -> Result<usize, i32> {
+        self.start(CMD_UDP, 0, 0)
+    }
+    fn start(&mut self, cmd: u32, ip: u32, port: u16) -> Result<usize, i32> {
         if self.online() == 0 {
             return Err(-101); // ENETUNREACH
         }
@@ -124,12 +144,12 @@ impl Net {
         set(slot, 5, ip);
         set(slot, 6, u32::from(port));
         // Both rings start empty for the new connection.
-        for i in [7, 8, 9, 10, 11] {
+        for i in [7, 8, 9, 10, 11, 12, 13] {
             set(slot, i, 0);
         }
         set(slot, 3, CONNECTING);
         set(slot, 4, 0);
-        set(slot, 1, CMD_CONNECT);
+        set(slot, 1, cmd);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         set(slot, 0, get(slot, 0).wrapping_add(1));
         Ok(slot)
@@ -168,6 +188,48 @@ impl Net {
         }
         set(slot, 10, tail.wrapping_add(n as u32));
         out
+    }
+    /// A UDP socket's local address: (the phone's address on the network, port).
+    pub fn local(&self, slot: usize) -> (u32, u16) {
+        (get(slot, 13), get(slot, 12) as u16)
+    }
+    /// Queue a datagram on a UDP slot; false when the ring has no room for it.
+    /// `name` is sent instead of a stand-in address, for Radio to resolve.
+    pub fn send_datagram(&mut self, slot: usize, ip: u32, port: u16, data: &[u8]) -> bool {
+        let name = self.name_for(ip).map(|n| String::from(n)).unwrap_or_default();
+        let name = &name.as_bytes()[..name.len().min(63)];
+        let data = &data[..data.len().min(MAX_DATAGRAM)];
+        let body = 7 + name.len() + data.len();
+        if (self.tx_space(slot) as usize) < body + 2 {
+            return false;
+        }
+        let mut frame = Vec::with_capacity(body + 2);
+        frame.extend_from_slice(&(body as u16).to_le_bytes());
+        frame.extend_from_slice(&if name.is_empty() { ip } else { 0 }.to_le_bytes());
+        frame.extend_from_slice(&port.to_le_bytes());
+        frame.push(name.len() as u8);
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(data);
+        self.send(slot, &frame) == frame.len()
+    }
+    /// The next datagram a UDP slot received: its source and payload.
+    pub fn recv_datagram(&mut self, slot: usize) -> Option<((u32, u16), Vec<u8>)> {
+        let ready = self.rx_ready(slot) as usize;
+        if ready < 2 {
+            return None;
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        let tail = get(slot, 10);
+        let at = |k: u32| unsafe { rx(slot).add((tail.wrapping_add(k) % RX) as usize).read_volatile() };
+        let body = u16::from_le_bytes([at(0), at(1)]) as usize;
+        if ready < body + 2 || body < 7 {
+            return None;
+        }
+        let frame = self.recv(slot, body + 2);
+        let ip = u32::from_le_bytes(frame[2..6].try_into().unwrap());
+        let port = u16::from_le_bytes([frame[6], frame[7]]);
+        let skip = 9 + frame[8] as usize;
+        Some(((ip, port), frame.get(skip..).unwrap_or(&[]).to_vec()))
     }
     pub fn shutdown_send(&mut self, slot: usize) {
         if get(slot, 11) == 0 {

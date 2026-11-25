@@ -12,6 +12,9 @@ relay instead (RFC 1928/1929, user "violet", password VIOLET_NET_SOCKS_PASS),
 the way the handset's Phone Internet mode goes through the iPhone companion.
 Names ending in ".violet" are the companion's own endpoints; without a relay
 they fail at once instead of reaching the Mac's resolver.
+
+A UDP slot (command 3) is a Mac UDP socket; datagrams cross the rings framed
+as in net.rs. VIOLET_NET_UDP=0 refuses UDP, like a network that blocks it.
 """
 import json
 import mmap
@@ -34,6 +37,7 @@ class Relay(threading.Thread):
         self.ram = open(ram_path, "r+b")
         self.mem = mmap.mmap(self.ram.fileno(), 4096 + SLOTS * STRIDE, offset=PAGE)
         self.socks = [None] * SLOTS
+        self.udp = [False] * SLOTS
         self.closing = [False] * SLOTS
         self.hosts = json.loads(os.environ.get("VIOLET_NET_HOSTS", "{}"))
         proxy = os.environ.get("VIOLET_NET_SOCKS")
@@ -51,6 +55,7 @@ class Relay(threading.Thread):
         struct.pack_into("<I", self.mem, 256 + slot * 128 + 4 * i, v & 0xFFFFFFFF)
 
     def drop(self, slot):
+        self.udp[slot] = False
         if self.socks[slot]:
             try:
                 self.socks[slot].close()
@@ -122,10 +127,85 @@ class Relay(threading.Thread):
             sock.close()
             raise
 
+    def udp_open(self, slot):
+        if os.environ.get("VIOLET_NET_UDP") == "0" or self.socks_proxy:
+            self.put(slot, 4, 101)
+            self.put(slot, 3, FAILED)
+            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("0.0.0.0", 0))
+        sock.setblocking(False)
+        self.socks[slot] = sock
+        self.udp[slot] = True
+        self.put(slot, 12, sock.getsockname()[1])
+        self.put(slot, 13, struct.unpack(">I", socket.inet_aton(self.lan_address()))[0])
+        self.put(slot, 4, 0)
+        self.put(slot, 3, OPEN)
+
+    @staticmethod
+    def lan_address():
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 9))
+            return probe.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            probe.close()
+
+    def ring(self, base, at, n, size):
+        """n bytes of a ring from position at."""
+        out = b""
+        while n:
+            k = min(n, size - at % size)
+            out += bytes(self.mem[base + at % size:base + at % size + k])
+            at, n = at + k, n - k
+        return out
+
+    def pump_udp(self, slot):
+        sock = self.socks[slot]
+        base = 4096 + slot * STRIDE
+        head, tail = self.word(slot, 7), self.word(slot, 8)
+        while (head - tail) & 0xFFFFFFFF >= 2:
+            body = struct.unpack("<H", self.ring(base, tail, 2, TX))[0]
+            if body < 7 or (head - tail) & 0xFFFFFFFF < body + 2:
+                if body < 7:
+                    tail = head
+                break
+            f = self.ring(base, tail + 2, body, TX)
+            tail = (tail + 2 + body) & 0xFFFFFFFF
+            ip, port, nl = struct.unpack("<IHB", f[:7])
+            name = f[7:7 + nl].decode(errors="replace")
+            host = name or socket.inet_ntoa(struct.pack(">I", ip))
+            target = self.hosts.get(f"{host}:{port}")
+            if target:
+                host, _, mapped = target.partition(":")
+                port = int(mapped or port)
+            try:
+                sock.sendto(f[7 + nl:], (host, port))
+            except OSError:
+                pass
+        self.put(slot, 8, tail)
+        rin, rout = self.word(slot, 9), self.word(slot, 10)
+        while True:
+            try:
+                data, (h, p) = sock.recvfrom(2048)
+            except (BlockingIOError, OSError):
+                break
+            frame = struct.pack("<HIHB", len(data) + 7, struct.unpack(">I", socket.inet_aton(h))[0], p, 0) + data
+            if RX - ((rin - rout) & 0xFFFFFFFF) < len(frame):
+                continue  # the app is not reading: drop it
+            for k in range(0, len(frame)):
+                self.mem[base + TX + (rin + k) % RX] = frame[k]
+            rin = (rin + len(frame)) & 0xFFFFFFFF
+        self.put(slot, 9, rin)
+
     def pump(self, slot):
         sock = self.socks[slot]
         if not sock or self.word(slot, 3) not in (OPEN, PEER_CLOSED):
             return
+        if self.udp[slot]:
+            return self.pump_udp(slot)
         base = 4096 + slot * STRIDE
         head, tail = self.word(slot, 7), self.word(slot, 8)
         while head != tail:
@@ -182,6 +262,8 @@ class Relay(threading.Thread):
                     if command == 1:
                         self.put(slot, 3, CONNECTING)
                         self.connect(slot)
+                    elif command == 3:
+                        self.udp_open(slot)
                     else:
                         self.put(slot, 3, IDLE)
                     self.put(slot, 2, seq)

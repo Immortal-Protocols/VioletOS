@@ -3,6 +3,8 @@
 import CryptoKit
 import Foundation
 import SwiftUI
+import CoreImage
+import AppKit
 
 struct Line: Identifiable {
     let id = UUID()
@@ -21,6 +23,16 @@ final class AgentModel: ObservableObject {
     @Published var workspaceState = "Preparing the app workspace…"
     @Published var activity = "idle"
     @Published var scanning = false
+    /// The one-time code this Mac shows for the phone's camera, while pairing.
+    @Published var showingCode: String?
+    /// Where the direct path to the phone goes, when it is open.
+    @Published var directPath: String?
+    /// The relay this Mac names in its own code: --relay, VIOLET_AGENT_RELAY or the Chariot.
+    let relayURL: String = {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--relay"), i + 1 < args.count { return args[i + 1] }
+        return ProcessInfo.processInfo.environment["VIOLET_AGENT_RELAY"] ?? "https://agent-2af29451c05342fcbb9db79b4df48ce1.apps.chariots.sh"
+    }()
     @Published var lastTiming: String?
     @Published var agentName = "Violet"
 
@@ -97,6 +109,7 @@ final class AgentModel: ObservableObject {
         }
         if let p = phone { link.connect(p) }
         if let i = args.firstIndex(of: "--pair"), i + 1 < args.count, let inv = Invitation(args[i + 1]) { pair(inv) }
+        if args.contains("--show-code") { showCode() }
         speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
         speaker.onEnd = { [weak self] id in
             guard let self else { return }
@@ -237,6 +250,21 @@ final class AgentModel: ObservableObject {
         }
     }
 
+    /// --install NAME=PATH once online; with --wait-direct, once the direct
+    /// path is open (or 20 s have passed), so a test sees a program cross it.
+    private func installPending(waited: Double) {
+        guard let (name, path) = pendingInstall, online else { return }
+        if CommandLine.arguments.contains("--wait-direct") && directPath == nil && waited < 20 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.installPending(waited: waited + 0.5) }
+            return
+        }
+        pendingInstall = nil
+        let via = directPath.map { "direct path \($0)" } ?? "relay"
+        install(["name": name, "title": name.capitalized, "path": path]) { [weak self] ok, text in
+            self?.log("test install \(name): \(ok ? "ok" : "failed") \(text) (via \(via))")
+        }
+    }
+
     private func sayPending() {
         guard let s = pendingSay, online, codex.thread != nil else { return }
         pendingSay = nil
@@ -250,6 +278,24 @@ final class AgentModel: ObservableObject {
         scanning = false
         log("pairing with \(inv.name) through \(inv.relay)")
         link.pair(inv)
+    }
+
+    /// Show a one-time code for the phone to read with its camera.
+    func showCode() {
+        let code = link.invite(relay: relayURL, name: Host.current().localizedName ?? "Mac")
+        showingCode = code
+        log("showing a pairing code for the phone's camera through \(relayURL)")
+        // For tests and setups without a person at the Mac: the code, as text and a picture.
+        try? code.write(to: support.appendingPathComponent("pairing-code.txt"), atomically: true, encoding: .utf8)
+        if let png = qrPNG(code) { try? png.write(to: support.appendingPathComponent("pairing-code.png")) }
+    }
+
+    func cancelCode() {
+        guard showingCode != nil else { return }
+        showingCode = nil
+        link.cancelInvite()
+        try? FileManager.default.removeItem(at: support.appendingPathComponent("pairing-code.txt"))
+        if let p = phone { link.connect(p) }
     }
 
     func unpair() {
@@ -272,6 +318,11 @@ final class AgentModel: ObservableObject {
             saved.phones = [p]
             Store.save(saved)
             phone = p
+            if showingCode != nil {
+                showingCode = nil
+                scanning = false
+                try? FileManager.default.removeItem(at: support.appendingPathComponent("pairing-code.txt"))
+            }
             lines.append(Line(user: false, text: "Paired with \(p.name)."))
             log("paired with \(p.name)")
         case .online(let up):
@@ -288,15 +339,12 @@ final class AgentModel: ObservableObject {
                     log("unpairing (--unpair-remote)")
                     unpair()
                 }
-                if let (name, path) = pendingInstall {
-                    pendingInstall = nil
-                    install(["name": name, "title": name.capitalized, "path": path]) { [weak self] ok, text in
-                        self?.log("test install \(name): \(ok ? "ok" : "failed") \(text)")
-                    }
-                }
+                installPending(waited: 0)
             }
         case .note(let s):
             log(s)
+        case .direct(let addr):
+            directPath = addr
         case .mic(let pcm):
             if useRose { rose.feed(pcm) } else { listener.feed(pcm) }
             micBytes += pcm.count
@@ -316,6 +364,14 @@ final class AgentModel: ObservableObject {
 
     private func phoneMessage(_ o: [String: Any]) {
         switch o["t"] as? String {
+        case "hello":
+            // A phone paired by reading our code is named once it says hello.
+            if let name = o["name"] as? String, !name.isEmpty, var p = phone, p.name != name {
+                p.name = name
+                phone = p
+                saved.phones = [p]
+                Store.save(saved)
+            }
         case "stop":
             log("tapped to interrupt")
             if useRose { rose.stop("tapped") } else { bargeIn() }
@@ -621,6 +677,7 @@ final class AgentModel: ObservableObject {
     private func writeStatus() {
         let s: [String: Any] = [
             "relay": relayUp, "online": online, "phone": phone?.name ?? "", "codex": codexState,
+            "direct": directPath ?? "", "showing_code": showingCode != nil,
             "speech": speechState, "workspace": workspaceState, "activity": activity,
             "last_timing": lastTiming ?? "", "lines": lines.suffix(8).map { ($0.user ? "user: " : "agent: ") + $0.text },
         ]
@@ -628,4 +685,14 @@ final class AgentModel: ObservableObject {
             try? d.write(to: support.appendingPathComponent("status.json"))
         }
     }
+}
+
+/// A QR code as a PNG, a few pixels per module, with its quiet zone.
+func qrPNG(_ text: String, scale: CGFloat = 12) -> Data? {
+    guard let f = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    f.setValue(Data(text.utf8), forKey: "inputMessage")
+    f.setValue("M", forKey: "inputCorrectionLevel")
+    guard let img = f.outputImage?.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) else { return nil }
+    let rep = NSBitmapImageRep(ciImage: img)
+    return rep.representation(using: .png, properties: [:])
 }

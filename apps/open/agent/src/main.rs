@@ -1,9 +1,13 @@
 //! Agent: talk to the paired Mac (Violet Agent, companion/mac), which listens,
 //! answers and builds apps with Codex; the apps it builds are installed here
 //! and stay after a restart. An unpaired phone shows a one-time QR code for
-//! the Mac's camera. The two meet through a relay (a Chariot) from any
-//! network and encrypt end to end: docs/agent-protocol.md.
+//! the Mac's camera, or reads the Mac's code with its own camera. The two
+//! meet through a relay (a Chariot) from any network, switch to a direct UDP
+//! path when the networks allow one, and encrypt end to end:
+//! docs/agent-protocol.md.
+mod direct;
 mod link;
+mod scan;
 mod secure;
 mod voice;
 
@@ -26,6 +30,13 @@ const ORB: (f32, f32) = (360.0, 600.0);
 const ORB_BOX: Rect = Rect::new(150, 390, 570, 810);
 const OPEN_BOX: Rect = Rect::new(60, 1330, 660, 1440);
 const UNPAIR_BOX: Rect = Rect::new(440, 1480, 680, 1560);
+const SCAN_BOX: Rect = Rect::new(110, 1210, 610, 1300);
+const PREVIEW: Rect = Rect::new(110, 300, 610, 1180);
+/// STUN servers for the direct path, unless the shared setting "stun" names
+/// one (HOST:PORT, or "off" for the relay only).
+const STUN: [&str; 2] = ["stun.l.google.com:19302", "stun.cloudflare.com:3478"];
+/// A build's own STUN server instead (tests: the local relay's).
+const STUN_BUILT: Option<&str> = option_env!("VIOLET_AGENT_STUN");
 const TALK: Rect = Rect::new(0, 380, W as i32, 900);
 const LINES: Rect = Rect::new(0, 900, W as i32, 1320);
 
@@ -34,6 +45,8 @@ enum Msg {
     Net(u32, link::Net),
     Mic(voice::Mic),
     Played(voice::Played),
+    Direct(u32, direct::Event),
+    Scan(scan::Scan),
 }
 
 /// What the phone remembers: its identity and the Mac it trusts.
@@ -43,6 +56,8 @@ struct Saved {
     peer_name: String,
     /// What the user calls the agent (the Mac's setting; "Violet" until it says).
     name: String,
+    /// The relay the paired Mac named in the code it showed (else our own).
+    relay: Option<String>,
 }
 
 impl Saved {
@@ -55,6 +70,7 @@ impl Saved {
             peer: key("peer "),
             peer_name: get("peer_name ").unwrap_or_default(),
             name: get("name ").filter(|n| !n.is_empty()).unwrap_or_else(|| "Violet".into()),
+            relay: get("relay ").filter(|r| r.contains("://")),
         };
         if s.seed == [0; 32] {
             s.seed = secure::random();
@@ -66,6 +82,9 @@ impl Saved {
         let mut t = format!("seed {}\nname {}\n", secure::hex(&self.seed), self.name.replace('\n', " "));
         if let Some(p) = self.peer {
             t += &format!("peer {}\npeer_name {}\n", secure::hex(&p), self.peer_name.replace('\n', " "));
+            if let Some(r) = &self.relay {
+                t += &format!("relay {}\n", r.replace('\n', ""));
+            }
         }
         if let Err(e) = std::fs::write(SAVED, t) {
             println!("agent: could not save: {e}");
@@ -97,7 +116,26 @@ struct Install {
 struct Agent {
     me: Identity,
     saved: Saved,
+    /// Our relay: the shared setting "relay", else the built-in one.
     relay: String,
+    /// The setting names the relay, overriding any a code named.
+    relay_set: bool,
+    /// The relay in use now.
+    using: String,
+    /// A Mac's code the camera read: pairing with it.
+    invitation: Option<secure::Invitation>,
+    /// Scanning: the camera thread's stop flag, and the last frame.
+    scanning: Option<Arc<AtomicBool>>,
+    preview: Option<(usize, usize, Vec<u8>)>,
+    /// The direct path: its thread, generation and key, where it is open,
+    /// and when to try again.
+    direct: Option<Sender<direct::Cmd>>,
+    direct_gen: u32,
+    direct_key: [u8; 32],
+    direct_up: Option<String>,
+    direct_next: Option<Instant>,
+    direct_fails: u32,
+    stun: Vec<String>,
     /// The link's generation: events from an older link are ignored.
     generation: u32,
     link: Option<Sender<Vec<u8>>>,
@@ -145,13 +183,28 @@ impl Agent {
         self.session = None;
         self.offer = None;
         self.relay_up = false;
-        match self.saved.peer {
-            Some(mac) => {
+        self.stop_direct();
+        self.using = self.relay.clone();
+        match (self.saved.peer, &self.invitation) {
+            (Some(mac), _) => {
+                self.invitation = None;
                 self.secret = None;
                 self.room = secure::session_room(&self.me.public(), &mac);
                 self.status = format!("Looking for {}…", self.mac_name());
+                if let Some(r) = self.saved.relay.clone().filter(|_| !self.relay_set) {
+                    self.using = r;
+                }
             }
-            None => {
+            (None, Some(inv)) => {
+                // The Mac showed the code: its secret opens the room, on its relay.
+                self.secret = Some(inv.secret);
+                self.room = secure::pairing_room(&inv.secret);
+                self.status = format!("Pairing with {}…", inv.name);
+                if !self.relay_set {
+                    self.using = inv.relay.clone();
+                }
+            }
+            (None, None) => {
                 let s = secure::random::<32>();
                 self.secret = Some(s);
                 self.room = secure::pairing_room(&s);
@@ -170,7 +223,7 @@ impl Agent {
                 }
             }
         });
-        self.link = Some(link::spawn(self.relay.clone(), self.room, "phone", tx));
+        self.link = Some(link::spawn(self.using.clone(), self.room, "phone", tx));
         self.update_mic();
         self.dirty = true;
     }
@@ -184,10 +237,80 @@ impl Agent {
         format!("violet-agent:1?r={}&k={}&s={}&n=Moto", self.relay, secure::b64url(&self.me.public()), secure::b64url(&s))
     }
 
+    /// A message to the Mac: over the direct path when it is open, else the relay.
     fn send_raw(&self, m: Vec<u8>) {
+        if let (Some(d), Some(_)) = (&self.direct, &self.direct_up) {
+            let _ = d.send(direct::Cmd::Send(m));
+        } else if let Some(l) = &self.link {
+            let _ = l.send(m);
+        }
+    }
+
+    fn relay_send(&self, m: Vec<u8>) {
         if let Some(l) = &self.link {
             let _ = l.send(m);
         }
+    }
+
+    /// Look for a direct path: a new key, our candidates to the Mac, then probes.
+    fn start_direct(&mut self) {
+        self.stop_direct();
+        if self.stun.is_empty() || self.session.is_none() {
+            return;
+        }
+        self.direct_gen += 1;
+        self.direct_key = secure::random();
+        let (tx, rx) = mpsc::channel();
+        let (gen, app) = (self.direct_gen, self.tx.clone());
+        std::thread::spawn(move || {
+            for e in rx {
+                if app.send(Msg::Direct(gen, e)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.direct = Some(direct::spawn(self.direct_key, self.stun.clone(), tx));
+    }
+
+    fn stop_direct(&mut self) {
+        self.direct = None;
+        self.direct_up = None;
+        self.direct_gen += 1;
+    }
+
+    fn on_direct(&mut self, e: direct::Event) {
+        match e {
+            direct::Event::Gathered(cands) => {
+                let key = secure::hex(&self.direct_key);
+                self.send_json(json!({"t": "direct", "key": key, "cands": cands}));
+            }
+            direct::Event::Open(addr) => {
+                println!("agent: direct path open to {addr}; the relay stands by");
+                self.direct_up = Some(addr);
+                self.direct_fails = 0;
+                self.status = format!("Connected to {} · direct", self.mac_name());
+            }
+            direct::Event::Message(m) => self.on_net(link::Net::Message(m)),
+            direct::Event::Down(why, unsent) => {
+                let was_up = self.direct_up.take().is_some();
+                self.direct = None;
+                if !why.is_empty() {
+                    println!("agent: direct path {}: {why}; using the relay", if was_up { "lost" } else { "not found" });
+                    if self.session.is_some() {
+                        self.send_json(json!({"t": "direct", "down": why}));
+                        self.status = format!("Connected to {} · relay", self.mac_name());
+                    }
+                    // Try again later: 30 s, doubling to 10 minutes.
+                    self.direct_fails += 1;
+                    let wait = 30u64 << self.direct_fails.min(5).saturating_sub(1);
+                    self.direct_next = Some(Instant::now() + Duration::from_secs(wait.min(600)));
+                }
+                for m in unsent {
+                    self.relay_send(m);
+                }
+            }
+        }
+        self.dirty = true;
     }
 
     fn send(&mut self, kind: u8, body: &[u8]) {
@@ -205,8 +328,10 @@ impl Agent {
 
     fn offer_hello(&mut self) {
         let mode = if self.paired() { secure::SESSION } else { secure::PAIRING };
-        let o = secure::offer(&self.me, secure::PHONE, mode, &self.room, None);
-        self.send_raw(o.message.clone());
+        // Pairing with a code the Mac showed: prove we read its secret.
+        let proof = self.invitation.as_ref().filter(|_| !self.paired()).map(|i| i.secret);
+        let o = secure::offer(&self.me, secure::PHONE, mode, &self.room, proof.as_ref());
+        self.relay_send(o.message.clone());
         self.offer = Some(o);
         self.offered = Instant::now();
     }
@@ -223,6 +348,7 @@ impl Agent {
             link::Net::PeerDown => {
                 self.session = None;
                 self.offer = None;
+                self.stop_direct();
                 if self.paired() {
                     self.status = format!("Waiting for {}…", self.mac_name());
                 }
@@ -233,6 +359,7 @@ impl Agent {
                 self.relay_up = false;
                 self.session = None;
                 self.offer = None;
+                self.stop_direct();
                 self.status = "Reconnecting…".into();
                 self.update_mic();
             }
@@ -256,9 +383,11 @@ impl Agent {
             return;
         }
         let pairing = !self.paired();
-        let trusted = match (pairing, self.saved.peer, self.secret) {
-            (true, _, Some(s)) => h.mode == secure::PAIRING && secure::proof_ok(&s, &h),
-            (false, Some(mac), _) => h.mode == secure::SESSION && h.ed == mac,
+        let trusted = match (pairing, self.saved.peer, self.secret, &self.invitation) {
+            // The Mac's own code named its key.
+            (true, _, Some(_), Some(inv)) => h.mode == secure::PAIRING && h.ed == inv.key,
+            (true, _, Some(s), None) => h.mode == secure::PAIRING && secure::proof_ok(&s, &h),
+            (false, Some(mac), _, _) => h.mode == secure::SESSION && h.ed == mac,
             _ => false,
         };
         if !trusted {
@@ -277,9 +406,11 @@ impl Agent {
         let phone = self.me.public();
         let Some(session) = secure::complete(ours, &h, secure::PHONE, &self.room, &phone, &h.ed) else { return };
         if pairing {
-            println!("agent: paired with a new Mac");
+            let scanned = self.invitation.take();
+            println!("agent: paired with a new Mac{}", if scanned.is_some() { " (its code, read by the camera)" } else { "" });
             self.saved.peer = Some(h.ed);
-            self.saved.peer_name = String::new();
+            self.saved.peer_name = scanned.as_ref().map(|i| i.name.clone()).unwrap_or_default();
+            self.saved.relay = scanned.map(|i| i.relay).filter(|r| *r != self.relay);
             self.saved.save();
             self.lines.clear();
             self.lines.push((false, "Paired. Say hello!".into()));
@@ -292,6 +423,8 @@ impl Agent {
         let listening = !self.muted;
         self.send_json(json!({"t": "hello", "name": "Moto G Pure", "version": 1, "listening": listening}));
         self.update_mic();
+        self.direct_fails = 0;
+        self.start_direct();
     }
 
     fn on_record(&mut self, p: &[u8]) {
@@ -335,6 +468,23 @@ impl Agent {
                     self.saved.save();
                 }
                 self.status = format!("Connected to {}", self.mac_name());
+            }
+            // The Mac's candidates for the direct path, or word that it failed there.
+            "direct" => {
+                if v["down"].is_string() {
+                    if self.direct_up.is_some() || self.direct.is_some() {
+                        println!("agent: the Mac lost the direct path: {}", v["down"]);
+                        self.direct = None; // its thread hands back what it holds
+                        self.direct_up = None;
+                        self.direct_next = Some(Instant::now() + Duration::from_secs(30));
+                    }
+                    return;
+                }
+                let peers: Vec<std::net::SocketAddrV4> = v["cands"].as_array().map_or(Vec::new(), |a| a.iter().filter_map(|c| c.as_str()?.parse().ok()).collect());
+                println!("agent: the Mac's candidates: {}", peers.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "));
+                if let Some(d) = &self.direct {
+                    let _ = d.send(direct::Cmd::Punch(peers));
+                }
             }
             "state" => {
                 self.activity = match v["state"].as_str() {
@@ -408,6 +558,7 @@ impl Agent {
     fn finish_install(&mut self) {
         let Some(i) = self.install.take() else { return };
         let path = format!("/apps/{}", i.name);
+        println!("agent: install {}: {} bytes arrived in {} ms over the {}", i.name, i.size, i.started.elapsed().as_millis(), if self.direct_up.is_some() { "direct path" } else { "relay" });
         let data = if i.deflate {
             miniz_oxide::inflate::decompress_to_vec_with_limit(&i.data, 8 << 20).unwrap_or_default()
         } else {
@@ -450,6 +601,7 @@ impl Agent {
         }
         println!("agent: unpaired");
         self.saved.peer = None;
+        self.saved.relay = None;
         self.saved.peer_name.clear();
         self.saved.save();
         self.lines.clear();
@@ -462,9 +614,62 @@ impl Agent {
         self.listening.store(on, Ordering::Relaxed);
     }
 
+    /// Read the Mac's code with the camera instead of showing ours.
+    fn start_scan(&mut self) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        scan::spawn(stop.clone(), tx);
+        let app = self.tx.clone();
+        std::thread::spawn(move || {
+            for s in rx {
+                if app.send(Msg::Scan(s)).is_err() {
+                    return;
+                }
+            }
+        });
+        self.scanning = Some(stop);
+        self.preview = None;
+        self.status = "Point the camera at the code on your Mac".into();
+    }
+
+    fn stop_scan(&mut self) {
+        if let Some(s) = self.scanning.take() {
+            s.store(true, Ordering::Relaxed);
+        }
+        self.preview = None;
+    }
+
+    fn on_scan(&mut self, s: scan::Scan) {
+        if self.scanning.is_none() {
+            return;
+        }
+        match s {
+            scan::Scan::Preview(w, h, g) => self.preview = Some((w, h, g)),
+            scan::Scan::Failed(why) => self.status = why,
+            scan::Scan::Code(text) => {
+                self.stop_scan();
+                if let Some(inv) = secure::parse_invitation(&text) {
+                    println!("agent: read {}'s code; pairing through {}", inv.name, inv.relay);
+                    self.invitation = Some(inv);
+                    self.connect();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
     fn tap(&mut self, x: i32, y: i32) {
         if violet::HOME_BOX.contains(x, y) {
             violet::home();
+        } else if !self.paired() && SCAN_BOX.contains(x, y) {
+            if self.scanning.is_some() || self.invitation.is_some() {
+                // Back to showing our own code.
+                self.stop_scan();
+                self.invitation = None;
+                self.connect();
+            } else {
+                self.start_scan();
+            }
         } else if self.paired() && UNPAIR_BOX.contains(x, y) {
             self.unpair(true);
         } else if self.paired() && ORB_BOX.contains(x, y) {
@@ -528,12 +733,23 @@ fn draw(c: &mut Canvas, fonts: &Fonts, a: &Agent) {
     let body = fonts.regular(30.0);
     small.draw(c, &small.fit(&a.status, W as i32 - 80), 40, 250, MUTED);
     if !a.paired() {
-        draw_qr(c, &a.pairing_url(), Rect::new(80, 330, 640, 890));
-        let host = a.relay.split("://").nth(1).unwrap_or(&a.relay).trim_end_matches('/');
-        body.centered(c, "Open Violet Agent on your Mac", 0, W as i32, 980, INK);
-        body.centered(c, "and show it this code.", 0, W as i32, 1025, INK);
-        small.centered(c, &small.fit(&format!("Relay: {host}"), W as i32 - 80), 0, W as i32, 1100, MUTED);
-        small.centered(c, if a.relay_up { "Relay connected" } else { "Connecting to the relay…" }, 0, W as i32, 1145, MUTED);
+        let host = a.using.split("://").nth(1).unwrap_or(&a.using).trim_end_matches('/');
+        let relay_line = format!("{} · {host}", if a.relay_up { "Relay connected" } else { "Connecting to the relay" });
+        if a.scanning.is_some() {
+            draw_preview(c, a.preview.as_ref(), PREVIEW);
+            violet::button(c, &fonts.medium(30.0), SCAN_BOX, "Show my code instead", PANEL, INK);
+        } else if let Some(inv) = &a.invitation {
+            body.centered(c, &format!("Pairing with {}…", inv.name), 0, W as i32, 640, INK);
+            small.centered(c, &small.fit(&relay_line, W as i32 - 80), 0, W as i32, 700, MUTED);
+            violet::button(c, &fonts.medium(30.0), SCAN_BOX, "Show my code instead", PANEL, INK);
+        } else {
+            draw_qr(c, &a.pairing_url(), Rect::new(80, 300, 640, 860));
+            body.centered(c, "Open Violet Agent on your Mac", 0, W as i32, 940, INK);
+            body.centered(c, "and show it this code,", 0, W as i32, 985, INK);
+            body.centered(c, "or scan the code your Mac shows.", 0, W as i32, 1030, INK);
+            small.centered(c, &small.fit(&relay_line, W as i32 - 80), 0, W as i32, 1110, MUTED);
+            violet::button(c, &fonts.bold(32.0), SCAN_BOX, "Scan the Mac's code", ACCENT, BACKGROUND);
+        }
         return;
     }
     draw_talk(c, fonts, a);
@@ -542,6 +758,29 @@ fn draw(c: &mut Canvas, fonts: &Fonts, a: &Agent) {
         violet::button(c, &fonts.bold(36.0), OPEN_BOX, &format!("Open {title}"), ACCENT, BACKGROUND);
     }
     violet::button(c, &fonts.medium(26.0), UNPAIR_BOX, "Unpair", PANEL, MUTED);
+}
+
+/// A grey camera frame, turned upright (the sensor lies on its side), scaled to fill `r`.
+fn draw_preview(c: &mut Canvas, frame: Option<&(usize, usize, Vec<u8>)>, r: Rect) {
+    let Some((w, h, g)) = frame else {
+        c.fill(r, rgb(0, 0, 0));
+        return;
+    };
+    // Upright, the picture is h wide and w tall.
+    let scale = (r.width() as f32 / *h as f32).min(r.height() as f32 / *w as f32);
+    let (uw, uh) = ((*h as f32 * scale) as i32, (*w as f32 * scale) as i32);
+    let (ox, oy) = (r.x0 + (r.width() - uw) / 2, r.y0 + (r.height() - uh) / 2);
+    c.fill(r, rgb(0, 0, 0));
+    let width = c.w;
+    for y in 0..uh {
+        let sx = ((y as f32 / scale) as usize).min(w - 1);
+        let row = (oy + y) as usize * width;
+        for x in 0..uw {
+            let sy = h - 1 - ((x as f32 / scale) as usize).min(h - 1);
+            let v = g[sy * w + sx] as u32;
+            c.px[row + (ox + x) as usize] = 0xff00_0000 | v << 16 | v << 8 | v;
+        }
+    }
 }
 
 fn draw_talk(c: &mut Canvas, fonts: &Fonts, a: &Agent) {
@@ -623,10 +862,20 @@ fn main() {
     // The shared setting "relay" names another relay: a URL, or HOST:PORT for plain HTTP
     // on a local network (`build/moto-package "open-run=@sys set relay 192.168.1.20:8787"`).
     let setting = violet::sys("get relay");
+    let relay_set = !matches!(setting.as_str(), "" | "error" | "default");
     let relay = match setting.as_str() {
         "" | "error" | "default" => RELAY.to_string(),
         s if s.contains("://") => s.to_string(),
         s => format!("http://{s}"),
+    };
+    // The direct path's STUN servers: `@sys set stun HOST:PORT`, or `off`.
+    let stun: Vec<String> = match violet::sys("get stun").trim() {
+        "" | "error" | "default" => match STUN_BUILT {
+            Some(s) => vec![s.to_string()],
+            None => STUN.iter().map(|s| s.to_string()).collect(),
+        },
+        "off" => Vec::new(),
+        s => vec![s.to_string()],
     };
     let saved = Saved::load();
     let me = Identity::from_seed(saved.seed);
@@ -634,7 +883,19 @@ fn main() {
     let mut a = Agent {
         me,
         saved,
+        using: relay.clone(),
         relay,
+        relay_set,
+        invitation: None,
+        scanning: None,
+        preview: None,
+        direct: None,
+        direct_gen: 0,
+        direct_key: [0; 32],
+        direct_up: None,
+        direct_next: None,
+        direct_fails: 0,
+        stun,
         generation: 0,
         link: None,
         room: [0; 16],
@@ -680,6 +941,15 @@ fn main() {
             Ok(Msg::Ui(_)) => {}
             Ok(Msg::Net(gen, e)) if gen == a.generation => a.on_net(e),
             Ok(Msg::Net(..)) => {}
+            Ok(Msg::Direct(gen, e)) if gen == a.direct_gen => a.on_direct(e),
+            // An old path's leftovers still go through the relay.
+            Ok(Msg::Direct(_, direct::Event::Down(_, unsent))) => {
+                for m in unsent {
+                    a.relay_send(m);
+                }
+            }
+            Ok(Msg::Direct(..)) => {}
+            Ok(Msg::Scan(s)) => a.on_scan(s),
             Ok(Msg::Mic(voice::Mic::Samples(pcm, peak))) => {
                 if a.session.is_some() && a.listening.load(Ordering::Relaxed) {
                     match a.gate.feed(pcm, peak) {
@@ -732,6 +1002,10 @@ fn main() {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return,
+        }
+        if a.session.is_some() && a.direct.is_none() && a.direct_next.is_some_and(|t| Instant::now() > t) {
+            a.direct_next = None;
+            a.start_direct();
         }
         // No session while the relay is up: offer again every 4 s (a message lost on the way).
         if a.session.is_none() && a.relay_up && a.offered.elapsed() > Duration::from_secs(4) {

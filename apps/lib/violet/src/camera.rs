@@ -63,6 +63,22 @@ impl Camera {
     }
 }
 
+/// The frame in grey, one value per 2 x 2 Bayer block (the mean of its four
+/// pixels), as the sensor sees it (not turned upright): width, height, values.
+/// For machine vision, such as reading QR codes.
+pub fn grey(f: &Frame) -> (usize, usize, Vec<u8>) {
+    let (w, h) = ((f.info.width / 2) as usize, (f.info.height / 2) as usize);
+    let mut out = vec![0u8; w * h];
+    for by in 0..h {
+        for bx in 0..w {
+            let (x, y) = (bx as u32 * 2, by as u32 * 2);
+            let p = Develop::sample(f, x, y) as u32 + Develop::sample(f, x + 1, y) as u32 + Develop::sample(f, x, y + 1) as u32 + Develop::sample(f, x + 1, y + 1) as u32;
+            out[by * w + bx] = (p / 4) as u8;
+        }
+    }
+    (w, h, out)
+}
+
 /// Colour from a raw frame: black level, grey-world white balance (smoothed
 /// across frames so it does not flicker) and a display gamma.
 pub struct Develop {

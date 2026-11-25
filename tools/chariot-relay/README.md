@@ -4,10 +4,13 @@
 
 ```sh
 python3 tools/chariot-relay/relay.py --port 8787          # on a local network
+python3 tools/chariot-relay/relay.py --port 8787 --stun 3478   # and the STUN rendezvous
 tools/chariot-relay/deploy.sh violet-chariot              # on a Chariot agent
 ```
 
-The phone's default relay is the `violet-chariot` agent on chariots.sh (`RELAY` in [apps/open/agent/src/main.rs](../../apps/open/agent/src/main.rs)); a pairing carries its relay, so the Mac follows whatever the phone's code names.
+The phone's default relay is the `violet-chariot` agent on chariots.sh (`RELAY` in [apps/open/agent/src/main.rs](../../apps/open/agent/src/main.rs)); a pairing carries its relay, so whichever side reads the code follows the relay it names.
+
+**Rendezvous for the direct path.** The relay carries the candidate exchange (inside the encrypted session), and the two ends learn their public UDP addresses from STUN. A Chariot is HTTPS only, so with it they use public STUN servers (Google's and Cloudflare's); a relay on a host that can take UDP answers STUN itself with `--stun PORT` (`@sys set stun HOST:PORT` on the phone, `VIOLET_AGENT_STUN` on the Mac). `make test-agent` uses that.
 
 What a Chariot does that matters here (learned November 2026):
 

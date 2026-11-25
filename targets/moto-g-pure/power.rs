@@ -18,22 +18,35 @@ fn write_reg(offset: usize, value: u32) {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
+/// WACS2's state machine: idle, and holding a read's answer until CLEAR.
+const IDLE: u32 = 0;
+const VALID: u32 = 6;
 fn wait(state: u32) -> Option<u32> {
     let start = unsafe { ticks() };
     loop {
         let status = read_reg(STATUS);
-        if (status >> 16) & 7 == state {
+        let now = (status >> 16) & 7;
+        if now == state {
             return Some(status);
         }
+        // A read whose answer was never collected (it timed out) leaves the
+        // wrapper waiting for CLEAR, and every later request would fail until
+        // a restart. Collect it, as Linux's pwrap_read does.
+        if state == IDLE && now == VALID {
+            write_reg(CLEAR, 1);
+            continue;
+        }
         if unsafe { ticks().wrapping_sub(start) >= ticks_per_ms * 2 } {
-            return None;
+            // This thread may have been preempted past the deadline: look once more.
+            let status = read_reg(STATUS);
+            return ((status >> 16) & 7 == state).then_some(status);
         }
     }
 }
 fn pmic_read(addr: u16) -> Option<u16> {
     wait(0)?;
     write_reg(COMMAND, (addr as u32) << 15);
-    let value = wait(6)? as u16;
+    let value = wait(VALID)? as u16;
     write_reg(CLEAR, 1);
     Some(value)
 }

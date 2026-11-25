@@ -36,6 +36,77 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
+pub fn unb64url(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => continue,
+            _ => return None,
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// A pairing code: `violet-agent:1?r=RELAY&k=KEY&s=SECRET&n=NAME`, shown by
+/// the phone (no `o`) or by a Mac (`o=m`; then `k` is the Mac's key).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Invitation {
+    pub relay: String,
+    pub key: [u8; 32],
+    pub secret: [u8; 32],
+    pub name: String,
+    pub from_mac: bool,
+}
+
+fn unpercent(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                match std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()).ok_or(()) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 3;
+                        continue;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn parse_invitation(text: &str) -> Option<Invitation> {
+    let q = text.trim().strip_prefix("violet-agent:1?")?;
+    let item = |k: &str| q.split('&').find_map(|p| p.strip_prefix(k).and_then(|v| v.strip_prefix('='))).map(unpercent);
+    let key: [u8; 32] = unb64url(&item("k")?)?.try_into().ok()?;
+    let secret: [u8; 32] = unb64url(&item("s")?)?.try_into().ok()?;
+    let relay = item("r")?;
+    if !relay.contains("://") {
+        return None;
+    }
+    let from_mac = item("o").as_deref() == Some("m");
+    Some(Invitation { relay, key, secret, name: item("n").unwrap_or_else(|| "Mac".into()), from_mac })
+}
+
 pub fn b64url(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut s = String::new();
@@ -155,7 +226,30 @@ pub struct Session {
     send: aead::LessSafeKey,
     recv: aead::LessSafeKey,
     sent: u64,
+    /// The highest counter received, and which of the 64 below it arrived.
     received: u64,
+    seen: u64,
+}
+
+/// Records may arrive out of order when the path changes (relay and direct):
+/// a counter is accepted once, if it is newer than the highest seen or one of
+/// the 64 before it not yet seen.
+pub fn replay_ok(received: u64, seen: u64, counter: u64) -> bool {
+    if counter > received {
+        return true;
+    }
+    let back = received - counter;
+    counter > 0 && back < 64 && back > 0 && seen & (1 << (back - 1)) == 0
+}
+
+fn replay_mark(received: &mut u64, seen: &mut u64, counter: u64) {
+    if counter > *received {
+        let shift = counter - *received;
+        *seen = if shift >= 64 { 0 } else { (*seen << shift) | if *received > 0 { 1 << (shift - 1) } else { 0 } };
+        *received = counter;
+    } else {
+        *seen |= 1 << (*received - counter - 1);
+    }
 }
 
 /// Finish a handshake. `phone` and `mac` are the two Ed25519 keys.
@@ -173,7 +267,7 @@ pub fn complete(ours: Offer, theirs: &Hello, role: u8, room: &[u8; 16], phone: &
     let key = |k: &[u8]| aead::LessSafeKey::new(aead::UnboundKey::new(&aead::CHACHA20_POLY1305, k).unwrap());
     let (to_mac, to_phone) = (key(&okm[..32]), key(&okm[32..]));
     let (send, recv) = if role == PHONE { (to_mac, to_phone) } else { (to_phone, to_mac) };
-    Some(Session { send, recv, sent: 0, received: 0 })
+    Some(Session { send, recv, sent: 0, received: 0, seen: 0 })
 }
 
 fn nonce(counter: u64) -> aead::Nonce {
@@ -198,13 +292,13 @@ impl Session {
             return None;
         }
         let counter = u64::from_be_bytes(m[1..9].try_into().unwrap());
-        if counter <= self.received {
+        if !replay_ok(self.received, self.seen, counter) {
             return None;
         }
         let mut body = m[9..].to_vec();
         let n = self.recv.open_in_place(nonce(counter), aead::Aad::empty(), &mut body).ok()?.len();
         body.truncate(n);
-        self.received = counter;
+        replay_mark(&mut self.received, &mut self.seen, counter);
         Some(body)
     }
 }
@@ -251,7 +345,65 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_once() {
+        let phone = Identity::from_seed([1; 32]);
+        let mac = Identity::from_seed([2; 32]);
+        let room = [5u8; 16];
+        let p = offer(&phone, PHONE, SESSION, &room, None);
+        let hp = parse_hello(&p.message, &room).unwrap();
+        let m = answer(&mac, MAC, SESSION, &room, None, &hp.x);
+        let hm = parse_hello(&m.message, &room).unwrap();
+        let (pk, mk) = (phone.public(), mac.public());
+        let mut a = complete(p, &hm, PHONE, &room, &pk, &mk).unwrap();
+        let mut b = complete(m, &hp, MAC, &room, &pk, &mk).unwrap();
+        let r: Vec<_> = (0..5).map(|i| a.seal(&[i])).collect();
+        assert_eq!(b.open(&r[2]).unwrap(), [2]);
+        assert_eq!(b.open(&r[0]).unwrap(), [0]);
+        assert!(b.open(&r[0]).is_none());
+        assert_eq!(b.open(&r[1]).unwrap(), [1]);
+        assert!(b.open(&r[2]).is_none());
+        assert_eq!(b.open(&r[4]).unwrap(), [4]);
+        assert_eq!(b.open(&r[3]).unwrap(), [3]);
+        for r in &r {
+            assert!(b.open(r).is_none(), "each record once");
+        }
+        let far: Vec<_> = (0..70).map(|_| a.seal(b"x")).collect();
+        assert!(b.open(&far[69]).is_some());
+        assert!(b.open(&far[0]).is_none(), "too old");
+        assert!(b.open(&far[10]).is_some());
+    }
+
+    #[test]
+    fn mac_shows_the_code() {
+        let mac = Identity::from_seed([2; 32]);
+        let phone = Identity::from_seed([1; 32]);
+        let secret = [9u8; 32];
+        let code = format!("violet-agent:1?r=https%3A%2F%2Fexample.apps.chariots.sh&k={}&s={}&n=Rose%27s%20Mac&o=m", b64url(&mac.public()), b64url(&secret));
+        let inv = parse_invitation(&code).unwrap();
+        assert!(inv.from_mac);
+        assert_eq!(inv.relay, "https://example.apps.chariots.sh");
+        assert_eq!(inv.name, "Rose's Mac");
+        assert_eq!(inv.key, mac.public());
+        let phone_code = format!("violet-agent:1?r=http://h:1&k={}&s={}&n=Moto", b64url(&phone.public()), b64url(&secret));
+        assert!(!parse_invitation(&phone_code).unwrap().from_mac);
+        assert!(parse_invitation("violet-agent:1?r=x&k=AA&s=BB").is_none());
+        // Roles reversed: the phone, which read the code, proves it knows the secret.
+        let room = pairing_room(&inv.secret);
+        let p = offer(&phone, PHONE, PAIRING, &room, Some(&inv.secret));
+        let hp = parse_hello(&p.message, &room).unwrap();
+        assert!(proof_ok(&secret, &hp));
+        let m = answer(&mac, MAC, PAIRING, &room, None, &hp.x);
+        let hm = parse_hello(&m.message, &room).unwrap();
+        assert_eq!(hm.ed, inv.key);
+        let (pk, mk) = (phone.public(), mac.public());
+        let mut a = complete(p, &hm, PHONE, &room, &pk, &mk).unwrap();
+        let mut b = complete(m, &hp, MAC, &room, &pk, &mk).unwrap();
+        assert_eq!(b.open(&a.seal(b"paired")).unwrap(), b"paired");
+    }
+
+    #[test]
     fn encodings() {
+        assert_eq!(unb64url(&b64url(&[1, 2, 3, 250, 251])).unwrap(), vec![1, 2, 3, 250, 251]);
         assert_eq!(b64url(b"\xfb\xff"), "-_8");
         assert_eq!(unhex(&hex(&[0, 255, 16])).unwrap(), vec![0, 255, 16]);
     }

@@ -1,17 +1,20 @@
-"""The voice agent's pairing and durable installs, in QEMU with the real Mac app.
+"""The voice agent's pairing, direct path and durable installs, in QEMU with
+the real Mac app.
 
-A local relay (tools/chariot-relay/relay.py) stands in for the Chariot; the
-guest reaches it as violet-relay.test through the host relay. First boot:
-the agent shows its pairing code; Violet Agent for macOS (built in
-build/mac-agent, run with a separate test identity and no speech) pairs with
-it, moves to the pair's room and installs a known-good program (the agent
-workspace's example, a Stopwatch) over the encrypted link. Second boot on the
-same disk, with the Mac app restarted: the program is still in /apps and in
-Programs and runs, and the pair reconnects without a new scan. Then the Mac
-unpairs and the phone shows a new code.
+A local relay (tools/chariot-relay/relay.py, with its STUN responder) stands
+in for the Chariot; the guest reaches it as violet-relay.test through the host
+relay. First boot: the agent shows its pairing code; Violet Agent for macOS
+(built in build/mac-agent, run with a separate test identity and no speech)
+pairs with it, moves to the pair's room, the two open a direct UDP path, and
+the Mac installs a known-good program (the agent workspace's example, a
+Stopwatch) over it. Second boot on the same disk, on a "network" that blocks
+UDP (the host relay refuses UDP sockets), with the Mac app restarted: the
+direct path fails, the pair carries on through the relay, the program is still
+in /apps and in Programs and runs, and the pair reconnected without a new scan.
+Then the Mac unpairs and the phone shows a new code.
 
 Needs the image built with the test relay:
-    VIOLET_AGENT_RELAY=http://violet-relay.test make qemu-image
+    VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu-image
 and the Mac app (xcodebuild, see companion/mac/README.md).
 """
 from pathlib import Path
@@ -96,7 +99,8 @@ def start(row):
     tap(360, 260 + row * h + (h - 12) // 2)
 def launch_mac(*args):
     global mac
-    env = dict(os.environ, VIOLET_AGENT_PROFILE="test", VIOLET_AGENT_RELAY_MAP="http://violet-relay.test=http://127.0.0.1:8787")
+    env = dict(os.environ, VIOLET_AGENT_PROFILE="test", VIOLET_AGENT_RELAY_MAP="http://violet-relay.test=http://127.0.0.1:8787",
+               VIOLET_AGENT_STUN="127.0.0.1:3478")
     mac = subprocess.Popen([APP, "--no-speech", *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
@@ -107,12 +111,18 @@ start(rows.index("agent"))
 if STAGE == "first":
     until("pairing code", lambda: re.search(r"agent: pairing code (\S+)", everything()), 60)
     code = re.findall(r"agent: pairing code (\S+)", everything())[-1]
-    launch_mac("--unpair", "--pair", code, "--install", "example=" + EXAMPLE)
+    launch_mac("--unpair", "--pair", code, "--install", "example=" + EXAMPLE, "--wait-direct")
     until("paired", lambda: "agent: paired with a new Mac" in everything(), 60)
     print("agent: paired through the relay", file=sys.stderr)
+    until("direct path", lambda: "agent: direct path open to" in everything(), 60)
+    print(re.findall(r"agent: direct path open to [^;\s]+", everything())[-1], file=sys.stderr)
     until("installed", lambda: re.search(r"agent: install example -> ok", everything()), 120)
-    print("agent:", re.findall(r"agent: install example -> .*", everything())[-1], file=sys.stderr)
+    print(re.findall(r"agent: install example: .* arrived .*", everything())[-1], file=sys.stderr)
+    print(re.findall(r"agent: install example -> .*", everything())[-1], file=sys.stderr)
     until("Mac sees the install", lambda: "test install example: ok" in mac_log(), 20)
+    if "(via direct path" not in mac_log():
+        fail("the install did not cross the direct path")
+    print("agent: the program crossed the direct path", file=sys.stderr)
     mac.terminate(); mac.wait()
     time.sleep(1)
     sys.exit(0)
@@ -121,6 +131,8 @@ until("installed apps loaded", lambda: re.search(r"installed apps: 1 loaded", ev
 launch_mac()
 until("reconnected", lambda: mac_log().count("phone online") >= 2, 90)
 print("agent: reconnected after the restart without a new scan", file=sys.stderr)
+until("relay fallback", lambda: "agent: direct path not found" in everything(), 30)
+print(re.findall(r"agent: direct path not found: .*", everything())[-1], file=sys.stderr)
 tap(100, 60)  # Home
 time.sleep(2)
 open_list()
@@ -184,11 +196,11 @@ def main():
         subprocess.run([sys.executable, str(ROOT / "tools/agent_build.py"), "setup"], check=True)
     original = ROOT / "build/sel4/qemu"
     cpio = (original / "initfs.cpio").read_bytes()
-    if b"violet-relay.test" not in cpio:
-        raise SystemExit("Build the image with the test relay: VIOLET_AGENT_RELAY=http://violet-relay.test make qemu-image")
+    if b"violet-relay.test" not in cpio or b"violet-relay.test:3478" not in cpio:
+        raise SystemExit("Build the image with the test relay: VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu-image")
     if not free(8787):
         raise SystemExit("Port 8787 is busy")
-    relay = subprocess.Popen([sys.executable, str(ROOT / "tools/chariot-relay/relay.py"), "--host", "127.0.0.1", "--port", "8787"],
+    relay = subprocess.Popen([sys.executable, str(ROOT / "tools/chariot-relay/relay.py"), "--host", "127.0.0.1", "--port", "8787", "--stun", "3478"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     shutil.rmtree(SUPPORT, ignore_errors=True)
     try:
@@ -205,16 +217,18 @@ def main():
             # Installed apps are titled, so they follow the image's titled apps.
             titled = home_titles(cpio)
             rows_after = [r for r in rows if r in titled] + ["example"] + [r for r in rows if r not in titled]
-            os.environ.update(VIOLET_NET_HOSTS=json.dumps({"violet-relay.test": "127.0.0.1:8787"}),
+            os.environ.update(VIOLET_NET_HOSTS=json.dumps({"violet-relay.test": "127.0.0.1:8787", "violet-relay.test:3478": "127.0.0.1:3478"}),
                               AGENT_APP=str(APP), AGENT_EXAMPLE=str(EXAMPLE), AGENT_SUPPORT=str(SUPPORT))
             for stage, listed in (("first", rows), ("second", rows_after)):
-                os.environ.update(AGENT_STAGE=stage, AGENT_ROWS=json.dumps(listed))
+                # The second boot's network blocks UDP: the pair falls back to the relay.
+                os.environ.update(AGENT_STAGE=stage, AGENT_ROWS=json.dumps(listed), VIOLET_NET_UDP="0" if stage == "second" else "1")
                 status = run.main(str(viewer))
                 if status != 0:
                     raise SystemExit(f"agent test failed in the {stage} boot (viewer status {status})")
     finally:
         relay.terminate()
-    print("Agent verified: QR pairing through the relay, an encrypted install that survives a restart, reconnect, unpair")
+    print("Agent verified: QR pairing through the relay, a direct UDP path carrying an encrypted install that survives a restart, "
+          "the relay when UDP is blocked, reconnect, unpair")
 
 
 if __name__ == "__main__":

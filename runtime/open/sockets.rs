@@ -1,5 +1,5 @@
-//! Socket system calls: IPv4 TCP through Radio (net.rs), and UDP only for the
-//! DNS questions the Open Runtime answers itself.
+//! Socket system calls: IPv4 TCP and UDP through Radio (net.rs). DNS
+//! questions to the runtime's resolver are answered here (net::answer_dns).
 use super::device::{Kind, OpenFile};
 use super::net;
 use super::syscall::{Outcome, EAGAIN, EBADF, EFAULT, EINVAL, ENOSYS};
@@ -46,16 +46,8 @@ impl Runtime {
                 self.send_call(i, a[0] as i32, a[1], a[2], a[3], to)
             }
             291 | 292 => {
-                let r = self.recv_call(i, a[0] as i32, a[1], a[2], a[3]);
-                if n == 292 && a[4] != 0 {
-                    if let Done(k) = r {
-                        if k >= 0 {
-                            let addr = self.peer_of(i, a[0] as i32).unwrap_or((NAMESERVER, 53));
-                            self.put_sockaddr(i, a[4], a[5], addr);
-                        }
-                    }
-                }
-                r
+                let (name, name_len) = if n == 292 { (a[4], a[5]) } else { (0, 0) };
+                self.recv_call(i, a[0] as i32, a[1], a[2], a[3], name, name_len)
             }
             293 => {
                 let Some(f) = self.socket_file(i, a[0] as i32) else { return Done(EBADF) };
@@ -142,7 +134,7 @@ impl Runtime {
         let flags = 2 | if kind & SOCK_NONBLOCK != 0 { O_NONBLOCK } else { 0 };
         let file = match kind & 0xf {
             SOCK_STREAM => OpenFile::new(Kind::Tcp { slot: None, peer: (0, 0) }, flags),
-            SOCK_DGRAM => OpenFile::new(Kind::Udp { peer: None, replies: VecDeque::new() }, flags),
+            SOCK_DGRAM => OpenFile::new(Kind::Udp { peer: None, replies: VecDeque::new(), slot: None, allowed: Vec::new() }, flags),
             _ => return EPROTONOSUPPORT,
         };
         let app = self.apps[i].as_mut().unwrap();
@@ -160,8 +152,14 @@ impl Runtime {
         let nonblock = f.borrow().flags & O_NONBLOCK != 0;
         let mut file = f.borrow_mut();
         match &mut file.kind {
-            Kind::Udp { peer, .. } => {
-                *peer = Some((ip, port));
+            Kind::Udp { .. } => {
+                drop(file);
+                if let Some(o) = self.udp_gate(i, fd, (ip, port)) {
+                    return o;
+                }
+                if let Kind::Udp { peer, .. } = &mut f.borrow_mut().kind {
+                    *peer = Some((ip, port));
+                }
                 Done(0)
             }
             Kind::Tcp { slot: Some(slot), .. } => {
@@ -237,16 +235,39 @@ impl Runtime {
         };
         let mut file = f.borrow_mut();
         match &mut file.kind {
-            Kind::Udp { peer, replies } => {
+            Kind::Udp { peer, replies, slot, allowed } => {
                 let dest = to.or(*peer);
                 match dest {
-                    Some((_, 53)) => {
+                    Some((ip, 53)) if ip == NAMESERVER || self.net.is_stand_in(ip) || !self.net.present => {
                         if let Some(answer) = net::answer_dns(&mut self.net, &data) {
-                            replies.push_back(answer);
+                            replies.push_back(((ip, 53), answer));
                         }
                         data.len() as i32
                     }
-                    Some(_) => ENETUNREACH,
+                    Some(d) if !allowed.contains(&d) => -13, // EACCES: send_call asks the Shield first
+                    Some((ip, port)) => {
+                        if data.len() > net::MAX_DATAGRAM {
+                            return -90; // EMSGSIZE
+                        }
+                        let s = match *slot {
+                            Some(s) => s,
+                            None => match self.net.udp_open() {
+                                Ok(s) => {
+                                    *slot = Some(s);
+                                    s
+                                }
+                                Err(e) => return e,
+                            },
+                        };
+                        match self.net.state(s) {
+                            (net::FAILED, e) => return -e.max(1),
+                            (net::IDLE, _) | (net::PEER_CLOSED, _) => return ENETUNREACH,
+                            _ => {}
+                        }
+                        // A full ring drops the datagram, as a full interface queue would.
+                        self.net.send_datagram(s, ip, port, &data);
+                        data.len() as i32
+                    }
                     None => -89, // EDESTADDRREQ
                 }
             }
@@ -268,7 +289,39 @@ impl Runtime {
         }
     }
 
+    /// The Shield's say on a UDP destination the first time a socket uses it.
+    /// None: allowed (and remembered); otherwise the outcome to return.
+    fn udp_gate(&mut self, i: usize, fd: i32, dest: (u32, u16)) -> Option<Outcome> {
+        let f = self.socket_file(i, fd)?;
+        let known = match &f.borrow().kind {
+            Kind::Udp { allowed, .. } => allowed.contains(&dest),
+            _ => return None,
+        };
+        if known || dest.1 == 53 {
+            return None;
+        }
+        let host = self.net.host_for(dest.0);
+        match self.gate(i, &super::policy::Action::Connect { host: &host, port: dest.1 }) {
+            super::Gate::Allow => {}
+            super::Gate::Deny => return Some(Done(-13)),
+            super::Gate::Frozen => return Some(Block(Wait::Frozen, None)),
+            super::Gate::Killed => return Some(Outcome::Gone),
+        }
+        if let Kind::Udp { allowed, .. } = &mut f.borrow_mut().kind {
+            if allowed.len() >= 64 {
+                allowed.remove(0);
+            }
+            allowed.push(dest);
+        }
+        None
+    }
+
     fn send_call(&mut self, i: usize, fd: i32, buf: u32, len: u32, flags: u32, to: Option<(u32, u16)>) -> Outcome {
+        if let Some(d) = to {
+            if let Some(o) = self.udp_gate(i, fd, d) {
+                return o;
+            }
+        }
         let r = self.socket_send(i, fd, buf, len, to);
         let nonblock = flags & MSG_DONTWAIT != 0
             || self.socket_file(i, fd).map_or(true, |f| f.borrow().flags & O_NONBLOCK != 0);
@@ -278,17 +331,33 @@ impl Runtime {
         Done(r)
     }
 
-    fn recv_call(&mut self, i: usize, fd: i32, buf: u32, len: u32, flags: u32) -> Outcome {
+    /// recv, recvfrom and recvmsg: `name` and `name_len` (pointers) take the
+    /// source address when given.
+    fn recv_call(&mut self, i: usize, fd: i32, buf: u32, len: u32, flags: u32, name: u32, name_len: u32) -> Outcome {
         if !self.is_socket(i, fd) {
             return Done(EBADF);
         }
-        let r = self.read_now(i, fd, buf, len);
+        let r = self.recv_from(i, fd, buf, len, name, name_len);
         let nonblock = flags & MSG_DONTWAIT != 0
             || self.socket_file(i, fd).map_or(true, |f| f.borrow().flags & O_NONBLOCK != 0);
         if r == EAGAIN && !nonblock {
-            return Block(Wait::Read { fd, buf, len }, self.recv_deadline(i, fd));
+            return Block(Wait::RecvFrom { fd, buf, len, name, name_len }, self.recv_deadline(i, fd));
         }
         Done(r)
+    }
+
+    /// One read, and the sender's address to `name` when something came.
+    pub fn recv_from(&mut self, i: usize, fd: i32, buf: u32, len: u32, name: u32, name_len: u32) -> i32 {
+        self.net.last_from = (0, 0);
+        let r = self.read_now(i, fd, buf, len);
+        if r >= 0 && name != 0 {
+            let addr = match self.net.last_from {
+                (0, 0) => self.peer_of(i, fd).unwrap_or((NAMESERVER, 53)),
+                a => a,
+            };
+            self.put_sockaddr(i, name, name_len, addr);
+        }
+        r
     }
 
     /// sendmsg and recvmsg: the address and the first buffer of the vector.
@@ -303,14 +372,8 @@ impl Runtime {
             let to = if name != 0 { self.read_sockaddr(i, name, namelen) } else { None };
             self.send_call(i, fd, v[0], v[1], flags, to)
         } else {
-            let r = self.recv_call(i, fd, v[0], v[1], flags);
+            let r = self.recv_call(i, fd, v[0], v[1], flags, name, if name != 0 { msg + 4 } else { 0 });
             if let Done(k) = r {
-                if k >= 0 && name != 0 {
-                    let addr = self.peer_of(i, fd).unwrap_or((NAMESERVER, 53));
-                    let app = self.apps[i].as_mut().unwrap();
-                    app.space.write(&mut self.k, &mut self.pool, name, &sockaddr(addr.0, addr.1));
-                    app.space.write_u32(&mut self.k, &mut self.pool, msg + 4, 16);
-                }
                 if k >= 0 {
                     // No control data; flags cleared.
                     let app = self.apps[i].as_mut().unwrap();
@@ -352,6 +415,19 @@ impl Runtime {
         Done(0)
     }
 
+    /// A UDP socket's address on the network, opening its slot if need be
+    /// (port 0 until Radio has bound it).
+    fn udp_local(&mut self, i: usize, fd: i32) -> Option<(u32, u16)> {
+        let f = self.socket_file(i, fd)?;
+        let mut file = f.borrow_mut();
+        let Kind::Udp { slot, .. } = &mut file.kind else { return None };
+        if slot.is_none() {
+            *slot = self.net.udp_open().ok();
+        }
+        let (ip, port) = self.net.local((*slot)?);
+        Some((if ip == 0 { 0x0a00_0002 } else { ip }, port))
+    }
+
     fn socket_name(&mut self, i: usize, fd: i32, ptr: u32, len_ptr: u32, peer: bool) -> Outcome {
         if !self.is_socket(i, fd) {
             return Done(EBADF);
@@ -362,7 +438,10 @@ impl Runtime {
                 _ => return Done(ENOTCONN),
             }
         } else {
-            (0x0a00_0002, 40000 + fd as u16)
+            match self.udp_local(i, fd) {
+                Some(a) => a,
+                None => (0x0a00_0002, 40000 + fd as u16),
+            }
         };
         self.put_sockaddr(i, ptr, len_ptr, addr);
         Done(0)
