@@ -1060,7 +1060,8 @@ impl Runtime {
             // `bench tap X Y N`: N synthetic presses on the app in front;
             // `bench drag X Y DY N`: N drags of DY pixels over 250 ms each.
             Some("bench") => {
-                let drag = words.next() == Some("drag");
+                let verb = words.next();
+                let (drag, release) = (verb == Some("drag"), verb == Some("press"));
                 let mut n = words.map(|w| w.parse::<i32>().unwrap_or(-1));
                 let (x, y) = (n.next().unwrap_or(-1), n.next().unwrap_or(-1));
                 let dy = if drag { n.next().unwrap_or(0) } else { 0 };
@@ -1068,10 +1069,10 @@ impl Runtime {
                     Some(count) if x >= 0 && y >= 0 && count > 0 && drag == (dy != 0) => {
                         let now = sys::now_ns();
                         self.frames.report(now);
-                        self.frames.bench = Some(super::frames::Bench { x, y, dy, step: 0, left: count as u32, next_ns: now + 300_000_000, pressed: false });
+                        self.frames.bench = Some(super::frames::Bench { x, y, dy, step: 0, left: count as u32, next_ns: now + 300_000_000, pressed: false, release });
                         String::from("ok\n")
                     }
-                    _ => String::from("error usage: bench tap X Y N | bench drag X Y DY N\n"),
+                    _ => String::from("error usage: bench tap X Y N | bench press X Y N | bench drag X Y DY N\n"),
                 }
             }
             // The programs running now, as paths.

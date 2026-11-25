@@ -18,8 +18,7 @@ use serde_json::{json, Value};
 use violet::{colors::*, mix, rgb, Canvas, Fonts, Rect, Screen, W};
 
 const SAVED: &str = "/data/agent";
-/// The relay unless the shared setting agent.relay names another
-/// (`set agent.relay http://192.168.1.20:8787` in /dev/violet/sys).
+/// The relay unless the shared setting "relay" names another.
 const RELAY: &str = match option_env!("VIOLET_AGENT_RELAY") {
     Some(r) => r,
     None => "https://violet-chariot.apps.chariots.sh",
@@ -601,8 +600,14 @@ fn main() {
             }
         });
     }
-    let setting = violet::sys("get agent.relay");
-    let relay = if setting.starts_with("http") || setting.starts_with("ws") { setting } else { RELAY.to_string() };
+    // The shared setting "relay" names another relay: a URL, or HOST:PORT for plain HTTP
+    // on a local network (`build/moto-package "open-run=@sys set relay 192.168.1.20:8787"`).
+    let setting = violet::sys("get relay");
+    let relay = match setting.as_str() {
+        "" | "error" | "default" => RELAY.to_string(),
+        s if s.contains("://") => s.to_string(),
+        s => format!("http://{s}"),
+    };
     let saved = Saved::load();
     let me = Identity::from_seed(saved.seed);
     println!("agent: key {} relay {relay}", &secure::hex(&me.public())[..16]);
@@ -692,5 +697,26 @@ fn main() {
             draw(&mut c, &fonts, &a);
             screen.show_all(&c);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The pairing screen's code, drawn as on the phone, for the Mac's decoder
+    /// (companion/mac/Tests/decode_qr.swift reads it back).
+    #[test]
+    fn pairing_code_draws() {
+        let mut c = violet::Canvas::new(720, 1600);
+        let url = "violet-agent:1?r=https://example.apps.chariots.sh&k=nif642QP8M59daxr5YLqmjdgUWfZVPTYZFsd-zX23_Y&s=Cgs7s24Ubm5GCft4oiKaZJgeb61R67Vkao0TtA2kv0U&n=Moto";
+        super::draw_qr(&mut c, url, violet::Rect::new(80, 330, 640, 890));
+        let mut ppm = b"P6\n720 1600\n255\n".to_vec();
+        for y in 0..1600 {
+            for x in 0..720 {
+                let p = c.get(x, y);
+                ppm.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+            }
+        }
+        let out = std::env::var("AGENT_QR_OUT").unwrap_or_else(|_| std::env::temp_dir().join("agent-qr.ppm").display().to_string());
+        std::fs::write(out, ppm).unwrap();
     }
 }

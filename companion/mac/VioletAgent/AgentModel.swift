@@ -78,7 +78,14 @@ final class AgentModel: ObservableObject {
         if let p = phone { link.connect(p) }
         if let i = args.firstIndex(of: "--pair"), i + 1 < args.count, let inv = Invitation(args[i + 1]) { pair(inv) }
         speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
-        speaker.onEnd = { [weak self] id in self?.link.send(["t": "say_end", "id": id]) }
+        speaker.onEnd = { [weak self] id in
+            guard let self else { return }
+            self.link.send(["t": "say_end", "id": id])
+            // Back to listening once the last sentence is out and Codex is done.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if !self.speaker.speaking && self.codex.activeTurn == nil && self.activity == "speaking" { self.setActivity("idle") }
+            }
+        }
         listener.onPartial = { [weak self] t in self?.partial(t) }
         listener.onFinal = { [weak self] t in self?.final(t) }
         if args.contains("--no-speech") {
@@ -357,6 +364,7 @@ final class AgentModel: ObservableObject {
     private func setActivity(_ a: String) {
         var state = a
         if a == "idle" && speaker.speaking { state = "speaking" }
+        if a == "thinking" && activity == "building" { state = "building" }
         activity = state
         let phoneState = state == "idle" ? "listening" : state
         link.send(["t": "state", "state": phoneState])
