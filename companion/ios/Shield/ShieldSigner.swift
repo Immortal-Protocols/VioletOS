@@ -11,10 +11,6 @@ import Security
 /// P-256 key (`-shieldDevKey <base64 PKCS#8 or PEM>`), the same one whose
 /// public half `image/packages/build.py` pins into the QEMU image.
 final class ShieldSigner {
-    enum Op: UInt8 { case install = 1, revoke = 2, unfreeze = 3, kill = 4, freeze = 5 }
-    enum Matcher: UInt8 { case path = 1, host = 2, writeExec = 3, binaryHash = 4 }
-    enum Verdict: UInt8 { case log = 1, deny = 2, freeze = 3, kill = 4 }
-
     private enum Key {
         case enclave(SecureEnclave.P256.Signing.PrivateKey)
         case software(P256.Signing.PrivateKey)
@@ -25,8 +21,17 @@ final class ShieldSigner {
     private var lastSeq: UInt64 = 0
     private var nextShieldId: UInt32 = UInt32(Date().timeIntervalSince1970) % 100_000 * 10
 
-    init() {
-        if let provisioned = Self.provisionedKey() {
+    init(emulatorKey: URL? = nil) {
+        if let emulatorKey {
+            if let pem = try? String(contentsOf: emulatorKey, encoding: .utf8),
+               let signingKey = try? P256.Signing.PrivateKey(pemRepresentation: pem) {
+                key = .software(signingKey)
+                keyDescription = "VioletOS P-256 " + Self.fingerprint(signingKey.publicKey.x963Representation)
+            } else {
+                key = nil
+                keyDescription = "VioletOS signing key unavailable"
+            }
+        } else if let provisioned = Self.provisionedKey() {
             key = .software(provisioned)
             keyDescription = "software P-256 (Simulator dev key) " + Self.fingerprint(provisioned.publicKey.x963Representation)
         } else if SecureEnclave.isAvailable, let k = Self.enclaveKey() {
@@ -37,8 +42,6 @@ final class ShieldSigner {
             keyDescription = "no signing key"
         }
     }
-
-    var canSign: Bool { key != nil }
 
     private static func fingerprint(_ point: Data) -> String {
         SHA256.hash(data: point).prefix(4).map { String(format: "%02x", $0) }.joined()
@@ -70,7 +73,7 @@ final class ShieldSigner {
         return k
     }
 
-    func newShieldId() -> UInt32 {
+    private func newShieldId() -> UInt32 {
         nextShieldId &+= 1
         return nextShieldId
     }
@@ -81,38 +84,24 @@ final class ShieldSigner {
         return lastSeq
     }
 
-    static func rulePayload(_ m: Matcher, _ v: Verdict, _ text: String, writeOnly: Bool = false, crossAppOnly: Bool = false) -> Data {
-        let raw = Data(text.utf8.prefix(255))
-        return Data([m.rawValue, v.rawValue, (writeOnly ? 1 : 0) | (crossAppOnly ? 2 : 0), UInt8(raw.count)]) + raw
-    }
-
-    /// Pushed as soon as the Sentinel links: writes into another app's code or the system freeze the writer
-    /// inside that call, before the write lands. Renewed before the hour-long TTL runs out.
-    static let baseline: [(Matcher, Verdict, String, Bool, Bool)] = [
-        (.path, .freeze, "/apps/", true, true),
-        (.path, .freeze, "/bin/", true, false),
-        (.path, .freeze, "/lib/", true, false),
-    ]
-
-    func envelope(op: Op, shieldId: UInt32, ttlSecs: UInt32, pid: UInt32 = 0, payload: Data = Data()) throws -> (Data, UInt64) {
+    func warning() throws -> (Data, UInt64) {
         guard let key else { throw NSError(domain: "Shield", code: 10, userInfo: [NSLocalizedDescriptionKey: "no signing key"]) }
         let seq = nextSeq()
         var head = Data("VSH1".utf8)
         head.appendLE(UInt16(1))
-        head.append(1)  // tier: companion auto (TTL-bounded)
-        head.append(op.rawValue)
-        head.appendLE(shieldId)
+        head.append(1)  // companion signing tier
+        head.append(6)  // display a warning on Home
+        head.appendLE(newShieldId())
         head.appendLE(seq)
-        head.appendLE(ttlSecs)
-        head.appendLE(pid)
-        head.appendLE(UInt16(payload.count))
+        head.appendLE(UInt32(0))  // no TTL or process target
+        head.appendLE(UInt32(0))
+        head.appendLE(UInt16(0))  // no payload
         // The signed header states the signature's length, and DER signatures
         // are 70-72 bytes: sign until the two agree.
         var guess = 71
         for _ in 0..<16 {
             var signed = head
             signed.appendLE(UInt16(guess))
-            signed.append(payload)
             let sig: Data
             switch key {
             case .enclave(let k): sig = try k.signature(for: signed).derRepresentation

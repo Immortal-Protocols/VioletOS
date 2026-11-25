@@ -4,7 +4,7 @@
 
 Speaks the companion's protocols exactly: SOCKS5 with username/password (the
 relay QEMU's net_relay.py dials with VIOLET_NET_SOCKS), `sentinel.violet:7000`
-answered locally, and signed `VSH1` Shields (vsh1.py, the dev key pinned in the
+answered locally, and signed `VSH1` Home warnings (vsh1.py, the dev key pinned in the
 QEMU image). With --model it scores windows with the trained student in PyTorch
 (the iPhone runs the CoreML export of the same weights); without it, Tier 0
 only. --record writes every Sentinel record as JSON lines (train.py reads
@@ -38,7 +38,6 @@ class Companion:
         self.tracks: dict[int, AppTrack] = {}
         self.flows: list[dict] = []
         self.reported: dict[str, float] = {}
-        self.blocked: set[str] = set()
         self.decisions: list[dict] = []
         self.link = None
         self.link_up_since = None
@@ -48,7 +47,7 @@ class Companion:
         self.stats = {"events": 0, "windows_scored": 0, "shields_sent": 0, "shields_accepted": 0, "shields_rejected": 0, "heartbeat": ""}
         self.record_file = open(args.record, "a") if args.record else None
         self.host_map = json.loads(args.host_map) if args.host_map else {}
-        self.contained: set[int] = set()
+        self.last_warning: dict[int, float] = {}
         self.dirty: dict[int, float] = {}
         self.model = None
         if args.model:
@@ -105,9 +104,6 @@ class Companion:
                 return c.close()
             target = f"{host.lower()}:{port}"
             with self.lock:
-                if host.lower() in self.blocked or target in self.blocked:
-                    c.sendall(b"\x05\x02\x00\x01" + bytes(6))
-                    return c.close()
                 flow = {"target": target, "started": time.time(), "up": 0, "down": 0, "sock": c, "flagged": False}
                 self.flows.append(flow)
             dial = self.host_map.get(host.lower(), f"{host}:{port}")
@@ -175,8 +171,6 @@ class Companion:
         with self.lock:
             if kind == 0x01:
                 self.stats["hello"] = text
-                for m, v, t, wo, xo in vsh1.BASELINE:
-                    self.send_shield(vsh1.OP_INSTALL, 3600, payload=vsh1.rule_payload(m, v, t, wo, xo), what=f"baseline {t}")
             elif kind == 0x02:
                 for line in text.splitlines():
                     r = Record.parse(line)
@@ -195,8 +189,6 @@ class Companion:
                         self.dirty.setdefault(r.pid, time.time())
                     if r.kind == "EXIT":
                         self.dirty.pop(r.pid, None)
-                    if r.kind == "THAWED":
-                        self.contained.discard(r.pid)
             elif kind == 0x03:
                 self.stats["heartbeat"] = text
             elif kind == 0x04:
@@ -260,31 +252,19 @@ class Companion:
         d["hosts"] = sorted(set(hosts))
         d["contained"] = False
         mal = d["p_malicious"] >= 0.9 and d["action"] in ("freeze_app", "block_host")
-        if mal and t.pid not in self.contained:
-            self.contained.add(t.pid)
-            d["contained"] = True
-            def cut(targets=[h.lower() for h in d["hosts"]]):
-                for f in self.flows:
-                    if f["target"] in targets:
-                        try:
-                            f["sock"].shutdown(socket.SHUT_RDWR)
-                            f["sock"].close()
-                        except OSError:
-                            pass
-            for h in d["hosts"]:
-                self.blocked.add(h.lower())
-                self.blocked.add(h.rsplit(":", 1)[0].lower())
-            # Cut the live upload just after the freeze, as the app does.
-            threading.Timer(1.0 if d["action"] == "freeze_app" and self.link else 0, cut).start()
-            if d["action"] == "freeze_app":
-                self.send_shield(vsh1.OP_FREEZE, self.args.ttl, pid=t.pid, what=f"freeze of {t.name}")
-            for h in d["hosts"]:
-                self.send_shield(vsh1.OP_INSTALL, self.args.ttl, payload=vsh1.rule_payload(vsh1.MATCH_HOST, vsh1.VERDICT_DENY, h.rsplit(":", 1)[0]),
-                                 what=f"DENY {h}")
-        print(f"companion_sim: {d['tier']} {t.name} pid {t.pid}: {d['verdict']} p_mal={d['p_malicious']:.2f} {d['action']}"
-              f"{' CONTAINED' if d['contained'] else ''}", flush=True)
+        d["warned"] = mal and self.warn(t.pid)
+        print(f"companion_sim: {d['tier']} {t.name} pid {t.pid}: {d['verdict']} p_mal={d['p_malicious']:.2f}"
+              f"{' WARNED' if d['warned'] else ''}", flush=True)
         self.decisions.insert(0, d)
         del self.decisions[30:]
+
+    def warn(self, pid):
+        now = time.time()
+        if not self.link or now - self.last_warning.get(pid, 0) < 60:
+            return False
+        self.send_shield(vsh1.OP_WARNING, 0, what="Home warning")
+        self.last_warning[pid] = now
+        return True
 
     def unreported(self, now):
         if not self.link_up_since or now - self.link_up_since < 5:
@@ -296,18 +276,16 @@ class Companion:
             r = self.reported.get(f["target"])
             if r and abs(r - f["started"]) < 15:
                 continue
-            host = f["target"].rsplit(":", 1)[0]
-            self.blocked.update({host, f["target"]})
-            self.send_shield(vsh1.OP_INSTALL, self.args.ttl, payload=vsh1.rule_payload(vsh1.MATCH_HOST, vsh1.VERDICT_DENY, host), what=f"DENY {host}")
             self.decisions.insert(0, {"time": now, "pid": 0, "app": "unattributed", "tier": "relay", "verdict": "exfil_or_c2", "p_malicious": 1.0,
-                                      "action": "block_host", "tags": ["socks_sentinel_mismatch"], "hosts": [f["target"]], "contained": True,
-                                      "note": "relay saw a connection the Sentinel never reported"})
-            print(f"companion_sim: UNREPORTED connection {f['target']} blocked", flush=True)
+                                      "action": "block_host", "tags": ["socks_sentinel_mismatch"], "hosts": [f["target"]], "contained": False,
+                                      "warned": self.warn(0), "note": "relay saw a connection the Sentinel never reported"})
+            del self.decisions[30:]
+            print(f"companion_sim: UNREPORTED connection {f['target']} flagged", flush=True)
 
     def write_status(self):
         if not self.args.status:
             return
-        s = dict(self.stats, link_up=self.link is not None, blocked=sorted(self.blocked),
+        s = dict(self.stats, link_up=self.link is not None, blocked=[],
                  decisions=[{k: v for k, v in d.items() if k != "window"} for d in self.decisions])
         Path(self.args.status).write_text(json.dumps(s, indent=1))
 
@@ -349,6 +327,5 @@ if __name__ == "__main__":
     ap.add_argument("--model", action="store_true")
     ap.add_argument("--record")
     ap.add_argument("--status")
-    ap.add_argument("--ttl", type=int, default=30)
     ap.add_argument("--host-map", default="")
     Companion(ap.parse_args()).serve()

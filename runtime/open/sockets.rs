@@ -175,6 +175,12 @@ impl Runtime {
                     return Done(EINVAL);
                 }
                 let host = self.net.host_for(ip);
+                if host == "sentinel.violet"
+                    || (matches!(host.as_str(), "agent-pair.violet" | "agent-relay.violet")
+                        && (cfg!(moto_board) || self.apps[i].as_ref().map(|a| a.path.as_str()) != Some(super::appstore::INSTALLER)))
+                {
+                    return Done(-13);
+                }
                 drop(file);
                 match self.gate(i, &super::policy::Action::Connect { host: &host, port }) {
                     super::Gate::Allow => {}

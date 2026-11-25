@@ -23,16 +23,13 @@ use std::time::{Duration, Instant};
 use layout::{Item, Layout};
 use url::Url;
 use violet::device::{TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP};
+use violet::keyboard::{Key, Keyboard, TOP as KEYBOARD_TOP};
 use violet::{colors, compositor, mix, rgb, Canvas, Compositor, Fonts, Rect, Screen, H, W};
 
 const TOOLBAR: i32 = 124;
 const BACK_BOX: Rect = Rect::new(200, 34, 284, 92);
 const ADDRESS_BOX: Rect = Rect::new(298, 34, 694, 92);
 const PROGRESS: Rect = Rect::new(0, TOOLBAR - 6, W as i32, TOOLBAR);
-const KEY_H: i32 = 96;
-const KEYBOARD_TOP: i32 = H as i32 - 5 * KEY_H - 16;
-const KEY_ROWS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl:", "zxcvbnm.-/"];
-
 const START_PAGE: &str = r#"<!doctype html>
 <html><head><title>Ladybird</title>
 <style>
@@ -141,6 +138,7 @@ struct Browser {
     generation: u64,
     status: String,
     editing: Option<String>,
+    keyboard: Keyboard,
     tx: mpsc::Sender<Loaded>,
     /// Counts pages shown, so the compositor's layer is repainted for a new one.
     serial: u64,
@@ -353,21 +351,24 @@ impl Browser {
     }
 
     /// How far the page scrolls, with the keyboard up or not.
-    fn max_scroll(&self) -> i32 {
-        let height = self.page.as_ref().map_or(0, |p| p.layout.height);
-        let room = if self.editing.is_some() { KEYBOARD_TOP - TOOLBAR } else { viewport() };
-        (height - room + 40).max(0)
+    fn visible_rows(&self) -> i32 {
+        if self.editing.is_some() { KEYBOARD_TOP - TOOLBAR } else { viewport() }
     }
 
-    /// A band of the page around scroll `around` for the compositor to scroll
-    /// through: up to four screens, painted here on the main thread while the
-    /// compositor keeps scrolling the band it has.
-    fn band(&self, around: i32) -> (Canvas, i32) {
-        let room = viewport();
+    fn max_scroll(&self) -> i32 {
+        let height = self.page.as_ref().map_or(0, |p| p.layout.height);
+        (height - self.visible_rows() + 40).max(0)
+    }
+
+    /// Paint at most two viewports of the page. Reuse the old backing store
+    /// when its size fits, or drop it before allocating the replacement.
+    fn band(&self, around: i32, old: Option<Canvas>) -> (Canvas, i32) {
+        let room = self.visible_rows();
         let content = self.max_scroll() + room;
-        let band_h = (4 * room).min(content).max(room);
-        let origin = (around - (band_h - room) / 2).clamp(0, (content - band_h).max(0));
-        let mut c = Canvas::new(W, band_h as usize);
+        let band_h = (2 * room).min(content);
+        let origin = (around - (band_h - room) / 2).clamp(0, content - band_h);
+        let mut c = old.filter(|layer| layer.h == band_h as usize)
+            .unwrap_or_else(|| Canvas::new(W, band_h as usize));
         match &self.page {
             None => c.fill(c.bounds(), rgb(0xff, 0xff, 0xff)),
             Some(page) => {
@@ -419,50 +420,12 @@ impl Browser {
         }
     }
 
-    fn key_at(x: i32, y: i32) -> Option<&'static str> {
-        if y < KEYBOARD_TOP + 8 {
-            return None;
-        }
-        let row = (y - KEYBOARD_TOP - 8) / KEY_H;
-        let col = (x / 72).clamp(0, 9) as usize;
-        match row {
-            0..=3 => Some(&KEY_ROWS[row as usize][col..col + 1]),
-            4 => Some(match x {
-                0..144 => ".com",
-                144..216 => "_",
-                216..432 => " ",
-                432..576 => "⌫",
-                _ => "Go",
-            }),
-            _ => None,
-        }
-    }
-
     fn draw_keyboard(&mut self) {
-        if self.editing.is_none() {
-            return;
-        }
-        let c = &mut self.c;
-        c.fill(Rect::new(0, KEYBOARD_TOP, W as i32, H as i32), colors::BACKGROUND);
-        let face = self.fonts.medium(34.0);
-        let key = |c: &mut Canvas, r: Rect, label: &str, bg| {
-            c.round_rect(r.inset(4), 14.0, bg);
-            let base = r.y0 + (r.height() + face.ascent() - face.descent()) / 2;
-            face.centered(c, label, r.x0, r.x1, base, if bg == colors::ACCENT { colors::BACKGROUND } else { colors::INK });
-        };
-        for (row, keys) in KEY_ROWS.iter().enumerate() {
-            for (col, k) in keys.chars().enumerate() {
-                let r = Rect::new(col as i32 * 72, KEYBOARD_TOP + 8 + row as i32 * KEY_H, col as i32 * 72 + 72, KEYBOARD_TOP + 8 + (row as i32 + 1) * KEY_H);
-                key(c, r, &k.to_string(), colors::PANEL);
-            }
-        }
-        let y0 = KEYBOARD_TOP + 8 + 4 * KEY_H;
-        for (x0, x1, label, bg) in [(0, 144, ".com", colors::PANEL), (144, 216, "_", colors::PANEL), (216, 432, "space", colors::PANEL), (432, 576, "⌫", colors::PANEL), (576, 720, "Go", colors::ACCENT)] {
-            key(c, Rect::new(x0, y0, x1, y0 + KEY_H), label, bg);
+        if self.editing.is_some() {
+            self.keyboard.draw(&mut self.c, &self.fonts);
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn draw(&mut self) {
         self.draw_page();
         self.draw_toolbar();
@@ -495,25 +458,22 @@ impl Browser {
         if ADDRESS_BOX.contains(x, y) {
             if self.editing.is_none() {
                 self.editing = Some(String::new());
+                self.keyboard = Keyboard::address();
                 println!("ladybird: editing address");
             }
             return;
         }
         if let Some(text) = self.editing.as_mut() {
-            if let Some(k) = Self::key_at(x, y) {
-                match k {
-                    "⌫" => {
-                        text.pop();
+            if let Some(key) = self.keyboard.key_at(x, y) {
+                if key == Key::Go {
+                    let typed = std::mem::take(text);
+                    self.editing = None;
+                    println!("ladybird: go {typed:?}");
+                    if let Some(u) = interpret(&typed) {
+                        self.navigate(Location::Web(u), true);
                     }
-                    "Go" => {
-                        let typed = std::mem::take(text);
-                        self.editing = None;
-                        println!("ladybird: go {typed:?}");
-                        if let Some(u) = interpret(&typed) {
-                            self.navigate(Location::Web(u), true);
-                        }
-                    }
-                    k => text.push_str(k),
+                } else {
+                    self.keyboard.press(key, text, usize::MAX);
                 }
                 return;
             }
@@ -549,7 +509,7 @@ pub fn register_names() {
 #[cfg(target_os = "macos")]
 fn render_to_file(input: &str, output: &str, scroll: i32) {
     let (tx, _rx) = mpsc::channel::<Loaded>();
-    let mut b = Browser { fonts: Fonts::load(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, tx, serial: 0 };
+    let mut b = Browser { fonts: Fonts::load(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, keyboard: Keyboard::address(), tx, serial: 0 };
     let body = std::fs::read(input).expect("input");
     let url = Url::parse("http://localhost/").unwrap();
     let sheets: Vec<String> = std::env::args().skip(5).map(|p| std::fs::read_to_string(p).expect("style sheet")).collect();
@@ -592,6 +552,7 @@ fn main() {
         generation: 0,
         status: String::new(),
         editing: None,
+        keyboard: Keyboard::address(),
         tx,
         serial: 0,
     };
@@ -618,9 +579,16 @@ fn main() {
                 }
             }
             Ok(e) if e.kind == compositor::BAND => band_at = Some(e.value),
-            Ok(e) if e.kind == TOUCH_DOWN => press = Some((e.x, e.y)),
+            Ok(e) if e.kind == TOUCH_DOWN => {
+                press = Some((e.x, e.y));
+                if b.editing.is_some() {
+                    b.keyboard.pressed = b.keyboard.key_at(e.x, e.y);
+                    chrome |= b.keyboard.pressed.is_some();
+                }
+            }
             Ok(e) if e.kind == TOUCH_MOVE && e.code == compositor::SCROLLING => press = None,
             Ok(e) if e.kind == TOUCH_UP => {
+                chrome |= b.keyboard.pressed.take().is_some();
                 if let Some((x, y)) = press.take().filter(|_| e.code != compositor::SCROLLING) {
                     b.scroll = comp.scroll(view);
                     b.tap(x, y);
@@ -646,7 +614,7 @@ fn main() {
                 comp.set_viewport(view, Rect::new(0, TOOLBAR, W as i32, bottom));
             }
             let around = band_at.unwrap_or(b.scroll);
-            let (layer, origin) = b.band(around);
+            let (layer, origin) = b.band(around, comp.take_layer(view));
             comp.set_layer(view, layer, origin, b.max_scroll());
             if band_at.is_none() {
                 comp.set_scroll(view, b.scroll);

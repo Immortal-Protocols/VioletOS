@@ -43,10 +43,13 @@ use procmgr::Space;
 use sys::Object;
 
 /// Apps that may run at once; each gets a slice of kernel memory for its objects.
+#[cfg(moto_board)]
 pub const MAX_APPS: usize = 6;
+#[cfg(not(moto_board))]
+pub const MAX_APPS: usize = 8;
 /// The Home app: started at boot and shown whenever no other app is in front.
 pub const HOME_APP: &str = "/apps/home";
-const APP_KERNEL_BITS: u32 = 19; // 512 KiB of kernel objects per app: six fit in the 4 MiB the supervisor gives
+const APP_KERNEL_BITS: u32 = 19; // 512 KiB of kernel objects per app
 const APP_CNODE_BITS: u32 = 8;
 /// Pages of the pool kept for the runtime's own heap.
 const HEAP_PAGES: usize = 768; // 48 MiB: the runtime, pushed apps and file data

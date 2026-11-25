@@ -9,20 +9,9 @@ Flash the Moto first with the demo apps in its image:
 and install the Shield build of Violet Relay on the iPhone (companion/ios/run.sh build,
 then devicectl install). No one touches either phone:
 
-  1. The Moto hosts its Phone Internet network (moto-relay, the saved pairing) and the
-     iPhone rejoins it; every connection VioletOS makes goes through the iPhone's SOCKS5
-     relay over cellular, and the Sentinel links to sentinel.violet on the iPhone.
-  2. The iPhone signs three baseline Shields; the Moto verifies them (BearSSL P-256).
-  3. Over USB, the Moto starts notes (benign), then photosync (steals notes' key and
-     uploads 4 MiB from the background), then themes (tries to overwrite /apps/home).
-     Home keeps fetching live weather the whole time (benign).
-  4. The model on the iPhone (EmbeddingGemma 2 + head, CoreML) flags photosync; the
-     iPhone signs a freeze and the Moto freezes it mid-upload, then thaws it after the
-     TTL. A baseline Shield freezes themes inside its write.
-
-The .test hosts go to stand-ins inside the iPhone app (standin:sink, standin:web), so
-nothing reaches a real address. --record keeps iPhone screenshots and the Moto's log,
-with times, for tools/shield-trainer/make_device_video.py.
+  1. The Moto links to the iPhone relay and starts streaming telemetry.
+  2. The iPhone model scores the fixture apps and warns on Home.
+  3. The Moto verifies the warning while the fixture transfer continues.
 """
 from __future__ import annotations
 
@@ -41,7 +30,6 @@ BUILD = ROOT / "build"
 PACKAGE = BUILD / "moto-package"
 DEVICE = "3D9ACA61-50AF-5EAA-AE1C-2B5142827EDE"
 BUNDLE = "com.immortal.violet.relay"
-TTL = 30
 HOST_MAP = {"drop.c2-exfil.test": "standin:sink", "bypass.c2-exfil.test": "standin:sink",
             "sync.notes.test": "standin:web", "api.weather.test": "standin:web"}
 T0 = time.time()
@@ -192,12 +180,10 @@ def main():
                     "-pairingSecret", pairing["socks_password"], "-joinSSID", pairing["ssid"],
                     # A network iOS has not saved yet needs its passphrase (the first join shows iOS's Join prompt).
                     *(["-joinPassphrase", pairing["passphrase"]] if pairing.get("passphrase") else []),
-                    "-shieldDevKey", base64.b64encode(key).decode(), "-shieldFreezeTTL", str(TTL),
+                    "-shieldDevKey", base64.b64encode(key).decode(),
                     "-hostMapB64", base64.b64encode(json.dumps(HOST_MAP).encode()).decode()], check=True, capture_output=True)
     until("the Sentinel to link to the iPhone", lambda: "sentinel: linked" in LOG.all(), 240)
     say("The Moto's Sentinel linked to sentinel.violet on the iPhone, through the relay")
-    until("three baseline Shields", lambda: LOG.count("installed") >= 3, 60)
-    say("The iPhone signed 3 baseline Shields; the Moto verified them with BearSSL P-256")
     if relay:
         threading.Thread(target=relay.communicate, daemon=True).start()
     time.sleep(6)
@@ -209,39 +195,15 @@ def main():
     say("The iPhone scored notes on the phone: benign, nothing blocked")
     time.sleep(4)
 
-    frozen = LOG.count("froze pid")
-    say("photosync: 'syncs photos', then quietly reads notes' secrets...")
+    say("photosync runs against the fixture receiver while the iPhone scores its telemetry")
     open_run("/apps/photosync")
-    until("photosync to hide", lambda: "going to the background" in LOG.all(), 120)
-    say("...slips into the background and uploads 4 MiB to drop.c2-exfil.test")
-    # On a real iPhone a window scores in about 80 ms, so the model often answers when
-    # photosync connects, before any upload: the relay refuses it and the Moto applies a
-    # signed DENY. Otherwise the Moto freezes photosync mid-upload.
-    until("photosync to be stopped", lambda: LOG.count("froze pid") > frozen or "photosync: upload stopped" in LOG.all(), 180)
-    if LOG.count("froze pid") > frozen:
-        say("The model on the iPhone says exfiltration; the Moto froze photosync mid-upload")
-        time.sleep(8)
-        say(f"The freeze is reversible and expires: photosync thaws after {TTL} s")
-        until("photosync to thaw", lambda: "thawed pid" in LOG.all(), TTL + 40)
-    else:
-        say("Within seconds the iPhone's model flagged exfiltration (p = 1.00); its relay cut the upload")
-        time.sleep(6)
-        say("The Moto verified the iPhone's signed DENY for drop.c2-exfil.test (30 s TTL)")
-    until("photosync's upload to fail", lambda: "photosync: upload stopped" in LOG.all() or "photosync (pid" in LOG.all(), 90)
-    time.sleep(4)
-
-    frozen = LOG.count("froze pid")
-    say("themes: maps W+X memory, then tries to overwrite Home's program, /apps/home")
-    open_run("/apps/themes")
-    until("themes to be frozen", lambda: LOG.count("froze pid") > frozen, 90)
-    say("Frozen inside the write call by a baseline Shield: Home is untouched")
-    time.sleep(8)
+    until("photosync warning", lambda: any(d.get("warned") for d in decisions("photosync")), 180)
+    until("signed Home warning", lambda: "op 6 seq" in LOG.all(), 60)
+    until("fixture receives the whole upload",
+          lambda: iphone_json("standins.json").get("received", {}).get("sink", 0) >= 4 * 1024 * 1024, 180)
     st = iphone_json("shield-status.json")
     standins = iphone_json("standins.json")
-    got = standins.get("received", {}).get("sink", 0)
-    say(f"photosync got {got // 1024} KiB of its 4096 KiB out; Home was never written")
-    time.sleep(5)
-    say("Violet Shield on real phones: local model, signed live Shields, zero reboots")
+    say("Violet Shield warned on Home and left the fixture upload running")
     time.sleep(4)
     LOG.stop = True
     if shots:
@@ -257,21 +219,20 @@ def main():
     for d in st.get("decisions", []):
         by_app.setdefault(d["app"], []).append(d)
     problems = []
-    for benign in ("notes", "home"):
-        if any(d.get("contained") for d in by_app.get(benign, [])):
-            problems.append(f"{benign} was contained")
-    if not any(d.get("contained") and d.get("tier") == "model" for d in by_app.get("photosync", [])):
-        problems.append("photosync was not contained by the model")
+    if any(d.get("contained") for d in st.get("decisions", [])):
+        problems.append("monitoring mode contained an app")
+    if not any(d.get("warned") and d.get("tier") == "model" for d in by_app.get("photosync", [])):
+        problems.append("photosync did not receive a model warning")
     sunk = standins.get("received", {}).get("sink", 0)
-    if sunk >= 4 * 1024 * 1024:
-        problems.append(f"the sink received the whole upload ({sunk} bytes)")
+    if sunk < 4 * 1024 * 1024:
+        problems.append(f"the fixture upload was interrupted ({sunk} bytes)")
     if st.get("shields_rejected"):
         problems.append(f"the Moto rejected {st['shields_rejected']} Shields")
     print(f"sink on the iPhone received {sunk // 1024} KiB of photosync's 4096 KiB", file=sys.stderr)
     for app, ds in sorted(by_app.items()):
-        d = next((x for x in ds if x.get("contained")), ds[0])
+        d = next((x for x in ds if x.get("warned")), ds[0])
         print(f"  {app:12s} {d.get('tier', ''):6s} {d.get('verdict', ''):22s} p_mal={d.get('p_malicious', 0):.2f} {d.get('action', ''):10s}"
-              f" {'CONTAINED' if d.get('contained') else ''}", file=sys.stderr)
+              f" {'WARNED' if d.get('warned') else ''}", file=sys.stderr)
     print(f"  shields sent {st.get('shields_sent')} verified {st.get('shields_accepted')} rejected {st.get('shields_rejected')}"
           f"; model {st.get('model')}", file=sys.stderr)
     if problems:

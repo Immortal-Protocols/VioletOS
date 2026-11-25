@@ -27,6 +27,7 @@ final class AgentModel: ObservableObject {
     @Published var showingCode: String?
     /// Where the direct path to the phone goes, when it is open.
     @Published var directPath: String?
+    @Published var localReady = false
     /// The relay this Mac names in its own code: --relay, VIOLET_AGENT_RELAY or the Chariot.
     let relayURL: String = {
         let args = CommandLine.arguments
@@ -39,6 +40,10 @@ final class AgentModel: ObservableObject {
     private var saved: Saved
     private let identity: Curve25519.Signing.PrivateKey
     private var link: PhoneLink!
+    private var local: LocalCompanion?
+    private var localInvite: UUID?
+    private var shieldSession: UUID?
+    private var started = false
     private let listener = Listener()
     private let speaker = Speaker()
     /// RoseOS's listener and speaker (voice/violet_voice.py); Apple's speech when unavailable.
@@ -77,11 +82,12 @@ final class AgentModel: ObservableObject {
     /// Answers the phone owes: its list of apps, and removals by name.
     private var appLists: [([String: Any]) -> Void] = []
     private var removals: [String: ([String: Any]) -> Void] = [:]
+    private var opens: [String: (UUID, ([String: Any]) -> Void)] = [:]
     private var timing: [String: Any] = [:]
     /// --say TEXT (repeatable): typed requests once online, --say-gap seconds apart (default 10).
     private var pendingSays: [String] = []
-    /// --install NAME=PATH (repeatable): install built programs once the phone is online (tests).
-    private var pendingInstalls: [(String, String)] = []
+    /// --install NAME[|TITLE]=PATH (repeatable): install locally built programs after connecting.
+    private var pendingInstalls: [(name: String, title: String, path: String)] = []
     /// --record-mic: the phone's microphone stream, kept as mic.wav (measurements).
     private var recording: Data?
     private var micBytes = 0
@@ -112,6 +118,8 @@ final class AgentModel: ObservableObject {
     // MARK: start
 
     func start() {
+        guard !started else { return }
+        started = true
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--unpair"), i >= 0 { saved.phones = []; Store.save(saved); phone = nil }
         for (i, a) in args.enumerated() where a == "--say" && i + 1 < args.count { pendingSays.append(args[i + 1]) }
@@ -119,10 +127,28 @@ final class AgentModel: ObservableObject {
         if let i = args.firstIndex(of: "--name"), i + 1 < args.count { rename(args[i + 1]) }
         for (i, a) in args.enumerated() where a == "--install" && i + 1 < args.count {
             if let eq = args[i + 1].firstIndex(of: "=") {
-                pendingInstalls.append((String(args[i + 1][..<eq]), String(args[i + 1][args[i + 1].index(after: eq)...])))
+                let spec = args[i + 1]
+                let label = spec[..<eq].split(separator: "|", maxSplits: 1)
+                guard let first = label.first else { continue }
+                let name = String(first)
+                let title = label.count == 2 ? String(label[1]) : name.capitalized
+                pendingInstalls.append((name, title, String(spec[spec.index(after: eq)...])))
             }
         }
-        if let p = phone { link.connect(p) }
+        if let p = phone, p.relay != LocalCompanion.relay { link.connect(p) }
+        let key = ProcessInfo.processInfo.environment["VIOLET_SHIELD_KEY"].map { URL(fileURLWithPath: $0) }
+            ?? repo.appendingPathComponent("build/shield/companion-signing.pem")
+        Shield.shared.start(emulatorKey: key, dataDirectory: support)
+        let companion = LocalCompanion(repo: repo, invitation: { [weak self] in self?.inviteEmulator() }) { [weak self] port in
+            guard let self else { return }
+            self.localReady = port != nil
+            self.link.localRelayPort = port
+            if let p = self.phone, p.relay == LocalCompanion.relay {
+                if port != nil { self.link.connect(p) } else { self.link.stop(); self.relayUp = false }
+            }
+        }
+        local = companion
+        companion.start()
         if let i = args.firstIndex(of: "--pair"), i + 1 < args.count, let inv = Invitation(args[i + 1]) { pair(inv) }
         if args.contains("--show-code") { showCode() }
         speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
@@ -350,17 +376,17 @@ final class AgentModel: ObservableObject {
         codex.say("[builder] " + (ok ? "" : "The build stopped. ") + lastBuild)
     }
 
-    /// --install NAME=PATH once online; with --wait-direct, once the direct
+    /// Process queued installs once online; with --wait-direct, once the direct
     /// path is open (or 20 s have passed), so a test sees a program cross it.
     private func installPending(waited: Double) {
-        guard let (name, path) = pendingInstalls.first, online else { return }
+        guard let (name, title, path) = pendingInstalls.first, online else { return }
         if CommandLine.arguments.contains("--wait-direct") && directPath == nil && waited < 20 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.installPending(waited: waited + 0.5) }
             return
         }
         pendingInstalls.removeFirst()
         let via = directPath.map { "direct path \($0)" } ?? "relay"
-        install(["name": name, "title": name.capitalized, "path": path]) { [weak self] ok, text in
+        install(["name": name, "title": title, "path": path]) { [weak self] ok, text in
             self?.log("test install \(name): \(ok ? "ok" : "failed") \(text) (via \(via))")
             self?.installPending(waited: 20)
         }
@@ -380,13 +406,29 @@ final class AgentModel: ObservableObject {
     // MARK: pairing
 
     func pair(_ inv: Invitation) {
+        localInvite = nil
         scanning = false
         log("pairing with \(inv.name) through \(inv.relay)")
         link.pair(inv)
     }
 
+    private func inviteEmulator() -> String? {
+        guard localReady, phone == nil, !scanning, showingCode == nil else { return nil }
+        let id = UUID()
+        localInvite = id
+        let code = link.invite(relay: LocalCompanion.relay, name: Host.current().localizedName ?? "Mac")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+            guard let self, self.localInvite == id else { return }
+            self.localInvite = nil
+            self.link.cancelInvite()
+            self.relayUp = false
+        }
+        return code
+    }
+
     /// Show a one-time code for the phone to read with its camera.
     func showCode() {
+        localInvite = nil
         let code = link.invite(relay: relayURL, name: Host.current().localizedName ?? "Mac")
         showingCode = code
         log("showing a pairing code for the phone's camera through \(relayURL)")
@@ -420,6 +462,7 @@ final class AgentModel: ObservableObject {
         case .relay(let up):
             relayUp = up
         case .paired(let p):
+            localInvite = nil
             saved.phones = [p]
             Store.save(saved)
             phone = p
@@ -433,6 +476,8 @@ final class AgentModel: ObservableObject {
         case .online(let up):
             if up != online { log(up ? "phone online" : "phone offline") }
             online = up
+            if let session = shieldSession { Shield.shared.disconnectAgent(session) }
+            shieldSession = up ? UUID() : nil
             if !up {
                 // A transfer in flight is lost with the link: fail it now rather than at its timeout.
                 for (name, (_, done)) in installs { log("install of \(name) cut off"); done(["ok": false, "error": "the phone went offline during the transfer"]) }
@@ -440,7 +485,8 @@ final class AgentModel: ObservableObject {
                 phonePython = nil
             }
             if up {
-                link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac", "agent_name": agentName])
+                link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac",
+                           "agent_name": agentName, "shield": true])
                 sayPending()
                 if let i = CommandLine.arguments.firstIndex(of: "--speak"), i + 1 < CommandLine.arguments.count {
                     let line = CommandLine.arguments[i + 1]
@@ -467,6 +513,14 @@ final class AgentModel: ObservableObject {
             if recording != nil {
                 recording!.append(pcm)
                 if recording!.count % (32000 * 5) < pcm.count { saveRecording() }
+            }
+        case .shield(let data):
+            guard let session = shieldSession else { return }
+            Shield.shared.receiveAgent(data, session: session) { [weak self] warning in
+                DispatchQueue.main.async {
+                    guard let self, self.shieldSession == session else { return }
+                    self.link.send(kind: 0x32, warning)
+                }
             }
         case .json(let o):
             phoneMessage(o)
@@ -502,7 +556,8 @@ final class AgentModel: ObservableObject {
             removals.removeValue(forKey: name)?(o)
         case "opened":
             let name = o["name"] as? String ?? ""
-            if timing["name"] as? String == name, timing["opened_s"] == nil, let at = requestAt {
+            opens.removeValue(forKey: name)?.1(o)
+            if o["ok"] as? Bool == true, timing["name"] as? String == name, timing["opened_s"] == nil, let at = requestAt {
                 timing["opened_s"] = round(Date().timeIntervalSince(at) * 10) / 10
                 finishTiming()
             }
@@ -730,8 +785,19 @@ final class AgentModel: ObservableObject {
             }
         case "open_app":
             let app = args["name"] as? String ?? ""
+            guard online else { return reply(false, "The phone is offline.") }
+            guard opens[app] == nil else { return reply(false, "An open request for \(app) is already pending.") }
+            let request = UUID()
+            opens[app] = (request, { answer in
+                let ok = answer["ok"] as? Bool == true
+                let reason = answer["error"] as? String ?? "the device refused the launch"
+                reply(ok, ok ? "Opened \(app) on the phone." : "Could not open \(app): \(reason)")
+            })
             link.send(["t": "open", "name": app])
-            reply(online, online ? "Opened \(app) on the phone." : "The phone is offline.")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, self.opens[app]?.0 == request else { return }
+                self.opens.removeValue(forKey: app)?.1(["ok": false, "error": "the phone did not answer"])
+            }
         default:
             reply(false, "Unknown tool \(name)")
         }

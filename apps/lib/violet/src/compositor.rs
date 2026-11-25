@@ -85,12 +85,13 @@ impl View {
             }
         }
     }
-    /// Whether the visible window is within a screen of the layer's edge.
+    /// Whether most of the layer's spare rows are behind the viewport.
     fn near_band_edge(&self) -> bool {
         let Some(l) = &self.layer else { return false };
         let s = self.scroll as i32;
         let (top, bottom) = (self.origin, self.origin + l.h as i32);
-        (s - top < self.height() && top > 0) || (bottom - (s + self.height()) < self.height() && bottom < self.max_scroll + self.height())
+        let margin = ((l.h as i32 - self.height()) / 3).clamp(1, self.height().max(1));
+        (s - top < margin && top > 0) || (bottom - (s + self.height()) < margin && bottom < self.max_scroll + self.height())
     }
 }
 
@@ -173,6 +174,12 @@ impl Compositor {
             v.viewport = viewport;
             v.shown = None;
         });
+    }
+
+    /// Let the app reuse a layer's backing store. The last frame remains
+    /// visible until the replacement is presented.
+    pub fn take_layer(&self, view: usize) -> Option<Canvas> {
+        self.shared.0.lock().unwrap().views[view].layer.take()
     }
 
     /// Give the view a painted layer as wide as its viewport, holding content
@@ -473,6 +480,15 @@ mod tests {
         assert!(end > released + 300.0, "fling went {released} -> {end}");
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].value, end.round() as i32);
+    }
+
+    #[test]
+    fn a_centered_short_band_does_not_request_itself_again() {
+        let mut v = view(Rect::new(0, 100, 720, 1600), 3000, 2000, 7000);
+        v.scroll = 2750.0;
+        assert!(!v.near_band_edge());
+        v.scroll = 3470.0;
+        assert!(v.near_band_edge());
     }
 
     #[test]

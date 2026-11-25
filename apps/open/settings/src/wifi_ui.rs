@@ -5,7 +5,7 @@ use std::f32::consts::PI;
 use violet::wifi::{Network, Security};
 use violet::{colors::*, mix, Canvas, Color, Fonts, Rect, H, W};
 
-use crate::keyboard::{self, Keyboard};
+use violet::keyboard::{self, Keyboard};
 
 pub const ALERT: Color = violet::paper::ALERT;
 const ROW_PRESSED: Color = violet::paper::PAPER_PRESSED;

@@ -11,6 +11,8 @@ mod scan;
 mod secure;
 mod voice;
 
+use std::io::{BufRead, BufReader, Read};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -31,6 +33,8 @@ const ORB_BOX: Rect = Rect::new(150, 390, 570, 810);
 const OPEN_BOX: Rect = Rect::new(60, 1330, 660, 1440);
 const UNPAIR_BOX: Rect = Rect::new(440, 1480, 680, 1560);
 const SCAN_BOX: Rect = Rect::new(110, 1210, 610, 1300);
+const LOCAL_BOX: Rect = Rect::new(110, 1350, 610, 1440);
+const LOCAL_RELAY: &str = "http://agent-relay.violet";
 const PREVIEW: Rect = Rect::new(110, 300, 610, 1180);
 /// STUN servers for the direct path, unless the shared setting "stun" names
 /// one (HOST:PORT, or "off" for the relay only).
@@ -47,6 +51,7 @@ enum Msg {
     Played(voice::Played),
     Direct(u32, direct::Event),
     Scan(scan::Scan),
+    Local(Result<secure::Invitation, String>),
 }
 
 /// What the phone remembers: its identity and the Mac it trusts.
@@ -114,6 +119,10 @@ struct Install {
 }
 
 struct Agent {
+    emulator: bool,
+    local_pending: bool,
+    shield_requested: bool,
+    shield_polled: Option<Instant>,
     me: Identity,
     saved: Saved,
     /// Our relay: the shared setting "relay", else the built-in one.
@@ -181,6 +190,8 @@ impl Agent {
     fn connect(&mut self) {
         self.generation += 1;
         self.session = None;
+        self.shield_requested = false;
+        self.shield_polled = None;
         self.offer = None;
         self.relay_up = false;
         self.stop_direct();
@@ -191,7 +202,7 @@ impl Agent {
                 self.secret = None;
                 self.room = secure::session_room(&self.me.public(), &mac);
                 self.status = format!("Looking for {}…", self.mac_name());
-                if let Some(r) = self.saved.relay.clone().filter(|_| !self.relay_set) {
+                if let Some(r) = self.saved.relay.clone().filter(|r| !self.relay_set || r == LOCAL_RELAY) {
                     self.using = r;
                 }
             }
@@ -200,7 +211,7 @@ impl Agent {
                 self.secret = Some(inv.secret);
                 self.room = secure::pairing_room(&inv.secret);
                 self.status = format!("Pairing with {}…", inv.name);
-                if !self.relay_set {
+                if !self.relay_set || inv.relay == LOCAL_RELAY {
                     self.using = inv.relay.clone();
                 }
             }
@@ -254,6 +265,9 @@ impl Agent {
 
     /// Look for a direct path: a new key, our candidates to the Mac, then probes.
     fn start_direct(&mut self) {
+        if self.using == LOCAL_RELAY {
+            return;
+        }
         self.stop_direct();
         if self.stun.is_empty() || self.session.is_none() {
             return;
@@ -407,7 +421,8 @@ impl Agent {
         let Some(session) = secure::complete(ours, &h, secure::PHONE, &self.room, &phone, &h.ed) else { return };
         if pairing {
             let scanned = self.invitation.take();
-            println!("agent: paired with a new Mac{}", if scanned.is_some() { " (its code, read by the camera)" } else { "" });
+            let local = scanned.as_ref().is_some_and(|i| i.relay == LOCAL_RELAY);
+            println!("agent: paired with a new Mac{}", if local { " (local companion)" } else if scanned.is_some() { " (its code, read by the camera)" } else { "" });
             self.saved.peer = Some(h.ed);
             self.saved.peer_name = scanned.as_ref().map(|i| i.name.clone()).unwrap_or_default();
             self.saved.relay = scanned.map(|i| i.relay).filter(|r| *r != self.relay);
@@ -419,9 +434,12 @@ impl Agent {
             return;
         }
         self.session = Some(session);
+        self.shield_requested = false;
+        self.shield_polled = None;
         self.status = format!("Connected to {}", self.mac_name());
         let listening = !self.muted;
-        self.send_json(json!({"t": "hello", "name": "Moto G Pure", "version": 1, "listening": listening, "python": has_python()}));
+        let device = if self.emulator { "VioletOS emulator" } else { "Moto G Pure" };
+        self.send_json(json!({"t": "hello", "name": device, "version": 1, "listening": listening, "python": has_python()}));
         self.update_mic();
         self.direct_fails = 0;
         self.start_direct();
@@ -439,6 +457,9 @@ impl Agent {
                 let seg = u32::from_le_bytes(body[..4].try_into().unwrap());
                 let _ = self.speech.send(voice::Speech::Pcm(seg, body[4..].to_vec()));
             }
+            0x32 if self.shield_requested && body.len() <= 512 => {
+                violet::sys(&format!("shield-agent push {}", secure::hex(body)));
+            }
             0x30 if body.len() >= 4 => {
                 let offset = u32::from_le_bytes(body[..4].try_into().unwrap()) as u64;
                 if let Some(i) = self.install.as_mut() {
@@ -452,11 +473,25 @@ impl Agent {
         }
     }
 
+    fn poll_shield(&mut self) {
+        if !self.shield_requested || self.session.is_none()
+            || self.shield_polled.is_some_and(|last| last.elapsed() < Duration::from_millis(250)) {
+            return;
+        }
+        let command = if self.shield_polled.is_some() { "shield-agent pull" } else { "shield-agent start" };
+        self.shield_polled = Some(Instant::now());
+        if let Some(bytes) = secure::unhex(&violet::sys(command)).filter(|bytes| !bytes.is_empty()) {
+            self.send(0x31, &bytes);
+        }
+    }
+
     fn on_json(&mut self, v: Value) {
         let t = v["t"].as_str().unwrap_or("");
         let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
         match t {
             "hello" => {
+                self.shield_requested = !self.emulator && v["shield"].as_bool() == Some(true);
+                if !self.shield_requested { self.shield_polled = None; }
                 let name = text("name");
                 if !name.is_empty() && name != self.saved.peer_name {
                     self.saved.peer_name = name;
@@ -555,13 +590,23 @@ impl Agent {
             "open" => {
                 let name = text("name");
                 if secure_name(&name) {
-                    let r = violet::sys(&format!("open /apps/{name}"));
-                    self.send_json(json!({"t": "opened", "name": name, "ok": r.starts_with("ok")}));
+                    self.open_app(&name);
                 }
             }
             "unpair" => self.unpair(false),
             _ => {}
         }
+    }
+
+    fn open_app(&mut self, name: &str) {
+        let result = violet::sys(&format!("open /apps/{name}"));
+        let ok = result == "ok";
+        let reason = result.strip_prefix("error ").unwrap_or(&result);
+        if !ok {
+            self.status = format!("Couldn’t open {name} · {reason}");
+            self.dirty = true;
+        }
+        self.send_json(json!({"t": "opened", "name": name, "ok": ok, "error": if ok { "" } else { reason }}));
     }
 
     fn begin_install(&mut self, v: &Value) {
@@ -582,7 +627,7 @@ impl Agent {
 
     fn finish_install(&mut self) {
         let Some(i) = self.install.take() else { return };
-        let path = format!("/apps/{}", i.name);
+        let staged = "/apps/.agent-install";
         println!("agent: install {}: {} bytes arrived in {} ms over the {}", i.name, i.size, i.started.elapsed().as_millis(), if self.direct_up.is_some() { "direct path" } else { "relay" });
         let data = if i.deflate {
             miniz_oxide::inflate::decompress_to_vec_with_limit(&i.data, 8 << 20).unwrap_or_default()
@@ -602,10 +647,13 @@ impl Agent {
         };
         let r = if data.len() != i.bytes || digest != i.sha256 {
             format!("error the program arrived damaged ({} of {} bytes)", data.len(), i.bytes)
-        } else if let Err(e) = std::fs::write(&path, &stored) {
+        } else if let Err(e) = std::fs::write(staged, &stored) {
+            let _ = std::fs::remove_file(staged);
             format!("error {e}")
         } else {
-            violet::sys(&format!("install {} {}", i.name, i.title))
+            let result = violet::sys(&format!("install {} {}", i.name, i.title));
+            let _ = std::fs::remove_file(staged);
+            result
         };
         let ok = r.starts_with("ok");
         let ms = i.started.elapsed().as_millis() as u64;
@@ -699,10 +747,35 @@ impl Agent {
         self.dirty = true;
     }
 
+    fn pair_local(&mut self) {
+        self.local_pending = true;
+        self.status = "Looking for Violet Agent on this Mac…".into();
+        self.dirty = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let stream = TcpStream::connect(("agent-pair.violet", 80))
+                    .map_err(|_| "Open Violet Agent on this Mac and try again".to_string())?;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+                let mut line = String::new();
+                BufReader::new(stream).take(1024).read_line(&mut line)
+                    .map_err(|_| "The Mac did not answer. Try again".to_string())?;
+                secure::parse_invitation(&line)
+                    .filter(|i| i.from_mac && i.relay == LOCAL_RELAY)
+                    .ok_or_else(|| "The Mac is busy or already paired".to_string())
+            })();
+            let _ = tx.send(Msg::Local(result));
+        });
+    }
+
     fn tap(&mut self, x: i32, y: i32) {
         if violet::HOME_BOX.contains(x, y) {
             violet::home();
-        } else if !self.paired() && SCAN_BOX.contains(x, y) {
+        } else if self.emulator && !self.paired() && !self.local_pending
+            && self.scanning.is_none() && self.invitation.is_none() && LOCAL_BOX.contains(x, y)
+        {
+            self.pair_local();
+        } else if !self.paired() && !self.local_pending && SCAN_BOX.contains(x, y) {
             if self.scanning.is_some() || self.invitation.is_some() {
                 // Back to showing our own code.
                 self.stop_scan();
@@ -723,8 +796,7 @@ impl Agent {
                 self.send_json(json!({"t": "hello", "listening": listening}));
             }
         } else if let Some((name, _)) = self.built.clone().filter(|_| OPEN_BOX.contains(x, y)) {
-            violet::sys(&format!("open /apps/{name}"));
-            self.send_json(json!({"t": "opened", "name": name, "ok": true}));
+            self.open_app(&name);
         }
         self.dirty = true;
     }
@@ -795,6 +867,10 @@ fn draw(c: &mut Canvas, fonts: &Fonts, a: &Agent) {
             body.centered(c, "or scan the code your Mac shows.", 0, W as i32, 1030, INK);
             small.centered(c, &small.fit(&relay_line, W as i32 - 80), 0, W as i32, 1110, MUTED);
             violet::button(c, &fonts.bold(32.0), SCAN_BOX, "Scan the Mac's code", ACCENT, BACKGROUND);
+            if a.emulator {
+                let label = if a.local_pending { "Looking for this Mac…" } else { "Connect to this Mac" };
+                violet::button(c, &fonts.bold(32.0), LOCAL_BOX, label, PANEL, INK);
+            }
         }
         return;
     }
@@ -926,7 +1002,13 @@ fn main() {
     let saved = Saved::load();
     let me = Identity::from_seed(saved.seed);
     println!("agent: key {} relay {relay}", &secure::hex(&me.public())[..16]);
+    let status = violet::sys("status");
+    let status = violet::fields(&status);
     let mut a = Agent {
+        emulator: status.get("emulator").is_some_and(|v| v == "1"),
+        local_pending: false,
+        shield_requested: false,
+        shield_polled: None,
         me,
         saved,
         using: relay.clone(),
@@ -959,7 +1041,7 @@ fn main() {
         listening,
         muted: false,
         // Started behind Home at boot when paired, so not necessarily in front.
-        focused: violet::fields(&violet::sys("status")).get("focused").map_or(true, |v| v == "1"),
+        focused: status.get("focused").map_or(true, |v| v == "1"),
         speech: speech_tx,
         speaking: false,
         tx,
@@ -997,6 +1079,15 @@ fn main() {
             }
             Ok(Msg::Direct(..)) => {}
             Ok(Msg::Scan(s)) => a.on_scan(s),
+            Ok(Msg::Local(result)) => {
+                a.local_pending = false;
+                if !a.paired() {
+                    match result {
+                        Ok(invitation) => { a.invitation = Some(invitation); a.connect(); }
+                        Err(why) => { a.status = why; a.dirty = true; }
+                    }
+                }
+            }
             Ok(Msg::Mic(voice::Mic::Samples(pcm, peak))) => {
                 if a.session.is_some() && a.listening.load(Ordering::Relaxed) {
                     match a.gate.feed(pcm, peak) {
@@ -1050,6 +1141,7 @@ fn main() {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return,
         }
+        a.poll_shield();
         if a.session.is_some() && a.direct.is_none() && a.direct_next.is_some_and(|t| Instant::now() > t) {
             a.direct_next = None;
             a.start_direct();

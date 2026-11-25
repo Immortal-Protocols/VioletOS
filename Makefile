@@ -14,13 +14,16 @@ $(VENV)/.deps: tools/requirements-sel4.txt
 	touch $@
 build/sel4/viewer: tools/emulator/viewer.c
 	mkdir -p $(@D)
-	$(CC) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) $< -o $@ $(shell sdl2-config --libs)
+	$(CC) $(VIEWER_FLAGS) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) $< -o $@ $(shell sdl2-config --libs)
 VIEWER := build/sel4/viewer
 ifeq ($(shell uname -s),Darwin)
+VIEWER_FLAGS := -x objective-c
 VIEWER := build/sel4/VioletOS.app/Contents/MacOS/viewer
-$(VIEWER): build/sel4/viewer tools/emulator/Info.plist
+$(VIEWER): build/sel4/viewer tools/emulator/Info.plist tools/emulator/VioletOS.icns
 	mkdir -p $(@D)
+	mkdir -p build/sel4/VioletOS.app/Contents/Resources
 	cp tools/emulator/Info.plist build/sel4/VioletOS.app/Contents/
+	cp tools/emulator/VioletOS.icns build/sel4/VioletOS.app/Contents/Resources/
 	cp $< $@
 endif
 emulator: qemu-image $(VIEWER)

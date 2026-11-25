@@ -140,7 +140,7 @@ impl Mask {
     /// with a shadow of `depth` pixels below and to the right.
     pub fn emboss(&self, tone: Color, depth: f32) -> Sprite {
         let (w, h) = (self.w, self.h);
-        let height = blur(&self.a, w, h, 2);
+        let height = blur(&self.a, w, h, 3);
         let shadow = blur(&self.a, w, h, (depth * 0.9).max(1.0) as usize);
         let (ox, oy) = ((depth * 0.6).round() as i32, depth.round() as i32);
         let mut px = vec![0u32; w * h];
@@ -153,8 +153,8 @@ impl Mask {
                 let (xi, yi) = (x as i32, y as i32);
                 // The surface rises into the shape: where it faces the light it is brighter.
                 let slope = (at(xi + 1, yi) - at(xi - 1, yi)) + (at(xi, yi + 1) - at(xi, yi - 1)) * 1.3;
-                let lit = (slope * 1.5).clamp(-1.0, 1.0);
-                let grade = 1.0 - 0.10 * y as f32 / h as f32;
+                let lit = (slope * 1.8).clamp(-1.0, 1.0);
+                let grade = 1.04 - 0.14 * y as f32 / h as f32 - 0.04 * x as f32 / w as f32;
                 let mut body = mix(BLACK, tone, grade);
                 body = if lit > 0.0 { mix(body, WHITE, lit * 0.55) } else { mix(body, rgb(0x3a, 0x32, 0x28), -lit * 0.6) };
                 let a = self.a[i];
@@ -240,51 +240,67 @@ fn hash(x: u32, y: u32) -> u32 {
     v ^ (v >> 13)
 }
 
-/// Home's wallpaper: stepped sheets of dark paper with a little grain.
-pub fn wallpaper(w: usize, h: usize) -> Canvas {
-    let mut c = Canvas::new(w, h);
-    c.fill(Rect::new(0, 0, w as i32, h as i32), rgb(0x24, 0x23, 0x22));
-    // Each sheet: where it lies, its tone, and how far it stands off the one below.
-    let sheets: [(Rect, Color, f32); 9] = [
-        (Rect::new(596, -40, 760, 1236), rgb(0x21, 0x20, 0x1f), 10.0),
-        (Rect::new(-40, -40, 596, 1010), rgb(0x2c, 0x2b, 0x29), 18.0),
-        (Rect::new(566, -40, 690, 168), rgb(0x30, 0x2f, 0x2d), 12.0),
-        (Rect::new(-40, 1010, 470, 1112), rgb(0x28, 0x27, 0x26), 14.0),
-        (Rect::new(-40, 1112, 214, 1262), rgb(0x2a, 0x29, 0x27), 14.0),
-        (Rect::new(470, 830, 596, 1112), rgb(0x26, 0x25, 0x24), 12.0),
-        (Rect::new(214, 1236, 760, 1340), rgb(0x2e, 0x2d, 0x2b), 16.0),
-        (Rect::new(-40, 1262, 214, 1640), rgb(0x23, 0x22, 0x21), 10.0),
-        (Rect::new(214, 1340, 760, 1640), rgb(0x27, 0x26, 0x25), 12.0),
-    ];
-    for (r, tone, lift) in sheets {
-        // The shadow falls down and to the right, softer the higher the sheet.
-        let area = Rect::new(r.x0, r.y0, r.x1 + (lift * 3.0) as i32, r.y1 + (lift * 3.0) as i32).intersect(c.bounds());
-        let (cx, cy) = ((r.x0 + r.x1) as f32 / 2.0 + lift * 0.5, (r.y0 + r.y1) as f32 / 2.0 + lift * 0.8);
-        let (hw, hh) = (r.width() as f32 / 2.0, r.height() as f32 / 2.0);
-        for y in area.y0..area.y1 {
-            for x in area.x0..area.x1 {
-                if r.contains(x, y) {
-                    continue;
-                }
-                let d = sdf::rbox(x as f32 + 0.5, y as f32 + 0.5, cx, cy, hw, hh, 0.0);
-                let t = (1.0 - (d + lift) / (2.0 * lift)).clamp(0.0, 1.0);
-                c.blend(x, y, BLACK, 0.55 * t * t);
+/// Paint a sheet with rounded, overlapping sections, from the shadow up to
+/// the lit stock. The rectangles overlap so there are no seams within a sheet.
+fn sheet(c: &mut Canvas, panels: &[Rect], tone: Color, lift: f32) {
+    let bounds = panels.iter().copied().reduce(|a, b| a.union(b)).unwrap();
+    let area = bounds.inset(-((lift * 2.0) as i32)).intersect(c.bounds());
+    let panels: Vec<_> = panels.iter().map(|r| {
+        let (hw, hh) = (r.width() as f32 * 0.5, r.height() as f32 * 0.5);
+        (r.x0 as f32 + hw, r.y0 as f32 + hh, hw, hh)
+    }).collect();
+    let distance = |x: f32, y: f32| {
+        panels.iter().map(|&(cx, cy, hw, hh)| sdf::rbox(x, y, cx, cy, hw, hh, 7.0))
+            .fold(f32::MAX, f32::min)
+    };
+    for y in area.y0..area.y1 {
+        for x in area.x0..area.x1 {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let edge = distance(px, py);
+            if edge > 0.0 {
+                let shadow = distance(px - lift * 0.38, py - lift * 0.70);
+                let ambient = (1.0 - edge / (lift * 0.7)).clamp(0.0, 1.0);
+                let cast = (1.0 - shadow / lift).clamp(0.0, 1.0);
+                c.blend(x, y, BLACK, 0.22 * ambient + 0.48 * cast * cast);
+            }
+            if edge < 0.5 {
+                let rim = (1.0 + edge / 5.0).clamp(0.0, 1.0);
+                let diffuse = (1.0 + edge / 72.0).clamp(0.0, 1.0);
+                let lit = mix(tone, rgb(0x83, 0x7e, 0x71), rim * 0.19 + diffuse * 0.085);
+                c.blend(x, y, lit, cover(edge));
             }
         }
-        c.fill(r, tone);
-        // A lit top and left edge, a dark lower and right one.
-        c.fill(Rect::new(r.x0, r.y0, r.x1, r.y0 + 2), mix(tone, WHITE, 0.10));
-        c.fill(Rect::new(r.x0, r.y0, r.x0 + 2, r.y1), mix(tone, WHITE, 0.07));
-        c.fill(Rect::new(r.x0, r.y1 - 2, r.x1, r.y1), mix(tone, BLACK, 0.25));
-        c.fill(Rect::new(r.x1 - 2, r.y0, r.x1, r.y1), mix(tone, BLACK, 0.25));
     }
-    // Grain, and the light falling off towards the bottom.
+}
+
+/// Home's wallpaper: staggered sheets of charcoal paper and their cast shadows.
+pub fn wallpaper(w: usize, h: usize) -> Canvas {
+    let mut c = Canvas::new(w, h);
+    c.fill(c.bounds(), rgb(0x22, 0x22, 0x20));
+    sheet(&mut c, &[Rect::new(583, -40, 762, 1287)], rgb(0x29, 0x28, 0x25), 23.0);
+    sheet(&mut c, &[Rect::new(202, 1286, 762, 1379)], rgb(0x2b, 0x2a, 0x27), 27.0);
+    sheet(&mut c, &[Rect::new(-40, -40, 205, 1318)], rgb(0x2d, 0x2c, 0x28), 33.0);
+    sheet(&mut c, &[Rect::new(-40, -40, 472, 1200)], rgb(0x30, 0x2e, 0x2a), 26.0);
+    sheet(&mut c, &[
+        Rect::new(-40, -40, 676, 831),
+        Rect::new(-40, -40, 608, 990),
+        Rect::new(-40, -40, 472, 1112),
+    ], rgb(0x31, 0x30, 0x2c), 24.0);
+    sheet(&mut c, &[Rect::new(585, -40, 762, 190)], rgb(0x28, 0x27, 0x23), 18.0);
+
+    // Vary the stock at two scales, with softer light towards the screen edges.
     for y in 0..h {
-        let fade = 1.0 - 0.12 * y as f32 / h as f32;
+        let v = y as f32 / h as f32;
         for x in 0..w {
-            let n = (hash(x as u32, y as u32) % 7) as i32 - 3;
+            let u = x as f32 / w as f32;
+            let grain = (hash(x as u32, y as u32) % 7) as i32 - 3;
+            let fibres = (hash((x / 2) as u32, (y / 3) as u32) % 5) as i32 - 2;
+            let falloff = 1.02 - 0.18 * (u - 0.38).abs() - 0.10 * v;
             let p = c.px[y * w + x];
-            let ch = |shift: u32| ((((p >> shift) & 0xff) as f32 * fade) as i32 + n).clamp(0, 255) as u32;
+            let ch = |shift: u32| {
+                let channel = ((p >> shift) & 0xff) as f32 * falloff;
+                (channel as i32 + grain + fibres).clamp(0, 255) as u32
+            };
             c.px[y * w + x] = 0xff00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0);
         }
     }
@@ -303,77 +319,88 @@ pub mod icons {
     /// Ladybird Browser: three orbits.
     pub fn ladybird() -> Mask {
         let mut m = Mask::new(SIZE, SIZE);
-        for angle in [PI / 4.0, -PI / 4.0] {
-            m.add(|x, y| outline(ellipse(x, y, C, C, 62.0, 25.0, angle), 9.0));
+        for angle in [PI / 4.7, -PI / 4.7] {
+            m.add(|x, y| outline(ellipse(x, y, C, C, 84.0, 27.0, angle), 9.5));
         }
-        m.add(|x, y| outline(ellipse(x, y, C, C, 64.0, 40.0, 0.0), 9.0));
+        m.add(|x, y| outline(ellipse(x, y, C, C, 58.0, 62.0, 0.0), 9.5));
         m
     }
 
     /// Bitchat: a tile with BIT pressed into it.
     pub fn bitchat(fonts: &Fonts) -> Mask {
         let mut m = Mask::new(SIZE, SIZE);
-        m.add(|x, y| rbox(x, y, C, C, 56.0, 56.0, 16.0));
-        m.text(&fonts.bold(46.0), "BIT", C as i32, 100, true);
+        m.add(|x, y| rbox(x, y, C, C, 62.0, 62.0, 22.0));
+        m.text(&fonts.bold(44.0), "BIT", C as i32, 100, true);
         m
     }
 
     /// Violet Agent: a head in profile, looking right.
     pub fn agent() -> Mask {
         let mut m = Mask::new(SIZE, SIZE);
-        let face: [(f32, f32); 15] = [
-            (84.0, 36.0), (108.0, 42.0), (118.0, 60.0), (117.0, 72.0), (130.0, 92.0), (119.0, 96.0), (121.0, 104.0),
-            (116.0, 108.0), (119.0, 116.0), (112.0, 128.0), (96.0, 130.0), (92.0, 150.0), (60.0, 150.0), (62.0, 110.0), (60.0, 60.0),
+        let shape = |(x, y): (f32, f32)| (C + (x - C) * 1.08, C + (y - C) * 0.86);
+        let profile = [
+            (40.0, 60.0), (49.0, 39.0), (64.0, 27.0), (84.0, 16.0),
+            (103.0, 15.0), (119.0, 20.0), (125.0, 29.0), (125.0, 42.0),
+            (132.0, 57.0), (133.0, 69.0), (145.0, 91.0), (144.0, 96.0),
+            (135.0, 99.0), (135.0, 106.0), (131.0, 110.0), (132.0, 118.0),
+            (127.0, 130.0), (108.0, 132.0), (101.0, 150.0), (64.0, 150.0),
+            (65.0, 141.0), (47.0, 135.0), (38.0, 123.0), (37.0, 109.0),
+            (42.0, 96.0), (35.0, 82.0), (35.0, 73.0),
+        ].map(shape);
+        m.add(|x, y| polygon(x, y, &profile) - 2.5);
+        // Swept hair, modelled as shallow grooves across the silhouette.
+        let waves: [&[(f32, f32)]; 2] = [
+            &[(36.0, 93.0), (49.0, 90.0), (65.0, 81.0), (77.0, 69.0),
+              (87.0, 52.0), (98.0, 40.0), (111.0, 34.0), (126.0, 35.0)],
+            &[(62.0, 145.0), (59.0, 132.0), (64.0, 119.0), (74.0, 108.0),
+              (90.0, 100.0), (102.0, 93.0), (111.0, 79.0), (122.0, 69.0), (132.0, 68.0)],
         ];
-        m.add(|x, y| polygon(x, y, &face) - 3.0);
-        // Hair swept back into a knot.
-        m.add(|x, y| circle(x, y, 76.0, 62.0, 40.0));
-        m.add(|x, y| circle(x, y, 42.0, 96.0, 19.0));
-        m.add(|x, y| ellipse(x, y, 56.0, 84.0, 22.0, 34.0, 0.3));
-        // The hairline, a band, an eye and the parting of the lips.
-        m.cut(|x, y| outline(circle(x, y, 56.0, 58.0, 52.0), 4.5).max(-(x - 84.0)).max(y - 104.0));
-        m.cut(|x, y| outline(circle(x, y, 70.0, 66.0, 30.0), 3.5).max(x - 84.0).max(y - 70.0));
-        m.cut(|x, y| segment(x, y, (107.0, 73.0), (114.0, 74.0), 4.5));
-        m.cut(|x, y| segment(x, y, (112.0, 105.0), (120.0, 104.0), 2.5));
+        for wave in waves {
+            m.each(|x, y, a| {
+                let d = wave.windows(2).map(|p| segment(x, y, shape(p[0]), shape(p[1]), 1.0)).fold(f32::MAX, f32::min);
+                a * (0.55 + 0.45 * (d / 4.0).clamp(0.0, 1.0))
+            });
+        }
+        m.cut(|x, y| segment(x, y, shape((115.0, 81.0)), shape((126.0, 82.0)), 5.0));
+        m.cut(|x, y| segment(x, y, shape((129.0, 108.0)), shape((134.0, 107.0)), 2.5));
         m
     }
 
     /// Locomo Music: a dog in headphones.
     pub fn music() -> Mask {
         let mut m = Mask::new(SIZE, SIZE);
-        // The band over the head and the two cups.
-        m.add(|x, y| outline(circle(x, y, C, 84.0, 54.0), 9.0).max(y - 84.0));
+        m.add(|x, y| outline(ellipse(x, y, C, 81.0, 59.0, 57.0, 0.0), 8.0).max(y - 90.0));
         for cx in [28.0, 140.0] {
-            m.add(|x, y| rbox(x, y, cx, 96.0, 12.0, 22.0, 9.0));
+            m.add(|x, y| rbox(x, y, cx, 86.0, 13.0, 23.0, 12.0));
         }
-        // Head, muzzle and ears.
-        m.add(|x, y| ellipse(x, y, C, 90.0, 37.0, 40.0, 0.0));
-        m.add(|x, y| ellipse(x, y, C, 116.0, 24.0, 20.0, 0.0));
-        for (cx, a) in [(50.0, 0.35), (118.0, -0.35)] {
-            m.add(|x, y| ellipse(x, y, cx, 96.0, 13.0, 30.0, a));
+        m.add(|x, y| ellipse(x, y, C, 102.0, 41.0, 45.0, 0.0));
+        m.add(|x, y| ellipse(x, y, C, 137.0, 17.0, 14.0, 0.0));
+        for cx in [43.0, 125.0] {
+            m.cut(|x, y| segment(x, y, (cx, 76.0), (cx, 106.0), 4.5));
         }
-        m.cut(|x, y| outline(ellipse(x, y, 50.0, 96.0, 13.0, 30.0, 0.35), 3.0).max(x - 58.0));
-        m.cut(|x, y| outline(ellipse(x, y, 118.0, 96.0, 13.0, 30.0, -0.35), 3.0).max(110.0 - x));
-        for cx in [70.0, 98.0] {
-            m.cut(|x, y| circle(x, y, cx, 84.0, 5.5));
+        for cx in [64.0, 104.0] {
+            m.cut(|x, y| circle(x, y, cx, 94.0, 6.0));
         }
-        m.cut(|x, y| ellipse(x, y, C, 106.0, 9.0, 6.5, 0.0));
-        m.cut(|x, y| segment(x, y, (C, 112.0), (C, 120.0), 3.0));
-        m.cut(|x, y| outline(circle(x, y, 76.0, 118.0, 8.0), 3.0).max(118.0 - y).max(x - 84.0));
-        m.cut(|x, y| outline(circle(x, y, 92.0, 118.0, 8.0), 3.0).max(118.0 - y).max(84.0 - x));
+        m.cut(|x, y| ellipse(x, y, C, 116.0, 11.0, 8.0, 0.0));
+        m.cut(|x, y| segment(x, y, (C, 120.0), (C, 134.0), 5.0));
+        for cx in [74.0, 94.0] {
+            m.cut(|x, y| outline(circle(x, y, cx, 131.0, 10.0), 4.5).max(131.0 - y));
+        }
         m
     }
 
-    /// Settings: a gear.
+    /// Settings: a six-tooth gear.
     pub fn settings() -> Mask {
         let mut m = Mask::new(SIZE, SIZE);
-        m.add(|x, y| circle(x, y, C, C, 44.0));
-        for k in 0..8 {
-            let a = k as f32 * PI / 4.0;
-            let tip = (C + a.cos() * 50.0, C + a.sin() * 50.0);
-            m.add(|x, y| segment(x, y, (C, C), tip, 20.0) - 3.0);
+        m.add(|x, y| circle(x, y, C, C, 41.0));
+        for k in 0..6 {
+            let a = k as f32 * PI / 3.0 - PI / 2.0;
+            let tooth = [(31.0, -14.0), (53.0, -10.0), (53.0, 10.0), (31.0, 14.0)]
+                .map(|(radius, tangent)| (C + a.cos() * radius - a.sin() * tangent,
+                                          C + a.sin() * radius + a.cos() * tangent));
+            m.add(|x, y| polygon(x, y, &tooth) - 2.5);
         }
-        m.cut(|x, y| circle(x, y, C, C, 20.0));
+        m.cut(|x, y| circle(x, y, C, C, 25.0));
         m
     }
 

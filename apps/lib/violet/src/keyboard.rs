@@ -1,6 +1,6 @@
-//! An on-screen keyboard for passwords: every printable ASCII character, on
+//! An on-screen keyboard for text fields: every printable ASCII character, on
 //! three pages (letters, numbers and symbols, more symbols).
-use violet::{colors::*, rgb, Canvas, Color, Fonts, Rect, W};
+use crate::{colors::*, rgb, Canvas, Color, Face, Fonts, Rect, W};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Key {
@@ -8,6 +8,7 @@ pub enum Key {
     Shift,
     Back,
     Space,
+    Go,
     Page(Page),
 }
 
@@ -30,6 +31,7 @@ pub enum Shift {
 
 #[derive(Default)]
 pub struct Keyboard {
+    address: bool,
     pub page: Page,
     pub shift: Shift,
     /// The key under the finger.
@@ -51,8 +53,15 @@ fn chars(s: &str) -> Vec<(Key, f32)> {
 }
 
 /// The keys of each row on a page, with their widths in key units.
-fn rows(page: Page) -> [Vec<(Key, f32)>; 4] {
-    let bottom = |mode: Page| vec![(Key::Page(mode), 2.0), (Key::Space, 6.0), (Key::Char('.'), 1.5)];
+fn rows(page: Page, address: bool) -> [Vec<(Key, f32)>; 4] {
+    let bottom = |mode: Page| {
+        if address {
+            vec![(Key::Page(mode), 2.0), (Key::Space, 3.0), (Key::Char('.'), 1.0),
+                 (Key::Char('/'), 1.0), (Key::Go, 2.0)]
+        } else {
+            vec![(Key::Page(mode), 2.0), (Key::Space, 6.0), (Key::Char('.'), 1.5)]
+        }
+    };
     let punctuation = |mode: Page| {
         let mut r = vec![(Key::Page(mode), 1.5)];
         r.extend(chars(".,?!'"));
@@ -72,9 +81,9 @@ fn rows(page: Page) -> [Vec<(Key, f32)>; 4] {
 }
 
 /// Every key on the page and where it is.
-pub fn layout(page: Page) -> Vec<(Key, Rect)> {
+fn layout(page: Page, address: bool) -> Vec<(Key, Rect)> {
     let mut out = Vec::new();
-    for (row, keys) in rows(page).iter().enumerate() {
+    for (row, keys) in rows(page, address).iter().enumerate() {
         let units: f32 = keys.iter().map(|k| k.1).sum();
         let width = units * UNIT + (keys.len() - 1) as f32 * GAP;
         let mut x = (W as f32 - width) / 2.0;
@@ -88,12 +97,17 @@ pub fn layout(page: Page) -> Vec<(Key, Rect)> {
 }
 
 impl Keyboard {
+    /// The text keyboard with URL punctuation and a submit key on every page.
+    pub fn address() -> Self {
+        Self { address: true, ..Self::default() }
+    }
+
     /// The key at a point, counting the gaps around keys as theirs.
     pub fn key_at(&self, x: i32, y: i32) -> Option<Key> {
         if y < TOP {
             return None;
         }
-        layout(self.page)
+        layout(self.page, self.address)
             .into_iter()
             .filter(|(_, r)| y >= r.y0 - GAP as i32 && y < r.y1 + GAP as i32)
             .min_by_key(|(_, r)| if x < r.x0 { r.x0 - x } else if x >= r.x1 { x - r.x1 + 1 } else { 0 })
@@ -121,6 +135,7 @@ impl Keyboard {
                 text.push(' ');
             }
             Key::Back => return text.pop().is_some(),
+            Key::Go => return false,
             Key::Shift => {
                 self.shift = match self.shift {
                     Shift::Off => Shift::Once,
@@ -136,15 +151,15 @@ impl Keyboard {
     pub fn draw(&self, c: &mut Canvas, f: &Fonts) {
         c.fill(Rect::new(0, TOP, W as i32, c.bounds().y1), BED);
         let (big, small) = (f.medium(40.0), f.medium(28.0));
-        for (key, r) in layout(self.page) {
+        for (key, r) in layout(self.page, self.address) {
             let down = self.pressed == Some(key);
             let special = !matches!(key, Key::Char(_) | Key::Space);
             let lit = key == Key::Shift && self.shift != Shift::Off;
-            let bg = if down { ACCENT } else if lit { INK } else if special { SPECIAL } else { LETTER };
-            let ink = if down || lit { BACKGROUND } else { INK };
+            let bg = if down || key == Key::Go { ACCENT } else if lit { INK } else if special { SPECIAL } else { LETTER };
+            let ink = if down || lit || key == Key::Go { BACKGROUND } else { INK };
             c.round_rect(r, 14.0, bg);
             let mid_y = r.y0 + r.height() / 2;
-            let label = |c: &mut Canvas, face: &violet::Face, s: &str| {
+            let label = |c: &mut Canvas, face: &Face, s: &str| {
                 let base = mid_y + (face.ascent() + face.descent()) / 2;
                 face.centered(c, s, r.x0, r.x1, base, ink);
             };
@@ -154,6 +169,7 @@ impl Keyboard {
                     label(c, &big, &shown.to_string());
                 }
                 Key::Space => label(c, &small, "space"),
+                Key::Go => label(c, &small, "Go"),
                 Key::Page(Page::Letters) => label(c, &small, "ABC"),
                 Key::Page(Page::Numbers) => label(c, &small, "123"),
                 Key::Page(Page::Symbols) => label(c, &small, "#+="),
@@ -186,7 +202,7 @@ mod tests {
     fn every_printable_character_can_be_typed() {
         let mut typed = std::collections::HashSet::new();
         for page in [Page::Letters, Page::Numbers, Page::Symbols] {
-            for (key, r) in layout(page) {
+            for (key, r) in layout(page, false) {
                 assert!(r.x0 >= 0 && r.x1 <= W as i32, "{key:?} is off screen");
                 if let Key::Char(c) = key {
                     typed.insert(c);
@@ -203,10 +219,22 @@ mod tests {
     #[test]
     fn keys_are_found_where_they_are_drawn() {
         let k = Keyboard::default();
-        for (key, r) in layout(Page::Letters) {
+        for (key, r) in layout(Page::Letters, false) {
             assert_eq!(k.key_at((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2), Some(key));
         }
         assert_eq!(k.key_at(360, 900), None);
+    }
+
+    #[test]
+    fn address_keys_are_visible_and_tappable_on_every_page() {
+        for page in [Page::Letters, Page::Numbers, Page::Symbols] {
+            let keyboard = Keyboard { page, ..Keyboard::address() };
+            for key in [Key::Char('.'), Key::Char('/'), Key::Go] {
+                let (_, r) = layout(page, true).into_iter().rev().find(|(k, _)| *k == key).unwrap();
+                assert!(r.x0 >= 0 && r.x1 <= W as i32);
+                assert_eq!(keyboard.key_at((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2), Some(key));
+            }
+        }
     }
 
     #[test]

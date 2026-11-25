@@ -108,21 +108,37 @@ def count(pattern):
 def loaded(url, title):
     return re.search(r"ladybird: loaded " + re.escape(url) + r" status=200 .*title=" + re.escape(json.dumps(title)), everything())
 
-KEYBOARD_TOP = 1600 - 5 * 96 - 16
-ROWS = ["1234567890", "qwertyuiop", "asdfghjkl:", "zxcvbnm.-/"]
-def key(k):
-    special = {".com": 72, "_": 180, " ": 324, "back": 504, "go": 648}
-    if k in special:
-        tap(special[k], KEYBOARD_TOP + 8 + 4 * 96 + 48, .25)
-        return
-    row = next(i for i, r in enumerate(ROWS) if k in r)
-    tap(ROWS[row].index(k) * 72 + 36, KEYBOARD_TOP + 8 + row * 96 + 48, .25)
-def type_address(keys):
+# Address mode of the shared VioletOS keyboard (left to right, with widths).
+ADDRESS_BOTTOM = [("mode", 2), (" ", 3), (".", 1), ("/", 1), ("go", 2)]
+LETTERS = [list(zip(row, [1] * len(row))) for row in ("qwertyuiop", "asdfghjkl")]
+LETTERS += [[("shift", 1.5)] + [(c, 1) for c in "zxcvbnm"] + [("back", 1.5)], ADDRESS_BOTTOM]
+NUMBERS = [[(c, 1) for c in row] for row in ("1234567890", '-/:;()$&@"')]
+NUMBERS += [[], ADDRESS_BOTTOM]
+
+def key(k, page):
+    for row, keys in enumerate(page):
+        width = sum(units * 63 for _, units in keys) + max(0, len(keys)-1) * 8
+        x = (720 - width) / 2
+        for name, units in keys:
+            if name == k:
+                tap(round(x + units * 63 / 2), 1072 + row * 120 + 52, .25)
+                return
+            x += units * 63 + 8
+    fail(f"{k!r} is missing from the address keyboard")
+
+def type_address(text):
+    old = everything().count("ladybird: editing address")
     tap(500, 63)
-    until("address editing", lambda: "ladybird: editing address" in everything())
-    for k in keys:
-        key(k)
-    key("go")
+    until("address editing", lambda: everything().count("ladybird: editing address") > old)
+    page = LETTERS
+    for k in text:
+        if k not in "./ ":
+            next_page = LETTERS if k.isalpha() else NUMBERS
+            if page is not next_page:
+                key("mode", page)
+                page = next_page
+        key(k, page)
+    key("go", page)
 
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
 time.sleep(3)
@@ -169,17 +185,17 @@ until("banner scrolled away", lambda: len(rows_with(0xcc2266)) == 0, 10)
 print(f"scroll: dragged to {scrolled}", file=sys.stderr)
 
 # 5. The address bar and keyboard.
-type_address(list("http://typed.test/form"))
+type_address("http://typed.test/form")
 until("typed address", lambda: loaded("http://typed.test/form", "Typed"), 60)
 
 # 6. HTTPS on the real web.
 if ONLINE:
-    type_address(list("example") + [".com"])
+    type_address("example.com")
     until("example.com over HTTPS", lambda: loaded("https://example.com/", "Example Domain"), 90)
     print("https:", re.findall(r"ladybird: loaded https://example.com.*", everything())[-1], file=sys.stderr)
     # A large real page with linked style sheets. It depends on Wikipedia, so
     # it is reported, not required.
-    type_address(list("en.m.wikipedia.org/wiki/html"))
+    type_address("en.m.wikipedia.org/wiki/html")
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not re.search(r"ladybird: (loaded|failed) https://en(?:\.m)?\.wikipedia\.org/wiki/HTML", everything(), re.I):
         time.sleep(0.2)

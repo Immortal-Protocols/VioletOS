@@ -11,7 +11,9 @@ VIOLET_NET_SOCKS="127.0.0.1:1080" sends every connection through a SOCKS5
 relay instead (RFC 1928/1929, user "violet", password VIOLET_NET_SOCKS_PASS),
 the way the handset's Phone Internet mode goes through the iPhone companion.
 Names ending in ".violet" are the companion's own endpoints; without a relay
-they fail at once instead of reaching the Mac's resolver.
+they fail at once instead of reaching the Mac's resolver. The Mac companion's
+private checkout-local discovery file enables its loopback SOCKS relay and
+Agent pairing without setting environment variables.
 
 A UDP slot (command 3) is a Mac UDP socket; datagrams cross the rings framed
 as in net.rs. VIOLET_NET_UDP=0 refuses UDP, like a network that blocks it.
@@ -19,16 +21,43 @@ as in net.rs. VIOLET_NET_UDP=0 refuses UDP, like a network that blocks it.
 import json
 import mmap
 import os
+from pathlib import Path
 import socket
 import struct
+import stat
 import threading
 import time
+
+LOCAL_COMPANION = Path(__file__).resolve().parents[1] / "build/local-companion/connection.json"
+LOCAL_NAMES = {"agent-pair.violet", "agent-relay.violet", "sentinel.violet"}
 
 PAGE = 0x49230000 - 0x40000000
 SLOTS, TX, RX = 8, 8192, 16384
 STRIDE = TX + RX
 MAGIC = 0x3154454E
 IDLE, CONNECTING, OPEN, PEER_CLOSED, FAILED = range(5)
+
+
+def local_companion():
+    """Read the same-user companion's loopback endpoints on each new connection."""
+    try:
+        fd = os.open(LOCAL_COMPANION, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as stream:
+            info = os.fstat(stream.fileno())
+            if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                return None
+            config = json.loads(stream.read(4096))
+        if not isinstance(config, dict) or not all(
+            type(config.get(key)) is int and 0 < config[key] < 65536 for key in ("relayPort", "socksPort")
+        ) or not isinstance(config.get("password"), str) or not 1 <= len(config["password"]) <= 255:
+            return None
+        pid = config.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return None
+        os.kill(pid, 0)
+        return config
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 class Relay(threading.Thread):
@@ -68,17 +97,22 @@ class Relay(threading.Thread):
         ip, port = self.word(slot, 5), self.word(slot, 6)
         host = name or socket.inet_ntoa(struct.pack(">I", ip))
         try:
-            # VIOLET_NET_SOCKS_SCOPE=violet: only the companion's own .violet endpoints use the relay.
+            # Explicit test mappings and SOCKS settings override desktop discovery.
             only_violet = os.environ.get("VIOLET_NET_SOCKS_SCOPE") == "violet"
-            if self.socks_proxy and (not only_violet or host.endswith(".violet")):
-                sock = self.socks_connect(host, port, bool(name))
+            target = self.hosts.get(name) or self.hosts.get(f"{host}:{port}")
+            local = local_companion() if not self.socks_proxy and not target else None
+            if local and host == "agent-relay.violet" and port == 80:
+                sock = socket.create_connection(("127.0.0.1", local["relayPort"]), timeout=2)
+            elif local and (not host.endswith(".violet") or host in LOCAL_NAMES):
+                sock = self.socks_connect(host, port, bool(name), ("127.0.0.1", local["socksPort"]), local["password"])
+            elif self.socks_proxy and (not only_violet or host.endswith(".violet")):
+                sock = self.socks_connect(host, port, bool(name), self.socks_proxy, self.socks_pass)
             else:
-                if host.endswith(".violet") and not self.socks_proxy:
-                    raise ConnectionRefusedError(111, "no companion relay")
-                target = self.hosts.get(name) or self.hosts.get(f"{host}:{port}")
                 if target:
                     host, _, mapped = target.partition(":")
                     port = int(mapped or port)
+                elif host.endswith(".violet"):
+                    raise ConnectionRefusedError(111, "no companion relay")
                 sock = socket.create_connection((host, port), timeout=8)
             sock.setblocking(False)
             self.socks[slot] = sock
@@ -94,8 +128,8 @@ class Relay(threading.Thread):
     # SOCKS5 reply codes as the errno the app sees.
     SOCKS_ERRNO = {1: 5, 2: 13, 3: 101, 4: 113, 5: 111, 6: 110, 7: 95, 8: 97}
 
-    def socks_connect(self, host, port, by_name):
-        sock = socket.create_connection(self.socks_proxy, timeout=8)
+    def socks_connect(self, host, port, by_name, proxy, password):
+        sock = socket.create_connection(proxy, timeout=8)
         try:
             def exact(n):
                 data = b""
@@ -108,7 +142,7 @@ class Relay(threading.Thread):
             sock.sendall(b"\x05\x01\x02")
             if exact(2) != b"\x05\x02":
                 raise ConnectionRefusedError(111, "relay refused auth method")
-            user, pw = b"violet", self.socks_pass.encode()
+            user, pw = b"violet", password.encode()
             sock.sendall(bytes([1, len(user)]) + user + bytes([len(pw)]) + pw)
             if exact(2)[1] != 0:
                 raise PermissionError(13, "relay rejected credentials")

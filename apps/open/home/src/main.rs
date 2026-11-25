@@ -38,7 +38,7 @@ fn main() {
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut art = ui::Art::new();
-    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, shield: Default::default(), listening: false };
+    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, shield: Default::default(), listening: false };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
     let refresh = move || {
@@ -56,7 +56,7 @@ fn main() {
         s.shield = ui::Shield {
             known: sh.contains_key("linked"),
             linked: sh.get("linked").is_some_and(|v| v == "1"),
-            frozen: sh.get("frozen").filter(|v| *v != "-").map(|v| v.split(',').map(String::from).collect()).unwrap_or_default(),
+            warnings: sh.get("warnings").and_then(|v| v.parse().ok()).unwrap_or(0),
         };
     };
     let draw = |c: &mut Canvas, s: &mut ui::State, art: &ui::Art, glance: &Option<Glance>, screen: &mut Screen| {
@@ -80,6 +80,7 @@ fn main() {
                 focused = true;
                 println!("home: shown");
                 s.pressed = None;
+                s.launch_error = None;
                 status(&mut s, &mut art);
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
                 // Settings may have switched cities while Home was away.
@@ -112,6 +113,9 @@ fn main() {
                     let answer = violet::sys(&format!("open {path}"));
                     if answer != "ok" {
                         println!("home: open {} -> {}", path, answer);
+                        let reason = answer.strip_prefix("error ").unwrap_or(&answer).trim();
+                        s.launch_error = Some(format!("Couldn’t open app · {reason}"));
+                        draw(&mut c, &mut s, &art, &glance, &mut screen);
                     }
                 }
             }
@@ -166,8 +170,8 @@ mod preview {
             listing += &format!("{n}\t{t}\n");
         }
         ui::State {
-            now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
-            shield: ui::Shield { known: true, linked: true, frozen: vec![] }, listening: true,
+            now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None,
+            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true,
         }
     }
 
