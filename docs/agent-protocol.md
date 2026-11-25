@@ -73,10 +73,12 @@ A plaintext is a kind byte and a body:
 
 JSON messages carry `"t"`:
 
-- phone → Mac: `hello` (name, version, `listening`), `stop` (the user tapped to interrupt), `audio_report`, `installed` (`name`, `ok`, `error`, `ms`), `opened` (`name`), `unpair`, `direct` (below).
-- Mac → phone: `direct` (below), `hello` (`name`: the Mac's, `agent_name`: what the user calls the agent, "Violet" by default), `state` (`thinking`, `speaking`, `listening`, `building`), `transcript` (`who`: `user` or `agent`, `text`, `final`), `audio`, `say_stop`, `install` (`name`, `title`, `size` on the wire, `bytes` and `sha256` of the program, `encoding`: `deflate` or `none`), `install_end`, `open` (`name`), `unpair`.
+- phone → Mac: `hello` (name, version, `listening`, `python`: whether `/bin/python3` is there), `stop` (the user tapped to interrupt), `audio_report`, `installed` (`name`, `ok`, `error`, `ms`), `apps` (`apps`: `name`, `title`, `bytes` stored; `free` bytes; `python`), `uninstalled` (`name`, `ok`, `error`), `opened` (`name`), `unpair`, `direct` (below).
+- Mac → phone: `direct` (below), `hello` (`name`: the Mac's, `agent_name`: what the user calls the agent, "Violet" by default), `state` (`thinking`, `speaking`, `listening`, `building`), `transcript` (`who`: `user` or `agent`, `text`, `final`), `audio`, `say_stop`, `install` (`name`, `title`, `size` on the wire, `bytes` and `sha256` of the program, `encoding`: `deflate` or `none`), `install_end`, `apps` (list them), `uninstall` (`name`), `open` (`name`), `unpair`.
 
-An install arrives (raw DEFLATE when `encoding` says so), is inflated and checked against its length and SHA-256, written to `/apps/NAME`, and then the agent asks the Open Runtime (`install NAME TITLE` in `/dev/violet/sys`) to keep it on disk. Only an authenticated session can deliver one, so the phone accepts installs only from its paired Mac.
+An install arrives (raw DEFLATE when `encoding` says so), is inflated and checked against its length and SHA-256, written to `/apps/NAME` (a deflated program as `VZ1`, its length and the DEFLATE, which the Open Runtime keeps compressed and runs inflated), and then the agent asks the Open Runtime (`install NAME TITLE` in `/dev/violet/sys`) to keep it on disk. Only an authenticated session can deliver one, so the phone accepts installs only from its paired Mac.
+
+A Python app is a `#!/bin/python3` script installed the same way. The handset image has no Python, so before the first one the Mac installs the package `python` ([tools/build_python_package.py](../tools/build_python_package.py)): data starting with `VGZ1` that the Open Runtime unpacks into `/bin` and `/lib` at every start rather than keeping as `/apps/python`. The phone's next `hello` says `python: true`.
 
 ## Direct path
 

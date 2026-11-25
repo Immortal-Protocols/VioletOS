@@ -11,6 +11,14 @@
 //! writes the program into free sectors and flushes, then writes the newer
 //! directory over the older copy and flushes again, so a power cut leaves
 //! either the old set of apps or the new one, never a torn program.
+//!
+//! A package is an entry whose data is "VGZ1", the gzip length and the gzip of
+//! a cpio archive (Python: /bin/python3 and /lib). It is unpacked into /bin
+//! and /lib instead of becoming /apps/NAME, and is not listed in Programs.
+//!
+//! A program may also be kept compressed: "VZ1\0", its length (u32 LE), then
+//! raw DEFLATE (the form the agent receives it in). /apps/NAME gets the program
+//! itself; the store keeps the compressed bytes, about half the size.
 use crate::log;
 use crate::protocol::*;
 use alloc::string::String;
@@ -38,6 +46,8 @@ pub struct Entry {
     len: u32,
     crc: u32,
     pub time: u32,
+    /// Unpacked into /bin and /lib (not stored in the directory: read from the data).
+    pub package: bool,
 }
 
 #[derive(Default)]
@@ -133,7 +143,7 @@ fn decode(raw: &[u8]) -> Option<(u32, Vec<Entry>)> {
         if name.is_empty() {
             continue;
         }
-        entries.push(Entry { name, title: text(&e[24..48]), first: word(e, 48), len: word(e, 52), crc: word(e, 56), time: word(e, 60) });
+        entries.push(Entry { name, title: text(&e[24..48]), first: word(e, 48), len: word(e, 52), crc: word(e, 56), time: word(e, 60), package: false });
     }
     Some((word(raw, 8), entries))
 }
@@ -203,9 +213,28 @@ impl Store {
                 log!("installed apps: {} is damaged and was skipped", e.name);
                 continue;
             }
-            let path = alloc::format!("/apps/{}", e.name);
-            if let Some(f) = fs.writable(&path, true, true, 0) {
-                *f = data;
+            let mut e = e;
+            if is_package(&data) {
+                match unpack(fs, &data) {
+                    Ok(n) => log!("installed apps: package {} ({} files)", e.name, n),
+                    Err(why) => {
+                        log!("installed apps: package {}: {}", e.name, why);
+                        continue;
+                    }
+                }
+                e.package = true;
+            } else {
+                let program = match expand(data) {
+                    Ok(p) => p,
+                    Err(why) => {
+                        log!("installed apps: {}: {}", e.name, why);
+                        continue;
+                    }
+                };
+                let path = alloc::format!("/apps/{}", e.name);
+                if let Some(f) = fs.writable(&path, true, true, 0) {
+                    *f = program;
+                }
             }
             store.entries.push(e);
         }
@@ -225,7 +254,7 @@ impl Store {
             })
             .map(String::from)
             .collect();
-        for e in &self.entries {
+        for e in self.entries.iter().filter(|e| !e.package) {
             lines.push(alloc::format!("{}\t{}", e.name, if e.title.is_empty() { &e.name } else { &e.title }));
         }
         let mut text = lines.join("\n");
@@ -280,12 +309,24 @@ impl Store {
         }
         let sectors = ((data.len() + 511) / 512) as u32;
         let first = self.place(&keep, sectors).ok_or("no room for the program")?;
+        let package = is_package(&data);
+        if package {
+            // Unpacked first: a package that does not unpack is never stored.
+            unpack(fs, &data)?;
+            let _ = fs.unlink(&path, false);
+        } else if is_compressed(&data) {
+            // Runs from /apps as the program itself; the store keeps the compressed form.
+            let program = expand(data.clone())?;
+            if let Some(f) = fs.writable(&path, true, true, 0) {
+                *f = program;
+            }
+        }
         if !write(first, &data) || !flush() {
             return Err("write failed");
         }
         let mut entries = keep;
         let title: String = title.chars().filter(|c| *c != '\t' && *c != '\n').take(23).collect();
-        entries.push(Entry { name: String::from(name), title, first, len: data.len() as u32, crc: crc32(&data), time });
+        entries.push(Entry { name: String::from(name), title, first, len: data.len() as u32, crc: crc32(&data), time, package });
         if !self.commit(entries) {
             return Err("directory write failed");
         }
@@ -302,18 +343,72 @@ impl Store {
         if !self.commit(keep) {
             return Err("directory write failed");
         }
+        // A removed package's files stay until the next restart.
         let _ = fs.unlink(&alloc::format!("/apps/{}", name), false);
         self.titles(fs, Some(name));
         Ok(())
     }
 
-    /// "name<TAB>bytes<TAB>title" lines.
+    /// "name<TAB>bytes<TAB>title" lines (bytes as stored), then ".free<TAB>bytes<TAB>"
+    /// with the room left for programs.
     pub fn list(&self) -> String {
         let mut s = String::new();
         for e in &self.entries {
             s.push_str(&alloc::format!("{}\t{}\t{}\n", e.name, e.len, e.title));
         }
+        let used: u32 = self.entries.iter().map(|e| (e.len + 511) / 512).sum();
+        let free = self.sectors.saturating_sub(FIRST_DATA).saturating_sub(used);
+        s.push_str(&alloc::format!(".free\t{}\t\n", u64::from(free) * 512));
         s
+    }
+}
+
+pub fn is_compressed(data: &[u8]) -> bool {
+    data.len() > 8 && &data[..4] == b"VZ1\0"
+}
+
+/// A stored program as it runs: compressed ones inflated, others as they are.
+fn expand(data: Vec<u8>) -> Result<Vec<u8>, &'static str> {
+    if !is_compressed(&data) {
+        return Ok(data);
+    }
+    let len = word(&data, 4) as usize;
+    if len > MAX_PROGRAM * 2 {
+        return Err("compressed program too large");
+    }
+    let mut out = alloc::vec![0u8; len];
+    let n = super::inflate::inflate_into(&data[8..], &mut out)?;
+    if n != len {
+        return Err("compressed program damaged");
+    }
+    Ok(out)
+}
+
+pub fn is_package(data: &[u8]) -> bool {
+    data.len() > 8 && &data[..4] == b"VGZ1"
+}
+
+/// Where a package may put files: /bin and /lib, never /apps or /data.
+pub fn package_path(path: &str) -> bool {
+    (path.starts_with("/bin/") || path.starts_with("/lib/") || path == "/bin" || path == "/lib") && !path.contains("/../")
+}
+
+/// Unpack a package's archive into the file system. The unpacked bytes stay
+/// for the rest of the boot (the file system refers to them in place).
+fn unpack(fs: &mut Fs, data: &[u8]) -> Result<usize, &'static str> {
+    let len = word(data, 4) as usize;
+    let packed = data.get(8..8 + len).ok_or("package truncated")?;
+    let size = super::inflate::gzip_size(packed).ok_or("package truncated")?;
+    if size > 64 << 20 {
+        return Err("package too large");
+    }
+    let mut dest = alloc::vec![0u8; size];
+    let n = super::inflate::gunzip(packed, &mut dest)?;
+    dest.truncate(n);
+    let image: &'static [u8] = alloc::boxed::Box::leak(dest.into_boxed_slice());
+    match fs.add_archive(image, package_path) {
+        0 => Err("package holds no files for /bin or /lib"),
+        n => Ok(n),
     }
 }
 
@@ -322,7 +417,7 @@ mod tests {
     use super::*;
     #[test]
     fn directory_round_trip() {
-        let e = Entry { name: "scorekeeper".into(), title: "Scorekeeper".into(), first: 8, len: 1000, crc: 7, time: 9 };
+        let e = Entry { name: "scorekeeper".into(), title: "Scorekeeper".into(), first: 8, len: 1000, crc: 7, time: 9, package: false };
         let raw = encode(3, &[e]);
         let (g, entries) = decode(&raw).unwrap();
         assert_eq!(g, 3);
@@ -332,6 +427,14 @@ mod tests {
         let mut bad = raw.clone();
         bad[100] ^= 1;
         assert!(decode(&bad).is_none());
+    }
+    #[test]
+    fn packages_stay_in_bin_and_lib() {
+        assert!(package_path("/bin/python3"));
+        assert!(package_path("/lib/python312.zip"));
+        assert!(!package_path("/apps/agent"));
+        assert!(!package_path("/data/agent"));
+        assert!(!package_path("/binx"));
     }
     #[test]
     fn crc_matches_zlib() {

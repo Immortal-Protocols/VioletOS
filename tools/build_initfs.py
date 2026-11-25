@@ -290,6 +290,8 @@ def main(out, python=True, compress=False, skip=()):
     files["etc/ssl/certs/ca-certificates.crt"] = (root_certificates(), 0o100644)
     # Python from tools/build_python.py, when it has been built.
     extra = os.environ.get("VIOLET_INITFS_EXTRA")
+    # VIOLET_OPEN_NO_PYTHON=1 leaves Python out, as on the handset (make test-agent installs it as a package).
+    python = python and os.environ.get("VIOLET_OPEN_NO_PYTHON") != "1"
     if not extra and python and (ROOT / "build/open-toolchain/python-root/bin/python3").exists():
         extra = str(ROOT / "build/open-toolchain/python-root")
     if extra:

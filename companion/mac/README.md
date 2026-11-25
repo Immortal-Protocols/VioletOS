@@ -25,12 +25,14 @@ It needs Codex signed in with ChatGPT (`codex login`), the build tools of this c
 | Identity and paired phones, in the login Keychain | [Store.swift](VioletAgent/Store.swift) |
 | RoseOS's voice (listener, Phonon speaker, barge-in) | [RoseVoice.swift](VioletAgent/RoseVoice.swift), [voice/violet_voice.py](voice/violet_voice.py) |
 | macOS speech, when RoseOS is not installed | [Voice.swift](VioletAgent/Voice.swift) |
-| Codex (`codex app-server`, sandboxed to the workspace) | [Codex.swift](VioletAgent/Codex.swift) |
+| Codex (`codex app-server`: the talker, and the builder sandboxed to the workspace) | [Codex.swift](VioletAgent/Codex.swift) |
 | Turns, barge-in, installs and timings | [AgentModel.swift](VioletAgent/AgentModel.swift) |
 | The camera scanner, and the code this Mac shows | [Scanner.swift](VioletAgent/Scanner.swift), `PairSheet` in [VioletAgentApp.swift](VioletAgent/VioletAgentApp.swift) |
 | The direct UDP path (STUN, hole punching, ordered delivery) | [Direct.swift](VioletAgent/Direct.swift) |
 
-Codex works in `build/agent-workspace` ([tools/agent_build.py](../../tools/agent_build.py)): the recipe in [AGENTS.md](../../tools/agent-workspace/AGENTS.md), a working native example and `./build NAME`, which builds offline from a warm cache. Codex runs with the `workspace-write` sandbox and no approvals, and installs only through the `install_app` tool this app provides.
+**Two Codex threads.** The *talker* holds the conversation: quick turns, a read-only sandbox, never writes code. When you ask for an app it calls `build_app` and goes on talking with you; the *builder* works in the background, and the talker learns how it is going (`build_status`) and hears when it is done (a `[builder]` message it passes on to you in a sentence). More requests during a build join it; `cancel_build` stops it. `list_apps` and `remove_app` let you free the phone's app space by voice; the talker removes only apps you agreed to remove.
+
+The builder works in `build/agent-workspace` ([tools/agent_build.py](../../tools/agent_build.py)): the recipe in [AGENTS.md](../../tools/agent-workspace/AGENTS.md), a working Rust example (`apps/example`), a working Python example (`python/tally`) and `./build NAME`. Rust builds run offline from a warm cache. Python apps use the [violet module](../../apps/lib/python/violet.py) (screen, touch, the Go fonts, sound, saved state); `./build` runs them once against a fake screen with taps across it, so errors show up before the install. The builder runs with the `workspace-write` sandbox and no approvals, and installs only through the `install_app` tool this app provides. The first Python app also installs Python on the phone (`build/python-package.vgz`, about 5 MB, made by [tools/build_python_package.py](../../tools/build_python_package.py) when missing).
 
 **Direct path.** Once the phone is online the two look for a direct UDP path and use it when they find one; the window says *Direct path to the phone* or *Through the relay*. On a network that blocks UDP, or behind two strict NATs, everything keeps going through the relay. Details in [docs/agent-protocol.md](../../docs/agent-protocol.md#direct-path).
 
@@ -47,8 +49,8 @@ Codex works in `build/agent-workspace` ([tools/agent_build.py](../../tools/agent
 | `--relay URL` | the relay this Mac's own code names (else `VIOLET_AGENT_RELAY`, else the Chariot) |
 | `--no-direct` | keep to the relay (`VIOLET_AGENT_STUN=off` does too; `VIOLET_AGENT_STUN=HOST:PORT` names another STUN server) |
 | `--wait-direct` | with `--install`, install once the direct path is open (or after 20 s) |
-| `--say TEXT` | send a typed request once the phone is online |
-| `--install NAME=PATH` | install a built program once online |
+| `--say TEXT` | send a typed request once the phone is online; repeat it for more, `--say-gap SECONDS` apart (10 by default), e.g. to ask questions during a build |
+| `--install NAME=PATH` | install a built program once online (repeatable; a Python script installs Python first if the phone lacks it) |
 | `--speak TEXT` | say a line on the phone |
 | `--record-mic` | keep the phone's microphone stream as `mic.wav` |
 | `--no-speech` | no voice at all |
