@@ -42,7 +42,8 @@ def mac_log():
     return path.read_text(errors="replace") if path.exists() else ""
 
 def fail(reason):
-    raise RuntimeError(f"{reason}\nGuest log:\n{everything()}\nMac log:\n{mac_log()[-3000:]}")
+    guest = re.sub(r"(agent: pairing code )\S+", r"\1[redacted]", everything())
+    raise RuntimeError(f"{reason}\nGuest log:\n{guest}\nMac log:\n{mac_log()[-3000:]}")
 
 def until(reason, check, seconds=25):
     deadline = time.monotonic() + seconds
@@ -70,12 +71,31 @@ try:
     until("Mac did not pair", lambda: "phone online" in mac_log(), 60)
     leave_to_home()
     open_icon("music")
-    until("Locomo button did not draw", lambda: struct.unpack_from("<I", screen, (60 * 720 + 345) * 4)[0] == 0xff523a7a)
-    tap(510, 60)
+    until("Music did not open", lambda: "music: starting" in everything())
+    time.sleep(1)
+    tap(580, 1528)
+    until("Library did not draw", lambda: struct.unpack_from("<I", screen, (1500 * 720 + 580) * 4)[0] == 0xff191919)
+    until("Mac library page did not arrive", lambda: "music: Mac library received" in everything())
+    tap(580, 215)
+    until("Cloud Songs filter did not select", lambda: struct.unpack_from("<I", screen, (187 * 720 + 580) * 4)[0] == 0xff191919)
+    tap(140, 215)
+    until("Mac library did not reload", lambda: everything().count("music: Mac library received") >= 2)
+    tap(350, 455)
+    until("Selected Mac library song did not transfer", lambda: "agent: Locomo track verified" in everything(), 60)
+    tap(360, 1528)
+    until("Generate did not draw", lambda: struct.unpack_from("<I", screen, (1500 * 720 + 360) * 4)[0] == 0xff191919)
+    def generated_playing():
+        title = re.findall(r"locomo: delivering (.+) \(\d+ MP3 bytes\)", mac_log())
+        if len(title) < 2:
+            return None
+        return re.search(r"music: playing \d+ (" + re.escape(title[-1]) + r") \(0 BPM, Cool Jazz\)", everything())
+    tap(360, 660)  # Open the song-length picker.
+    tap(360, 455)  # Keep the desktop preference.
+    tap(360, 1130)
     until("Mac did not receive the station request", lambda: "locomo: requested Cool Jazz song" in mac_log())
     print("QEMU requested a Cool Jazz track. Waiting for Locomo Music.", file=sys.stderr, flush=True)
-    until("No generated track arrived", lambda: "agent: Locomo track verified" in everything(), 620)
-    playing = until("The received track did not start", lambda: re.search(r"music: playing \d+ (.+) \(0 BPM, Cool Jazz\)", everything()))
+    until("No generated track arrived", lambda: everything().count("agent: Locomo track verified") >= 2 or generated_playing(), 920)
+    playing = until("The received track did not start", generated_playing)
     until("QEMU produced no audible PCM", lambda: struct.unpack_from("<I", card, 40)[0] > 100
           and struct.unpack_from("<I", card, 44)[0] >= 48_000, 30)
     print(f"QEMU played verified Locomo audio: {playing[1]}", file=sys.stderr, flush=True)

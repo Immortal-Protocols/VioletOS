@@ -494,6 +494,10 @@ impl Agent {
         let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
         match t {
             "locomo_available" => self.locomo.set_available(v["enabled"].as_bool().unwrap_or(true)),
+            "locomo_library" => self.locomo.library(&v),
+            "locomo_control_status" => {
+                if let Some(message) = v["message"].as_str() { self.locomo.status(message); }
+            }
             "locomo_status" | "locomo_track" | "locomo_end" => self.locomo.record(&v),
             "hello" => {
                 self.locomo.set_available(v["locomo"] == true);
@@ -1158,7 +1162,7 @@ fn main() {
         if a.session.is_none() {
             a.locomo.set_available(false);
         }
-        if let Some(request) = a.locomo.request() {
+        for request in a.locomo.requests() {
             a.send_json(request);
         }
         if a.session.is_some() && a.direct.is_none() && a.direct_next.is_some_and(|t| Instant::now() > t) {
