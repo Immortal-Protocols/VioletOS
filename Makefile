@@ -97,6 +97,28 @@ test-open-apps: qemu-image
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
 	build/tests/inflate
 
+# Host unit tests (CI): each test finishes in well under a second.
+HOST_CARGO ?= $(or $(shell command -v cargo),$(dir $(HOST_RUSTC))cargo)
+.PHONY: test-unit
+test-unit:
+	@mkdir -p build/tests
+	"$(HOST_RUSTC)" --edition=2021 --test -O apps/stopwatch/state.rs -o build/tests/stopwatch-state
+	build/tests/stopwatch-state
+	"$(HOST_RUSTC)" --edition=2021 --test -O services/audio/mic.rs -o build/tests/mic
+	build/tests/mic
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
+	build/tests/inflate
+	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home --target-dir ../build/host-tests
+
+# The QEMU tests CI runs: one boot of the supervisor and its services (touch,
+# storage, the watchdog, the classic launcher), then the open apps (Home,
+# Stopwatch keeping its time across a restart, Sounds playing).
+.PHONY: test-ci
+test-ci: qemu-image
+	$(PYTHON) targets/qemu/test_guest.py --spi normal --watchdog-enabled
+	OPEN_FORCE_OFFLINE=1 $(PYTHON) targets/qemu/test_open_apps.py
+
 .PHONY: test-moto-diagnostics
 test-moto-diagnostics: moto qemu-image
 	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial confirm

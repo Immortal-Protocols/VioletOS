@@ -8,6 +8,7 @@ a #! line runs without a build step.
 from pathlib import Path
 import glob
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -81,7 +82,12 @@ def build_cargo(work):
         "RUSTC": str(rustc),
     })
     env.setdefault("CARGO_HOME", str(ROOT / "build/cargo-home"))
-    subprocess.run([cargo, "build", "--release", "--target", TARGET, "--workspace"], cwd=ROOT / "apps", env=env, check=True)
+    # Only the apps the image takes (VIOLET_OPEN_SKIP leaves some out: CI skips the slow ones).
+    skip = {n for n in os.environ.get("VIOLET_OPEN_SKIP", "").split(",") if n}
+    listed = re.search(r"members\s*=\s*\[(.*?)\]", (ROOT / "apps/Cargo.toml").read_text(), re.S).group(1)
+    members = [m.split("/")[-1] for m in re.findall(r'"([^"]+)"', listed)]
+    chosen = [arg for m in members if m not in skip for arg in ("-p", m)] if skip else ["--workspace"]
+    subprocess.run([cargo, "build", "--release", "--target", TARGET, *chosen], cwd=ROOT / "apps", env=env, check=True)
     return ROOT / "build/open-cargo" / TARGET / "release"
 
 
