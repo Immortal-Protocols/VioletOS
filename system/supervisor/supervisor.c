@@ -48,12 +48,19 @@ struct process {
 // Audio follows USB Diagnostics so app and service identities keep their values.
 // QEMU has no USB Diagnostics process; its slot stays empty there.
 // The Open Runtime (24) hosts Linux-ABI apps from /apps. Slot 23 is left for Bluetooth.
+// Camera (25) serves the image sensors to the Open Runtime.
 enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7, OPEN_RT = COUNT + 9,
-       USB_TRANSFER_BADGE = 14, TOTAL = OPEN_RT + 1, LANE_BASE = 0x07400000,
-       RUNTIME_AUDIO_SLOT = 2, AUDIO_POWER_SLOT = 6,
-       // Badges 16 and up mean faults, so Audio's supervisor requests use an
-       // app identity that never holds the lifecycle endpoint.
-       AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071 };
+       CAMERA = COUNT + 10,
+       USB_TRANSFER_BADGE = 14, TOTAL = CAMERA + 1, LANE_BASE = 0x07400000,
+       RUNTIME_AUDIO_SLOT = 2, AUDIO_POWER_SLOT = 6, CAMERA_POWER_SLOT = 6,
+       // Badges 16 and up mean faults, so Audio's and Camera's supervisor
+       // requests use app identities that never hold the lifecycle endpoint.
+       AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071,
+       CAMERA_LIFE_BADGE = 13, CAMERA_PLATFORM = 0x4043 };
+// Every other package ends below its two-page stack at 0x13e000. The Open
+// Runtime's stack is at OPEN_STACK_TOP instead, so its image may run on up to
+// 0x160000, well below its IPC buffer at 0x200000.
+enum { OPEN_WINDOW = 0x60000 };
 // The Open Runtime's CSpace and the capabilities the supervisor places in it.
 // Runtime knows it as client 9, an identity no catalog app uses.
 enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
@@ -84,7 +91,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
 #ifdef VIOLET_MOTO
   if (p->id==RADIO && p->abi==3) abi_ok=true;
 #endif
-  bool allowed_id = p->id < COUNT || p->id == AUDIO || p->id == OPEN_RT;
+  bool allowed_id = p->id < COUNT || p->id == AUDIO || p->id == OPEN_RT || p->id == CAMERA;
 #ifdef VIOLET_MOTO
   allowed_id |= p->id == USB_DIAG;
 #endif
@@ -92,7 +99,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
       !abi_ok || !p->id || p->id == PACKAGES ||
       !allowed_id || !p->code || p->code % PAGE || p->size < p->code ||
       p->size > limit - sizeof(*p) ||
-      p->size > (p->id == RUNTIME ? 0x38000 : 0x3e000))
+      p->size > (p->id == RUNTIME ? 0x38000 : p->id == OPEN_RT ? OPEN_WINDOW : 0x3e000))
     return false;
   if (p->id >= 11 && p->id < COUNT) {
     if (p->size > 65512 || p->size < p->code + 20 ||
@@ -147,6 +154,7 @@ static bool parse(const struct archive *a, unsigned limit) {
 #endif
   procs[AUDIO].package = found[AUDIO];
   procs[OPEN_RT].package = found[OPEN_RT];
+  procs[CAMERA].package = found[CAMERA];
   return true;
 }
 static void grant(struct task *t, unsigned slot, seL4_CPtr ep, unsigned badge,
@@ -478,8 +486,9 @@ static const char *title(const struct package *p) {
                                    "TOUCH", "DISPLAY",  "STORAGE",    "RADIO",
                                    "POWER", "",         "WI-FI SETUP"};
   static const char diag_name[16] = "USB DIAGNOSTICS", audio_name[16] = "AUDIO",
-                    open_name[16] = "OPEN RUNTIME";
+                    open_name[16] = "OPEN RUNTIME", camera_name[16] = "CAMERA";
   if (p->id == USB_DIAG) return diag_name;
+  if (p->id == CAMERA) return camera_name;
   if (p->id == AUDIO) return audio_name;
   if (p->id == OPEN_RT) return open_name;
   return p->id >= 11 ? (const char *)p->bytes + p->size - 16 : names[p->id];
@@ -497,7 +506,7 @@ static bool update_catalog(unsigned id, bool remove) {
   // Each physical device is wired to a process on this board.
   if (remove && id >= STORAGE && id <= POWER) return false;
 #endif
-  bool known = (id > 0 && id < COUNT && id != PACKAGES) || id == AUDIO || id == OPEN_RT;
+  bool known = (id > 0 && id < COUNT && id != PACKAGES) || id == AUDIO || id == OPEN_RT || id == CAMERA;
 #ifdef VIOLET_MOTO
   if (usb_trial_bytes && id != USB_DIAG) return false;
   if (id == USB_DIAG) known = !remove && usb_trial_bytes && usb_trial_generation == generation;
@@ -511,7 +520,7 @@ static bool update_catalog(unsigned id, bool remove) {
     return false;
   unsigned count = 0, length = 0;
   for (unsigned i = 1; i < TOTAL; i++) {
-    if (i >= COUNT && i != USB_DIAG && i != AUDIO && i != OPEN_RT) continue;
+    if (i >= COUNT && i != USB_DIAG && i != AUDIO && i != OPEN_RT && i != CAMERA) continue;
     const struct package *p = i == id ? (remove ? 0 : inbox) : procs[i].package;
     if (!p || i == PACKAGES)
       continue;
@@ -714,6 +723,45 @@ static void open_runtime(void) {
   for (unsigned i = 0; i < 2; i++) ((volatile unsigned *)0x09202000)[46 + i] = open_setup[i];
 #endif
 }
+// Camera's frame memory, 4 MiB at 0x0b000000 in Camera and, read-only, at
+// 0x0b000000 in the Open Runtime. On the handset it is physical 0xe0000000,
+// which CAMSV writes; the loader leaves "CAMM" at 0x43ffffd4 when no
+// reservation touches it. Both map it cacheable: Camera holds the four
+// (mapped) section capabilities in its slots 8-11 and invalidates each slot's
+// lines once CAMSV has written a frame there, before publishing it. In QEMU
+// Camera draws its frames itself, into guest RAM at 0x78000000.
+enum { CAMERA_FRAME_SLOT = 8 };
+static void camera_frames(void) {
+  if (!procs[CAMERA].package) return;
+  seL4_ARM_VMAttributes attrs = seL4_ARM_ExecuteNever;
+  for (unsigned off = 0; off < 0x400000; off += 0x100000) {
+    seL4_CPtr frame;
+#ifdef VIOLET_MOTO
+    if (((volatile unsigned *)0x09f00000)[0xfffd4 / 4] != 0x4d4d4143) return;
+    device(CAMERA, 0xe0000000 + off, 0x0b000000 + off, 20);
+    frame = next_slot - 1;
+    attrs = seL4_ARM_PageCacheable | seL4_ARM_ExecuteNever;
+    check(seL4_ARM_Page_Unmap(frame));
+    check(seL4_ARM_Page_Map(frame, procs[CAMERA].task.pd, 0x0b000000 + off, seL4_AllRights, attrs));
+#else
+    // Guest RAM the kernel does not manage, after the open-app pool (and
+    // below the framebuffer), so the 64 MiB the kernel has stay for objects.
+    device(CAMERA, 0x78000000 + off, 0x0b000000 + off, 20);
+    frame = next_slot - 1;
+#endif
+    struct task *t = &procs[OPEN_RT].task;
+    if (t->pd) {
+      unsigned copy = next_slot++;
+      check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode, frame, 32,
+                            seL4_AllRights));
+      check(seL4_ARM_Page_Map(copy, t->pd, 0x0b000000 + off, seL4_CanRead, attrs));
+    }
+#ifdef VIOLET_MOTO
+    check(seL4_CNode_Move(procs[CAMERA].task.caps, CAMERA_FRAME_SLOT + off / 0x100000, CAP_BITS,
+                          seL4_CapInitThreadCNode, frame, 32));
+#endif
+  }
+}
 static void wire(void) {
   build_group();
 #ifdef VIOLET_QEMU
@@ -794,6 +842,18 @@ static void wire(void) {
     map_shared(state_frame, &procs[AUDIO].task, 0x09320000, seL4_AllRights);
     map_shared(state_frame, &procs[RUNTIME].task, 0x07500000, seL4_CanRead);
   }
+  if (procs[CAMERA].package) {
+    // Only the Open Runtime talks to Camera, through one shared page
+    // (services/camera/process.rs): its requests and Camera's state. The
+    // frames follow, once the board's frame memory is known (camera_frames).
+    prepare_process(CAMERA);
+    if (procs[POWER].package)
+      grant(&procs[CAMERA].task, CAMERA_POWER_SLOT, procs[POWER].ep, CAMERA, false);
+    unsigned state_frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(state_frame, &procs[CAMERA].task, 0x09320000, seL4_AllRights);
+    if (procs[OPEN_RT].task.pd)
+      map_shared(state_frame, &procs[OPEN_RT].task, 0x09120000, seL4_AllRights);
+  }
   for (unsigned id = 1; id < COUNT; id++)
     if ((id == LAUNCHER || id == WATCH || id >= WIFI) && procs[id].package)
       grant(&procs[id].task, 1, procs[RUNTIME].ep, id, false);
@@ -842,6 +902,22 @@ static void wire(void) {
     map_shared(request_frame, &procs[AUDIO].task, 0x09204000, seL4_CanRead);
     grant(&procs[AUDIO].task, 7, life, AUDIO_LIFE_BADGE, false);
   }
+  if (procs[CAMERA].package) {
+    // Camera's diagnostics and developer requests, as for Audio.
+    unsigned status_frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(status_frame, &procs[CAMERA].task, 0x09203000, seL4_AllRights);
+    map_shared(status_frame, &procs[USB_DIAG].task, 0x09207000, seL4_CanRead);
+    unsigned request_frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(request_frame, &procs[USB_DIAG].task, 0x09208000, seL4_AllRights);
+    map_shared(request_frame, &procs[CAMERA].task, 0x09204000, seL4_CanRead);
+    // A 64 KiB preview Camera writes for `moto-package camera-shot`.
+    for (unsigned i = 0; i < 16; i++) {
+      unsigned frame = create(ram, seL4_ARM_SmallPageObject);
+      map_shared(frame, &procs[CAMERA].task, 0x09340000 + i * PAGE, seL4_AllRights);
+      map_shared(frame, &procs[USB_DIAG].task, 0x09230000 + i * PAGE, seL4_CanRead);
+    }
+    grant(&procs[CAMERA].task, 7, life, CAMERA_LIFE_BADGE, false);
+  }
   unsigned diagnostic_frame = create(ram, seL4_ARM_SmallPageObject);
   map_lane(diagnostic_frame, &bootstrap, 0x09202000);
   map_shared(diagnostic_frame, &procs[USB_DIAG].task, 0x09202000, seL4_CanRead);
@@ -865,6 +941,7 @@ static void wire(void) {
                           seL4_CanRead, seL4_ARM_ExecuteNever));
   grant(&procs[RADIO].task, 7, life, RADIO, false);
   board_device(TOUCH, 0x10007000, 0x09005000, 0x09703000);
+  device(0, 0x1000c000, 0x0970a000, 12); // APMIXED: the MIPI receivers' 26 MHz gates
   device(POWER, 0x1000d000, 0x09000000, 12);
   if (procs[AUDIO].package) {
     // Keypad (Volume Down), read-only: Audio cannot reconfigure the scan.
@@ -872,6 +949,8 @@ static void wire(void) {
     map_device_rights(0x10010000, 0x09000000, 12, seL4_CanRead);
     map_device(0x11007000, 0x09004000, 12); // I2C0: FS1603 speaker amplifier
   }
+  if (procs[CAMERA].package)
+    device(CAMERA, 0x11009000, 0x09002000, 12); // I2C2: the rear camera's control bus
   device(RADIO, 0x1100c000, 0x09010000, 12);
   device(TOUCH, 0x11013000, 0x09003000, 12);
   device(USB_DIAG, 0x11200000, 0x09000000, 12);
@@ -883,6 +962,12 @@ static void wire(void) {
   }
   board_device(STORAGE, 0x11230000, 0x0a000000, 0x0a000000);
   record_boot_stage(4);
+  if (procs[CAMERA].package) {
+    // The MIPI CSI receivers' analog front ends (CSI0A/B, CSI1A/B, CSI2A/B).
+    mapping = &procs[CAMERA].task;
+    for (unsigned off = 0; off < 0x6000; off += PAGE)
+      map_device(0x11c10000 + off, 0x09020000 + off, 12);
+  }
   device(USB_DIAG, 0x11cc0000, 0x09001000, 12);
   if (procs[OPEN_RT].package) {
     // The display engine, read-only, for the Open Runtime's frame pipeline
@@ -891,8 +976,23 @@ static void wire(void) {
     // at 0x09800000 onwards (addresses from the phone's device tree).
     mapping = &procs[OPEN_RT].task;
     static const unsigned blocks[] = {0x14000000, 0x14001000, 0x1400b000, 0x1400c000, 0x1400d000, 0x14014000};
-    for (unsigned i = 0; i < sizeof(blocks) / sizeof(*blocks); i++)
+    for (unsigned i = 0; i < sizeof(blocks) / sizeof(*blocks); i++) {
+      // SMI common, between them, for the camera power domain's bus clamp.
+      if (blocks[i] == 0x1400b000 && procs[CAMERA].package) device(0, 0x14002000, 0x0970b000, 12);
+      mapping = &procs[OPEN_RT].task;
       map_device_rights(blocks[i], 0x09800000 + i * PAGE, 12, seL4_CanRead);
+      if (blocks[i] == 0x14000000 && procs[CAMERA].package) {
+        // MMSYS config, writable here: the camera's bridge to the MM bus is one of its clock gates.
+        ensure_table(&bootstrap, 0x0970c000);
+        unsigned copy = next_slot++;
+        check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode, next_slot - 2, 32,
+                              seL4_AllRights));
+        check(seL4_ARM_Page_Map(copy, bootstrap.pd, 0x0970c000, seL4_AllRights, seL4_ARM_ExecuteNever));
+      }
+    }
+  } else if (procs[CAMERA].package) {
+    device(0, 0x14000000, 0x0970c000, 12);
+    device(0, 0x14002000, 0x0970b000, 12);
   }
   board_device(RADIO, 0x18002000, 0x09015000, 0x09706000); // connectivity MCU and ROM mailbox
   device(RADIO, 0x18004000, 0x09011000, 12);
@@ -901,6 +1001,18 @@ static void wire(void) {
   mapping = &bootstrap;
   map_device_rights(0x180b1000, 0x09705000, 12, seL4_CanRead);
   board_device(RADIO,0x180c1000,0x09013000,0x09707000); // shared oscillator control
+  if (procs[CAMERA].package) {
+    // The camera subsystem, powered on request (camera_platform): its clock
+    // gates, SMI larb3 (the camera's memory port), the four sensor interfaces
+    // with their muxes and test pattern generators, and CAMSV1, which writes
+    // what a sensor interface receives straight to memory.
+    mapping = &procs[CAMERA].task;
+    map_device(0x1a000000, 0x09000000, 12);
+    map_device(0x1a002000, 0x09001000, 12);
+    for (unsigned off = 0; off < 0x8000; off += PAGE)
+      map_device(0x1a040000 + off, 0x09010000 + off, 12);
+    map_device(0x1a050000, 0x09018000, 12);
+  }
   mapping = &procs[RADIO].task;
   for (unsigned off = 0; off < 0x300000; off += 0x100000)
     map_device(0x42400000 + off, 0x09c00000 + off, 20);
@@ -928,6 +1040,7 @@ static void wire(void) {
     if (procs[id].package)
       surface(id);
   open_runtime();
+  camera_frames();
   unsigned first = 0;
 #ifdef VIOLET_MOTO
   struct task *display = &procs[DISPLAY].task;
@@ -1241,6 +1354,131 @@ static unsigned audio_platform(unsigned want, bool change, unsigned survey[10]) 
   survey[9] = 0x41555031; // "AUP1"
   return done;
 }
+// Camera power, clocks and pins, from Motorola's ellis kernel: the CAM power
+// domain (spm_mtcmos_ctrl_cam_pwr and _bus_prot in clk-mt6765-pg.c), camtg_sel
+// at 24 MHz (usb20_192m_d8, clk-mt6765.c) and the ellis camera pinctrl
+// (mt6762-ellis-camera-sensor-overlay.dtsi). The low byte of `val` names the
+// items to change and the next byte their new state:
+//   1 CAM power domain and seninf_sel   2 MCLK0: camtg 24 MHz, GPIO99 CMMCLK0
+//   4 AVDD switch (GPIO92)   8 rear reset (GPIO101, high = running)
+//   16 front reset (GPIO102) 32 I2C2 pins (GPIO103/104) and its clocks
+//   64 MIPI CSI0 26 MHz gate 128 torch (GPIO154)
+// The survey reports what the hardware shows either way.
+static void gpio_out(volatile unsigned *gpio, unsigned pin, bool high) {
+  unsigned bank = pin / 32 * 0x10 / 4, bit = 1u << (pin % 32);
+  write_board(gpio + 0x300 / 4 + pin / 8 * 4 + 2, 0xfu << (pin % 8 * 4)); // mode 0 (GPIO)
+  write_board(gpio + 0x100 / 4 + bank + (high ? 1 : 2), bit);              // DOUT set/clear
+  write_board(gpio + 0x000 / 4 + bank + 1, bit);                           // DIR set: output
+}
+static void gpio_mode(volatile unsigned *gpio, unsigned pin, unsigned mode) {
+  set_field(gpio + 0x300 / 4 + pin / 8 * 4, 0xfu << (pin % 8 * 4), mode << (pin % 8 * 4));
+}
+static unsigned camera_platform(unsigned val, bool change, unsigned survey[10]) {
+  volatile unsigned *top = (void *)0x09708000, *infra = (void *)0x09701000,
+                    *gpio = (void *)0x09702000, *spm = (void *)0x09700000,
+                    *apmixed = (void *)0x0970a000, *smi = (void *)0x0970b000,
+                    *mmsys = (void *)0x0970c000;
+  volatile unsigned *cam = spm + 0x344 / 4;
+  unsigned which = change ? val & 0xff : 0, on = val >> 8, done = 0;
+  if (which & 1) {
+    if (!(spm[0] & 1)) write_board(spm, 0x0b160001u | (spm[0] & 0xffff));
+    if (on & 1) {
+      write_board(cam, *cam | 4);   // PWR_ON
+      write_board(cam, *cam | 8);   // PWR_ON_2ND
+      bool up = await_field(spm + 0x180 / 4, 1u << 25, 1u << 25) &&
+                await_field(spm + 0x184 / 4, 1u << 25, 1u << 25);
+      write_board(cam, *cam & ~16u); // PWR_CLK_DIS
+      write_board(cam, *cam & ~2u);  // PWR_ISO
+      write_board(cam, *cam | 1);    // PWR_RST_B
+      write_board(cam, *cam & ~(1u << 8));
+      up = up && await_field(cam, 1u << 12, 0);
+      write_board(cam, *cam & ~(1u << 9));
+      up = up && await_field(cam, 1u << 13, 0);
+      write_board(infra + 0x2a4 / 4, 1u << 20);              // bus protect step 2
+      write_board(smi + 0x3c8 / 4, 1u << 3);                 // SMI clamp
+      write_board(infra + 0x2ac / 4, (1u << 19) | (1u << 21)); // bus protect step 1
+      write_board(mmsys + 0x108 / 4, 1u << 25); // mm_smi_cam_ck: SMI larb3's bridge (gals-cam2mm)
+      // seninf_sel, the sensor interfaces' clock: univpll1_d4 (312 MHz), ungated.
+      write_board(top + 0xa8 / 4, (3u << 16) | (1u << 23));
+      write_board(top + 0xa4 / 4, 1u << 16);
+      write_board(top + 0x04 / 4, 1u << 26);
+      // camtm_sel, the receivers' timing clock: univpll2_d2 (208 MHz), ungated.
+      write_board(top + 0xb8 / 4, (3u << 8) | (1u << 15));
+      write_board(top + 0xb4 / 4, 3u << 8);
+      write_board(top + 0x04 / 4, 1u << 29);
+      if (up) done |= 1;
+    } else {
+      write_board(infra + 0x2a8 / 4, (1u << 19) | (1u << 21));
+      bool idle = await_field(infra + 0x258 / 4, (1u << 19) | (1u << 21), (1u << 19) | (1u << 21));
+      write_board(infra + 0x2a0 / 4, 1u << 20);
+      idle = idle && await_field(infra + 0x228 / 4, 1u << 20, 1u << 20);
+      write_board(smi + 0x3c4 / 4, 1u << 3);
+      idle = idle && await_field(smi + 0x3c0 / 4, 1u << 3, 1u << 3);
+      write_board(top + 0xa4 / 4, 1u << 23); // gate seninf_sel
+      write_board(mmsys + 0x104 / 4, 1u << 25);
+      write_board(top + 0xb4 / 4, 1u << 15); // and camtm_sel
+      write_board(cam, *cam | (3u << 8));
+      idle = idle && await_field(cam, 3u << 12, 3u << 12);
+      write_board(cam, *cam | 2);
+      write_board(cam, *cam | 16);
+      write_board(cam, *cam & ~1u);
+      write_board(cam, *cam & ~4u);
+      write_board(cam, *cam & ~8u);
+      idle = idle && await_field(spm + 0x180 / 4, 1u << 25, 0) &&
+             await_field(spm + 0x184 / 4, 1u << 25, 0);
+      if (idle) done |= 1;
+    }
+  }
+  if (which & 2) {
+    if (on & 2) {
+      write_board(top + 0x58 / 4, (7u << 16) | (1u << 23)); // camtg_sel: clear, ungate
+      write_board(top + 0x54 / 4, 1u << 16);                // usb20_192m_d8 = 24 MHz
+      write_board(top + 0x04 / 4, 1u << 6);
+      gpio_mode(gpio, 99, 1);
+    } else {
+      gpio_out(gpio, 99, false);
+      write_board(top + 0x54 / 4, 1u << 23);
+    }
+    done |= 2;
+  }
+  if (which & 4) gpio_out(gpio, 92, on & 4), done |= 4;
+  if (which & 8) gpio_out(gpio, 101, on & 8), done |= 8;
+  if (which & 16) gpio_out(gpio, 102, on & 16), done |= 16;
+  if (which & 32) {
+    gpio_mode(gpio, 103, 1);
+    gpio_mode(gpio, 104, 1);
+    write_board(infra + 0x84 / 4, 1u << 11); // ifr_i2c_ap
+    // I2C2 is a shared, arbitrated bus: its arbiter and IMM clocks
+    // (ifr_i2c2a, ifr_i2c2_imm) must run too.
+    write_board(infra + 0xa8 / 4, (1u << 23) | (1u << 24));
+    if (!(infra[0x90 / 4] & (1u << 11)) && !(infra[0xac / 4] & (3u << 23))) done |= 32;
+  }
+  if (which & 64) {
+    // mipic0_26m and mipic1_26m (clk-mt6765.c GATE_APMIXED 6 and 11)
+    set_field(apmixed + 0x14 / 4, (1u << 6) | (1u << 11), (on & 64) ? (1u << 6) | (1u << 11) : 0);
+    done |= 64;
+  }
+  if (which & 128) gpio_out(gpio, 154, on & 128), done |= 128;
+  survey[0] = *cam;
+  survey[1] = spm[0x180 / 4];
+  survey[2] = infra[0xac / 4];  // infra gates: I2C2 arbiter and IMM
+  survey[3] = (top[0x50 / 4] >> 16 & 0xff) | (top[0xa0 / 4] >> 16 & 0xff) << 8 |
+              (top[0xb0 / 4] >> 8 & 0xff) << 16; // camtg_sel, seninf_sel, camtm_sel
+  survey[4] = gpio[0x3b0 / 4];  // GPIO88-95 modes
+  survey[5] = gpio[0x3c0 / 4];  // GPIO96-103 modes
+  survey[6] = gpio[0x130 / 4];  // GPIO96-127 levels
+  // GPIO96-111 input levels (SCL 103, SDA 104), and how often MCLK (99) changed in 256 reads.
+  unsigned toggles = 0, last = gpio[0x230 / 4];
+  for (unsigned i = 0; i < 256; i++) {
+    unsigned now = gpio[0x230 / 4];
+    toggles += ((now ^ last) >> 3) & 1;
+    last = now;
+  }
+  survey[7] = (last & 0xffff) | toggles << 16;
+  survey[8] = (apmixed[0x14 / 4] & 0xffff) | (mmsys[0x100 / 4] >> 25 & 1) << 16;
+  survey[9] = infra[0x258 / 4] | (smi[0x3c0 / 4] & 8) << 28;
+  return done;
+}
 #endif
 void root_main(seL4_BootInfo *bi) {
   unsigned freq;
@@ -1385,6 +1623,16 @@ void root_main(seL4_BootInfo *bi) {
           seL4_MessageInfo_get_length(msg) == 14 && (op == GET || (op == EXECUTE && val <= 15))) {
         unsigned survey[10];
         result = audio_platform(op == EXECUTE ? val : 0, op == EXECUTE, survey);
+        for (unsigned i = 0; i < 10; i++) seL4_SetMR(4 + i, survey[i]);
+        seL4_SetMR(0, 0);
+        seL4_SetMR(2, result);
+        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 14));
+        continue;
+      }
+      if (badge == CAMERA_LIFE_BADGE && key == CAMERA_PLATFORM &&
+          seL4_MessageInfo_get_length(msg) == 14 && (op == GET || (op == EXECUTE && val <= 0xffff))) {
+        unsigned survey[10];
+        result = camera_platform(val, op == EXECUTE, survey);
         for (unsigned i = 0; i < 10; i++) seL4_SetMR(4 + i, survey[i]);
         seL4_SetMR(0, 0);
         seL4_SetMR(2, result);
@@ -1624,6 +1872,8 @@ void root_main(seL4_BootInfo *bi) {
           result |= 1u << AUDIO;
         if (procs[OPEN_RT].package)
           result |= 1u << OPEN_RT;
+        if (procs[CAMERA].package)
+          result |= 1u << CAMERA;
       } else if (badge == PACKAGES && op == GET && key == 9 && val < COUNT) {
         error = 0;
         if (procs[val].package && val != PACKAGES) {

@@ -1,6 +1,7 @@
 //! A small library for VioletOS open apps written in Rust: the /dev/violet
 //! devices as ordinary Linux files (runtime/open/abi.rs), drawing on a
 //! 720x1600 canvas, text in the Go fonts, and HTTPS with rustls.
+pub mod camera;
 pub mod canvas;
 pub mod device;
 pub mod http;

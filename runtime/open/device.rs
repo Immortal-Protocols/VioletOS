@@ -23,6 +23,8 @@ pub enum Kind {
     Screen,
     /// 48 kHz s16 PCM to the Audio service; `pending` holds a partial frame.
     Audio { channels: u32, pending: Vec<u8> },
+    /// Frames from the Camera service; `seen` is the last frame returned.
+    Camera { seen: u32 },
     Events,
     Sys { pending: Vec<u8> },
     Log,
@@ -55,6 +57,9 @@ impl Drop for OpenFile {
     fn drop(&mut self) {
         if let Kind::Pipe { write: true, peer_open, .. } = &self.kind {
             *peer_open.borrow_mut() = 0;
+        }
+        if let Kind::Camera { .. } = self.kind {
+            camera::want(false);
         }
         if let Kind::Tcp { slot: Some(slot), .. } = self.kind {
             super::net::close(slot);
@@ -143,6 +148,33 @@ fn text(x: usize, y: usize, s: &str, scale: usize, color: u32) {
                 }
             }
         }
+    }
+}
+
+/// The page and frame window shared with Camera (see services/camera/process.rs).
+pub mod camera {
+    const PAGE: *mut u32 = 0x0912_0000 as *mut u32;
+    const WINDOW: usize = 0x0b00_0000;
+    fn get(i: usize) -> u32 {
+        unsafe { PAGE.add(i).read_volatile() }
+    }
+    /// Camera writes its magic when it starts; the page exists only with Camera.
+    pub fn present(mapped: bool) -> bool {
+        mapped && get(8) == 0x314d_4143
+    }
+    pub fn want(on: bool) {
+        unsafe { PAGE.write_volatile(on as u32) }
+    }
+    pub fn frames() -> u32 {
+        get(10)
+    }
+    /// The CameraFrame header (runtime/open/abi.rs) for the newest frame, its
+    /// offset in the window and its length, or the header alone after a failure.
+    pub fn newest() -> ([u32; 8], Option<(usize, usize)>) {
+        let (state, error) = (get(9), get(16));
+        let h = [0x3146_4356, get(10), get(12), get(13), get(14), get(15), get(17), state | error << 8];
+        let frame = (state == 2).then(|| (WINDOW + get(11) as usize, (h[4] * h[3]) as usize));
+        (h, frame)
     }
 }
 
@@ -419,6 +451,10 @@ impl Runtime {
             // An app that leaves the front stops recording, as with any app.
             request(EXECUTE, MICROPHONE, MIC_OFF);
         }
+        if value == LIFECYCLE_FOCUS_LOST && self.camera {
+            // And its camera: an app may only watch while it is on screen.
+            camera::want(false);
+        }
         self.event(i, InputEvent { timestamp_us: now, kind: EVENT_LIFECYCLE, code: 0, x: 0, y: 0, value });
     }
 
@@ -637,6 +673,7 @@ impl Runtime {
             }
             Kind::Pipe { write: true, .. } => 4,
             Kind::Audio { .. } => if pcm_space() > 0 { 4 } else { 0 },
+            Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i)) as u32,
             Kind::Udp { replies, .. } => 4 | (!replies.is_empty()) as u32,
             Kind::Tcp { slot: None, .. } => 4,
             Kind::Tcp { slot: Some(slot), .. } => {
@@ -812,6 +849,43 @@ impl Runtime {
                 }
                 let n = b.len().min(len as usize);
                 b.drain(..n).collect()
+            }
+            Kind::Camera { seen } => {
+                // Only the app on screen sees frames (not while the phone
+                // sleeps or another screen is up); reading keeps the camera on.
+                if !self.focused || self.foreground != Some(i) || len < 32 {
+                    return if len < 32 { EINVAL } else { EAGAIN };
+                }
+                camera::want(true);
+                let (mut h, frame) = camera::newest();
+                // A failure is reported once, as a header alone.
+                let next = match h[7] & 0xff {
+                    2 => h[1],
+                    3 => u32::MAX,
+                    _ => return EAGAIN,
+                };
+                if next == *seen {
+                    return EAGAIN;
+                }
+                *seen = next;
+                let mut n = 0;
+                let app = self.apps[i].as_mut().unwrap();
+                if let Some((at, bytes)) = frame {
+                    n = bytes.min(len as usize - 32);
+                    let pixels = unsafe { core::slice::from_raw_parts(at as *const u8, n) };
+                    if !app.space.write(&mut self.k, &mut self.pool, buf + 32, pixels) {
+                        return EFAULT;
+                    }
+                    // A frame that Camera overwrote while it was copied is marked torn.
+                    if camera::frames().wrapping_sub(h[1]) > 1 {
+                        h[7] |= 1 << 31;
+                    }
+                }
+                let raw: [u8; 32] = unsafe { core::mem::transmute(h) };
+                if !app.space.write(&mut self.k, &mut self.pool, buf, &raw) {
+                    return EFAULT;
+                }
+                return 32 + n as i32;
             }
             _ => return EBADF,
         };

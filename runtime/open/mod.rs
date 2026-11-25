@@ -190,6 +190,8 @@ pub struct Runtime {
     usb_serial: u32,
     /// Audio is installed, so its PCM ring is mapped at 0x09100000.
     pub audio: bool,
+    /// The Camera service's page and frames are mapped.
+    pub camera: bool,
     pub net: net::Net,
     pub shield: ShieldPolicy,
     pub sentinel: sentinel::Sentinel,
@@ -282,6 +284,7 @@ impl Runtime {
             last_poll: 0,
             stats: Stats::default(),
             audio: false,
+            camera: false,
             // Radio (handset) or the emulator's host relay serves the socket pages.
             net: net::Net::new(true),
             shield: ShieldPolicy::new(),
@@ -1047,6 +1050,7 @@ pub fn run() -> ! {
     };
     let inventory = request(GET, INVENTORY, 0);
     rt.audio = inventory.op == OK && inventory.value & (1 << AUDIO_COMPONENT) != 0;
+    rt.camera = inventory.op == OK && inventory.value & (1 << CAMERA_COMPONENT) != 0;
     log!(
         "ready: {} files in /apps image, {} MiB for apps",
         rt.fs.files(),

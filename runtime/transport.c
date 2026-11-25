@@ -57,4 +57,8 @@ void delay_ms(unsigned ms) {
 }
 
 void worker_signal(unsigned cap) { seL4_Signal(cap); }
+// Drop a mapped frame's cached lines in [start, end) after a device wrote it.
+int page_invalidate(unsigned cap, unsigned start, unsigned end) {
+  return seL4_ARM_Page_Invalidate_Data(cap, start, end);
+}
 void worker_wait(unsigned cap) { seL4_Wait(cap, 0); }

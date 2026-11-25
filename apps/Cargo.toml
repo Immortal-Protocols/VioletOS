@@ -3,7 +3,7 @@
 # ordinary Linux program; lib/violet is their shared crate.
 [workspace]
 resolver = "2"
-members = ["lib/violet", "open/home", "open/music", "open/sounds", "open/stopwatch", "open/weather", "open/wifi",
+members = ["lib/violet", "open/camera", "open/home", "open/music", "open/sounds", "open/stopwatch", "open/weather", "open/wifi",
            "shield-demo/notes", "shield-demo/photosync", "shield-demo/themes"]
 
 [workspace.dependencies]
