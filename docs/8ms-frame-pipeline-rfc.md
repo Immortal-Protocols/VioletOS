@@ -1,6 +1,6 @@
 # RFC: Sub-8 ms Frame Pipeline & Zero-Jank Compositing on Pure seL4
 
-**Status:** Phases 1–4 implemented on the Moto G Pure and in QEMU (November 24, 2026), with interrupt-driven touch, seL4 MCS budgets and four cores. See [Implementation](#implementation) for what was built, where it departs from the plan below, and measurements.  
+**Status:** Phases 1–4 implemented on the Moto G Pure and in QEMU (November 24, 2026), with interrupt-driven touch. seL4 MCS budgets and four cores are built and were measured on the handset, but are off by default (`VIOLET_MCS=1`, `VIOLET_CORES=4`) because of two open problems listed under "Not done yet". See [Implementation](#implementation) for what was built, where it departs from the plan below, and measurements.  
 **Targets:** Moto G Pure (`XT2163DL`, MT6765 / 8× Cortex-A53, 720×1600 60 Hz MIPI-DSI) and QEMU on macOS.
 
 ## Motivation
@@ -139,6 +139,9 @@ On the handset, with Ladybird showing CNN Lite (a page 14,939 pixels tall), five
 - **Not done:** Touch interrupts with seL4 MCS timeout handlers, per-core budgets beyond the two tiers, and the AArch64 port.
 
 ### Not done yet
+
+- **MCS is off by default** (`VIOLET_MCS=1` turns it on). With MCS and the Wi-Fi changes of PR #26, Home faults at start in QEMU (a read near address 0x10, always at the same instruction, after ordinary `mmap`/`munmap` traffic); without MCS, or with MCS before #26, every suite passes. Not yet explained.
+- **One core by default** (`VIOLET_CORES=4` boots four). Four cores with MCS joined Wi-Fi and gave the measurements above; four cores without MCS fail Wi-Fi's rail start on the handset (join step 6), and one core does not.
 
 - The classic launcher's Display service still scales through uncached scanout on the handset.
 - `make test-open` fails at `pytone` on `main` as well: the Programs list shows 13 rows, and with Ladybird and Wi-Fi added the last test programs no longer fit.

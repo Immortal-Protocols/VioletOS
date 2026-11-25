@@ -89,8 +89,12 @@ int open_tcb_configure(unsigned tcb, unsigned fault_ep, unsigned cspace, unsigne
    `period_us` (equal: round robin) at `priority`, faulting to `fault_ep` (a
    capability in the Open Runtime's CSpace). Reconfiguring a running thread's
    context is how it moves between tiers. */
+/* Cores the kernel was built for. */
+unsigned open_cores(void) { return CONFIG_MAX_NUM_NODES; }
+/* Without MCS: `priority`, and with more than one core, `core`. */
 int open_tcb_schedule(unsigned tcb, unsigned authority, unsigned priority, unsigned sc,
-                      unsigned fault_ep, unsigned control, unsigned budget_us, unsigned period_us) {
+                      unsigned fault_ep, unsigned control, unsigned budget_us, unsigned period_us,
+                      unsigned core) {
 #ifdef CONFIG_KERNEL_MCS
   int e = seL4_SchedControl_ConfigureFlags(control, sc, budget_us, period_us, 0, 0, 0);
   if (e) return e;
@@ -98,7 +102,13 @@ int open_tcb_schedule(unsigned tcb, unsigned authority, unsigned priority, unsig
   return seL4_TCB_SetPriority(tcb, authority, priority);
 #else
   (void)sc; (void)fault_ep; (void)control; (void)budget_us; (void)period_us;
-  return seL4_TCB_SetPriority(tcb, authority, priority);
+  int e = seL4_TCB_SetPriority(tcb, authority, priority);
+#ifdef CONFIG_ENABLE_SMP_SUPPORT
+  if (!e) e = seL4_TCB_SetAffinity(tcb, core);
+#else
+  (void)core;
+#endif
+  return e;
 #endif
 }
 int open_tcb_priority(unsigned tcb, unsigned authority, unsigned priority) {

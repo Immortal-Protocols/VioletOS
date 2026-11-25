@@ -482,11 +482,15 @@ impl Runtime {
             sc = app.space.object(k, Object::SchedContext, sys::SCHED_CONTEXT_BITS)?;
             let fault = k.slot();
             sys::mint_into(sys::SLOT_CNODE, fault, sys::CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
-            let tier = if self.tiered == Some(index) { sys::TIER_FOREGROUND } else { sys::tier_background(index) };
+            let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
             let r = sys::tcb_schedule(tcb, sc, fault, tier);
             sys::delete(fault);
             k.release(fault);
             r?;
+        } else if sys::cores() > 1 {
+            // Without MCS: just the core.
+            let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
+            sys::tcb_schedule(tcb, 0, 0, tier)?;
         }
         let stub = procmgr::STUBS + 8 * slot as u32;
         let words = [0xe51f_f004u32, target];
@@ -881,13 +885,13 @@ impl Runtime {
     /// never starving them; every other app runs round robin at 100.
     fn set_tiers(&mut self) {
         let front = self.foreground.filter(|_| self.focused);
-        if !sys::mcs() || front == self.tiered {
+        if front == self.tiered || (!sys::mcs() && sys::cores() == 1) {
             return;
         }
         for (i, front) in [(self.tiered, false), (front, true)] {
             let Some(app) = i.and_then(|i| self.apps[i].as_ref()) else { continue };
-            let tier = if front { sys::TIER_FOREGROUND } else { sys::tier_background(i.unwrap()) };
-            for t in app.threads.iter().filter(|t| t.alive && t.sc != 0) {
+            let tier = if front { sys::tier_foreground() } else { sys::tier_background(i.unwrap()) };
+            for t in app.threads.iter().filter(|t| t.alive && (t.sc != 0 || !sys::mcs())) {
                 let _ = sys::tcb_schedule(t.tcb, t.sc, 0, tier);
             }
         }
@@ -1142,8 +1146,11 @@ pub fn run() -> ! {
     } else {
         log!("no timer: polling at priority {}", sys::PRIORITY);
     }
-    if sys::mcs() {
-        log!("scheduling: MCS budgets, {} cores (the app in front on core 1, others on 2-3)", sys::cores());
-    }
+    log!(
+        "scheduling: {}, {} {}",
+        if sys::mcs() { "MCS budgets" } else { "static priorities" },
+        sys::cores(),
+        if sys::cores() > 1 { "cores (the app in front on core 1, others on 2-3)" } else { "core" }
+    );
     rt.run()
 }

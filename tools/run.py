@@ -27,7 +27,7 @@ DEFAULT_NETWORKS = ["VIOLET LAB", "GUEST WIFI", {"name": "VIOLET HOME", "passwor
 def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None),peer=None):
     network="guestport" if peer is not None else "wifi"
     cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
-           "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", os.environ.get("VIOLET_CORES", "4"), "-display", "none",
+           "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", os.environ.get("VIOLET_CORES", "1"), "-display", "none",
            "-monitor", "none", "-global","virtio-mmio.force-legacy=false",
            "-netdev","user,id=wifi,restrict=on","-device",
            f"virtio-net-device,netdev={network},bus=virtio-mmio-bus.8,mac=52:54:00:56:00:01", "-no-reboot"]

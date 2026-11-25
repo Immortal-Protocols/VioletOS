@@ -16,7 +16,8 @@ extern "C" {
     fn open_save_caller(root: u32, slot: u32, bits: u32) -> i32;
     fn open_cnode_move(root: u32, dest: u32, bits: u32, src: u32, src_bits: u32) -> i32;
     fn open_is_mcs() -> i32;
-    fn open_tcb_schedule(tcb: u32, authority: u32, priority: u32, sc: u32, fault_ep: u32, control: u32, budget_us: u32, period_us: u32) -> i32;
+    fn open_tcb_schedule(tcb: u32, authority: u32, priority: u32, sc: u32, fault_ep: u32, control: u32, budget_us: u32, period_us: u32, core: u32) -> i32;
+    fn open_cores() -> u32;
     fn open_tcb_configure(tcb: u32, fault_ep: u32, cspace: u32, cspace_bits: u32, vspace: u32) -> i32;
     fn open_tcb_priority(tcb: u32, authority: u32, priority: u32) -> i32;
     fn open_tcb_write(tcb: u32, resume: i32, regs: *const u32) -> i32;
@@ -290,19 +291,29 @@ pub struct Tier {
 pub const fn tier_background(app: usize) -> Tier {
     Tier { priority: PRIORITY, budget_us: 10_000, period_us: 10_000, core: 2 + (app as u32 & 1) }
 }
-/// The app in front, on its own core: above the services, but at most 6 ms
-/// of every 8, so a busy app cannot starve Audio, Radio or Touch when cores
-/// are short (the RFC's MCS budget).
-pub const TIER_FOREGROUND: Tier = Tier { priority: 120, budget_us: 6_000, period_us: 8_000, core: 1 };
+/// The app in front, on its own core. With MCS also above the services, but
+/// at most 6 ms of every 8, so a busy app cannot starve Audio, Radio or Touch
+/// when cores are short (the RFC's MCS budget). Without MCS budgets nothing
+/// bounds it, so it keeps the services' priority and relies on its own core.
+pub fn tier_foreground() -> Tier {
+    let priority = if mcs() { 120 } else { PRIORITY };
+    Tier { priority, budget_us: 6_000, period_us: 8_000, core: 1 }
+}
 /// SchedControl capabilities for cores 1-3 (supervisor.c).
 const SLOT_SCHED_CORES: u32 = 20;
 
 static CORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Cores the supervisor gave SchedControl capabilities for (MCS), 1 to 4.
+/// Cores apps can run on, 1 to 4: under MCS those the supervisor gave
+/// SchedControl capabilities for, otherwise those the kernel was built for.
 pub fn cores() -> u32 {
     let known = CORES.load(core::sync::atomic::Ordering::Relaxed);
     if known != 0 {
         return known;
+    }
+    if !mcs() {
+        let n = unsafe { open_cores() }.clamp(1, 4);
+        CORES.store(n, core::sync::atomic::Ordering::Relaxed);
+        return n;
     }
     let mut n = 1;
     while n < 4 && copy(SLOT_PROBE, SLOT_SCHED_CORES + n - 1).is_ok() {
@@ -319,7 +330,7 @@ pub fn cores() -> u32 {
 pub fn tcb_schedule(tcb: u32, sc: u32, fault_ep: u32, tier: Tier) -> Result<(), i32> {
     let core = tier.core % cores();
     let control = if core == 0 { SLOT_SCHED_CONTROL } else { SLOT_SCHED_CORES + core - 1 };
-    check(unsafe { open_tcb_schedule(tcb, SLOT_AUTHORITY, tier.priority, sc, fault_ep, control, tier.budget_us, tier.period_us) })
+    check(unsafe { open_tcb_schedule(tcb, SLOT_AUTHORITY, tier.priority, sc, fault_ep, control, tier.budget_us, tier.period_us, core) })
 }
 
 /// Move a capability within this CSpace.
