@@ -197,6 +197,13 @@ pub fn inflate(data: &[u8], out: &mut Out) -> Result<usize, &'static str> {
 }
 
 /// The decoded size a gzip file records in its trailer.
+/// Decode a raw DEFLATE stream into `dest`, which must hold all of it.
+pub fn inflate_into(data: &[u8], dest: &mut [u8]) -> Result<usize, &'static str> {
+    let mut out = Out { buf: dest, len: 0 };
+    inflate(data, &mut out)?;
+    Ok(out.len)
+}
+
 pub fn gzip_size(data: &[u8]) -> Option<usize> {
     let t = data.get(data.len().checked_sub(4)?..)?;
     Some(u32::from_le_bytes(t.try_into().ok()?) as usize)

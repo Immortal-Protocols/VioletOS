@@ -669,7 +669,7 @@ impl Runtime {
         // "@sys frames" or "@sys bench tap X Y N": measurements, answered in the log.
         if let Some(line) = path.strip_prefix("@sys ") {
             // Shared settings too ("@sys set relay 192.168.1.20:8787" points the agent at a relay).
-            if line.starts_with("frames") || line.starts_with("bench ") || line.starts_with("set ") || line.starts_with("get ") {
+            if line.starts_with("frames") || line.starts_with("bench ") || line.starts_with("set ") || line.starts_with("get ") || line == "installed" {
                 let answer = self.system(self.foreground.unwrap_or(0), line);
                 log!("{}: {}", line, answer.trim_end());
             }

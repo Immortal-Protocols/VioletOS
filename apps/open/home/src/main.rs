@@ -46,7 +46,7 @@ fn main() {
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut s = ui::State {
-        now: None, online: false, battery: -1, volume: 0, phones: false,
+        now: None, online: false, battery: -1, volume: 0, phones: false, listening: false,
         temp: String::new(), sky: String::new(), city: String::new(), running: Default::default(), pressed: None, shield: Default::default(),
         wifi: String::new(),
     };
@@ -64,6 +64,7 @@ fn main() {
         s.battery = f.get("battery").and_then(|v| v.parse().ok()).filter(|b| (0..=100).contains(b)).unwrap_or(-1);
         s.volume = f.get("volume").and_then(|v| v.parse().ok()).unwrap_or(0);
         s.phones = f.get("headphones").is_some_and(|v| v == "1");
+        s.listening = f.get("listening").is_some_and(|v| v == "1");
         let w = violet::wifi::state();
         s.wifi = if w.hosting {
             "Phone Internet".to_string()
@@ -168,10 +169,10 @@ fn main() {
         }
         if last_status.elapsed() > Duration::from_secs(2) {
             last_status = Instant::now();
-            let (b, v, p, r, sh, w) = (s.battery, s.volume, s.phones, s.running.clone(), s.shield.clone(), s.wifi.clone());
+            let (b, v, p, r, sh, w, l) = (s.battery, s.volume, s.phones, s.running.clone(), s.shield.clone(), s.wifi.clone(), s.listening);
             status(&mut s);
             let minute = glance.as_ref().and_then(|g| g.now()).map(|t| t.minute);
-            if minute != shown_minute || (b, v, p) != (s.battery, s.volume, s.phones) || r != s.running || sh != s.shield || w != s.wifi {
+            if minute != shown_minute || (b, v, p) != (s.battery, s.volume, s.phones) || r != s.running || sh != s.shield || w != s.wifi || l != s.listening {
                 shown_minute = minute;
                 draw(&mut c, &mut s, &glance, &mut screen);
             }
@@ -185,7 +186,7 @@ mod preview {
         let t = super::clock::parse_http_date("Tue, 24 Nov 2026 02:47:33 GMT");
         let g = super::Glance { utc: t, offset: -8 * 3600, at: std::time::Instant::now(), temp: "54°F".into(), sky: "Partly cloudy".into(), city: "Oakland".into() };
         super::ui::State {
-            now: g.now(), online: true, battery: 82, volume: 8, phones: false, temp: g.temp.clone(), sky: g.sky.clone(),
+            now: g.now(), online: true, battery: 82, volume: 8, phones: false, listening: false, temp: g.temp.clone(), sky: g.sky.clone(),
             city: g.city.clone(), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
             shield: super::ui::Shield { known: true, linked: true, rules: 3, frozen: vec![] }, wifi: "LouieDog".into(),
         }
@@ -241,7 +242,7 @@ mod preview {
         let t = super::clock::parse_http_date("Tue, 24 Nov 2026 02:47:33 GMT");
         let g = super::Glance { utc: t, offset: -8 * 3600, at: std::time::Instant::now(), temp: "54°F".into(), sky: "Partly cloudy".into(), city: "Oakland".into() };
         let s = super::ui::State {
-            now: g.now(), online: true, battery: 82, volume: 8, phones: false, temp: g.temp.clone(), sky: g.sky.clone(),
+            now: g.now(), online: true, battery: 82, volume: 8, phones: false, listening: false, temp: g.temp.clone(), sky: g.sky.clone(),
             city: g.city.clone(), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
             shield: Default::default(), wifi: "LouieDog".into(),
         };

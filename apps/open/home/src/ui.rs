@@ -13,6 +13,8 @@ pub struct State {
     pub battery: i32, // percent, -1 unknown
     pub volume: i32,
     pub phones: bool,
+    /// The voice agent is listening (in front or in the background).
+    pub listening: bool,
     pub temp: String,
     pub sky: String,
     pub city: String,
@@ -244,6 +246,16 @@ fn status(c: &mut Canvas, f: &Fonts, s: &State) {
         c.round_rect(Rect::new(x - 16, y - 12, x - 8, y), 3.0, INK);
     } else {
         speaker(c, (x - 34) as f32, (y - 20) as f32, 0.75, INK);
+    }
+    if s.listening {
+        // A green microphone while the agent hears the room, as phones show it.
+        let mx = (x - 84) as f32;
+        let top = (y - 30) as f32;
+        c.line(mx, top + 6.0, mx, top + 16.0, 12.0, SAFE);
+        c.circle(mx, top + 6.0, 6.0, SAFE);
+        c.circle(mx, top + 16.0, 6.0, SAFE);
+        c.arc(mx, top + 15.0, 11.0, 3.0, -PI, 0.0, SAFE);
+        c.line(mx, top + 26.0, mx, top + 31.0, 3.0, SAFE);
     }
 }
 

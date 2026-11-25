@@ -347,6 +347,15 @@ impl Runtime {
             }
             Err(e) => crate::log!("could not start Home: {}", e),
         }
+        // A paired voice agent starts behind Home, so it hears the user without
+        // being opened first (its state is /data/agent; "peer" once paired).
+        let paired = self.fs.contents("/data/agent").is_some_and(|d| d.split(|&b| b == b'\n').any(|l| l.starts_with(b"peer ")));
+        if paired && self.fs.stat(super::appstore::INSTALLER).is_some() {
+            match self.launch(super::appstore::INSTALLER, &[]) {
+                Ok(_) => crate::log!("started the agent in the background"),
+                Err(e) => crate::log!("could not start the agent: {}", e),
+            }
+        }
     }
     /// Show the Home app when nothing else is in front (or the list without one).
     pub fn show_home(&mut self) {
@@ -529,18 +538,28 @@ impl Runtime {
         }
         self.foreground = next;
     }
+    fn holds_mic(&self, i: usize) -> bool {
+        self.apps[i].as_ref().is_some_and(|a| a.fds.iter().flatten().any(|f| matches!(f.borrow().kind, Kind::Mic { .. })))
+    }
+    /// The app allowed to keep the microphone when it is not in front (the
+    /// voice agent), while it holds it.
+    pub fn background_listener(&self) -> Option<usize> {
+        (0..MAX_APPS).find(|&n| self.apps[n].as_ref().is_some_and(|a| a.path == super::appstore::INSTALLER) && self.holds_mic(n))
+    }
     pub fn lifecycle(&mut self, i: usize, value: i32) {
         let now = sys::now_ns() / 1000;
         if value == LIFECYCLE_FOCUS_LOST && self.audio {
-            // An app that leaves the front stops recording, as with any app.
-            request(EXECUTE, MICROPHONE, MIC_OFF);
+            // An app that leaves the front stops recording, as with any app,
+            // unless the agent is listening from the background (Home shows it).
+            if self.background_listener().is_none() {
+                request(EXECUTE, MICROPHONE, MIC_OFF);
+            } else if Some(i) == self.background_listener() {
+                crate::log!("the agent keeps listening in the background");
+            }
         }
         if value == LIFECYCLE_FOCUS_GAINED && self.audio {
             // An app back in front that still holds the microphone hears again.
-            let holds = self.apps[i].as_ref().is_some_and(|a| {
-                a.fds.iter().flatten().any(|f| matches!(f.borrow().kind, Kind::Mic { .. }))
-            });
-            if holds {
+            if self.holds_mic(i) {
                 mic::resume();
             }
         }
@@ -1190,12 +1209,14 @@ impl Runtime {
             Some("status") => {
                 let power = request(GET, POWER, 0);
                 let volume = request(GET, VOLUME, 0);
+                // listening=1 while the agent holds the microphone (in front or not).
                 alloc::format!(
-                    "battery={} volume={} headphones={} focused={}\n",
+                    "battery={} volume={} headphones={} focused={} listening={}\n",
                     if power.op == OK { power.value as i32 } else { -1 },
                     if volume.op == OK { volume.value as i32 } else { -1 },
                     (volume.op == OK && volume.arg & AUDIO_HEADPHONES != 0) as u32,
-                    (self.focused && self.foreground == Some(i)) as u32
+                    (self.focused && self.foreground == Some(i)) as u32,
+                    self.background_listener().is_some() as u32
                 )
             }
             Some("volume") if line.split_whitespace().nth(1).map_or(false, |w| w == "up" || w == "down") => {
