@@ -7,8 +7,9 @@ deletions; the owner's Stop; step and time budgets). This gives that session a
 VioletOS workspace: screenshots of the panel and touches through the Open
 Runtime, carried by Violet Agent to the phone's agent (apps/open/agent/src/
 control.rs). VioletOS has one screen and no hidden workspace, so Rose works on
-the screen the owner sees, one app at a time. Typing into fields and Android's
-Back are not available; apps here are built with their own on-screen keys.
+the screen the owner sees, one app at a time, and her life's own app work
+waits until the phone sits on Home. Typing into fields and Android's Back are
+not available; apps here are built with their own on-screen keys.
 
 It also answers what Rose's server and her life ask of a phone: the installed
 apps, look() for look_at_screen, and the controller's state.

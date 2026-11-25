@@ -32,6 +32,15 @@ pub fn run(action: &str, args: &Value, shot: &mut u64) -> Value {
             json!({"status": "action_accepted"})
         }
         "list_apps" => json!({"status": "ok", "apps": apps()}),
+        // The app in front, without an image: Rose's life works in apps only while the phone sits on Home.
+        "front" => {
+            let r = violet::sys("screenshot");
+            let f: Vec<&str> = r.split_whitespace().collect();
+            match f.as_slice() {
+                ["ok", _, _, _, _, front, ..] => json!({"status": "ok", "packageName": front}),
+                _ => json!({"status": "unavailable", "errorCode": r.trim()}),
+            }
+        }
         _ => json!({"status": "unsupported", "reason": format!("{action} is not available on VioletOS")}),
     }
 }

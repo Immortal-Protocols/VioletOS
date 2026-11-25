@@ -79,6 +79,11 @@ class VioletConductor(CodexConductor):
         # Rose's life can start app work by itself: never when phone control is off.
         if not self.phone_control:
             raise PhoneTaskError('phone_control_unavailable', 'This phone cannot be operated by the agent.')
+        # Her life's own app work uses the screen the owner sees here: only while it sits on Home.
+        if kw.get('origin') == 'autonomous':
+            front = self.phone.call('front').get('packageName') if getattr(self.phone, 'call', None) else None
+            if front not in ('home', 'apps'):
+                raise PhoneTaskError('owner_using_phone', 'The owner is using the phone; defer this app work to a later wake.')
         # One screen: one app task at a time (a follow-up to the same app joins its task).
         with self._lock:
             other = next((s for s in self.sessions.values() if s.task and not s.closed and not s.cancelled.is_set()
