@@ -175,7 +175,7 @@ pub const JOIN_NO_KEY: u32 = 50;
 /// GET: value is RELAY_OFF..=RELAY_ONLINE, arg the last failure code.
 /// EXECUTE 1 turns it on with the pairing code in the text (12 characters: the
 /// network tag, then the relay password); EXECUTE 0 turns it off; EXECUTE 2 returns
-/// a new random pairing code. Only Home (the launcher) may send it.
+/// a new random pairing code. The launcher and the Open Runtime (for Settings) may send it.
 pub const RELAY: u32 = 29;
 pub const RELAY_OFF: u32 = 0;
 pub const RELAY_STARTING: u32 = 1;

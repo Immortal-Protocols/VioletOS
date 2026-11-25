@@ -1,0 +1,10 @@
+[package]
+name = "sounds"
+version = "0.1.0"
+edition = "2021"
+# A test program, built with the phone's apps (apps/Cargo.toml) but carried
+# only by the images of make test-audio and make test-open.
+workspace = "../../../../apps"
+
+[dependencies]
+violet = { path = "../../../../apps/lib/violet" }

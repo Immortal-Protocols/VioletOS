@@ -38,7 +38,7 @@ pub struct Palette {
 
 impl Default for Palette {
     fn default() -> Palette {
-        Palette { deep: rgb(20, 14, 30), mid: rgb(40, 28, 60), accent: rgb(0xe6, 0x8c, 0xc8), glow: rgb(90, 50, 110) }
+        Palette { deep: rgb(0x1f, 0x1e, 0x1d), mid: rgb(0x36, 0x34, 0x31), accent: rgb(0xb3, 0x9a, 0xf0), glow: rgb(0x55, 0x4c, 0x66) }
     }
 }
 

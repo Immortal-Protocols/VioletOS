@@ -5,12 +5,6 @@
     "required": true
   },
   {
-    "id": 2,
-    "name": "stopwatch",
-    "required": false,
-    "title": "STOPWATCH"
-  },
-  {
     "id": 3,
     "name": "runtime",
     "required": true
@@ -39,12 +33,6 @@
     "id": 8,
     "name": "power",
     "required": false
-  },
-  {
-    "id": 10,
-    "name": "wifi",
-    "required": false,
-    "title": "WI-FI SETUP"
   },
   {
     "id": 22,

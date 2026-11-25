@@ -43,9 +43,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     env:
-      # The two QEMU tests need Home, Stopwatch, Sounds and Weather; leave out
+      # The two QEMU tests need Home and Settings; leave out
       # the apps that are slow to build, and skip whole-program optimisation.
-      VIOLET_OPEN_SKIP: ladybird,music,canvas,hello,agent,bitchat
+      VIOLET_OPEN_SKIP: ladybird,music,agent,bitchat
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:

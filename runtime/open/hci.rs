@@ -33,6 +33,11 @@ pub fn up() -> bool {
     get(0) == MAGIC && get(1) == ON
 }
 /// Claims the controller. Events that arrived before are dropped.
+/// Whether an app has /dev/violet/hci open.
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::Relaxed)
+}
+
 pub fn open() -> bool {
     if OPEN.swap(true, Ordering::Relaxed) {
         return false;

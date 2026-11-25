@@ -194,17 +194,14 @@ impl Runtime {
                 req.arg = m.value;
                 self.forward(who, 5, req)
             }
-            (GET | EXECUTE, NETWORK | PROFILE) | (EXECUTE, RADIO_TEST) if who == WIFI => {
-                self.forward(who, 7, m)
-            }
-            (GET, SCAN) if who == WIFI => self.forward(who, 7, m),
             // The Open Runtime's Wi-Fi settings (the "wifi" commands in
             // /dev/violet/sys, which only /apps/wifi may use to join or leave).
             (GET, SCAN | PROFILE) | (EXECUTE, PROFILE) if who == OPEN_APPS => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == OPEN_APPS && m.value == 1 => self.forward(who, 7, m),
             (GET, RADIO) => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),
-            (GET | EXECUTE, RELAY) if who == LAUNCHER => self.forward(who, 7, m),
+            // Phone Internet: the Open Runtime asks for Settings (runtime/open/wifi.rs).
+            (GET | EXECUTE, RELAY) if who == LAUNCHER || who == OPEN_APPS => self.forward(who, 7, m),
             (GET, POWER) => self.forward(who, 8, m),
             (GET, VOLUME | PLAYBACK | MICROPHONE) => audio(m),
             // Volume is shared. Only the app on screen may change it, make sound

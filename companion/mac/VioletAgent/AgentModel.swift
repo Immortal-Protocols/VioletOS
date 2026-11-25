@@ -759,7 +759,7 @@ final class AgentModel: ObservableObject {
             self.timing["transfer_install_s"] = round(secs * 10) / 10
             if let at = self.requestAt { self.timing["installed_s"] = round(Date().timeIntervalSince(at) * 10) / 10 }
             self.log("installed \(name): \(ok) \(error) in \(String(format: "%.1f", secs)) s")
-            done(ok, ok ? "Installed \(title) on the phone. It is listed in Programs and survives a restart; the user can tap Open \(title) in the agent."
+            done(ok, ok ? "Installed \(title) on the phone. It has an icon on the phone's Home screen and survives a restart; the user can tap Open \(title) in the agent."
                      : "The phone could not install it: \(error)")
         }
         let app = { [weak self] in

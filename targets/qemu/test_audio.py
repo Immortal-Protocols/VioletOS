@@ -2,7 +2,7 @@
 the microphone.
 
 A scripted viewer takes the place of the SDL window. It holds the virtual volume
-buttons, plugs in headphones, opens the Sounds open app (apps/open/sounds) and
+buttons, plugs in headphones, opens the Sounds test program (targets/qemu/open-test-apps/sounds) and
 taps its controls, feeds a tone
 into the microphone ring, then checks the guest's sound card registers, the PCM
 it wrote and the volume bar on screen.
@@ -14,6 +14,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "targets/qemu"))
+import home_grid
 import run
 
 SCRIPT = r'''#!/usr/bin/env python3
@@ -22,7 +24,7 @@ ram = open(sys.argv[1], "r+b")
 card = mmap.mmap(ram.fileno(), 11 * 4096, offset=0x49204000 - 0x40000000)
 screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000,
                    prot=mmap.PROT_READ)
-ACCENT, PANEL = 0xffe68cc8, 0xff2a203c  # the open apps' colours (apps/lib/violet)
+ACCENT, PANEL = 0xffb39af0, 0xff363431  # the open apps' colours (apps/lib/violet/src/paper.rs)
 GAIN = [0, 260, 368, 519, 734, 1036, 1464, 2067, 2920, 4125, 5827, 8231, 11626, 16422, 23197, 32767]
 
 log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
@@ -84,11 +86,10 @@ hold(3, 0.3); time.sleep(0.2)
 if word(4) != 7: fail("both buttons together must not change volume")
 hold(1, 2.4); until("held button repeats to the top", lambda: word(4) == 15)
 
-# Home -> APPS (the Home app) -> Sounds.
-until("Open Runtime ready", lambda: "[open] ready" in open_log() or "[open] started" in open_log(), 60)
-tap(570, 276)  # the classic launcher's APPS button shows the Home app
-until("Home app", lambda: pixel(5, 5) == 0xff2a1740, 90)
-tap(138, 1141)  # Home's Sounds tile
+# Home -> Sounds (a test program: make test-audio builds it into the image).
+until("Home app", lambda: "home: ready" in open_log(), 90)
+time.sleep(1)
+open_icon("sounds")
 until("Sounds shows the volume bar", lambda: bar(15), 60)
 
 before = word(11)
@@ -155,9 +156,9 @@ print("audio checks passed", file=sys.stderr)
 with TemporaryDirectory() as tmp:
     run.IMAGE = ROOT / "build/sel4/qemu"
     viewer = Path(tmp) / "input.py"
-    viewer.write_text(SCRIPT)
-    viewer.chmod(0o755)
     original = run.ROOT / "build/sel4/qemu"
+    viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
+    viewer.chmod(0o755)
     # Use a throwaway disk so the test never changes the emulator's saved state.
     image = Path(tmp) / "image"
     image.mkdir()

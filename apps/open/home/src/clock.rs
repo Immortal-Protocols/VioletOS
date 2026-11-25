@@ -1,4 +1,4 @@
-//! Local time without a timezone database: wttr.in gives the city's UTC
+//! Local time without a timezone database: wttr.in gives the chosen city's UTC
 //! offset ("18:47:32-0800") and the HTTP Date header the UTC time.
 use std::time::Instant;
 
@@ -7,8 +7,6 @@ pub struct Glance {
     pub utc: Option<i64>, // seconds since 1970, when the answer was sent
     pub offset: i64,      // seconds east of UTC at the city
     pub at: Instant,
-    pub temp: String,
-    pub sky: String,
     pub city: String,
 }
 
@@ -20,12 +18,12 @@ pub struct Local {
     pub day: u32,
 }
 
-const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 impl Local {
     pub fn date(&self) -> String {
-        format!("{}, {} {}", DAYS[self.weekday], MONTHS[self.month - 1], self.day)
+        format!("{} {}, {}", MONTHS[self.month - 1], self.day, DAYS[self.weekday])
     }
 }
 
@@ -106,9 +104,9 @@ mod tests {
     #[test]
     fn dates() {
         let t = parse_http_date("Tue, 24 Nov 2026 02:47:33 GMT").unwrap();
-        let g = Glance { utc: Some(t), offset: parse_offset("18:47:32-0800"), at: Instant::now(), temp: String::new(), sky: String::new(), city: String::new() };
+        let g = Glance { utc: Some(t), offset: parse_offset("18:47:32-0800"), at: Instant::now(), city: String::new() };
         let l = g.now().unwrap();
         assert_eq!((l.hour, l.minute), (18, 47));
-        assert_eq!(l.date(), "Monday, November 23");
+        assert_eq!(l.date(), "Nov 23, Mon");
     }
 }

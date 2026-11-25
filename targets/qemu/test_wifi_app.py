@@ -1,6 +1,6 @@
-"""The Wi-Fi app in QEMU, driven by touch like a person would.
+"""Settings › Wi-Fi in QEMU, driven by touch like a person would.
 
-First boot: Home's Wi-Fi bar opens the app, which scans and lists the
+First boot: Settings › Wi-Fi (apps/open/settings) opens, which scans and lists the
 emulator's three networks (tools/run.py: two open, VIOLET HOME with WPA2).
 Choosing VIOLET HOME asks for its password; a wrong one is refused by Radio,
 the right one ("violet-home", typed on the on-screen keyboard, symbols page
@@ -18,6 +18,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "targets/qemu"))
+import home_grid
 import run
 
 SCRIPT = r'''#!/usr/bin/env python3
@@ -61,12 +63,10 @@ def tap(x, y, hold=.12):
     time.sleep(hold); os.write(1, bytes(6)); time.sleep(.2)
 def pixel(x, y):
     return struct.unpack_from("<I", screen, (y * 720 + x) * 4)[0]
-def on_home():
-    return pixel(5, 5) == 0xff2a1740
 def count(pattern):
     return len(re.findall(pattern, everything()))
 
-# The keyboard's layout (apps/open/wifi/src/keyboard.rs).
+# The keyboard's layout (apps/open/settings/src/keyboard.rs).
 UNIT, GAP, ROW_Y, KEY_H = 63.0, 8.0, [1072, 1192, 1312, 1432], 104
 def rows(page):
     bottom = lambda mode: [(mode, 2.0), ("SPACE", 6.0), (".", 1.5)]
@@ -100,11 +100,11 @@ CONNECT = (360, 535)
 
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
 time.sleep(3)
-if not on_home():
-    tap(570, 276)  # the classic launcher's APPS button shows Home
-    until("Home app", on_home, 90)
-tap(360, 690)  # Home's Wi-Fi bar
-until("Wi-Fi app starts", lambda: "wifi: ready" in everything(), 60)
+until("Home", lambda: "home: ready" in everything(), 60)
+open_icon("settings")
+until("Settings starts", lambda: "wifi: ready" in everything(), 60)
+time.sleep(1)
+tap(360, 250 + 54)  # Settings' Wi-Fi row
 until("scan finds the three networks", lambda: "wifi: found 3 networks" in everything(), 30)
 time.sleep(.5)
 
@@ -167,11 +167,11 @@ time.sleep(1.5)  # the runtime writes /data back on its next pass
 
 with TemporaryDirectory() as tmp:
     viewer = Path(tmp) / "input.py"
-    viewer.write_text(SCRIPT)
-    viewer.chmod(0o755)
     original = run.ROOT / "build/sel4/qemu"
     if not (original / "initfs.cpio").exists():
         raise SystemExit("Build the QEMU image first (make qemu-image).")
+    viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
+    viewer.chmod(0o755)
     image = Path(tmp) / "image"
     image.mkdir()
     for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):

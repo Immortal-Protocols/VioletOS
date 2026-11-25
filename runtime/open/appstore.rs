@@ -14,7 +14,7 @@
 //!
 //! A package is an entry whose data is "VGZ1", the gzip length and the gzip of
 //! a cpio archive (Python: /bin/python3 and /lib). It is unpacked into /bin
-//! and /lib instead of becoming /apps/NAME, and is not listed in Programs.
+//! and /lib instead of becoming /apps/NAME, and gets no Home icon.
 //!
 //! A program may also be kept compressed: "VZ1\0", its length (u32 LE), then
 //! raw DEFLATE (the form the agent receives it in). /apps/NAME gets the program
@@ -354,7 +354,8 @@ impl Store {
     pub fn list(&self) -> String {
         let mut s = String::new();
         for e in &self.entries {
-            s.push_str(&alloc::format!("{}\t{}\t{}\n", e.name, e.len, e.title));
+            // A package (Python) is marked, so Settings does not offer it as an app.
+            s.push_str(&alloc::format!("{}\t{}\t{}{}\n", e.name, e.len, e.title, if e.package { "\tpackage" } else { "" }));
         }
         let used: u32 = self.entries.iter().map(|e| (e.len + 511) / 512).sum();
         let free = self.sectors.saturating_sub(FIRST_DATA).saturating_sub(used);
