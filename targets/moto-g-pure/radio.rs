@@ -403,7 +403,7 @@ pub fn run() -> ! {
                 let relay = pairing.is_some()
                     || (usb_job.arg != 0 && usb_name.starts_with(b"VioletRelay"));
                 if relay {
-                    let result = wmt::enable(files[2], profile, stage).and_then(|()| match pairing {
+                    let result = wmt_enable(files[2], profile, stage).and_then(|()| match pairing {
                         Some((n, _, password)) => relay_start(axi, &app_name[..n], files[3], None, &password[..8]),
                         None => {
                             let pmk = wpa::profile_key(usb_name).ok_or(50u32)?;
@@ -445,7 +445,7 @@ pub fn run() -> ! {
                     }
                     return reply;
                 }
-                let result = wmt::enable(files[2], profile, stage)
+                let result = wmt_enable(files[2], profile, stage)
                     .and_then(|()| axi.scan(files[3], scan, stage))
                     .and_then(|()| {
                         if usb_job.arg != 0 {
@@ -894,4 +894,13 @@ fn scan_entry(scan: &passive_scan::Results, index: u32) -> Message {
         reply.put_text(&ap.ssid[..ap.ssid_len]);
     }
     reply
+}
+
+/// The WMT handshake, with Radio above every other thread while it runs:
+/// it polls a UART that loses bytes if Radio is preempted (transport.c, hold_cpu).
+fn wmt_enable(patch: &[u8], profile: u32, stage: fn(u32)) -> Result<(), u32> {
+    unsafe { crate::protocol::hold_cpu(1) };
+    let result = wmt::enable(patch, profile, stage);
+    unsafe { crate::protocol::hold_cpu(0) };
+    result
 }

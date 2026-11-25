@@ -1,6 +1,7 @@
 // The seL4 invocations the Open Runtime makes, as plain C functions for Rust.
 // Every call returns the seL4 error code (0 on success) unless noted.
 #include "tasks.h"
+#include "mcs.h"
 
 int open_retype(unsigned untyped, unsigned type, unsigned bits, unsigned root, unsigned slot) {
   return seL4_Untyped_Retype(untyped, type, bits, root, 0, 0, slot, 1);
@@ -15,7 +16,11 @@ unsigned open_object_type(unsigned which) {
   case 5: return seL4_ARM_PageTableObject;
   case 6: return seL4_ARM_LargePageObject;
   case 7: return seL4_ARM_SmallPageObject;
-  case 8: return seL4_NotificationObject;
+  case 8: return seL4_NotificationObject;  /* 9, 10: Reply, SchedContext (MCS) */
+#ifdef CONFIG_KERNEL_MCS
+  case 9: return seL4_ReplyObject;
+  case 10: return seL4_SchedContextObject;
+#endif
   default: return ~0u;
   }
 }
@@ -46,13 +51,65 @@ int open_cnode_delete(unsigned root, unsigned slot, unsigned bits) {
 int open_cnode_revoke(unsigned root, unsigned slot, unsigned bits) {
   return seL4_CNode_Revoke(root, slot, bits);
 }
-int open_save_caller(unsigned root, unsigned slot, unsigned bits) {
-  return seL4_CNode_SaveCaller(root, slot, bits);
+int open_cnode_move(unsigned root, unsigned dest, unsigned bits, unsigned src, unsigned src_bits) {
+  return seL4_CNode_Move(root, dest, bits, root, src, src_bits);
 }
+/* Whether the kernel has MCS scheduling contexts and Reply objects. */
+int open_is_mcs(void) {
+#ifdef CONFIG_KERNEL_MCS
+  return 1;
+#else
+  return 0;
+#endif
+}
+/* Keep the caller of the last fault so it can be answered later. Under MCS
+   it is in the Reply object at REPLY_SLOT; sys.rs moves that object to `slot`
+   and puts an idle one in REPLY_SLOT for the next receive. */
+int open_save_caller(unsigned root, unsigned slot, unsigned bits) {
+#ifdef CONFIG_KERNEL_MCS
+  return seL4_CNode_Move(root, slot, bits, root, REPLY_SLOT, bits);
+#else
+  return seL4_CNode_SaveCaller(root, slot, bits);
+#endif
+}
+/* A thread's spaces and, without MCS, its fault endpoint (in the thread's
+   own CSpace). Under MCS the fault endpoint comes with its scheduling
+   context (open_tcb_schedule). */
 int open_tcb_configure(unsigned tcb, unsigned fault_ep, unsigned cspace, unsigned cspace_bits,
                        unsigned vspace) {
   seL4_Word guard = seL4_CNode_CapData_new(0, 32 - cspace_bits).words[0];
+#ifdef CONFIG_KERNEL_MCS
+  (void)fault_ep;
+  return seL4_TCB_Configure(tcb, cspace, guard, vspace, 0, 0, seL4_CapNull);
+#else
   return seL4_TCB_Configure(tcb, fault_ep, cspace, guard, vspace, 0, 0, seL4_CapNull);
+#endif
+}
+/* MCS: give `tcb` scheduling context `sc` with `budget_us` of every
+   `period_us` (equal: round robin) at `priority`, faulting to `fault_ep` (a
+   capability in the Open Runtime's CSpace). Reconfiguring a running thread's
+   context is how it moves between tiers. */
+/* Cores the kernel was built for. */
+unsigned open_cores(void) { return CONFIG_MAX_NUM_NODES; }
+/* Without MCS: `priority`, and with more than one core, `core`. */
+int open_tcb_schedule(unsigned tcb, unsigned authority, unsigned priority, unsigned sc,
+                      unsigned fault_ep, unsigned control, unsigned budget_us, unsigned period_us,
+                      unsigned core) {
+#ifdef CONFIG_KERNEL_MCS
+  int e = seL4_SchedControl_ConfigureFlags(control, sc, budget_us, period_us, 0, 0, 0);
+  if (e) return e;
+  if (fault_ep) return seL4_TCB_SetSchedParams(tcb, authority, 0, priority, sc, fault_ep);
+  return seL4_TCB_SetPriority(tcb, authority, priority);
+#else
+  (void)sc; (void)fault_ep; (void)control; (void)budget_us; (void)period_us;
+  int e = seL4_TCB_SetPriority(tcb, authority, priority);
+#ifdef CONFIG_ENABLE_SMP_SUPPORT
+  if (!e) e = seL4_TCB_SetAffinity(tcb, core);
+#else
+  (void)core;
+#endif
+  return e;
+#endif
 }
 int open_tcb_priority(unsigned tcb, unsigned authority, unsigned priority) {
   return seL4_TCB_SetPriority(tcb, authority, priority);
@@ -78,7 +135,7 @@ int open_tcb_resume(unsigned tcb) { return seL4_TCB_Resume(tcb); }
 // and up to 16 message registers.
 unsigned open_receive(unsigned ep, int block, unsigned *badge, unsigned *mrs) {
   seL4_Word b = 0;
-  seL4_MessageInfo_t info = block ? seL4_Recv(ep, &b) : seL4_NBRecv(ep, &b);
+  seL4_MessageInfo_t info = block ? IPC_RECV(ep, &b, REPLY_SLOT) : IPC_NBRECV(ep, &b, REPLY_SLOT);
   unsigned length = seL4_MessageInfo_get_length(info);
   for (unsigned i = 0; i < length && i < 16; i++) mrs[i] = seL4_GetMR(i);
   *badge = b;
@@ -89,7 +146,7 @@ static seL4_MessageInfo_t load(unsigned label, const unsigned *mrs, unsigned len
   return seL4_MessageInfo_new(label, 0, 0, length);
 }
 // Answer the faulting thread that sent the last message.
-void open_reply(const unsigned *mrs, unsigned length) { seL4_Reply(load(0, mrs, length)); }
+void open_reply(const unsigned *mrs, unsigned length) { IPC_REPLY(REPLY_SLOT, load(0, mrs, length)); }
 // Answer a thread whose reply capability was saved with open_save_caller.
 void open_send(unsigned cap, const unsigned *mrs, unsigned length) {
   seL4_Send(cap, load(0, mrs, length));

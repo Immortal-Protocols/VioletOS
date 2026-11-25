@@ -2,12 +2,14 @@
 //! devices as ordinary Linux files (runtime/open/abi.rs), drawing on a
 //! 720x1600 canvas, text in the Go fonts, and HTTPS with rustls.
 pub mod canvas;
+pub mod compositor;
 pub mod device;
 pub mod http;
 pub mod text;
 pub mod wifi;
 
 pub use canvas::{mix, rgb, Canvas, Color, Rect};
+pub use compositor::Compositor;
 pub use device::{events, fields, home, log, sys, Event, Events, Screen, H, W};
 pub use text::{Face, Fonts};
 

@@ -15,11 +15,13 @@ pub struct Pool {
 pub struct Kernel {
     next_slot: u32,
     free_slots: Vec<u32>,
+    /// MCS: Reply objects answered and ready for reuse, by slot.
+    idle_replies: Vec<u32>,
 }
 
 impl Kernel {
     pub fn new() -> Self {
-        Self { next_slot: SLOT_DYNAMIC, free_slots: Vec::new() }
+        Self { next_slot: SLOT_DYNAMIC, free_slots: Vec::new(), idle_replies: Vec::new() }
     }
     pub fn slot(&mut self) -> u32 {
         if let Some(s) = self.free_slots.pop() {
@@ -28,6 +30,25 @@ impl Kernel {
         assert!(self.next_slot < SLOTS, "out of capability slots");
         self.next_slot += 1;
         self.next_slot - 1
+    }
+    /// MCS: after save_caller moved the pending Reply object out, put an idle
+    /// one (or a new one) where the next receive expects it.
+    pub fn refill_reply(&mut self) -> Result<(), i32> {
+        if let Some(idle) = self.idle_replies.pop() {
+            move_cap(SLOT_REPLY, idle)?;
+            self.release(idle);
+            return Ok(());
+        }
+        retype(SLOT_KERNEL, Object::Reply, 0, SLOT_REPLY)
+    }
+    /// A saved reply that has been answered: without MCS the capability is
+    /// gone with the answer; with MCS the Reply object is kept for reuse.
+    pub fn reply_done(&mut self, slot: u32) {
+        if mcs() {
+            self.idle_replies.push(slot);
+        } else {
+            self.release(slot);
+        }
     }
     /// Return a slot that is already empty.
     pub fn release(&mut self, slot: u32) {

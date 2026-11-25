@@ -15,6 +15,10 @@ pub struct Screen {
     pix: *mut u32,
 }
 
+// The mapping lasts as long as the process; the compositor thread owns the
+// Screen it presents with.
+unsafe impl Send for Screen {}
+
 impl Screen {
     pub fn open() -> std::io::Result<Screen> {
         let file = OpenOptions::new().read(true).write(true).open("/dev/violet/screen")?;
@@ -69,6 +73,16 @@ impl Screen {
             bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
         }
         let _ = self.file.write_all(&bytes);
+    }
+
+    /// Wait until the panel starts its next frame (SCREEN_IOC_WAIT_VSYNC);
+    /// returns the frame's sequence number and period in microseconds.
+    pub fn wait_vsync(&mut self) -> Option<(u32, u32)> {
+        let mut info = [0u32; 4];
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), 0x5604, info.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        Some((info[0], info[1]))
     }
 
     pub fn show_all(&mut self, c: &Canvas) {

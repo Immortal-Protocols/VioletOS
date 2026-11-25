@@ -14,6 +14,10 @@ extern "C" {
     fn open_cnode_delete(root: u32, slot: u32, bits: u32) -> i32;
     fn open_cnode_revoke(root: u32, slot: u32, bits: u32) -> i32;
     fn open_save_caller(root: u32, slot: u32, bits: u32) -> i32;
+    fn open_cnode_move(root: u32, dest: u32, bits: u32, src: u32, src_bits: u32) -> i32;
+    fn open_is_mcs() -> i32;
+    fn open_tcb_schedule(tcb: u32, authority: u32, priority: u32, sc: u32, fault_ep: u32, control: u32, budget_us: u32, period_us: u32, core: u32) -> i32;
+    fn open_cores() -> u32;
     fn open_tcb_configure(tcb: u32, fault_ep: u32, cspace: u32, cspace_bits: u32, vspace: u32) -> i32;
     fn open_tcb_priority(tcb: u32, authority: u32, priority: u32) -> i32;
     fn open_tcb_write(tcb: u32, resume: i32, regs: *const u32) -> i32;
@@ -41,6 +45,9 @@ pub const SLOT_WAKE: u32 = 11;
 const SLOT_PROBE: u32 = 12;
 /// The badge a timer expiry arrives with (fault badges are below 0x8000).
 pub const TIMER_BADGE: u32 = 1 << 27;
+/// The badge Touch signals with when it has put a report in the ring (handset).
+pub const TOUCH_BADGE: u32 = 1 << 26;
+pub const NOTIFY_BADGES: u32 = TIMER_BADGE | TOUCH_BADGE;
 /// Above the 100 every process runs at, while the timer works: the Open
 /// Runtime then sleeps between events and wakes ahead of polling services.
 pub const EVENT_PRIORITY: u32 = 150;
@@ -201,6 +208,10 @@ pub enum Object {
     PageTable,
     LargePage,
     SmallPage,
+    Notification,
+    /// MCS only: a pending reply, and a thread's share of the CPU.
+    Reply,
+    SchedContext,
 }
 pub fn object_type(o: Object) -> u32 {
     unsafe { open_object_type(o as u32) }
@@ -249,8 +260,85 @@ pub fn save_caller(slot: u32) -> Result<(), i32> {
 }
 pub fn tcb_configure(tcb: u32, fault_ep: u32, cspace: u32, cspace_bits: u32, vspace: u32) -> Result<(), i32> {
     check(unsafe { open_tcb_configure(tcb, fault_ep, cspace, cspace_bits, vspace) })?;
+    if mcs() {
+        return Ok(()); // priority comes with the scheduling context (tcb_schedule)
+    }
     check(unsafe { open_tcb_priority(tcb, SLOT_AUTHORITY, PRIORITY) })
 }
+
+/// The kernel has MCS scheduling contexts (kernel/sel4/build.py).
+pub fn mcs() -> bool {
+    unsafe { open_is_mcs() != 0 }
+}
+
+/// The supervisor's SchedControl capability (MCS).
+pub const SLOT_SCHED_CONTROL: u32 = 13;
+/// Size of a scheduling context object (bits; seL4's minimum is 7).
+pub const SCHED_CONTEXT_BITS: u32 = 8;
+
+/// A share of the CPU for an app thread (MCS): `budget` of every `period`
+/// microseconds at `priority`. Equal budget and period is round robin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Tier {
+    pub priority: u32,
+    pub budget_us: u32,
+    pub period_us: u32,
+    /// The core it runs on (docs/8ms-frame-pipeline-rfc.md): 0 holds the
+    /// services and this process, 1 the app in front, 2 and 3 the rest.
+    pub core: u32,
+}
+/// Apps in the background: round robin at 100, 10 ms slices, on core 2 or 3.
+pub const fn tier_background(app: usize) -> Tier {
+    Tier { priority: PRIORITY, budget_us: 10_000, period_us: 10_000, core: 2 + (app as u32 & 1) }
+}
+/// The app in front, on its own core. With MCS also above the services, but
+/// at most 6 ms of every 8, so a busy app cannot starve Audio, Radio or Touch
+/// when cores are short (the RFC's MCS budget). Without MCS budgets nothing
+/// bounds it, so it keeps the services' priority and relies on its own core.
+pub fn tier_foreground() -> Tier {
+    let priority = if mcs() { 120 } else { PRIORITY };
+    Tier { priority, budget_us: 6_000, period_us: 8_000, core: 1 }
+}
+/// SchedControl capabilities for cores 1-3 (supervisor.c).
+const SLOT_SCHED_CORES: u32 = 20;
+
+static CORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Cores apps can run on, 1 to 4: under MCS those the supervisor gave
+/// SchedControl capabilities for, otherwise those the kernel was built for.
+pub fn cores() -> u32 {
+    let known = CORES.load(core::sync::atomic::Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    if !mcs() {
+        let n = unsafe { open_cores() }.clamp(1, 4);
+        CORES.store(n, core::sync::atomic::Ordering::Relaxed);
+        return n;
+    }
+    let mut n = 1;
+    while n < 4 && copy(SLOT_PROBE, SLOT_SCHED_CORES + n - 1).is_ok() {
+        delete(SLOT_PROBE);
+        n += 1;
+    }
+    CORES.store(n, core::sync::atomic::Ordering::Relaxed);
+    n
+}
+
+/// Put `tcb` on scheduling context `sc` in `tier`; with `fault_ep` (a
+/// capability in this CSpace) the first time, 0 to change tier later. A
+/// tier's core that does not exist folds onto the ones that do.
+pub fn tcb_schedule(tcb: u32, sc: u32, fault_ep: u32, tier: Tier) -> Result<(), i32> {
+    let core = tier.core % cores();
+    let control = if core == 0 { SLOT_SCHED_CONTROL } else { SLOT_SCHED_CORES + core - 1 };
+    check(unsafe { open_tcb_schedule(tcb, SLOT_AUTHORITY, tier.priority, sc, fault_ep, control, tier.budget_us, tier.period_us, core) })
+}
+
+/// Move a capability within this CSpace.
+pub fn move_cap(dest: u32, src: u32) -> Result<(), i32> {
+    check(unsafe { open_cnode_move(SLOT_CNODE, dest, CNODE_BITS, src, CNODE_BITS) })
+}
+/// Where the next receive's Reply object lives (MCS; see sel4.c).
+pub const SLOT_REPLY: u32 = 31;
 
 /// seL4_UserContext on AArch32.
 #[repr(C)]
@@ -297,6 +385,8 @@ pub fn tcb_resume(tcb: u32) {
 pub const FAULT_UNKNOWN_SYSCALL: u32 = 2;
 pub const FAULT_USER_EXCEPTION: u32 = 3;
 pub const FAULT_VM: u32 = 5;
+/// MCS: a thread ran out of budget with a timeout handler (none are set).
+pub const FAULT_TIMEOUT: u32 = 0x105;
 /// MR layout of an unknown-syscall fault: r0..r7, FaultIP, SP, LR, CPSR, number.
 pub const MR_FAULT_IP: usize = 8;
 pub const MR_SP: usize = 9;
@@ -314,6 +404,15 @@ pub fn receive(block: bool) -> Received {
     let mut r = Received { label: 0, length: 0, badge: 0, mrs: [0; 16] };
     let info = unsafe { open_receive(SLOT_FAULT_EP, block as i32, &mut r.badge, r.mrs.as_mut_ptr()) };
     r.label = info >> 16;
+    // MCS adds a Timeout fault (5) before VMFault, which becomes 6; keep the
+    // labels this file names (FAULT_VM is the VMFault of the kernel without MCS).
+    if r.badge != 0 && mcs() {
+        r.label = match r.label {
+            6 => FAULT_VM,
+            5 => FAULT_TIMEOUT,
+            l => l,
+        };
+    }
     r.length = info & 0xffff;
     r
 }

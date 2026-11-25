@@ -77,6 +77,14 @@ impl Surface {
     }
 }
 
+impl Shell {
+    /// Arm for taps now unless a finger is already down (it must lift first).
+    pub fn arm_with(&mut self, finger_down: bool) {
+        self.armed = !finger_down;
+        self.held = finger_down;
+    }
+}
+
 #[derive(Default)]
 pub struct Shell {
     pub dirty: bool,
@@ -339,7 +347,7 @@ impl Runtime {
         }
     }
 
-    /// A touch change from Runtime, in screen pixels.
+    /// A touch change from Runtime or the interrupt ring, in screen pixels.
     pub fn touch(&mut self, x: i32, y: i32, down: bool) {
         // A finger on the glass (the idle samples between touches do not count).
         if down {
@@ -901,18 +909,22 @@ impl Runtime {
                 None => String::from("error usage: open PATH\n"),
             },
             // Frame-pipeline measurements since the last `frames` (frames.rs).
-            Some("frames") => self.frames.report(sys::now_ns()),
-            // `bench tap X Y N`: N synthetic presses on the app in front.
+            Some("frames") => alloc::format!("{} {}", super::touch::describe(), self.frames.report(sys::now_ns())),
+            // `bench tap X Y N`: N synthetic presses on the app in front;
+            // `bench drag X Y DY N`: N drags of DY pixels over 250 ms each.
             Some("bench") => {
-                let mut n = words.skip(1).map(|w| w.parse::<i32>().unwrap_or(-1));
-                match (n.next(), n.next(), n.next()) {
-                    (Some(x), Some(y), Some(count)) if x >= 0 && y >= 0 && count > 0 => {
+                let drag = words.next() == Some("drag");
+                let mut n = words.map(|w| w.parse::<i32>().unwrap_or(-1));
+                let (x, y) = (n.next().unwrap_or(-1), n.next().unwrap_or(-1));
+                let dy = if drag { n.next().unwrap_or(0) } else { 0 };
+                match n.next() {
+                    Some(count) if x >= 0 && y >= 0 && count > 0 && drag == (dy != 0) => {
                         let now = sys::now_ns();
                         self.frames.report(now);
-                        self.frames.bench = Some(super::frames::Bench { x, y, left: count as u32, next_ns: now + 300_000_000, pressed: false });
+                        self.frames.bench = Some(super::frames::Bench { x, y, dy, step: 0, left: count as u32, next_ns: now + 300_000_000, pressed: false });
                         String::from("ok\n")
                     }
-                    _ => String::from("error usage: bench tap X Y N\n"),
+                    _ => String::from("error usage: bench tap X Y N | bench drag X Y DY N\n"),
                 }
             }
             // The programs running now, as paths.

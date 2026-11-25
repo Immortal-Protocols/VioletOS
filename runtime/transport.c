@@ -1,6 +1,7 @@
 // The C portion of the AArch32 ABI is limited to libsel4 and the virtual
 // counter.
 #include "tasks.h"
+#include "mcs.h"
 seL4_IPCBuffer *__sel4_ipc_buffer;
 char __sel4_print_error;
 enum { WORDS = 14 };
@@ -28,17 +29,17 @@ void ipc_call(unsigned ep, unsigned *words) {
 }
 unsigned ipc_receive(unsigned ep, unsigned *words) {
   unsigned badge = 0;
-  read_words(words, seL4_Recv(ep, &badge));
+  read_words(words, IPC_RECV(ep, &badge, REPLY_SLOT));
   return badge;
 }
 unsigned ipc_try_receive(unsigned ep,unsigned *words) {
   unsigned badge=0;
-  seL4_MessageInfo_t tag=seL4_NBRecv(ep,&badge);
+  seL4_MessageInfo_t tag=IPC_NBRECV(ep,&badge,REPLY_SLOT);
   if (seL4_MessageInfo_get_length(tag)!=WORDS) return 0;
   read_words(words,tag);
   return 1;
 }
-void ipc_reply(unsigned *words) { seL4_Reply(send_words(words)); }
+void ipc_reply(unsigned *words) { IPC_REPLY(REPLY_SLOT, send_words(words)); }
 unsigned ticks_per_ms;
 uint32_t ticks(void) {
   uint32_t lo, hi;
@@ -55,6 +56,14 @@ void delay_ms(unsigned ms) {
   while (ticks() - start < ms * ticks_per_ms)
     seL4_Yield();
 }
+
+/* Radio's WMT handshake polls the connectivity chip's UART, which has a small
+   FIFO and no flow control: a thread that preempts Radio mid-exchange (the
+   Open Runtime and Touch wake at priority 150) makes it lose bytes. Radio
+   holds the CPU above them while the exchange runs, then returns to 100.
+   Slot 12 is Radio's own TCB (supervisor.c); no other process calls this. */
+enum { SELF_TCB_SLOT = 12 };
+void hold_cpu(unsigned on) { seL4_TCB_SetPriority(SELF_TCB_SLOT, SELF_TCB_SLOT, on ? 160 : 100); }
 
 void worker_signal(unsigned cap) { seL4_Signal(cap); }
 void worker_wait(unsigned cap) { seL4_Wait(cap, 0); }

@@ -16,6 +16,7 @@ pub mod inflate;
 pub mod net;
 pub mod scanout;
 pub mod sockets;
+pub mod touch;
 pub mod policy;
 pub mod shield;
 pub mod guard;
@@ -142,6 +143,8 @@ pub struct Thread {
     pub clear_tid: u32,
     pub alive: bool,
     pub slot: u32,
+    /// Its scheduling context (MCS), or 0.
+    pub sc: u32,
 }
 
 pub type FileRef = Rc<RefCell<device::OpenFile>>;
@@ -202,6 +205,10 @@ pub struct Runtime {
     pub frames: frames::Frames,
     /// The panel's scan line and frame count (scanout.rs).
     pub beam: scanout::Beam,
+    /// Reports Touch reads on its interrupt (touch.rs, handset).
+    pub ring: touch::Ring,
+    /// The app whose threads run in the foreground tier (MCS), as last applied.
+    tiered: Option<usize>,
 }
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
@@ -298,6 +305,8 @@ impl Runtime {
             wifi: wifi::Wifi::default(),
             frames: frames::Frames::default(),
             beam: scanout::Beam::default(),
+            ring: touch::Ring::default(),
+            tiered: None,
             // Requests made before this boot are not repeated.
             usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
         })
@@ -466,6 +475,23 @@ impl Runtime {
         let ep_slot = slot as u32 + 1;
         sys::mint_into(app.cnode, ep_slot, APP_CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
         sys::tcb_configure(tcb, ep_slot, app.cnode, APP_CNODE_BITS, app.space.pd)?;
+        // MCS: its own scheduling context, from the app's kernel memory, and
+        // the fault endpoint named in this CSpace.
+        let mut sc = 0;
+        if sys::mcs() {
+            sc = app.space.object(k, Object::SchedContext, sys::SCHED_CONTEXT_BITS)?;
+            let fault = k.slot();
+            sys::mint_into(sys::SLOT_CNODE, fault, sys::CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
+            let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
+            let r = sys::tcb_schedule(tcb, sc, fault, tier);
+            sys::delete(fault);
+            k.release(fault);
+            r?;
+        } else if sys::cores() > 1 {
+            // Without MCS: just the core.
+            let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
+            sys::tcb_schedule(tcb, 0, 0, tier)?;
+        }
         let stub = procmgr::STUBS + 8 * slot as u32;
         let words = [0xe51f_f004u32, target];
         let at = app.stub_page as usize + 8 * slot;
@@ -486,6 +512,7 @@ impl Runtime {
             clear_tid: 0,
             alive: true,
             slot: slot as u32,
+            sc,
         });
         sys::tcb_write(tcb, true, &regs)?;
         Ok(slot)
@@ -544,7 +571,7 @@ impl Runtime {
         let mut mrs = t.saved;
         mrs[0] = result as u32;
         sys::send(reply, &mrs);
-        self.k.release(reply);
+        self.k.reply_done(reply);
     }
 
     fn handle_fault(&mut self, r: sys::Received) {
@@ -628,20 +655,6 @@ impl Runtime {
             return;
         }
         // The panel's scan line, sampled for 200 ms (frames seen, period).
-        if path == "@sys beam" {
-            log!("{}", display::sample_beam(200));
-            return;
-        }
-        // "@sys disp BLOCK FROM TO" (hex offsets): the display engine's non-zero
-        // registers in a short range, as the log is 4 KiB.
-        if let Some(args) = path.strip_prefix("@sys disp ") {
-            let mut n = args.split_whitespace().map(|w| usize::from_str_radix(w, 16).unwrap_or(0));
-            let (b, from, to) = (n.next().unwrap_or(0), n.next().unwrap_or(0), n.next().unwrap_or(0x100));
-            if b < display::BLOCKS.len() {
-                log!("disp {}", display::dump(b, from, to));
-            }
-            return;
-        }
         // "@sys frames" or "@sys bench tap X Y N": measurements, answered in the log.
         if let Some(line) = path.strip_prefix("@sys ") {
             if line.starts_with("frames") || line.starts_with("bench ") {
@@ -804,6 +817,11 @@ impl Runtime {
         if focused && !self.focused {
             self.shell.dirty = true;
             self.shell.armed = false;
+            if self.ring.live() {
+                // Interrupt-driven touch sends no idle samples to arm the
+                // shell; a finger already lifted counts as lifted.
+                self.shell.arm_with(self.ring.down);
+            }
             if let Some(i) = self.foreground {
                 self.refresh(i);
                 self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
@@ -826,7 +844,18 @@ impl Runtime {
                 self.contact = Some(r.value);
             }
         }
-        if let Some(stream) = self.contact {
+        // Touch comes from Touch's interrupt ring; poll Runtime only if the
+        // ring is not running, or to confirm a release that never arrived.
+        // Still ask every 500 ms: Touch kicks the hardware watchdog when it
+        // serves a request, so this chain (Runtime, its worker, Touch) is
+        // also how the phone knows the system is alive.
+        let stuck = self.ring.down && t0.wrapping_sub(self.ring.last_ns) > 200_000_000;
+        let liveness = t0.wrapping_sub(self.ring.polled_ns) > 500_000_000;
+        let ring_ok = self.ring.live() && !stuck && !liveness;
+        if !ring_ok && self.ring.live() {
+            self.ring.polled_ns = t0;
+        }
+        if let Some(stream) = self.contact.filter(|_| !ring_ok) {
             let t = sys::now_ns();
             // Runtime answers a touch poll with the sample its worker read
             // last and starts the next read; give that worker one turn so
@@ -851,6 +880,44 @@ impl Runtime {
         }
     }
 
+    /// MCS priority tiers (docs/8ms-frame-pipeline-rfc.md): the app on screen
+    /// runs at 120 with 6 ms of every 8, ahead of the services at 100 but
+    /// never starving them; every other app runs round robin at 100.
+    fn set_tiers(&mut self) {
+        let front = self.foreground.filter(|_| self.focused);
+        if front == self.tiered || (!sys::mcs() && sys::cores() == 1) {
+            return;
+        }
+        for (i, front) in [(self.tiered, false), (front, true)] {
+            let Some(app) = i.and_then(|i| self.apps[i].as_ref()) else { continue };
+            let tier = if front { sys::tier_foreground() } else { sys::tier_background(i.unwrap()) };
+            for t in app.threads.iter().filter(|t| t.alive && (t.sc != 0 || !sys::mcs())) {
+                let _ = sys::tcb_schedule(t.tcb, t.sc, 0, tier);
+            }
+        }
+        self.tiered = front;
+    }
+
+    /// Runtime polls (focus, and touch without the interrupt ring): every
+    /// 4 ms while apps run, 16 ms when touch arrives by interrupt, 50 ms idle.
+    fn poll_interval(&self, busy: bool) -> u64 {
+        match (busy, self.ring.live()) {
+            (false, _) => 50_000_000,
+            (true, true) => 16_000_000,
+            (true, false) => 4_000_000,
+        }
+    }
+
+    /// Reports Touch has put in the ring since the last pass, to the app in front.
+    fn drain_touch(&mut self) {
+        while let Some((x, y, down, delay_ns)) = self.ring.next() {
+            if self.focused {
+                self.frames.touch_irq.add(delay_ns);
+                self.touch(x, y, down);
+            }
+        }
+    }
+
     /// Synthetic presses from `bench tap`: a touch down on the app in front,
     /// then, 150 ms later, focus handed back so it drops the press.
     fn bench_tick(&mut self, now: u64) {
@@ -862,16 +929,30 @@ impl Runtime {
             self.frames.bench = None;
             return;
         };
-        if b.pressed {
+        let touch = |kind, y| abi::InputEvent { timestamp_us: now / 1000, kind, code: 0, x: b.x, y, value: 0 };
+        if b.pressed && b.dy != 0 {
+            // A drag: a move every 8 ms, 250 ms in all, then the finger lifts.
+            b.step += 1;
+            let y = b.y + b.dy * b.step.min(31) / 31;
+            if b.step <= 31 {
+                self.event(i, touch(abi::EVENT_TOUCH_MOVE, y));
+                b.next_ns = now + 8_000_000;
+            } else {
+                self.event(i, touch(abi::EVENT_TOUCH_UP, y));
+                b.pressed = false;
+                b.step = 0;
+                b.left -= 1;
+                b.next_ns = now + 1_500_000_000;
+            }
+        } else if b.pressed {
             self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
             b.pressed = false;
             b.left -= 1;
             b.next_ns = now + 350_000_000;
         } else {
-            let e = abi::InputEvent { timestamp_us: now / 1000, kind: abi::EVENT_TOUCH_DOWN, code: 0, x: b.x, y: b.y, value: 0 };
-            self.event(i, e);
+            self.event(i, touch(abi::EVENT_TOUCH_DOWN, b.y));
             b.pressed = true;
-            b.next_ns = now + 150_000_000;
+            b.next_ns = now + if b.dy != 0 { 8_000_000 } else { 150_000_000 };
         }
         self.frames.bench = (b.left > 0).then_some(b);
     }
@@ -884,8 +965,10 @@ impl Runtime {
                 if r.badge == 0 {
                     break;
                 }
-                if r.badge & sys::TIMER_BADGE != 0 {
-                    sys::timer_disarm(); // an expiry that came while we worked
+                if r.badge & sys::NOTIFY_BADGES != 0 {
+                    if r.badge & sys::TIMER_BADGE != 0 {
+                        sys::timer_disarm(); // an expiry that came while we worked
+                    }
                     continue;
                 }
                 self.handle_fault(r);
@@ -924,12 +1007,14 @@ impl Runtime {
             // Poll Runtime often while an app runs or the app list is on screen;
             // otherwise rarely, so an idle Open Runtime costs the other processes little.
             let busy = self.focused || self.apps.iter().any(|a| a.is_some());
-            let interval = if busy { 4_000_000 } else { 50_000_000 };
+            let interval = self.poll_interval(busy);
             if now.wrapping_sub(self.last_poll) >= interval {
                 self.last_poll = now;
                 self.poll_runtime();
                 self.stats.slowest_poll = self.stats.slowest_poll.max(sys::now_ns().wrapping_sub(now));
             }
+            self.drain_touch();
+            self.set_tiers();
             self.bench_tick(now);
             self.beam.tick();
             self.flush_presents();
@@ -962,7 +1047,7 @@ impl Runtime {
         let woke = sys::now_ns();
         self.stats.slept_ns += woke - now;
         self.stats.pass_start = 0; // a pass measures work, not sleep
-        if r.badge != 0 && r.badge & sys::TIMER_BADGE == 0 {
+        if r.badge != 0 && r.badge & sys::NOTIFY_BADGES == 0 {
             self.handle_fault(r);
         }
     }
@@ -973,7 +1058,7 @@ impl Runtime {
     /// something only polling notices (sockets, the audio ring, poll/epoll).
     fn next_wake(&mut self, now: u64) -> u64 {
         let busy = self.focused || self.apps.iter().any(|a| a.is_some());
-        let mut wake = self.last_poll + if busy { 4_000_000 } else { 50_000_000 };
+        let mut wake = self.last_poll + self.poll_interval(busy);
         wake = wake.min(self.last_sentinel + 100_000_000);
         if let Some(b) = self.frames.bench {
             wake = wake.min(b.next_ns);
@@ -1031,11 +1116,13 @@ impl Stats {
 
 /// Enough heap to report a failed start before the pool exists (the pool
 /// then adds HEAP_PAGES of its own; see pool.rs).
-static mut BOOT_HEAP: [u64; 1024] = [0; 1024];
+/// 7.9 KiB: with the other statics, the package (code and zeroed data) must
+/// stay within its 0x3e000-byte window.
+static mut BOOT_HEAP: [u64; 1008] = [0; 1008];
 
 pub fn run() -> ! {
     Log::init();
-    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1024 * 8) };
+    unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1008 * 8) };
     let mut rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -1059,5 +1146,11 @@ pub fn run() -> ! {
     } else {
         log!("no timer: polling at priority {}", sys::PRIORITY);
     }
+    log!(
+        "scheduling: {}, {} {}",
+        if sys::mcs() { "MCS budgets" } else { "static priorities" },
+        sys::cores(),
+        if sys::cores() > 1 { "cores (the app in front on core 1, others on 2-3)" } else { "core" }
+    );
     rt.run()
 }

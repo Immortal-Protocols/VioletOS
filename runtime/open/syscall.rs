@@ -98,7 +98,7 @@ impl Runtime {
             }
             Block(wait, deadline) => {
                 let reply = self.k.slot();
-                if sys::save_caller(reply).is_err() {
+                if sys::save_caller(reply).is_err() || (sys::mcs() && self.k.refill_reply().is_err()) {
                     self.k.release(reply);
                     saved[0] = EAGAIN as u32;
                     sys::reply(&saved);
