@@ -32,6 +32,7 @@ PROFILE = "test-rose"
 SUPPORT = Path.home() / f"Library/Application Support/Violet Agent {PROFILE}"
 ASK = "Make me a coin flip app in Python with one big button."
 CHAT = "While that builds, tell me your name in one sentence."
+TOUCH = "Now open Coin Flip on my phone and flip the coin once."
 
 SCRIPT = r'''#!/usr/bin/env python3
 import json, mmap, os, re, struct, subprocess, sys, time
@@ -40,7 +41,7 @@ log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
 screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000, prot=mmap.PROT_READ)
 APP, SUPPORT, PROFILE = os.environ["AGENT_APP"], os.environ["AGENT_SUPPORT"], os.environ["AGENT_PROFILE"]
 PORT, STUN = os.environ["AGENT_PORT"], os.environ["AGENT_STUN"]
-ASK, CHAT = os.environ["ROSE_ASK"], os.environ["ROSE_CHAT"]
+ASK, CHAT, TOUCH = os.environ["ROSE_ASK"], os.environ["ROSE_CHAT"], os.environ["ROSE_TOUCH"]
 
 def text():
     n = struct.unpack_from("<I", log, 4)[0]
@@ -95,7 +96,7 @@ until("pairing code", lambda: re.search(r"agent: pairing code (\S+)", everything
 code = re.findall(r"agent: pairing code (\S+)", everything())[-1]
 env = dict(os.environ, VIOLET_AGENT_PROFILE=PROFILE, VIOLET_AGENT_RELAY_MAP=f"http://violet-relay.test=http://127.0.0.1:{PORT}",
            VIOLET_AGENT_STUN=f"127.0.0.1:{STUN}")
-mac = subprocess.Popen([APP, "--unpair", "--pair", code, "--say", ASK, "--say", CHAT, "--say-gap", "12"],
+mac = subprocess.Popen([APP, "--unpair", "--pair", code, "--say", ASK, "--say", CHAT, "--say-gap", "12", "--say-after-install", TOUCH],
                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 until("paired", lambda: "agent: paired with a new Mac" in everything(), 60)
 until("Rose ready", lambda: "Rose ready" in mac_log(), 180)
@@ -124,6 +125,16 @@ print(f"rose: {', '.join(apps)} installed on the phone", file=sys.stderr)
 result = re.findall(rf"build {task} done in \d+ s: (.*)", mac_log())[0]
 until("the announcement", lambda: "agent: " + result + "\n" in mac_log(), 90)
 print("rose: she announced it: " + result[:120], file=sys.stderr)
+# Then she works the app by sight: a phone task opens it on screen and taps its button.
+until("the phone task", lambda: "user: " + TOUCH in mac_log(), 120)
+until("a phone task", lambda: re.search(r"task (\d+) \(phone\): running", mac_log()), 60)
+ptask = re.findall(r"task (\d+) \(phone\): running", mac_log())[-1]
+until("the phone task finished", lambda: re.search(rf"task {ptask} \(phone\): (done|failed|cancelled)", mac_log()), 240)
+outcome = re.findall(rf"task {ptask} \(phone\): (\w+) (.*)", mac_log())[-1]
+started = re.search(r"\[open\] started /bin/python3|\[open\] started /apps/coin-flip", everything())
+print(f"rose: phone task {ptask}: {outcome[0]}: {outcome[1][:140]}" + (" (the app was opened)" if started else ""), file=sys.stderr)
+if outcome[0] != "done" or not started:
+    fail("the phone task did not open the app and finish")
 for line in everything().splitlines():
     if line.startswith("agent:") and ("install" in line or "speech" in line or "stop" in line):
         print("guest " + line[:160], file=sys.stderr)
@@ -159,13 +170,13 @@ def main():
             os.environ.update(VIOLET_NET_HOSTS=json.dumps({"violet-relay.test": f"127.0.0.1:{port}",
                                                           "violet-relay.test:3478": f"127.0.0.1:{stun}"}),
                               AGENT_APP=str(APP), AGENT_SUPPORT=str(SUPPORT), AGENT_PROFILE=PROFILE,
-                              AGENT_PORT=str(port), AGENT_STUN=str(stun), ROSE_ASK=ASK, ROSE_CHAT=CHAT)
+                              AGENT_PORT=str(port), AGENT_STUN=str(stun), ROSE_ASK=ASK, ROSE_CHAT=CHAT, ROSE_TOUCH=TOUCH)
             if run.main(str(viewer)) != 0:
                 raise SystemExit("rose test failed")
     finally:
         relay.terminate()
     print("Rose verified: Violet Agent's agent is Rose; a typed request became her build task, the app was built and "
-          "installed on the phone, she talked during the build and announced the result")
+          "installed on the phone, she talked during the build and announced the result, then opened it and worked it by sight")
 
 
 if __name__ == "__main__":

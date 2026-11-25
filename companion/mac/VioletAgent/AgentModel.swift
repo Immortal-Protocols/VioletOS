@@ -78,9 +78,14 @@ final class AgentModel: ObservableObject {
     private var appLists: [([String: Any]) -> Void] = []
     private var removals: [String: ([String: Any]) -> Void] = [:]
     private var opens: [String: (UUID, ([String: Any]) -> Void)] = [:]
+    /// Rose's phone commands (screenshots, touches, opening apps) waiting for the phone's answer.
+    private var phoneCalls: [Int: ([String: Any]) -> Void] = [:]
+    private var nextPhoneCall = 1
     private var timing: [String: Any] = [:]
     /// --say TEXT (repeatable): typed requests once online, --say-gap seconds apart (default 10).
     private var pendingSays: [String] = []
+    /// --say-after-install TEXT: a typed turn once an app (not Python) is installed (tests).
+    private var afterInstall: [String] = []
     /// --install NAME[|TITLE]=PATH (repeatable): install locally built programs after connecting.
     private var pendingInstalls: [(name: String, title: String, path: String)] = []
     /// --record-mic: the phone's microphone stream, kept as mic.wav (measurements).
@@ -117,6 +122,7 @@ final class AgentModel: ObservableObject {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--unpair"), i >= 0 { saved.phones = []; Store.save(saved); phone = nil }
         for (i, a) in args.enumerated() where a == "--say" && i + 1 < args.count { pendingSays.append(args[i + 1]) }
+        for (i, a) in args.enumerated() where a == "--say-after-install" && i + 1 < args.count { afterInstall.append(args[i + 1]) }
         if args.contains("--record-mic") { recording = Data() }
         if let i = args.firstIndex(of: "--name"), i + 1 < args.count { agentName = args[i + 1]; saved.name = agentName; Store.save(saved) }
         for (i, a) in args.enumerated() where a == "--install" && i + 1 < args.count {
@@ -263,7 +269,13 @@ final class AgentModel: ObservableObject {
             link.send(["t": "transcript", "who": "agent", "text": t, "final": true])
             log("agent: \(t)\((m["interrupted"] as? Bool ?? false) ? " (interrupted)" : "")")
         case "task":
-            if let t = m["task"] as? [String: Any], let id = t["id"] as? Int { tasks[id] = t }
+            if let t = m["task"] as? [String: Any], let id = t["id"] as? Int {
+                let status = t["status"] as? String ?? ""
+                if tasks[id]?["status"] as? String != status {
+                    log("task \(id) (\(t["kind"] ?? "")): \(status) \((t["result"] as? String ?? "").prefix(160))")
+                }
+                tasks[id] = t
+            }
         case "assistant_name":
             let n = m["name"] as? String ?? agentName
             agentName = n
@@ -690,6 +702,8 @@ final class AgentModel: ObservableObject {
             let name = o["name"] as? String ?? ""
             log("the phone removed \(name): \(o["ok"] ?? false)")
             removals.removeValue(forKey: name)?(o)
+        case "phone_result":
+            if let id = o["id"] as? Int { phoneCalls.removeValue(forKey: id)?(o) }
         case "opened":
             let name = o["name"] as? String ?? ""
             opens.removeValue(forKey: name)?.1(o)
@@ -752,6 +766,14 @@ final class AgentModel: ObservableObject {
                 guard let self, self.opens[app]?.0 == request else { return }
                 self.opens.removeValue(forKey: app)?.1(["ok": false, "error": "the phone did not answer"])
             }
+        case "phone":
+            let id = nextPhoneCall
+            nextPhoneCall += 1
+            phoneCalls[id] = { o in answer(o["result"] as? [String: Any] ?? ["status": "failed"]) }
+            link.send(["t": "phone", "id": id, "action": args["action"] as? String ?? "", "args": args["args"] ?? [String: Any]()])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+                self?.phoneCalls.removeValue(forKey: id)?(["result": ["status": "timeout", "reason": "the phone did not answer"]])
+            }
         default:
             answer(["ok": false, "reason": "Unknown call \(name)"])
         }
@@ -802,6 +824,10 @@ final class AgentModel: ObservableObject {
             self.timing["transfer_install_s"] = round(secs * 10) / 10
             if let at = self.requestAt { self.timing["installed_s"] = round(Date().timeIntervalSince(at) * 10) / 10 }
             self.log("installed \(name): \(ok) \(error) in \(String(format: "%.1f", secs)) s")
+            if ok, !self.afterInstall.isEmpty {
+                let next = self.afterInstall.removeFirst()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { self.log("typed request: \(next)"); self.rose.text(next) }
+            }
             done(ok, ok ? "Installed \(title) on the phone. It has an icon on the phone's Home screen and survives a restart; the user can tap Open \(title) in the agent."
                      : "The phone could not install it: \(error)")
         }

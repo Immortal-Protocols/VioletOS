@@ -38,6 +38,8 @@ VIOLET_TOOLS = [
     _named('remove_app', 'Remove an installed app from the VioletOS phone. Only after the owner agreed to remove that app.'),
 ]
 VIOLET_POLICY = """
+Phone tasks here work on the screen the owner sees, one app at a time, by screenshots and touch. Apps on this phone
+have their own on-screen keys: there is no typing into fields from outside and no Back button.
 You live on the owner's VioletOS phone (a Moto G Pure running VioletOS), and run on their Mac.
 When the owner asks for an app or a change to one, call build_app at once with what they asked for, in their words
 (say "in Python" when they asked for Python), then say one short line. The build runs as a task: keep talking with the
@@ -68,14 +70,22 @@ class VioletConductor(CodexConductor):
         for line in (customization.POLICY_LINE, builder_voice.POLICY_LINE, composer.POLICY_LINE):
             policy = policy.replace(line.strip() + '\n', '')
         hidden = ANDROID_ONLY | (set() if self.phone_control else PHONE_CONTROL | {'update_task', 'cancel_task'})
-        words = sorted(hidden) + ['Never copy on your own'] + ([] if self.phone_control else ['Do not describe a screen', 'phone action', 'two apps'])
+        # One screen here: never two app tasks at once.
+        words = sorted(hidden) + ['Never copy on your own', 'two apps'] + ([] if self.phone_control else ['Do not describe a screen', 'phone action'])
         kept = [l for l in policy.split('\n') if not any(w in l for w in words)]
         return '\n'.join(kept) + VIOLET_POLICY
 
     def start_phone(self, app, goal, **kw):
-        # Rose's life can start app work by itself: never on a phone that cannot be driven yet.
+        # Rose's life can start app work by itself: never when phone control is off.
         if not self.phone_control:
-            raise PhoneTaskError('phone_control_unavailable', 'This phone cannot be operated by the agent yet.')
+            raise PhoneTaskError('phone_control_unavailable', 'This phone cannot be operated by the agent.')
+        # One screen: one app task at a time (a follow-up to the same app joins its task).
+        with self._lock:
+            other = next((s for s in self.sessions.values() if s.task and not s.closed and not s.cancelled.is_set()
+                          and s.task.status == 'running' and s.app.casefold() != str(app).casefold()), None)
+        if other is not None:
+            raise PhoneTaskError('one_screen', f'This phone shows one app at a time: wait for the task in {other.app}, '
+                                               'or stop it first.')
         return super().start_phone(app, goal, **kw)
 
     # ------------------------------------------------------------- tools

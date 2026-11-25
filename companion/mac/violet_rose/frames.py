@@ -22,10 +22,20 @@ def take_stdout() -> None:
     sys.stdout = sys.stderr
 
 
+_closed = False
+
+
 def put(kind: int, data: bytes) -> None:
+    """One frame to Violet Agent; nothing once it has gone (Rose is then stopping)."""
+    global _closed
     with _lock:
-        _out.write(struct.pack("!BI", kind, len(data)) + data)
-        _out.flush()
+        if _closed:
+            return
+        try:
+            _out.write(struct.pack("!BI", kind, len(data)) + data)
+            _out.flush()
+        except (BrokenPipeError, OSError):
+            _closed = True
 
 
 def event(**e) -> None:

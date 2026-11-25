@@ -20,7 +20,8 @@ It needs Codex signed in with ChatGPT (`codex login`, with GPT 6.1 Terra Fast, a
 | --- | --- |
 | [host.py](violet_rose/host.py) | runs Rose's own server (`rose.app.Server`: listener, speaker, the Codex conductor, tasks, identity, transcripts, life) for the phone, and serves her dashboard and HTTP API on 127.0.0.1 (the window links it) |
 | [transport.py](violet_rose/transport.py) | Rose's audio transport with the phone at the far end: its microphone in, her speech to its player, the player's reports back |
-| [conductor.py](violet_rose/conductor.py) | her Codex conductor plus VioletOS's app tools (`build_app` as one of her tasks, `open_app`, `list_apps`, `remove_app`); it withholds the tools whose far end is Rose Agent on Android, and the phone-control tools until VioletOS answers screenshots and taps |
+| [conductor.py](violet_rose/conductor.py) | her Codex conductor plus VioletOS's app tools (`build_app` as one of her tasks, `open_app`, `list_apps`, `remove_app`); it withholds the tools whose far end is Rose Agent on Android, and keeps her to one app task at a time |
+| [phone.py](violet_rose/phone.py) | the VioletOS phone as Rose's phone: her vision sessions (`phone_task`, her life's app work) see it by screenshots and work it by touch, and `look_at_screen` sees it; on the screen you see, since VioletOS has no hidden workspace |
 | [RoseAgent.swift](VioletAgent/RoseAgent.swift) | starts the host and carries its frames: audio, her bus events, her calls and builds |
 
 She keeps her state in the profile's `rose` folder: `identity.json` (her name and voice), `rosie-life/` (her life and journal), `transcripts/`. Her name starts as the one this app already used (Violet until you rename her: **Rename…** in the window, `--name`, or just ask). Interrupting works as in RoseOS: tap the circle on the phone, say "wait", or talk over her. `rose.log` in the support folder is her log.
@@ -64,13 +65,14 @@ The builder works in `build/agent-workspace` ([tools/agent_build.py](../../tools
 | `--no-direct` | keep to the relay (`VIOLET_AGENT_STUN=off` does too; `VIOLET_AGENT_STUN=HOST:PORT` names another STUN server) |
 | `--wait-direct` | with `--install`, install once the direct path is open (or after 20 s) |
 | `--say TEXT` | send a typed request once the phone is online; repeat it for more, `--say-gap SECONDS` apart (10 by default), e.g. to ask questions during a build |
+| `--say-after-install TEXT` | a typed turn once an app (not Python) is installed (tests) |
 | `--install NAME=PATH` | install a built program once online (repeatable; a Python script installs Python first if the phone lacks it) |
 | `--record-mic` | keep the phone's microphone stream as `mic.wav` |
 | `--no-speech` | no agent at all (Rose is not started) |
 | `--name NAME` | the agent's name, for a new Rose profile |
 | `--unpair`, `--unpair-remote` | forget the phone here, or tell the phone too |
 
-`VIOLET_AGENT_PROFILE=test` keeps a separate identity; `make test-agent` uses it to pair with the phone in QEMU through a local relay, install a program, restart the phone, check the program is still there and runs, and unpair. `make test-rose` runs Rose too: a typed request for a Python app becomes her build task, the app is installed on the phone in QEMU, she answers a question during the build and announces the result, each reply heard in full. `violet_rose/test_transport.py` checks the transport without Rose or a phone.
+`VIOLET_AGENT_PROFILE=test` keeps a separate identity; `make test-agent` uses it to pair with the phone in QEMU through a local relay, install a program, restart the phone, check the program is still there and runs, and unpair. `make test-rose` runs Rose too: a typed request for a Python app becomes her build task, the app is installed on the phone in QEMU, she answers a question during the build and announces the result, each reply heard in full. `violet_rose/test_transport.py` checks the transport and `violet_rose/test_phone.py` Rose's vision session on a fake VioletOS phone, without Rose's server or a device (run them with `build/rose-env/bin/python`).
 
 ## Locomo Music
 

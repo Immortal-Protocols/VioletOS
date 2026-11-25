@@ -105,7 +105,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=0, help="Rose's dashboard on 127.0.0.1 (0: any free port)")
     ap.add_argument("--name", help="the agent's name, for a new profile")
     ap.add_argument("--voice", help="the agent's voice, for a new profile")
-    ap.add_argument("--phone-control", action="store_true", help="offer phone_task and look_at_screen")
+    ap.add_argument("--no-phone-control", action="store_true", help="withhold phone_task and look_at_screen")
     a = ap.parse_args()
     profile = a.profile.expanduser()
     profile.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -131,19 +131,27 @@ def main() -> int:
         return emit(self, kind, **data)
     rose.bus.Bus.emit = emit_with_cause
     from violet_rose.conductor import VioletConductor
+    from violet_rose.phone import VioletPhone
     from violet_rose.transport import PhoneTransport
 
     bridge = Bridge()
     transport = PhoneTransport()
+    phone = VioletPhone(lambda name, args: bridge.call(name, args, timeout=25))
 
     class Conductor(VioletConductor):
         pass
     Conductor.bridge = bridge
-    Conductor.phone_control = a.phone_control
+    Conductor.phone_control = not a.no_phone_control
     # Rose's server constructs rose.codex_conductor.CodexConductor when it loads: ours, with Violet's tools.
     rose.codex_conductor.CodexConductor = Conductor
 
     class VioletServer(rose_app.Server):
+        def __init__(self, args):
+            super().__init__(args)
+            # The VioletOS phone, in place of Rose's fake one (phone.py).
+            self.phone = phone
+            phone.listeners.append(self._on_phone)
+
         def _make_transport(self):
             transport.on_mic = self.mic.mic
             transport.on_client = self._on_client
@@ -168,6 +176,7 @@ def main() -> int:
             conductor = server.conductor
             if cmd == "phone":
                 transport.set_online(bool(c.get("online")))
+                phone.set_connected(bool(c.get("online")))
             elif cmd == "client":
                 transport.report(c.get("msg") or {})
             elif cmd == "text" and conductor is not None:

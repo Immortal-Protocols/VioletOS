@@ -5,6 +5,7 @@
 //! meet through a relay (a Chariot) from any network, switch to a direct UDP
 //! path when the networks allow one, and encrypt end to end:
 //! docs/agent-protocol.md.
+mod control;
 mod direct;
 mod link;
 mod locomo;
@@ -53,6 +54,8 @@ enum Msg {
     Direct(u32, direct::Event),
     Scan(scan::Scan),
     Local(Result<secure::Invitation, String>),
+    /// The answer to one of the Mac's phone commands (control.rs), for its id.
+    Phone(u64, Value),
 }
 
 /// What the phone remembers: its identity and the Mac it trusts.
@@ -171,6 +174,8 @@ struct Agent {
     speech: Sender<voice::Speech>,
     speaking: bool,
     tx: Sender<Msg>,
+    /// Screenshots taken for the Mac: each has its own frame id.
+    shots: std::sync::Arc<std::sync::Mutex<u64>>,
     dirty: bool,
     mic_bytes: u64,
     gate: voice::Gate,
@@ -608,6 +613,22 @@ impl Agent {
                 }
             }
             "unpair" => self.unpair(false),
+            // Rose's eyes and hands (control.rs): run off the main loop, answered when done.
+            "phone" => {
+                let id = v["id"].as_u64().unwrap_or(0);
+                let action = text("action");
+                let args = v["args"].clone();
+                let tx = self.tx.clone();
+                let shots = self.shots.clone();
+                std::thread::spawn(move || {
+                    let mut n = shots.lock().map(|g| *g).unwrap_or(0);
+                    let result = control::run(&action, &args, &mut n);
+                    if let Ok(mut g) = shots.lock() {
+                        *g = n;
+                    }
+                    let _ = tx.send(Msg::Phone(id, result));
+                });
+            }
             _ => {}
         }
     }
@@ -1062,6 +1083,7 @@ fn main() {
         speech: speech_tx,
         speaking: false,
         tx,
+        shots: Default::default(),
         dirty: true,
         mic_bytes: 0,
         gate: voice::Gate::default(),
@@ -1096,6 +1118,7 @@ fn main() {
             }
             Ok(Msg::Direct(..)) => {}
             Ok(Msg::Scan(s)) => a.on_scan(s),
+            Ok(Msg::Phone(id, result)) => a.send_json(json!({"t": "phone_result", "id": id, "result": result})),
             Ok(Msg::Local(result)) => {
                 a.local_pending = false;
                 if !a.paired() {
