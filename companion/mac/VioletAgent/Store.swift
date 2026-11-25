@@ -26,18 +26,20 @@ enum Store {
     }
 
     static func load() -> Saved {
-        var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: service,
                                 kSecAttrAccount as String: account,
                                 kSecReturnData as String: true]
         var out: AnyObject?
-        if SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data,
+        let result = SecItemCopyMatching(q as CFDictionary, &out)
+        if result == errSecSuccess, let d = out as? Data,
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             return s
         }
         let fresh = Saved(seed: Curve25519.Signing.PrivateKey().rawRepresentation.hex, phones: [])
-        q.removeValue(forKey: kSecReturnData as String)
-        save(fresh)
+        // A different build may need Keychain approval to read an existing
+        // pairing. Preserve it if the lookup fails or its data cannot decode.
+        if result == errSecItemNotFound { save(fresh) }
         return fresh
     }
 

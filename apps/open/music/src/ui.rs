@@ -5,6 +5,8 @@ use violet::{mix, rgb, Canvas, Color, Fonts, Rect, H, W};
 use crate::player::{Catalog, Player, BANDS};
 
 pub const HOME: Rect = Rect::new(28, 34, 188, 92);
+pub const LATEST: Rect = Rect::new(198, 34, 318, 92);
+pub const LOCOMO: Rect = Rect::new(330, 34, 692, 92);
 pub const COVER: Rect = Rect::new(110, 150, 610, 650);
 const WAVE: Rect = Rect::new(50, 880, 670, 940);
 const PREV: (i32, i32) = (180, 1080);
@@ -106,6 +108,19 @@ fn clock(sec: f32) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+pub fn draw_locomo(c: &mut Canvas, f: &Fonts, status: &str, has_track: bool) {
+    if has_track {
+        c.round_rect_alpha(LATEST, 26.0, WHITE, 0.15);
+        f.medium(21.0).centered(c, "Latest", LATEST.x0, LATEST.x1, 72, WHITE);
+    }
+    c.round_rect(LOCOMO, 26.0, rgb(82, 58, 122));
+    f.medium(23.0).centered(c, "Make a Cool Jazz song", LOCOMO.x0, LOCOMO.x1, 72, WHITE);
+    if !status.is_empty() {
+        let font = f.medium(19.0);
+        font.centered(c, &font.fit(status, 660), 0, W as i32, 130, WHITE);
+    }
+}
+
 /// Everything that changes only with the track.
 pub fn draw_static(c: &mut Canvas, f: &Fonts, cat: &Catalog, cover: Option<&Cover>, current: Option<usize>) {
     let pal = cover.map_or(Palette::default(), |c| c.palette);
@@ -180,7 +195,8 @@ pub fn draw_static(c: &mut Canvas, f: &Fonts, cat: &Catalog, cover: Option<&Cove
             let t = &cat.tracks[i];
             title.centered(c, &title.fit(&t.title, 640), 0, W as i32, 728, WHITE);
             body.centered(c, &t.artist, 0, W as i32, 774, rgb(225, 220, 235));
-            small.centered(c, &format!("{} BPM   ·   {}", t.bpm, t.key), 0, W as i32, 816, pal.accent);
+            let details = if t.bpm == 0 { t.key.clone() } else { format!("{} BPM   ·   {}", t.bpm, t.key) };
+            small.centered(c, &details, 0, W as i32, 816, pal.accent);
         }
         None => {
             title.centered(c, &cat.album, 0, W as i32, 728, WHITE);
@@ -197,7 +213,8 @@ pub fn draw_static(c: &mut Canvas, f: &Fonts, cat: &Catalog, cover: Option<&Cove
         }
         tiny.draw(c, &format!("{:02}", t.number), 54, y + 24, pal.accent);
         tiny.draw(c, &tiny.fit(&t.title, 380), 104, y + 24, ink);
-        let meta = format!("{} BPM  {}", t.bpm, clock(t.duration_ms as f32 / 1000.0));
+        let length = clock(t.duration_ms as f32 / 1000.0);
+        let meta = if t.bpm == 0 { length } else { format!("{} BPM  {length}", t.bpm) };
         tiny.draw(c, &meta, W as i32 - 54 - tiny.width(&meta), y + 24, rgb(185, 178, 200));
     }
 }

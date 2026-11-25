@@ -67,3 +67,18 @@ The builder works in `build/agent-workspace` ([tools/agent_build.py](../../tools
 | `--unpair`, `--unpair-remote` | forget the phone here, or tell the phone too |
 
 `VIOLET_AGENT_PROFILE=test` keeps a separate identity; `make test-agent` uses it to pair with the phone in QEMU through a local relay, install a program, restart the phone, check the program is still there and runs, and unpair.
+
+## Locomo Music
+
+1. Build and open Violet Agent on an Apple-silicon Mac with macOS 15 or later. Click **+** next to the tabs, then **Set Up Locomo Music**. The companion downloads and verifies the [signed Locomo Music 0.1.14 release](https://github.com/wonderdawg/locomo-music-releases/releases/tag/v0.1.14), installs it in your Applications folder, and opens it to prepare its local models. Setup uses Homebrew to install ffmpeg if needed. The model download is about 10.9 GB and Locomo requires 16 GB free.
+2. When setup finishes, the **Locomo Music** tab appears and stays enabled for that companion profile. Click **Enable One-Tap Generation…** and grant Violet Agent Accessibility access in System Settings if you want the companion to press Locomo’s controls automatically.
+3. On a Moto running the updated VioletOS Agent and Music apps, connect the phone to Wi-Fi and pair **Violet Agent** with the Mac using the QR flow above. For QEMU, run `make emulator` from the same checkout, then open **Violet Agent → Connect to this Mac**. Launch the Mac companion with `VIOLET_AGENT_PROFILE=emulator` if you want to keep a separate handset pairing.
+4. Return to Home, open **Locomo Music**, and tap **Make a Cool Jazz song** in the upper-right. The track plays on arrival. Tap **Latest** to replay it during the current boot.
+
+If the companion asks for a Mac-side click, open the **Cool Jazz** station in Locomo, click **Start** if generation is idle, then click **Stop** once the first song has started. The adapter reads the 0.1.14 library in read-only mode and sends the finished audio over Agent's existing encrypted connection. **Remove Plugin** removes the tab and disables requests from the paired device. The Mac app, downloaded models, and songs stay on disk.
+
+The smoke test uses a separate pairing and disposable QEMU disk. Build the Mac companion in Debug under `build/mac-agent` and run these commands from the repo root with Locomo ready.
+
+```sh
+make test-locomo LOCOMO_APP="/Applications/Locomo Music.app"
+```

@@ -37,6 +37,13 @@ final class AgentModel: ObservableObject {
     @Published var lastTiming: String?
     @Published var agentName = "Violet"
 
+    @Published var locomoStatus = "Downloads Locomo Music and prepares its local models."
+    @Published private(set) var locomoApp: URL?
+    @Published private(set) var locomoInstalling = false
+    private var locomoJob: (id: UUID, phone: String, status: String, song: LocomoPlugin.Song?)?
+    @Published private(set) var locomoRunning = false
+    private var locomoRegistration: URL { support.appendingPathComponent("locomo-plugin") }
+
     private var saved: Saved
     private let identity: Curve25519.Signing.PrivateKey
     private var link: PhoneLink!
@@ -151,6 +158,12 @@ final class AgentModel: ObservableObject {
         companion.start()
         if let i = args.firstIndex(of: "--pair"), i + 1 < args.count, let inv = Invitation(args[i + 1]) { pair(inv) }
         if args.contains("--show-code") { showCode() }
+        if let i = args.firstIndex(of: "--locomo-app"), i + 1 < args.count {
+            enableLocomo(URL(fileURLWithPath: args[i + 1]))
+        } else if FileManager.default.fileExists(atPath: locomoRegistration.path),
+                  FileManager.default.fileExists(atPath: LocomoSetup.installedApp.path) {
+            enableLocomo(LocomoSetup.installedApp)
+        }
         speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
         speaker.onEnd = { [weak self] id in
             guard let self else { return }
@@ -486,7 +499,7 @@ final class AgentModel: ObservableObject {
             }
             if up {
                 link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac",
-                           "agent_name": agentName, "shield": true])
+                           "agent_name": agentName, "shield": true, "locomo": locomoApp != nil])
                 sayPending()
                 if let i = CommandLine.arguments.firstIndex(of: "--speak"), i + 1 < CommandLine.arguments.count {
                     let line = CommandLine.arguments[i + 1]
@@ -527,6 +540,105 @@ final class AgentModel: ObservableObject {
         }
     }
 
+    func setupLocomo() {
+        guard !locomoInstalling, locomoApp == nil else { return }
+        locomoInstalling = true
+        locomoStatus = "Downloading and verifying Locomo Music…"
+        Task { @MainActor in
+            defer { locomoInstalling = false }
+            do {
+                let app = try await LocomoSetup.installApp()
+                if LocomoPlugin.encoder == nil {
+                    locomoStatus = "Installing ffmpeg for phone playback…"
+                    try await LocomoSetup.installEncoder()
+                }
+                locomoStatus = "Preparing Locomo’s music models…"
+                try await LocomoSetup.prepareModels(app) { self.locomoStatus = $0 }
+                try Data().write(to: locomoRegistration, options: .atomic)
+                enableLocomo(app)
+            } catch {
+                locomoStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func removeLocomo() {
+        guard !locomoRunning else { return }
+        do {
+            if FileManager.default.fileExists(atPath: locomoRegistration.path) {
+                try FileManager.default.removeItem(at: locomoRegistration)
+            }
+            locomoApp = nil
+            locomoJob = nil
+            locomoStatus = "Downloads Locomo Music and prepares its local models."
+            link.send(["t": "locomo_available", "enabled": false])
+        } catch {
+            locomoStatus = error.localizedDescription
+        }
+    }
+
+    private func enableLocomo(_ url: URL) {
+        do {
+            try LocomoPlugin.verify(url)
+            locomoApp = url
+            locomoStatus = "Cool Jazz is ready to request from Locomo Music on the paired device."
+            link.send(["t": "locomo_available", "enabled": true])
+        } catch {
+            locomoStatus = error.localizedDescription
+        }
+    }
+
+    private func receiveLocomo(_ o: [String: Any]) {
+        guard let raw = o["id"] as? String, let id = UUID(uuidString: raw), let phone else { return }
+        func reply(_ message: String, failed: Bool = true) {
+            link.send(["t": "locomo_status", "id": raw, "message": message, "done": failed])
+        }
+        if let job = locomoJob, job.id == id, job.phone == phone.key {
+            if let song = job.song { sendLocomo(song, id: raw) }
+            else { reply(job.status, failed: !locomoRunning) }
+            return
+        }
+        guard o["resume"] as? Bool != true else { return reply("The Mac no longer has that song request.") }
+        guard !locomoRunning else { return reply("Locomo is already making a song.") }
+        guard let app = locomoApp else { return reply("Enable Locomo in Violet Agent on the Mac.") }
+        locomoRunning = true
+        locomoJob = (id, phone.key, "Opening Locomo Music…", nil)
+        reply("Opening Locomo Music…", failed: false)
+        log("locomo: requested Cool Jazz song")
+        Task { @MainActor in
+            do {
+                let song = try await LocomoPlugin.generate(app: app) { message in
+                    self.locomoJob?.status = message
+                    self.locomoStatus = message
+                    self.log("locomo: \(message)")
+                    if self.phone?.key == phone.key { reply(message, failed: false) }
+                }
+                locomoJob?.song = song
+                locomoStatus = "Finished \(song.title)"
+                log("locomo: generated \(song.title) (\(song.audio.count) MP3 bytes)")
+                if self.phone?.key == phone.key { sendLocomo(song, id: raw) }
+            } catch {
+                locomoJob?.status = error.localizedDescription
+                locomoStatus = error.localizedDescription
+                log("locomo: \(error.localizedDescription)")
+                if self.phone?.key == phone.key { reply(error.localizedDescription) }
+            }
+            locomoRunning = false
+        }
+    }
+
+    private func sendLocomo(_ song: LocomoPlugin.Song, id: String) {
+        link.send(["t": "locomo_track", "id": id, "title": song.title, "durationMs": song.durationMs,
+                   "size": song.audio.count, "sha256": sha256(song.audio).hex])
+        for offset in stride(from: 0, to: song.audio.count, by: 48 * 1024) {
+            var body = Data()
+            withUnsafeBytes(of: UInt32(offset).littleEndian) { body.append(contentsOf: $0) }
+            body.append(song.audio[offset..<min(offset + 48 * 1024, song.audio.count)])
+            link.send(kind: 0x33, body)
+        }
+        link.send(["t": "locomo_end", "id": id])
+    }
+
     private func phoneMessage(_ o: [String: Any]) {
         switch o["t"] as? String {
         case "hello":
@@ -538,6 +650,8 @@ final class AgentModel: ObservableObject {
                 saved.phones = [p]
                 Store.save(saved)
             }
+        case "locomo_make":
+            receiveLocomo(o)
         case "stop":
             log("tapped to interrupt")
             if useRose { rose.stop("tapped") } else { bargeIn() }

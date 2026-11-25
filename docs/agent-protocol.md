@@ -66,6 +66,7 @@ A plaintext is a kind byte and a body:
 | `0x23` | phone → Mac | silence: a sample count (u32 LE) the phone did not send |
 | `0x21` | Mac → phone | speech: segment id (u32 LE), then 24 kHz s16le mono (one piece) |
 | `0x30` | Mac → phone | app install data: offset (u32 LE), then bytes |
+| `0x33` | Mac → device | Locomo MP3 data: offset (u32 LE), then bytes |
 
 **Microphone.** The phone's uplink through a relay cannot carry 32 KB/s, and silence needs none: a noise gate sends µ-law around speech (320 ms before it, 600 ms after) and a count of silent samples every 200 ms otherwise, so the Mac's endpointing, which counts samples, still sees time pass.
 
@@ -79,6 +80,8 @@ JSON messages carry `"t"`:
 An install arrives (raw DEFLATE when `encoding` says so), is inflated and checked against its length and SHA-256, written to `/apps/NAME` (a deflated program as `VZ1`, its length and the DEFLATE, which the Open Runtime keeps compressed and runs inflated), and then the agent asks the Open Runtime (`install NAME TITLE` in `/dev/violet/sys`) to keep it on disk. Only an authenticated session can deliver one, so the phone accepts installs only from its paired Mac.
 
 A Python app is a `#!/bin/python3` script installed the same way. The handset image has no Python, so before the first one the Mac installs the package `python` ([tools/build_python_package.py](../tools/build_python_package.py)): data starting with `VGZ1` that the Open Runtime unpacks into `/bin` and `/lib` at every start rather than keeping as `/apps/python`. The phone's next `hello` says `python: true`.
+
+**Locomo Music.** The Mac advertises the enabled plugin as `locomo: true` in `hello` and sends `locomo_available` with an `enabled` boolean when availability changes during the session. The device sends `locomo_make` with a request UUID in `id` and includes `resume: true` when reconnecting for that request. The Mac responds with `locomo_status` (`id`, `message`, `done`), or `locomo_track` (`id`, `title`, `durationMs`, `size`, `sha256`), MP3 records, then `locomo_end` with the request ID. The device publishes the file to Music after checking its SHA-256.
 
 ## Direct path
 
