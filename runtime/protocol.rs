@@ -247,6 +247,12 @@ pub const MIC_RECORD_MS: u32 = 4000;
 /// Internal: Audio -> Power, a PMIC register read or masked write on the handset.
 pub const PMIC_ACCESS: u32 = 0x4070;
 
+// Camera. Component 25 serves the image sensors to the Open Runtime through a
+// shared page (services/camera/process.rs); no app or Runtime calls it.
+pub const CAMERA_COMPONENT: u32 = 25;
+/// Internal: Camera -> supervisor (lifecycle slot 7): camera power, clocks and pins.
+pub const CAMERA_PLATFORM: u32 = 0x4043;
+
 // Open Runtime. It hosts Linux-ABI apps (see runtime/open) and is Runtime's
 // client 9, an identity no catalog app uses. The launcher brings it to the
 // front with EXECUTE OPEN OPEN_APPS; it draws the screen itself while in front.

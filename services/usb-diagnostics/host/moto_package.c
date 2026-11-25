@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | open-log | open-run=PATH | open-push=NAME | screenshot[=SCALE] | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | camera-status | camera=HEX | camera-shot=FILE.pgm | camera-raw=FILE | open-log | open-run=PATH | open-push=NAME | screenshot[=SCALE] | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -161,6 +161,43 @@ int main(int argc,char **argv) {
             uint32_t request=(uint32_t)strtoul(argv[1]+6,NULL,16);
             rc=transfer(chosen,0x40,0x4e,request,NULL,0);
             if (!rc) printf("Audio request %08x sent.\n",request);
+        } else if (!strcmp(argv[1],"camera-status")) {
+            // Ninety-six status words from the Camera process, one per line.
+            unsigned char page[64];
+            rc=0;
+            for (uint16_t p=0;p<6 && !rc;p++) {
+                rc=libusb_control_transfer(chosen,0xc0,0x43,0,p,page,64,3000)!=64;
+                for (unsigned i=0;i<16 && !rc;i++) printf("%2u %08x\n",p*16+i,word(page+4*i));
+            }
+        } else if (!strncmp(argv[1],"camera=",7)) {
+            uint32_t request=(uint32_t)strtoul(argv[1]+7,NULL,16);
+            rc=transfer(chosen,0x40,0x44,request,NULL,0);
+            if (!rc) printf("Camera request %08x sent.\n",request);
+        } else if (!strncmp(argv[1],"camera-shot=",12)) {
+            // Camera's 160 x 90 grey preview of a recent frame, as a PGM.
+            static unsigned char preview[160*90];
+            unsigned char chunk[64];
+            rc=0;
+            for (uint16_t c=0;c*64<sizeof(preview) && !rc;c++) {
+                rc=libusb_control_transfer(chosen,0xc0,0x42,0,c,chunk,64,3000)!=64;
+                if (!rc) memcpy(preview+c*64,chunk,c*64+64<=sizeof(preview)?64:sizeof(preview)-c*64);
+            }
+            FILE *out=rc?NULL:fopen(argv[1]+12,"wb");
+            if (out) {
+                fprintf(out,"P5\n160 90\n255\n");
+                fwrite(preview,1,sizeof(preview),out);
+                fclose(out);
+                printf("Wrote %s\n",argv[1]+12);
+            } else if (!rc) rc=1;
+        } else if (!strncmp(argv[1],"camera-raw=",11)) {
+            // Camera's whole 64 KiB preview window, raw.
+            static unsigned char window[65536];
+            rc=0;
+            for (uint16_t c=0;c<1024 && !rc;c++)
+                rc=libusb_control_transfer(chosen,0xc0,0x42,0,c,window+c*64,64,3000)!=64;
+            FILE *out=rc?NULL:fopen(argv[1]+11,"wb");
+            if (out) { fwrite(window,1,sizeof(window),out); fclose(out); printf("Wrote %s\n",argv[1]+11); }
+            else if (!rc) rc=1;
         } else if (!strcmp(argv[1],"open-log")) {
             // The Open Runtime's 4 KiB log ring: magic, bytes written, then text.
             unsigned char ring[4096];

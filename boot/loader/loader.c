@@ -15,7 +15,10 @@ static unsigned panel_index;
 // page pool) only if no live reservation touches it. On the measured handset
 // the modem, SCP and ATF reservations all lie below 0xc0000000.
 enum { open_base = 0xc0000000u, open_size = 0x20000000u };
-static int open_memory_ok = 1;
+// The camera writes frames to 4 MiB at 0xe0000000 (services/camera), likewise
+// only if no reservation touches it.
+enum { camera_base = 0xe0000000u, camera_size = 0x400000u };
+static int open_memory_ok = 1, camera_memory_ok = 1;
 static uint32_t initrd_start, initrd_end, open_conflicts;
 static uint32_t open_conflict[2];
 static void check_open(uint64_t base, uint64_t size)
@@ -25,6 +28,8 @@ static void check_open(uint64_t base, uint64_t size)
         open_memory_ok = 0;
         open_conflicts++;
     }
+    if (size && base < (uint64_t)camera_base + camera_size && base + size > camera_base)
+        camera_memory_ok = 0;
 }
 static int layout_ok(const void *dt)
 {
@@ -190,6 +195,7 @@ void prepare(const void *dt)
         *(volatile unsigned *)0x43ffffe8 = initrd_end - initrd_start;
         *(volatile unsigned *)0x43ffffec = 0x4e45504f;
     }
+    *(volatile unsigned *)0x43ffffd4 = camera_memory_ok ? 0x4d4d4143u : 0; // "CAMM"
     *(volatile unsigned *)0x43dffffc = volume_load((void *)0x43c00000);
     // Resume the bootloader's USB peripheral clock for the diagnostic device.
     *(volatile uint32_t *)0x10000098 = (1u << 23) | (1u << 16);

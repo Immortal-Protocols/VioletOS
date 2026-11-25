@@ -18,10 +18,12 @@ def inspect(blob):
     if (
         magic != b"VPK1"
         or (abi != package_abi(identity) and (identity, abi) != (7, 3))
-        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24))
+        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24, 25))
     ):
         raise ValueError("unsupported package or ABI")
-    if not 0 < code <= size <= 0x3E000 or code % 4096 or len(blob) != 24 + size:
+    # The Open Runtime (24) keeps its stack elsewhere, so its image may be larger.
+    window = 0x60000 if identity == 24 else 0x3E000
+    if not 0 < code <= size <= window or code % 4096 or len(blob) != 24 + size:
         raise ValueError("invalid segment sizes")
     if identity == 3 and size > 0x38000:
         raise ValueError("package overlaps its process stack")

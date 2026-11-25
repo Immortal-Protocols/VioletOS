@@ -463,6 +463,35 @@ pub fn run() -> ! {
                 }
                 send(&out, len);
             }
+            // Camera's status page, 16 words per request selected by the index.
+            (0xc0, 0x43, 0, page) if page < 6 => {
+                let mut out = [0; 64];
+                let src = (0x09207000 + usize::from(page) * 64) as *const u32;
+                for (i, dest) in out.chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { src.add(i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
+            // Camera's 64 KiB preview, 64 bytes per request.
+            (0xc0, 0x42, 0, chunk) if chunk < 1024 => {
+                let mut out = [0; 64];
+                let src = (0x09230000 + usize::from(chunk) * 64) as *const u8;
+                for (i, dest) in out.iter_mut().enumerate() {
+                    *dest = unsafe { src.add(i).read_volatile() };
+                }
+                send(&out, len);
+            }
+            // A developer camera request: command in the high byte.
+            (0x40, 0x44, lo, hi) if configuration == 1 && len == 0 => {
+                let request = 0x09208000 as *mut u32;
+                unsafe {
+                    request.add(1).write_volatile(u32::from(lo) | (u32::from(hi) << 16));
+                    let serial = request.read_volatile().wrapping_add(1);
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    request.write_volatile(serial);
+                }
+                put_half(CSR, 0x48);
+            }
             // A developer audio request for Audio to act on: command in the high byte.
             (0x40, 0x4e, lo, hi) if configuration == 1 && len == 0 => {
                 let request = 0x09204000 as *mut u32;

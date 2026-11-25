@@ -882,6 +882,16 @@ impl Runtime {
                 }
                 Kind::Audio { channels: 2, pending: Vec::new() }
             }
+            "/dev/violet/camera" => {
+                if !super::device::camera::present(self.camera) {
+                    return Done(ENODEV);
+                }
+                if self.focused && self.foreground == Some(i) {
+                    super::device::camera::want(true);
+                }
+                // Only frames that complete after the open.
+                Kind::Camera { seen: super::device::camera::frames() }
+            }
             "/dev/null" => Kind::Null,
             "/dev/urandom" | "/dev/random" => Kind::Random,
             "/dev/tty" | "/dev/stdout" | "/dev/stderr" | "/dev/console" => Kind::Log,

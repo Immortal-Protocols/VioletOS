@@ -66,6 +66,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
         "radio": repo / "services/radio/process.rs",
         "power": repo / "services/power/process.rs",
         "audio": repo / "services/audio/process.rs",
+        "camera": repo / "services/camera/process.rs",
         "open": repo / "runtime/open/mod.rs",
     }
     board = repo / "targets" / ("moto-g-pure" if target == "moto" else "qemu")
@@ -137,6 +138,16 @@ SECTIONS {
             modules["power_backend"] = board / "power.rs"
         if name == "audio":
             modules["audio_backend"] = board / "audio.rs"
+        if name == "camera":
+            modules["camera_backend"] = board / "camera.rs"
+            if target == "moto":
+                import sys
+
+                sys.path.insert(0, str(repo / "tools"))
+                from sensor_tables import generate
+
+                generate(dest / "sensor_tables.rs", repo / "build/downloads")
+                modules["sensor_tables"] = dest / "sensor_tables.rs"
         if name in scripts:
             modules["process"] = scripts[name]
         if name in ("stopwatch", "launcher", "wifi") or "entry" in item:
@@ -185,10 +196,9 @@ SECTIONS {
                 "--crate-type=staticlib",
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
-                # The Open Runtime (with the Sentinel) is optimised for size to fit the 0x3e000-byte window.
+                # The Open Runtime (with the Sentinel) is optimised for size; its window is 0x60000 bytes.
                 "-Copt-level=z" if name == "open" else "-Copt-level=s",
-                # One codegen unit: smaller code, which also helps the Open Runtime
-                # stay inside the 0x3E000-byte package window.
+                # One codegen unit: smaller code.
                 "-Ccodegen-units=1",
                 *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),

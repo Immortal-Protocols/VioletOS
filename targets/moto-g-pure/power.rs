@@ -230,6 +230,27 @@ const AUDIO_FIELDS: [(u16, u16); 10] = [
     (0x0088, 0xff00), // GPIO_DIR0: audio MOSI and MISO pad directions
     (0x002c, 0x0ff0), // SMT_CON1: audio pad Schmitt triggers
 ];
+// Camera may switch the MT6357 camera LDOs and nothing else: VCAMIO (1.8 V,
+// the sensors' I/O), VCAMD (the rear and front sensors' core, 1.0-1.8 V) and
+// VCAMA (2.8 V analog for the third sensor), with the voltage selectors of the
+// last two. Their status registers are read only.
+const CAMERA_FIELDS: [(u16, u16); 8] = [
+    (0x1a9c, 0x0001), // LDO_VCAMIO_CON0: enable
+    (0x1aaa, 0x0000), // LDO_VCAMIO_CON1: status
+    (0x1a88, 0x0001), // LDO_VCAMD_CON0: enable
+    (0x1a96, 0x0000), // LDO_VCAMD_CON1: status
+    (0x1c94, 0x0f00), // VCAMD_ANA_CON0: voltage
+    (0x1a6c, 0x0001), // LDO_VCAMA_CON0: enable
+    (0x1a7a, 0x0000), // LDO_VCAMA_CON1: status
+    (0x1c8c, 0x0f00), // VCAMA_ANA_CON0: voltage
+];
+pub fn camera_pmic(op: u32, addr: u32, arg: u32) -> Message {
+    let Ok(addr) = u16::try_from(addr) else { return Message::error(DENIED) };
+    let Some(&(_, mask)) = CAMERA_FIELDS.iter().find(|f| f.0 == addr) else {
+        return Message::error(DENIED);
+    };
+    pmic_access(op, addr, arg, mask)
+}
 /// GET reads `addr`. EXECUTE writes `arg & 0xffff` under the mask in its high half.
 pub fn audio_pmic(op: u32, addr: u32, arg: u32) -> Message {
     let Ok(addr) = u16::try_from(addr) else { return Message::error(DENIED) };
@@ -240,6 +261,9 @@ pub fn audio_pmic(op: u32, addr: u32, arg: u32) -> Message {
     } else {
         return Message::error(DENIED);
     };
+    pmic_access(op, addr, arg, allowed)
+}
+fn pmic_access(op: u32, addr: u16, arg: u32, allowed: u16) -> Message {
     if !ready() {
         return Message::error(OFFLINE);
     }

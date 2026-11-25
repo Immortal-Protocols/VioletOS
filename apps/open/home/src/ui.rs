@@ -44,19 +44,21 @@ pub struct Tile {
     icon: fn(&mut Canvas, f32, f32, Color),
 }
 
-pub const TILES: [Tile; 6] = [
+pub const TILES: [Tile; 7] = [
     Tile { name: "music", title: "Music", command: "open /apps/music", tint: rgb(0xe6, 0x5c, 0x9a), icon: icon_music },
     Tile { name: "weather", title: "Weather", command: "open /apps/weather", tint: rgb(0x3d, 0x9b, 0xe9), icon: icon_weather },
     Tile { name: "stopwatch", title: "Stopwatch", command: "open /apps/stopwatch", tint: rgb(0xf2, 0x9e, 0x38), icon: icon_stopwatch },
     Tile { name: "sounds", title: "Sounds", command: "open /apps/sounds", tint: rgb(0x45, 0xc4, 0x8f), icon: icon_sounds },
     Tile { name: "programs", title: "Programs", command: "apps", tint: rgb(0x8f, 0x7a, 0xe6), icon: icon_programs },
     Tile { name: "system", title: "System", command: "system", tint: rgb(0x7d, 0x86, 0x99), icon: icon_system },
+    Tile { name: "camera", title: "Camera", command: "open /apps/camera", tint: rgb(0x5b, 0x6f, 0xe0), icon: icon_camera },
 ];
 
+// Three rows; the second row still covers y = 1141, where tests tap.
 const TILE_W: i32 = 196;
-const TILE_H: i32 = 250;
+const TILE_H: i32 = 200;
 const GRID_TOP: i32 = 740;
-const GAP: i32 = 26;
+const GAP: i32 = 22;
 
 pub fn tile_rect(i: usize) -> Rect {
     let (col, row) = (i as i32 % 3, i as i32 / 3);
@@ -123,7 +125,7 @@ pub fn draw(c: &mut Canvas, f: &Fonts, s: &State) {
         tile(c, f, i, t, s.running.contains(&format!("/apps/{}", t.name)), s.pressed == Some(i));
     }
     shield(c, f, &s.shield);
-    f.regular(21.0).centered(c, "Hold the top edge in any app to come back here", 0, W as i32, 1530, rgb(0x6c, 0x63, 0x84));
+    f.regular(21.0).centered(c, "Hold the top edge in any app to come back here", 0, W as i32, 1550, rgb(0x6c, 0x63, 0x84));
 }
 
 fn wifi_bar(c: &mut Canvas, f: &Fonts, s: &State) {
@@ -154,29 +156,29 @@ fn shield(c: &mut Canvas, f: &Fonts, s: &Shield) {
     if !s.known {
         return;
     }
-    let r = Rect::new(40, 1300, W as i32 - 40, 1460);
+    let r = Rect::new(40, 1400, W as i32 - 40, 1500);
     let alert = !s.frozen.is_empty();
     c.round_rect(r, 30.0, if alert { rgb(0x4a, 0x1a, 0x26) } else { CARD });
     let tint = if alert { ALERT } else if s.linked { SAFE } else { DIM };
     // A shield: a rounded top and a point at the bottom.
-    let (cx, cy) = (112.0, 1380.0);
-    c.round_rect(Rect::new(cx as i32 - 30, cy as i32 - 40, cx as i32 + 30, cy as i32 + 4), 10.0, tint);
-    c.triangle([[cx - 30.0, cy], [cx + 30.0, cy], [cx, cy + 40.0]], tint);
+    let (cx, cy) = (112.0, 1450.0);
+    c.round_rect(Rect::new(cx as i32 - 22, cy as i32 - 30, cx as i32 + 22, cy as i32 + 3), 8.0, tint);
+    c.triangle([[cx - 22.0, cy], [cx + 22.0, cy], [cx, cy + 30.0]], tint);
     let x = 180;
     let title = f.bold(32.0);
     let line = f.medium(26.0);
     if alert {
         let names: Vec<String> = s.frozen.iter().map(|n| title_of(n)).collect();
-        title.draw(c, &title.fit(&format!("{} frozen", names.join(", ")), r.x1 - 30 - x), x, 1368, INK);
-        line.draw(c, "Violet Shield stopped it mid-call", x, 1414, rgb(0xf4, 0xb8, 0xc0));
+        title.draw(c, &title.fit(&format!("{} frozen", names.join(", ")), r.x1 - 30 - x), x, 1440, INK);
+        line.draw(c, "Violet Shield stopped it mid-call", x, 1480, rgb(0xf4, 0xb8, 0xc0));
     } else {
-        title.draw(c, "Violet Shield", x, 1368, INK);
+        title.draw(c, "Violet Shield", x, 1440, INK);
         let state = if s.linked {
             format!("On · linked to your iPhone · {} rule{}", s.rules, if s.rules == 1 { "" } else { "s" })
         } else {
             "Waiting for your iPhone".to_string()
         };
-        line.draw(c, &line.fit(&state, r.x1 - 30 - x), x, 1414, DIM);
+        line.draw(c, &line.fit(&state, r.x1 - 30 - x), x, 1480, DIM);
     }
 }
 
@@ -194,13 +196,13 @@ fn title_of(name: &str) -> String {
 fn tile(c: &mut Canvas, f: &Fonts, i: usize, t: &Tile, running: bool, pressed: bool) {
     let r = tile_rect(i);
     c.round_rect(r, 38.0, if pressed { rgb(0x3a, 0x2c, 0x55) } else { CARD });
-    let (cx, cy) = ((r.x0 + r.width() / 2) as f32, (r.y0 + 102) as f32);
+    let (cx, cy) = ((r.x0 + r.width() / 2) as f32, (r.y0 + 82) as f32);
     // The icon sits on a disc in the app's colour, lighter at the top.
     for k in 0..8 {
-        c.circle(cx, cy - k as f32 * 0.6, 66.0 - k as f32 * 0.4, mix(t.tint, WHITE, k as f32 * 0.03));
+        c.circle(cx, cy - k as f32 * 0.6, 58.0 - k as f32 * 0.4, mix(t.tint, WHITE, k as f32 * 0.03));
     }
     (t.icon)(c, cx, cy, WHITE);
-    f.medium(28.0).centered(c, t.title, r.x0, r.x1, r.y0 + 212, INK);
+    f.medium(28.0).centered(c, t.title, r.x0, r.x1, r.y0 + 178, INK);
     if running {
         c.circle(cx, (r.y1 - 14) as f32, 5.0, t.tint);
     }
@@ -296,6 +298,13 @@ fn icon_programs(c: &mut Canvas, cx: f32, cy: f32, ink: Color) {
         let (x, y) = (cx - 30.0 + (k % 2) as f32 * 34.0, cy - 30.0 + (k / 2) as f32 * 34.0);
         c.round_rect(Rect::new(x as i32, y as i32, x as i32 + 26, y as i32 + 26), 7.0, ink);
     }
+}
+
+fn icon_camera(c: &mut Canvas, cx: f32, cy: f32, ink: Color) {
+    c.round_rect(Rect::new((cx - 36.0) as i32, (cy - 20.0) as i32, (cx + 36.0) as i32, (cy + 28.0) as i32), 10.0, ink);
+    c.round_rect(Rect::new((cx - 14.0) as i32, (cy - 30.0) as i32, (cx + 14.0) as i32, (cy - 14.0) as i32), 5.0, ink);
+    c.circle(cx, cy + 4.0, 17.0, rgb(0x5b, 0x6f, 0xe0));
+    c.circle(cx, cy + 4.0, 10.0, ink);
 }
 
 fn icon_system(c: &mut Canvas, cx: f32, cy: f32, ink: Color) {

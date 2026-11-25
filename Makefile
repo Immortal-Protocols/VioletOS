@@ -85,6 +85,9 @@ test-open: qemu-image
 test-ladybird: qemu-image
 	$(PYTHON) targets/qemu/test_ladybird.py
 
+.PHONY: test-camera
+test-camera: qemu-image
+	$(PYTHON) targets/qemu/test_camera.py
 .PHONY: test-open-apps
 .PHONY: test-wifi-app
 test-wifi-app: qemu-image

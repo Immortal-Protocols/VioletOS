@@ -8,6 +8,7 @@ pub const DEV_SCREEN: &str = "/dev/violet/screen";
 pub const DEV_AUDIO: &str = "/dev/violet/audio";
 pub const DEV_EVENTS: &str = "/dev/violet/events";
 pub const DEV_SYS: &str = "/dev/violet/sys";
+pub const DEV_CAMERA: &str = "/dev/violet/camera";
 
 // ---------- /dev/violet/screen ----------
 //
@@ -84,6 +85,40 @@ pub struct AudioRingHeader {
     pub read_pos: u32,      // written by Audio service
     pub underruns: u32,
     pub sample_rate: u32,
+}
+
+// ---------- /dev/violet/camera ----------
+//
+// The rear camera, for the app in front.
+// 1. open("/dev/violet/camera", O_RDONLY) starts the sensor (ENODEV without one).
+// 2. read(fd, buf, len) returns a CameraFrame and then the newest frame's
+//    pixels (up to len - 32 bytes), once per new frame. It blocks (or, with
+//    O_NONBLOCK, returns EAGAIN) until there is one, and while the app is not
+//    in front. poll() reports POLLIN when a new frame is ready.
+// 3. close(fd), or leaving the front, turns the camera off.
+// Frames are raw Bayer as the sensor delivers them: demosaic them yourself.
+// The Moto G Pure's Hi-1336 gives 1280 x 720 RAW8 at 30 frames per second.
+
+pub const CAMERA_MAGIC: u32 = 0x3146_4356; // "VCF1"
+pub const CAMERA_RAW8: u32 = 1; // one byte per pixel
+pub const CAMERA_RAW10: u32 = 2; // MIPI RAW10: four high bytes, then their low bits
+pub const CAMERA_STREAMING: u32 = 2;
+pub const CAMERA_FAILED: u32 = 3;
+pub const CAMERA_TORN: u32 = 1 << 31;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CameraFrame {
+    pub magic: u32,    // CAMERA_MAGIC
+    pub sequence: u32, // frames since the camera started
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,   // bytes per row
+    pub format: u32,   // low byte CAMERA_RAW8/RAW10; next byte the Bayer order of the
+                       // top-left 2 x 2: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR
+    pub sensor: u32,   // the sensor's ID, e.g. 0x1336
+    pub state: u32,    // low byte CAMERA_STREAMING or CAMERA_FAILED, error code
+                       // above it; CAMERA_TORN if the frame changed while copied
 }
 
 // ---------- /dev/violet/events ----------
