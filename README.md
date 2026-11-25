@@ -199,7 +199,9 @@ The [handset README](targets/moto-g-pure/README.md) records the bring-up and eac
 
 ## Continuous integration
 
-[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the QEMU image and runs the stopwatch's unit tests. The macOS job builds the simulator, emulator viewer and USB clients, the musl sysroot and the Rust and Go open apps, then runs the QEMU suites for touch, storage, isolation, app lifecycle, updates, Wi-Fi, power, audio and open apps. CI does not build Python, so `make test-open` skips the Python apps there.
+[GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the QEMU image and runs the host unit tests (`make test-unit`); the macOS job builds the open apps it needs and runs two QEMU tests (`make test-ci`: one boot of the supervisor and its services, then the open apps). Every other QEMU suite (`make test-open`, `test-agent`, `test-ladybird`, `test-shield`, ...) runs locally.
+
+**Keep CI under 5 minutes.** Don't add QEMU suites to `test-ci` or new jobs to the workflow; add a local `make` target instead and run it before you push. If CI must cover something new, extend an existing test or add a host unit test that runs in seconds, and leave apps CI doesn't need out of its build (`VIOLET_OPEN_SKIP` in the workflow).
 
 The handset image and handset tests need the factory files and run locally. The public HTTPS endpoint test is separate: `make test-wifi-live`.
 
