@@ -2,6 +2,7 @@
 // Only this process holds untyped memory, child TCBs and their address spaces.
 #include "../../platform/sel4/board/memory.h"
 #include "tasks.h"
+#include "mcs.h"
 
 seL4_IPCBuffer *__sel4_ipc_buffer;
 char __sel4_print_error;
@@ -14,7 +15,7 @@ enum {
   BASE = 0x100000,
   PAGE = 4096,
   SCRATCH = 0x03000000,
-  CAP_BITS = 4,
+  CAP_BITS = 5, // 32 slots: REPLY_SLOT is 31
   FAULT_SLOT = 15
 };
 enum {
@@ -66,12 +67,29 @@ enum { OPEN_WINDOW = 0x60000 };
 enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
        OPEN_SLOT_RUNTIME = 2, OPEN_SLOT_CNODE = 3, OPEN_SLOT_PD = 4, OPEN_SLOT_ASID = 5,
        OPEN_SLOT_KERNEL = 6, OPEN_SLOT_AUTHORITY = 7, OPEN_SLOT_TIMER = 10, OPEN_SLOT_WAKE = 11,
+       OPEN_SLOT_SCHED_CONTROL = 13, OPEN_SLOT_SCHED_CORES = 20,
        OPEN_SLOT_POOL = 16, OPEN_KERNEL_BITS = 22,
        // The Open Runtime's priority while it waits for events (it starts at the
        // 100 every process runs at), and the badge its timer signals with.
        OPEN_EVENT_PRIORITY = 150, OPEN_TIMER_BADGE = 1u << 27, OPEN_TIMER_IRQ = 30 };
-// The Open Runtime's timer interrupt handler, deleted before the system is rebuilt.
-static seL4_CPtr open_timer_handler;
+// The supervisor's own Reply object (MCS), for answering on `life`.
+static seL4_CPtr root_reply;
+#ifdef CONFIG_KERNEL_MCS
+// Every thread runs on a scheduling context of its own: by default a full
+// 10 ms budget every 10 ms, which is round robin with the 10 ms timeslice the
+// kernel used before MCS. The Open Runtime gives app threads other budgets.
+enum { ROUND_ROBIN_US = 10000 };
+static void give_time(seL4_CPtr tcb, unsigned priority, seL4_CPtr fault_ep) {
+  seL4_CPtr sc = allocate(ram, seL4_SchedContextObject, seL4_MinSchedContextBits);
+  check(seL4_SchedControl_ConfigureFlags(boot->schedcontrol.start, sc, ROUND_ROBIN_US, ROUND_ROBIN_US, 0, 0, 0));
+  check(seL4_TCB_SetSchedParams(tcb, seL4_CapInitThreadTCB, 0, priority, sc, fault_ep));
+}
+#endif
+// The Open Runtime's timer interrupt handler and Touch's (handset), deleted
+// before the system is rebuilt.
+static seL4_CPtr open_timer_handler, touch_irq_handler;
+enum { TOUCH_GIC_IRQ = 203, TOUCH_IRQ_BADGE = 1u << 20, OPEN_TOUCH_BADGE = 1u << 26,
+       TOUCH_SLOT_IRQ = 9, TOUCH_SLOT_OPEN = 10, TOUCH_SLOT_TCB = 11 };
 static struct process procs[TOTAL];
 static seL4_CPtr life, scratch_slot;
 static volatile unsigned *report;
@@ -249,9 +267,20 @@ static void prepare_process(unsigned id) {
   private_page(p, IPC_BUFFER, 0, 0, false);
   grant(t, FAULT_SLOT, life, 16 + id, false);
   unsigned guard = seL4_CNode_CapData_new(0, 32 - t->cap_bits).words[0];
+#ifdef CONFIG_KERNEL_MCS
+  check(seL4_TCB_Configure(t->thread, t->caps, guard, t->pd, 0, IPC_BUFFER, t->ipc));
+  // The fault endpoint is named in this CSpace; a Reply object for receiving.
+  seL4_CPtr fault = next_slot++;
+  check(seL4_CNode_Mint(seL4_CapInitThreadCNode, fault, 32, seL4_CapInitThreadCNode, life, 32,
+                        seL4_CapRights_new(1, 0, 0, 1), 16 + id));
+  give_time(t->thread, 100, fault);
+  seL4_CPtr reply = create(ram, seL4_ReplyObject);
+  check(seL4_CNode_Move(t->caps, REPLY_SLOT, t->cap_bits, seL4_CapInitThreadCNode, reply, 32));
+#else
   check(seL4_TCB_Configure(t->thread, FAULT_SLOT, t->caps, guard, t->pd, 0,
                            IPC_BUFFER, t->ipc));
   check(seL4_TCB_SetPriority(t->thread, seL4_CapInitThreadTCB, 100));
+#endif
 }
 static void start(unsigned id) {
   struct process *p = &procs[id];
@@ -646,6 +675,14 @@ static void open_runtime(void) {
   // runs at and to raise itself above it while it waits for events.
   check(seL4_TCB_SetMCPriority(t->thread, seL4_CapInitThreadTCB, OPEN_EVENT_PRIORITY));
   give_open(OPEN_SLOT_AUTHORITY, t->thread);
+#ifdef CONFIG_KERNEL_MCS
+  // To give app threads scheduling contexts and move them between tiers:
+  // one SchedControl per core (core 0 at OPEN_SLOT_SCHED_CONTROL, cores 1-3
+  // from OPEN_SLOT_SCHED_CORES), which also decides the core a thread runs on.
+  give_open(OPEN_SLOT_SCHED_CONTROL, boot->schedcontrol.start);
+  for (unsigned core = 1; core < boot->schedcontrol.end - boot->schedcontrol.start && core < 4; core++)
+    give_open(OPEN_SLOT_SCHED_CORES + core - 1, boot->schedcontrol.start + core);
+#endif
   // Its alarm clock: the nonsecure physical timer (PPI 30), which the kernel
   // lets user mode program, signals a notification bound to its thread. It
   // blocks between app calls and timer expiries instead of polling, and checks
@@ -661,6 +698,38 @@ static void open_runtime(void) {
       give_open(OPEN_SLOT_WAKE, wake);
     }
   }
+#ifdef VIOLET_MOTO
+  // Touch interrupts (services/touch/events.c): the controller's EINT 10
+  // reaches GIC interrupt 203, bound to Touch's thread. Touch reads each
+  // report as it arrives into a ring the Open Runtime maps read-only at
+  // 0x09807000, then signals the Open Runtime's notification. The mark in
+  // word 0 tells Touch its capabilities are in place.
+  if (procs[TOUCH].package) {
+    unsigned ring = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(ring, &procs[TOUCH].task, 0x09007000, seL4_AllRights);
+    map_shared(ring, t, 0x09807000, seL4_CanRead);
+    map_shared(ring, &bootstrap, 0x0970a000, seL4_AllRights);
+    seL4_CPtr notification = create(ram, seL4_NotificationObject);
+    seL4_CPtr badged_touch = next_slot++, irq = next_slot++;
+    check(seL4_CNode_Mint(seL4_CapInitThreadCNode, badged_touch, 32, seL4_CapInitThreadCNode,
+                          notification, 32, seL4_AllRights, TOUCH_IRQ_BADGE));
+    if (!seL4_IRQControl_GetTrigger(seL4_CapIRQControl, TOUCH_GIC_IRQ, 0, seL4_CapInitThreadCNode, irq, 32)) {
+      touch_irq_handler = irq;
+      if (!seL4_IRQHandler_SetNotification(irq, badged_touch) &&
+          !seL4_TCB_BindNotification(procs[TOUCH].task.thread, notification)) {
+        check(seL4_CNode_Copy(procs[TOUCH].task.caps, TOUCH_SLOT_IRQ, CAP_BITS, seL4_CapInitThreadCNode,
+                              irq, 32, seL4_AllRights));
+        grant(&procs[TOUCH].task, TOUCH_SLOT_OPEN, wake, OPEN_TOUCH_BADGE, false);
+        // Its own thread: it rises to the Open Runtime's priority once its
+        // firmware is loaded, so a report is read as soon as it arrives.
+        check(seL4_TCB_SetMCPriority(procs[TOUCH].task.thread, seL4_CapInitThreadTCB, OPEN_EVENT_PRIORITY));
+        check(seL4_CNode_Copy(procs[TOUCH].task.caps, TOUCH_SLOT_TCB, CAP_BITS, seL4_CapInitThreadCNode,
+                              procs[TOUCH].task.thread, 32, seL4_AllRights));
+        ((volatile unsigned *)0x0970a000)[0] = 0x31515249; // "IRQ1"
+      }
+    }
+  }
+#endif
   seL4_CPtr kernel_memory = spare_ram(seL4_UntypedObject, OPEN_KERNEL_BITS);
   if (kernel_memory) give_open(OPEN_SLOT_KERNEL, kernel_memory);
 #ifdef VIOLET_QEMU
@@ -764,6 +833,9 @@ static void camera_frames(void) {
 }
 static void wire(void) {
   build_group();
+#ifdef CONFIG_KERNEL_MCS
+  root_reply = create(ram, seL4_ReplyObject);
+#endif
 #ifdef VIOLET_QEMU
   // Device untypeds must be consumed in ascending physical address order.
   for (unsigned i = 0; i < sizeof(devices) / sizeof(*devices); i++) {
@@ -940,8 +1012,13 @@ static void wire(void) {
   check(seL4_ARM_Page_Map(spm_copy, procs[RADIO].task.pd, 0x09000000,
                           seL4_CanRead, seL4_ARM_ExecuteNever));
   grant(&procs[RADIO].task, 7, life, RADIO, false);
+  // Radio's own thread, allowed up to 160, for its WMT handshake (transport.c, hold_cpu).
+  check(seL4_TCB_SetMCPriority(procs[RADIO].task.thread, seL4_CapInitThreadTCB, 160));
+  check(seL4_CNode_Copy(procs[RADIO].task.caps, 12, CAP_BITS, seL4_CapInitThreadCNode,
+                        procs[RADIO].task.thread, 32, seL4_AllRights));
   board_device(TOUCH, 0x10007000, 0x09005000, 0x09703000);
-  device(0, 0x1000c000, 0x0970a000, 12); // APMIXED: the MIPI receivers' 26 MHz gates
+  device(TOUCH, 0x1000b000, 0x09006000, 12); // EINT: the touch controller's interrupt line
+  device(0, 0x1000c000, 0x0970d000, 12); // APMIXED: the MIPI receivers' 26 MHz gates
   device(POWER, 0x1000d000, 0x09000000, 12);
   if (procs[AUDIO].package) {
     // Keypad (Volume Down), read-only: Audio cannot reconfigure the scan.
@@ -969,30 +1046,17 @@ static void wire(void) {
       map_device(0x11c10000 + off, 0x09020000 + off, 12);
   }
   device(USB_DIAG, 0x11cc0000, 0x09001000, 12);
+  if (procs[CAMERA].package) {
+    // MMSYS config (the camera's bridge to the MM bus is one of its clock
+    // gates) and SMI common (the camera power domain's bus clamp).
+    device(0, 0x14000000, 0x0970f000, 12);
+    device(0, 0x14002000, 0x0970e000, 12);
+  }
   if (procs[OPEN_RT].package) {
-    // The display engine, read-only, for the Open Runtime's frame pipeline
-    // (docs/8ms-frame-pipeline-rfc.md): it reads the scan line from DISP_RDMA0.
-    // MMSYS config, DISP_MUTEX, DISP_OVL0, DISP_OVL0_2L, DISP_RDMA0 and DSI0,
-    // at 0x09800000 onwards (addresses from the phone's device tree).
+    // DISP_RDMA0, read-only: the Open Runtime reads the panel's scan line
+    // there to present without tearing (docs/8ms-frame-pipeline-rfc.md).
     mapping = &procs[OPEN_RT].task;
-    static const unsigned blocks[] = {0x14000000, 0x14001000, 0x1400b000, 0x1400c000, 0x1400d000, 0x14014000};
-    for (unsigned i = 0; i < sizeof(blocks) / sizeof(*blocks); i++) {
-      // SMI common, between them, for the camera power domain's bus clamp.
-      if (blocks[i] == 0x1400b000 && procs[CAMERA].package) device(0, 0x14002000, 0x0970b000, 12);
-      mapping = &procs[OPEN_RT].task;
-      map_device_rights(blocks[i], 0x09800000 + i * PAGE, 12, seL4_CanRead);
-      if (blocks[i] == 0x14000000 && procs[CAMERA].package) {
-        // MMSYS config, writable here: the camera's bridge to the MM bus is one of its clock gates.
-        ensure_table(&bootstrap, 0x0970c000);
-        unsigned copy = next_slot++;
-        check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode, next_slot - 2, 32,
-                              seL4_AllRights));
-        check(seL4_ARM_Page_Map(copy, bootstrap.pd, 0x0970c000, seL4_AllRights, seL4_ARM_ExecuteNever));
-      }
-    }
-  } else if (procs[CAMERA].package) {
-    device(0, 0x14000000, 0x0970c000, 12);
-    device(0, 0x14002000, 0x0970b000, 12);
+    map_device_rights(0x1400d000, 0x09804000, 12, seL4_CanRead);
   }
   board_device(RADIO, 0x18002000, 0x09015000, 0x09706000); // connectivity MCU and ROM mailbox
   device(RADIO, 0x18004000, 0x09011000, 12);
@@ -1068,6 +1132,10 @@ static void dismantle(void) {
   if (open_timer_handler) {
     seL4_CNode_Delete(seL4_CapInitThreadCNode, open_timer_handler, 32);
     open_timer_handler = 0;
+  }
+  if (touch_irq_handler) {
+    seL4_CNode_Delete(seL4_CapInitThreadCNode, touch_irq_handler, 32);
+    touch_irq_handler = 0;
   }
 }
 unsigned ticks_per_ms;
@@ -1376,8 +1444,8 @@ static void gpio_mode(volatile unsigned *gpio, unsigned pin, unsigned mode) {
 static unsigned camera_platform(unsigned val, bool change, unsigned survey[10]) {
   volatile unsigned *top = (void *)0x09708000, *infra = (void *)0x09701000,
                     *gpio = (void *)0x09702000, *spm = (void *)0x09700000,
-                    *apmixed = (void *)0x0970a000, *smi = (void *)0x0970b000,
-                    *mmsys = (void *)0x0970c000;
+                    *apmixed = (void *)0x0970d000, *smi = (void *)0x0970e000,
+                    *mmsys = (void *)0x0970f000;
   volatile unsigned *cam = spm + 0x344 / 4;
   unsigned which = change ? val & 0xff : 0, on = val >> 8, done = 0;
   if (which & 1) {
@@ -1525,9 +1593,9 @@ void root_main(seL4_BootInfo *bi) {
     for (;;) {
       unsigned badge = 0;
 #ifdef VIOLET_TEST_ISOLATION
-      seL4_MessageInfo_t msg = seL4_Recv(life, &badge);
+      seL4_MessageInfo_t msg = IPC_RECV(life, &badge, root_reply);
 #else
-      seL4_MessageInfo_t msg = seL4_NBRecv(life, &badge);
+      seL4_MessageInfo_t msg = IPC_NBRECV(life, &badge, root_reply);
 #ifdef VIOLET_MOTO
       if (usb_trial_bytes && ticks64() >= usb_deadline) {
         usb_last_failure = USB_TIMEOUT;
@@ -1626,7 +1694,7 @@ void root_main(seL4_BootInfo *bi) {
         for (unsigned i = 0; i < 10; i++) seL4_SetMR(4 + i, survey[i]);
         seL4_SetMR(0, 0);
         seL4_SetMR(2, result);
-        seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 14));
+        IPC_REPLY(root_reply, seL4_MessageInfo_new(0, 0, 0, 14));
         continue;
       }
       if (badge == CAMERA_LIFE_BADGE && key == CAMERA_PLATFORM &&
@@ -1646,7 +1714,7 @@ void root_main(seL4_BootInfo *bi) {
           seL4_SetMR(2,procs[USB_DIAG].package->crc);
           seL4_SetMR(3,usb_trial_bytes ? generation : 0);
           seL4_SetMR(4,usb_last_failure);
-          seL4_Reply(seL4_MessageInfo_new(0,0,0,5));
+          IPC_REPLY(root_reply, seL4_MessageInfo_new(0,0,0,5));
           continue;
         } else if (key == 0x6e && usb_trial_bytes && val == usb_trial_generation) {
           if (update_catalog(USB_DIAG,false)) {
@@ -1679,7 +1747,7 @@ void root_main(seL4_BootInfo *bi) {
           }
           for (unsigned i = 0; i < 14; ++i) seL4_SetMR(i, 0);
           seL4_SetMR(0, ok ? 0 : 2);
-          seL4_Reply(seL4_MessageInfo_new(0,0,0,1));
+          IPC_REPLY(root_reply, seL4_MessageInfo_new(0,0,0,1));
           continue;
         } else if (key == 0x66 || key == 0x67) {
           unsigned words[10];
@@ -1716,7 +1784,7 @@ void root_main(seL4_BootInfo *bi) {
           ok = seL4_MessageInfo_get_length(reply) == 2 && seL4_GetMR(0);
           seL4_SetMR(0, ok ? 0 : 3);
           seL4_SetMR(2, saved);
-          seL4_Reply(seL4_MessageInfo_new(0,0,0,14));
+          IPC_REPLY(root_reply, seL4_MessageInfo_new(0,0,0,14));
           continue;
         } else if (key == 0x65) {
           // Stop new writes and serialize the final flush with Storage's outstanding work.
@@ -1763,7 +1831,7 @@ void root_main(seL4_BootInfo *bi) {
         seL4_SetMR(0,ok?0:2);seL4_SetMR(1,upload_size);seL4_SetMR(2,uploaded);
         seL4_SetMR(3,procs[RADIO].package?procs[RADIO].package->crc:0);
         seL4_SetMR(4,(key==0x62 && valid_inbox())?inbox->id:0);seL4_SetMR(5,volume_bank);
-        seL4_Reply(seL4_MessageInfo_new(0,0,0,14));continue;
+        IPC_REPLY(root_reply, seL4_MessageInfo_new(0,0,0,14));continue;
       }
 #endif
 #ifdef VIOLET_MOTO
@@ -1774,7 +1842,7 @@ void root_main(seL4_BootInfo *bi) {
         seL4_SetMR(0,0);seL4_SetMR(2,profile_length);seL4_SetMR(3,join_job);
         for(unsigned i=0;i<8;i++) seL4_SetMR(4+i,words[i]);
         join_job=0;
-        seL4_Reply(seL4_MessageInfo_new(0,0,0,14));continue;
+        IPC_REPLY(root_reply, seL4_MessageInfo_new(0,0,0,14));continue;
       }
       if (badge == RADIO && op == GET && key == 0x405d &&
           seL4_MessageInfo_get_length(msg) == 14) {
@@ -1787,7 +1855,7 @@ void root_main(seL4_BootInfo *bi) {
           for (unsigned i=0;i<8;i++) seL4_SetMR(4+i,words[i]);
         }
         seL4_SetMR(0,ok ? 0 : 3);
-        seL4_Reply(seL4_MessageInfo_new(0,0,0,14));
+        IPC_REPLY(root_reply, seL4_MessageInfo_new(0,0,0,14));
         continue;
       }
 #endif
@@ -1894,7 +1962,7 @@ void root_main(seL4_BootInfo *bi) {
       }
       seL4_SetMR(0, error);
       seL4_SetMR(2, result);
-      seL4_Reply(seL4_MessageInfo_new(0, 0, 0, 14));
+      IPC_REPLY(root_reply, seL4_MessageInfo_new(0, 0, 0, 14));
     }
 
 #ifdef VIOLET_MOTO

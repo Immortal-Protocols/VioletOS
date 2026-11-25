@@ -24,7 +24,8 @@ ld = cc.with_name("ld.lld")
 objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
-defines = ["-DNDEBUG", "-DROOT_BYTES=0x100000"]
+# Cores the kernel boots (kernel/sel4/build.py); the loader starts the others.
+defines = ["-DNDEBUG", "-DROOT_BYTES=0x100000", "-DVIOLET_CORES=" + os.environ.get("VIOLET_CORES", "1")]
 if probe: defines.append("-DVIOLET_TEST_ISOLATION")
 defines.append("-DVIOLET_QEMU" if variant=="qemu" else "-DVIOLET_MOTO")
 sys.path.insert(0,str(repo / "services/touch"))

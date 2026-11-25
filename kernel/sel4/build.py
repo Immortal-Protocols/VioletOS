@@ -111,11 +111,19 @@ def build_target(target,out):
     kernel=out/"kernel"
     run("cmake","-GNinja","-S",src,"-B",kernel,"-DCMAKE_TOOLCHAIN_FILE="+str(src/"llvm.cmake"),
         "-DTRIPLE=arm-none-eabi","-DPYTHON3="+str(py),"-DKernelPlatform=ellis",
-        "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS=OFF","-DKernelPrinting=OFF",
+        "-DVioletQemuBoard="+("ON" if target=="qemu" else "OFF"),"-DKernelSel4Arch=aarch32","-DKernelIsMCS="+("ON" if os.environ.get("VIOLET_MCS")=="1" else "OFF"),"-DKernelPrinting=OFF",
         "-DKernelDebugBuild=OFF","-DKernelVerificationBuild=OFF","-DKernelArmExportVCNTUser=ON",
+        # MCS (VIOLET_MCS=1): scheduling contexts give the app in front a budget
+        # above the services (docs/8ms-frame-pipeline-rfc.md). Off by default:
+        # with it, Home crashes at start in QEMU once PR #26's Wi-Fi changes are in.
         # The Open Runtime programs the physical timer (PPI 30) to wake itself,
         # so it can block between events (docs/8ms-frame-pipeline-rfc.md).
         "-DKernelArmExportPTMRUser=ON",
+        # VIOLET_CORES=4: cores 0-3 of cluster 0 (the kernel numbers cores by
+        # MPIDR's low byte, so the second cluster would alias the first). One
+        # by default: with four and without MCS, Wi-Fi's rail start fails on
+        # the handset (docs/8ms-frame-pipeline-rfc.md).
+        "-DKernelMaxNumNodes="+os.environ.get("VIOLET_CORES","1"),
         # Linux ARM programs read their thread pointer from TPIDRURO; the Open Runtime sets it.
         "-DKernelArmTLSReg=tpidruro")
     generated=["include/sel4/"+f for f in ["shared_types_gen.h","syscall.h","invocation.h"]]

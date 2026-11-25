@@ -1,5 +1,9 @@
 name: Build and test
 
+# Kept to a few minutes: the seL4 build and host unit tests on Linux, and on
+# macOS two QEMU tests (`make test-ci`). The other QEMU suites (make
+# test-emulator, test-open, test-ladybird, test-shield, ...) run locally.
+
 on:
   pull_request:
   push:
@@ -15,9 +19,9 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux seL4 build
+    name: seL4 build and unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -26,32 +30,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y device-tree-compiler libxml2-utils ninja-build python3-venv
-          ndk_version=28.2.13676358
-          if [[ ! -f "$ANDROID_HOME/ndk/$ndk_version/source.properties" ]]; then
-            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
-          fi
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
           rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi
           rustup override set 1.91.1
-      - name: Build the QEMU image and test stopwatch and microphone logic
-        run: |
-          make qemu-image
-          rustc --edition=2021 --test apps/stopwatch/state.rs -o build/state-tests
-          build/state-tests
-          rustc --edition=2021 --test services/audio/mic.rs -o build/mic-tests
-          build/mic-tests
+      - name: Build the QEMU image
+        run: make qemu-image
+      - name: Unit tests
+        run: make test-unit
 
   mac:
-    name: macOS build and QEMU tests
+    name: QEMU tests
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 15
+    env:
+      # The two QEMU tests need Home, Stopwatch, Sounds and Weather; leave out
+      # the apps that are slow to build, and skip whole-program optimisation.
+      VIOLET_OPEN_SKIP: ladybird,music,canvas,hello
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Install build and emulator tools
         run: |
-          brew install dtc ninja qemu sdl2 libusb pkgconf
+          brew install dtc ninja qemu
           ndk_version=28.2.13676358
           if [[ ! -f "$ANDROID_HOME/ndk/$ndk_version/source.properties" ]]; then
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
@@ -59,20 +61,13 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
           rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi --target armv7-unknown-linux-musleabihf
           rustup override set 1.91.1
-          # Ladybird's Rust (build/ladybird/rust-toolchain.toml) for the browser.
-          rustup toolchain install 1.98.0 --profile minimal --target armv7-unknown-linux-musleabihf
-          brew install go
-      - name: Build the musl sysroot for open C apps
-        run: python3 tools/build_python.py musl
-      - name: Build simulator, emulator viewer and USB clients
-        run: make build/simulator build/sel4/VioletOS.app/Contents/MacOS/viewer build/moto-debug build/moto-package
-      - name: Test touch, storage and isolation
-        run: make test-emulator test-storage test-isolation
-      - name: Test lifecycle and package updates
-        run: make test-stack test-apps
-      - name: Test Wi-Fi and power
-        run: make test-wifi test-power test-audio test-open test-open-apps test-wifi-app
-      - name: Test the Ladybird browser
-        run: |
-          cargo +1.98.0 test --locked --manifest-path apps/open/ladybird/Cargo.toml
-          make test-ladybird
+      - name: Cache the Rust apps' build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            build/cargo-home/registry
+            build/open-cargo
+          key: open-apps-${{ runner.os }}-1.91.1-${{ hashFiles('apps/Cargo.lock') }}
+          restore-keys: open-apps-${{ runner.os }}-1.91.1-
+      - name: QEMU tests (supervisor boot, open apps)
+        run: make test-ci

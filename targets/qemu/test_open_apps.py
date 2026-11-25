@@ -137,11 +137,32 @@ time.sleep(1)
 
 
 def online():
+    if os.environ.get("OPEN_FORCE_OFFLINE") == "1":  # CI: no live weather
+        return False
     try:
         socket.create_connection(("wttr.in", 443), timeout=5).close()
         return True
     except OSError:
         return False
+
+
+def listed_apps(cpio):
+    """The shell's app list for this image: the titled apps in apps/.home's
+    order, then the other programs in /apps, sorted (Home is not listed)."""
+    names, home, at = set(), [], 0
+    while cpio[at:at + 6] == b"070701":
+        size, namesize = int(cpio[at + 54:at + 62], 16), int(cpio[at + 94:at + 102], 16)
+        name = cpio[at + 110:at + 110 + namesize - 1].decode()
+        data = (at + 110 + namesize + 3) & ~3
+        if name == "TRAILER!!!":
+            break
+        if name == "apps/.home":
+            home = [line.split("\t")[0] for line in cpio[data:data + size].decode().splitlines() if "\t" in line]
+        elif name.startswith("apps/") and name.count("/") >= 1:
+            names.add(name.split("/")[1])
+        at = (data + size + 3) & ~3
+    others = sorted(n for n in names if n not in home and not n.startswith(".") and n != "home")
+    return home + others
 
 
 with TemporaryDirectory() as tmp:
@@ -156,8 +177,7 @@ with TemporaryDirectory() as tmp:
     for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):
         (image / name).symlink_to(original / name)
     run.IMAGE = image
-    folders = sorted(p for p in (ROOT / "apps/open").iterdir() if p.is_dir() and p.name != "home")
-    apps = [p.name for p in folders if (p / "app.txt").exists()] + [p.name for p in folders if not (p / "app.txt").exists()]
+    apps = listed_apps((original / "initfs.cpio").read_bytes())
     result = Path(tmp) / "stopwatch.txt"
     os.environ.update(OPEN_APPS=json.dumps(apps), OPEN_ONLINE="1" if online() else "0", OPEN_RESULT=str(result))
     for stage in ("first", "second"):
