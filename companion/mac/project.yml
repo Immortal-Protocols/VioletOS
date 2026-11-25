@@ -17,8 +17,6 @@ targets:
     platform: macOS
     sources:
       - VioletAgent
-      - path: ../ios/Shield
-        excludes: [StandIns.swift]
       - ../ios/App/Socks5Server.swift
       - path: ../../build/shield/VioletShieldEmbedder.mlpackage
         optional: true

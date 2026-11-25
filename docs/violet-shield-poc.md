@@ -1,6 +1,6 @@
 # Violet Shield: proof of concept
 
-This is a working version of the [Violet Shield RFC](violet-shield-rfc.md) (PR #17). It runs in QEMU with the iOS Simulator, and on real phones: VioletOS on the Moto G Pure, with the companion on an iPhone 18 Pro Max (see [On real phones](#on-real-phones)). VioletOS runs on seL4 in QEMU. Its Open Runtime records security-relevant system calls, and the Sentinel streams them to the iPhone companion running in the Simulator. There EmbeddingGemma 2 and a small trained head score each app's activity. When an app looks malicious, the companion blocks its traffic in the SOCKS5 relay and sends VioletOS a signed Shield. VioletOS verifies it with BearSSL and freezes the app inside the system call it is making, until the Shield expires.
+VioletOS sends security telemetry to [Violet Agent on the Mac](../companion/mac/README.md). Deterministic checks and the optional EmbeddingGemma 2 model score the activity. VioletOS displays signed warnings on Home while the apps keep running. [Violet Relay on iPhone](../companion/ios/README.md) provides Phone Internet over cellular.
 
 ## Try it
 
@@ -8,16 +8,16 @@ This is a working version of the [Violet Shield RFC](violet-shield-rfc.md) (PR #
 | --- | --- |
 | `make test-shield-unit` | Host tests: Shield rules, telemetry ring, the Sentinel's `VSH1` verifier against 15 signed envelopes (good, replayed, wrong key, flipped bit, TTL bounds, owner tier, malformed), measurement chain, framing. Uses the real BearSSL built for the Mac. |
 | `make shield-train` | Builds the dataset, embeds it with frozen EmbeddingGemma 2, trains and calibrates the head, evaluates, and exports the CoreML models to `build/shield/`. About 7 minutes on an M4 Max. |
-| `make test-shield` | End to end with `companion_sim.py`, which runs the same model in PyTorch, instead of the iOS app. No Xcode needed. |
-| `make test-shield-ios` | End to end with the real companion app in the iOS Simulator. |
-| `make shield-demo` | The iOS run, recorded, composed into `build/shield/demo/violet-shield-demo.mp4`. |
+| `make test-shield` | End to end with `companion_sim.py`, which runs the same model in PyTorch, in a local test process. No Xcode needed. |
 | `make moto-shield` | The handset image with the demo apps. Flash it with `services/usb-diagnostics/host/moto-flash build/sel4/moto/boot.img`. |
-| `make test-shield-device` | End to end on the Moto and the iPhone, started from the Mac with no touches (see below). |
-| `make shield-device-demo` | The device run, recorded (USB screenshots of the Moto, `devicectl` screenshots of the iPhone), composed into `build/shield/device-demo/violet-shield-devices.mp4`. |
 
-You need the QEMU prerequisites in the main README, Rust 1.91.1 (the version the repo pins; `rustup toolchain install 1.91.1 -t armv7a-none-eabi -t armv7-unknown-linux-musleabihf`), the guest CPython (`python3 tools/build_python.py musl && python3 tools/build_python.py python`), Xcode with an iOS 26.4 simulator, and `make shield-setup` for the Python environment. Set `SHIELD_SIM` to your simulator's UDID. On macOS, keep `TMPDIR` short (for example `/tmp/vq`): QEMU's control socket path must fit in 104 bytes.
+You need the QEMU prerequisites in the main README, Rust 1.91.1 (the version the repo pins; `rustup toolchain install 1.91.1 -t armv7a-none-eabi -t armv7-unknown-linux-musleabihf`), the guest CPython (`python3 tools/build_python.py musl && python3 tools/build_python.py python`), and `make shield-setup` for the Python environment. On macOS, keep `TMPDIR` short (for example `/tmp/vq`): QEMU's control socket path must fit in 104 bytes.
 
-## What happens in the demo
+## Original iPhone proof of concept
+
+The following sections record the original iPhone demo, including its enforcement behavior and measurements. The iPhone Shield targets have been retired.
+
+### What happened in the demo
 
 The demo apps are Rust open apps in [apps/shield-demo](../apps/shield-demo), so they run on the handset too, which has no Python. The ordinary apps are the built-in ones, Home and Weather, fetching live weather from wttr.in.
 
@@ -35,7 +35,7 @@ Home shows the Shield on the main screen: a card under the tiles reads "Violet S
 
 ## On real phones
 
-`make test-shield-device` runs the demo on a Moto G Pure and an iPhone 18 Pro Max, driven from the Mac over USB with no one touching either phone:
+The former `make test-shield-device` target ran the demo on a Moto G Pure and an iPhone 18 Pro Max, driven from the Mac over USB with no one touching either phone:
 
 1. The Moto hosts its Phone Internet network and the iPhone joins it. Every connection VioletOS makes goes through Violet Relay on the iPhone and out over cellular, and the Sentinel links to `sentinel.violet` on the iPhone.
 2. The iPhone signs the three baseline Shields; the Moto verifies them with BearSSL.
@@ -52,7 +52,7 @@ Results from the recorded run on November 23, 2026:
 
 How the pieces reach each other on hardware:
 
-- **Stand-ins.** The `.test` hosts map to servers inside the iPhone app (`-hostMapB64` values `standin:sink` and `standin:web`, [StandIns.swift](../companion/ios/Shield/StandIns.swift)) on the phone's loopback, so nothing reaches a real address and the sink reports what arrived.
+- **Stand-ins.** The `.test` hosts map to servers inside the iPhone app (`-hostMapB64` values `standin:sink` and `standin:web`, [StandIns.swift](../companion/ios/App/StandIns.swift)) on the phone's loopback, so nothing reaches a real address and the sink reports what arrived.
 - **Moto screenshots.** `moto-package screenshot[=SCALE]` asks the Open Runtime to copy the screen, scaled down and as RGB565, into the USB install window one strip at a time, and reads it back over USB Diagnostics. A 360×800 frame takes about 1.6 s.
 - **Joining.** The first join after installing Violet Relay shows iOS's Join prompt. iOS may report "Unable to join" even though the join worked (the Moto shows a DHCP lease, Radio stage 63), and the network is saved from then on.
 
@@ -84,7 +84,7 @@ Still not tested on hardware: the Secure Enclave signing key (the iPhone signs w
 | [services/sentinel/mod.rs](../services/sentinel/mod.rs), [crypto.c](../services/sentinel/crypto.c) | `VSH1` parsing and verification, signing tiers, anti-replay, rule payloads, measurement chain, link framing, `violet-log-v1` records |
 | [image/packages/build.py](../image/packages/build.py) | Pins the companion's public key into the image (`companion_key`), links BearSSL into the Open Runtime |
 | [tools/net_relay.py](../tools/net_relay.py) | Optional SOCKS5 upstream, the emulator's Phone Internet mode; `.violet` names never reach the Mac's resolver |
-| [companion/ios/Shield/](../companion/ios/Shield) | The companion side; the relay hooks are in [Socks5Server.swift](../companion/ios/App/Socks5Server.swift) |
+| [companion/mac/VioletAgent/Shield/](../companion/mac/VioletAgent/Shield) | The companion side; the relay hooks are in [Socks5Server.swift](../companion/ios/App/Socks5Server.swift) |
 | [tools/shield-trainer/](../tools/shield-trainer) | `schema.py` and `windows.py` (the window format, mirrored in Swift), `scenarios.py` (data), `train.py`, `vsh1.py`, `companion_sim.py`, `make_video.py` |
 | [targets/qemu/test_shield.py](../targets/qemu/test_shield.py), [test_shield_unit.sh](../targets/qemu/test_shield_unit.sh) | The tests above |
 

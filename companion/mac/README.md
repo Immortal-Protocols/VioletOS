@@ -20,7 +20,7 @@ It needs Codex signed in with ChatGPT (`codex login`), the build tools of this c
 
 Build the companion and run `make emulator` from the same checkout. In the emulator, open **Violet Agent** and click **Connect to this Mac**. The companion and emulator use the existing encrypted Agent pairing over a relay bound to Mac loopback. Each companion profile keeps one pairing. Use `VIOLET_AGENT_PROFILE=emulator` to keep your handset pairing in a separate profile.
 
-The **Violet Shield** tab shows the emulator link and model verdicts. Signed warnings appear in the Shield badge on VioletOS Home. The Mac companion serves the emulator's Sentinel and its TCP relay. Build with the Shield model assets in `build/shield` to enable AI scoring. Built-in checks can still warn when the model is unavailable. Use the same checkout and `VIOLET_SHIELD_KEY` (if set) for the emulator image and Mac companion so they share the pinned public key. A Moto paired with this Mac sends Shield telemetry over its encrypted Agent connection. The iPhone companion can still provide handset Shield through Phone Internet.
+The **Violet Shield** tab shows the Sentinel link and model verdicts. Signed warnings appear in the Shield badge on VioletOS Home. The Mac serves the emulator's Sentinel and TCP relay. Build with the Shield model assets in `build/shield` to enable AI scoring. Built-in checks can still warn when the model is unavailable. Use the same checkout and `VIOLET_SHIELD_KEY` (if set) for the VioletOS image and Mac companion so they share the pinned public key. A Moto paired with this Mac sends Shield telemetry over its encrypted Agent connection, including when Violet Relay on an iPhone provides Phone Internet.
 
 ## How it fits together
 

@@ -221,7 +221,9 @@ pub fn run() -> ! {
                 // Leave it to the event loop's rejoin (radio::relink).
                 reconnecting.set(true);
             }
-            if leave || (!alive && (relaying || joined.get().is_none())) {
+            // Losing the iPhone's IP link is not an AP shutdown. relay_step
+            // resets the client state and keeps listening for it to rejoin.
+            if leave || (!alive && !relaying && joined.get().is_none()) {
                 reconnecting.set(false);
                 joined.set(None);
                 unsafe { wpa::close() };

@@ -178,7 +178,9 @@ final class Socks5Session {
     private var phase = "handshake"
     private var target = "?"
     private(set) var targetHost = ""
+    #if os(macOS)
     private var flowId: Int?
+    #endif
     private var upDone = false, downDone = false
     var onFinish: (() -> Void)?
 
@@ -282,7 +284,14 @@ final class Socks5Session {
                     let port = UInt16(p[0]) << 8 | UInt16(p[1])
                     guard cmd == 0x01 else { return self.fail(.commandNotSupported, "command \(cmd) not supported") }
                     if case .name("time.violet", _) = host { return self.sendTime() }
-                    if case .name("sentinel.violet", _) = host { return self.handOffToSentinel() }
+                    if case .name(let name, _) = host,
+                       name.lowercased() == "sentinel.violet" || name.lowercased() == "sentinel.violet." {
+                        #if os(macOS)
+                        return self.handOffToSentinel()
+                        #else
+                        return self.fail(.hostUnreachable, nil)
+                        #endif
+                    }
                     if case .name("agent-pair.violet", _) = host, let invitation = self.server.localInvitation {
                         return self.sendInvitation(invitation)
                     }
@@ -310,7 +319,9 @@ final class Socks5Session {
     private func connect(host: NWEndpoint.Host, port: UInt16) {
         target = "\(host):\(port)"
         targetHost = Self.name(of: host)
+        #if os(macOS)
         flowId = Shield.shared.flowStarted(host: targetHost, port: port)
+        #endif
         phase = "connecting"
         lastActivity = Date()
         // Demos only: send named test hosts to local stand-ins (-hostMap JSON): a host:port
@@ -396,8 +407,8 @@ final class Socks5Session {
         }
     }
 
-    /// "sentinel.violet" is Violet Shield's endpoint on this phone: after the SOCKS
-    /// reply the connection belongs to the Shield, not to an upstream.
+    #if os(macOS)
+    /// Transfer the authenticated local connection to the Mac's Shield.
     private func handOffToSentinel() {
         phase = "sentinel"
         let reply: [UInt8] = [0x05, Reply.succeeded.rawValue, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
@@ -412,6 +423,7 @@ final class Socks5Session {
             done?()
         }
     }
+    #endif
 
     func abort(_ why: String) {
         finish(why)
@@ -457,10 +469,12 @@ final class Socks5Session {
         return reply
     }
 
-    private func fail(_ code: Reply, _ message: String) {
+    private func fail(_ code: Reply, _ message: String?) {
         guard !finished else { return }
-        counters.failedConnections += 1
-        counters.noteError(message)
+        if let message {
+            counters.failedConnections += 1
+            counters.noteError(message)
+        }
         phase = "failed"
         client.send(content: Data([0x05, code.rawValue, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
                     completion: .contentProcessed { [weak self] _ in self?.finish(nil) })
@@ -475,7 +489,9 @@ final class Socks5Session {
             if let data, !data.isEmpty {
                 self.lastActivity = Date()
                 if up { self.counters.bytesUp += UInt64(data.count) } else { self.counters.bytesDown += UInt64(data.count) }
+                #if os(macOS)
                 if let id = self.flowId { Shield.shared.flowBytes(id, up: up ? data.count : 0, down: up ? 0 : data.count) }
+                #endif
                 dst.send(content: data, completion: .contentProcessed { [weak self] sendErr in
                     guard let self, !self.finished else { return }
                     if let sendErr { return self.finish("send error (\(up ? "up" : "down")) \(self.target): \(sendErr)") }
@@ -501,7 +517,9 @@ final class Socks5Session {
         guard !finished else { return }
         finished = true
         if let error { counters.noteError(error) }
+        #if os(macOS)
         if let id = flowId { Shield.shared.flowEnded(id) }
+        #endif
         timer?.cancel()
         timer = nil
         upstream?.cancel()

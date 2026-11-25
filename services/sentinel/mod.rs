@@ -6,8 +6,8 @@
 //! call. (The RFC puts it in a process of its own; that split is future work.)
 //!
 //! - Drains `TelemetryEvent`s from `ShieldPolicy` and sends them, as
-//!   `violet-log-v1` records, to `sentinel.violet` on the iPhone companion over
-//!   the same TCP path as app traffic (SOCKS5 through the companion). While
+//!   `violet-log-v1` records, over the paired Mac Agent connection or to
+//!   `sentinel.violet` on the emulator's SOCKS5 relay. While
 //!   the companion is away it keeps them in a bounded offline ring.
 //! - Keeps a per-boot SHA-256 measurement chain over every program started and
 //!   every Shield loaded or removed, and reports it in heartbeats.

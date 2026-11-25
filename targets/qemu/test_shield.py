@@ -1,17 +1,11 @@
-"""Violet Shield end to end: VioletOS in QEMU, the companion on the Mac or in the iOS Simulator.
+"""Violet Shield end to end: VioletOS in QEMU with the Python companion simulator.
 
-    build/shield/venv/bin/python targets/qemu/test_shield.py --companion ios|sim [--record DIR]
+    build/shield/venv/bin/python targets/qemu/test_shield.py [--record DIR]
 
 QEMU runs the Open Runtime with the built-in apps plus apps/shield-demo. Every TCP
 connection the guest makes goes through the companion's SOCKS5 relay
 (tools/net_relay.py, VIOLET_NET_SOCKS), exactly like Phone Internet mode on the
 handset, and the Sentinel links to `sentinel.violet` on the companion.
-
-  --companion ios  Violet Relay in the iOS Simulator (the real Swift app with the
-                   CoreML student and its signer). Build it first (see
-                   docs/violet-shield-poc.md); this script installs and launches it.
-  --companion sim  tools/shield-trainer/companion_sim.py with the same model in
-                   PyTorch, for runs without Xcode.
 
 A scripted viewer taps through the demo and checks the Open Runtime's log:
   1. A benign notes fixture runs and gets scored.
@@ -22,7 +16,6 @@ A scripted viewer taps through the demo and checks the Open Runtime's log:
 from __future__ import annotations
 
 import argparse
-import base64
 import http.server
 import json
 import os
@@ -41,8 +34,6 @@ sys.path.insert(0, str(ROOT / "targets/qemu"))
 import home_grid  # noqa: E402
 import run  # noqa: E402
 
-SIM = os.environ.get("VIOLET_SIM", "D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA")
-BUNDLE = "com.immortal.violet.relay"
 # The demo apps (apps/shield-demo) get icons on Home after the built-in ones.
 APPS = ["music", "notes", "photosync", "themes"]
 SKIP = ""
@@ -143,7 +134,7 @@ def count(s):
     return everything().count(s)
 
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 90)
-caption("VioletOS boots on seL4 in QEMU; its Sentinel links to the iPhone companion")
+caption("VioletOS boots on seL4 in QEMU; its Sentinel links to the companion simulator")
 until("Sentinel links to the companion", lambda: "sentinel: linked" in everything(), 90)
 caption("notes: an ordinary app saves notes (with an API key) and syncs to its server")
 start("notes")
@@ -262,37 +253,6 @@ def listed_titles(cpio: bytes):
     return []
 
 
-def start_ios(host_map, record_dir):
-    key = subprocess.check_output(["openssl", "pkcs8", "-topk8", "-nocrypt", "-in", str(ROOT / "build/shield/companion-signing.pem"), "-outform", "DER"])
-    subprocess.run(["xcrun", "simctl", "bootstatus", SIM, "-b"], check=True, capture_output=True)
-    data = Path(subprocess.check_output(["xcrun", "simctl", "get_app_container", SIM, BUNDLE, "data"], text=True).strip())
-    for name in ("shield-status.json", "status.json"):
-        (data / "Documents" / name).unlink(missing_ok=True)
-    video = None
-    if record_dir:
-        video = subprocess.Popen(["xcrun", "simctl", "io", SIM, "recordVideo", "--codec", "h264", "--force", str(record_dir / "ios.mp4")],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1.5)
-        (record_dir / "ios.start").write_text(str(time.time()))
-    # Grant notifications up front so the permission alert does not cover the recording.
-    subprocess.run(["xcrun", "simctl", "privacy", SIM, "grant", "notifications", BUNDLE], capture_output=True)
-    subprocess.run(["xcrun", "simctl", "launch", "--terminate-running-process", SIM, BUNDLE, "-pairingSecret", "violet-dev", "-upstream", "any",
-                    "-shieldDevKey", base64.b64encode(key).decode(), "-shieldComputeUnits", "gpu",
-                    "-hostMapB64", base64.b64encode(json.dumps(host_map).encode()).decode()], check=True, capture_output=True)
-    status = data / "Documents/status.json"
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        try:
-            st = json.loads(status.read_text())
-            shield = json.loads((data / "Documents/shield-status.json").read_text())
-            if st.get("listenerState") == "listening" and st.get("port") and "hybrid head" in shield.get("model", ""):
-                return st["port"], data / "Documents/shield-status.json", video
-        except (OSError, ValueError):
-            pass
-        time.sleep(0.5)
-    raise SystemExit("Violet Relay did not start listening with its model loaded in the Simulator")
-
-
 def start_sim(host_map, tmp: Path):
     port = free_port()
     status = tmp / "shield-status.json"
@@ -319,8 +279,7 @@ def free_port():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--companion", choices=["ios", "sim"], default="ios")
-    ap.add_argument("--record", help="directory for the demo recording (frames, captions, Simulator video)")
+    ap.add_argument("--record", help="directory for the demo recording (frames and captions)")
     args = ap.parse_args()
     original = ROOT / "build/sel4/qemu"
     if not (original / "zImage").exists():
@@ -344,11 +303,7 @@ def main():
         # machine() took build/sel4/qemu as its default when tools/run.py was imported.
         import functools
         run.machine = functools.partial(run.machine, image)
-        helper = None
-        if args.companion == "ios":
-            port, status, helper = start_ios(host_map, record)
-        else:
-            port, status, helper = start_sim(host_map, tmp)
+        port, status, helper = start_sim(host_map, tmp)
         viewer = tmp / "viewer.py"
         script = SCRIPT.replace("#!PYTHON", "#!" + str(ROOT / "build/shield/venv/bin/python"))
         viewer.write_text(home_grid.viewer(script, (image / "initfs.cpio").read_bytes()))
@@ -361,12 +316,7 @@ def main():
         try:
             code = run.main(str(viewer))
         finally:
-            if helper is not None:
-                if args.companion == "ios":
-                    helper.send_signal(2)
-                    helper.wait(timeout=20)
-                else:
-                    helper.terminate()
+            helper.terminate()
         st = json.loads(Path(status).read_text())
         # The companion's decisions, with each scored window, for a look after the run.
         (ROOT / "build/shield/last-status.json").write_text(json.dumps(st, indent=1))

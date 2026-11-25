@@ -36,6 +36,17 @@ impl Fonts {
             bold: family(include_bytes!("../fonts/Go-Bold.ttf")),
         }
     }
+    /// The browser uses regular for its toolbar and bold for emphasis.
+    /// Share the regular family wherever UI helpers ask for medium.
+    pub fn regular_and_bold() -> Fonts {
+        let regular = family(include_bytes!("../fonts/Go-Regular.ttf"));
+        Fonts {
+            medium: regular.clone(),
+            regular,
+            bold: family(include_bytes!("../fonts/Go-Bold.ttf")),
+        }
+    }
+
     pub fn regular(&self, size: f32) -> Face {
         Face { family: self.regular.clone(), size }
     }

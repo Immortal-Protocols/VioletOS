@@ -6,10 +6,8 @@ import Security
 /// tools/shield-trainer/vsh1.py; VioletOS verifies them with BearSSL
 /// against the public key pinned into its image (services/sentinel/mod.rs).
 ///
-/// On an iPhone the key lives in the Secure Enclave and never leaves it. The iOS
-/// Simulator has no Secure Enclave, so there the Mac provisions a software
-/// P-256 key (`-shieldDevKey <base64 PKCS#8 or PEM>`), the same one whose
-/// public half `image/packages/build.py` pins into the QEMU image.
+/// The Mac companion normally loads the P-256 key whose public half
+/// `image/packages/build.py` pins into the VioletOS image.
 final class ShieldSigner {
     private enum Key {
         case enclave(SecureEnclave.P256.Signing.PrivateKey)

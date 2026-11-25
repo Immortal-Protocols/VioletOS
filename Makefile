@@ -61,6 +61,11 @@ test-open: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) targets/qemu/test_open.py
 
+.PHONY: test-memory
+test-memory: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/memory-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_memory.py
+
 .PHONY: test-ladybird
 test-ladybird: qemu-image
 	$(PYTHON) targets/qemu/test_ladybird.py
@@ -158,32 +163,17 @@ moto-component: setup
 
 # Violet Shield (docs/violet-shield-poc.md).
 SHIELD_PY := build/shield/venv/bin/python
-SHIELD_SIM ?= D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA
-.PHONY: shield-setup shield-train shield-companion test-shield-unit test-shield test-shield-ios shield-demo moto-shield test-shield-device shield-device-demo
+.PHONY: shield-setup shield-train test-shield-unit test-shield moto-shield
 $(SHIELD_PY):
 	$(PYTHON) -m venv build/shield/venv
 	$(SHIELD_PY) -m pip install -q torch "transformers>=5.24" sentence-transformers coremltools numpy cryptography pillow
 shield-setup: $(SHIELD_PY)
 shield-train: $(SHIELD_PY)
 	$(SHIELD_PY) tools/shield-trainer/train.py
-shield-companion:
-	cd companion/ios && xcodegen generate -q && xcodebuild -project VioletRelay.xcodeproj -scheme VioletRelay \
-	  -destination 'platform=iOS Simulator,id=$(SHIELD_SIM)' -derivedDataPath ../../build/dd-sim CODE_SIGN_IDENTITY=- -quiet build
-	xcrun simctl install $(SHIELD_SIM) build/dd-sim/Build/Products/Debug-iphonesimulator/VioletRelay.app
 test-shield-unit: $(SHIELD_PY)
 	SHIELD_PYTHON=$(SHIELD_PY) HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_unit.sh
 test-shield: qemu-image $(SHIELD_PY)
-	$(SHIELD_PY) targets/qemu/test_shield.py --companion sim
-test-shield-ios: qemu-image shield-companion
-	VIOLET_SIM=$(SHIELD_SIM) $(SHIELD_PY) targets/qemu/test_shield.py --companion ios
-shield-demo: qemu-image shield-companion
-	VIOLET_SIM=$(SHIELD_SIM) $(SHIELD_PY) targets/qemu/test_shield.py --companion ios --record build/shield/demo
-	$(SHIELD_PY) tools/shield-trainer/make_video.py build/shield/demo
-# Real devices: the Moto image with the demo apps, then the run (see targets/moto-g-pure/test_shield_device.py).
+	$(SHIELD_PY) targets/qemu/test_shield.py
+# Moto image with the demo apps for use with the Mac companion.
 moto-shield: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto
-test-shield-device: $(SHIELD_PY)
-	$(SHIELD_PY) targets/moto-g-pure/test_shield_device.py
-shield-device-demo: $(SHIELD_PY)
-	$(SHIELD_PY) targets/moto-g-pure/test_shield_device.py --record build/shield/device-demo
-	$(SHIELD_PY) tools/shield-trainer/make_device_video.py build/shield/device-demo

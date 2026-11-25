@@ -1,6 +1,6 @@
 """Shared `violet-log-v1` canonical window schema and synthetic trace generator.
 
-Matches `CanonicalWindowFormatter` in `companion/ios/Shield/ShieldChecker.swift`
+Matches `CanonicalWindowFormatter` in `companion/mac/VioletAgent/Shield/ShieldChecker.swift`
 so the CoreML ANE student on iPhone sees the exact same token stream format it
 was trained on.
 """

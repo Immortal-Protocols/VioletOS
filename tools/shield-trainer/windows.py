@@ -4,7 +4,7 @@ A record is one tab-separated line from the Sentinel (services/sentinel/mod.rs):
     t_ms pid app sha8 kind flags idle_s detail target
 `WindowBuilder` keeps each app's recent records and the relay's own view of
 connections, and formats a window exactly like `ShieldWindowBuilder` in
-companion/ios/Shield/ShieldWindows.swift.
+companion/mac/VioletAgent/Shield/ShieldWindows.swift.
 """
 from __future__ import annotations
 

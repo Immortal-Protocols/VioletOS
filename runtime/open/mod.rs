@@ -174,7 +174,13 @@ pub struct App {
     /// Not part of the boot image (written or pushed since boot).
     pub new_hash: bool,
     pub frozen: Option<Frozen>,
+    /// When it was last in front (ns), to close the least recently used first.
+    pub used_ns: u64,
 }
+
+/// Room the pool keeps for the app in front: a launch closes background apps
+/// until this much is free (32 MiB).
+const RESERVE_PAGES: usize = 512;
 
 pub struct Runtime {
     pub k: Kernel,
@@ -342,7 +348,7 @@ impl Runtime {
 
     /// Start a program from the file system. Scripts name their interpreter
     /// on a "#!" line; a ".py" file without one runs under /bin/python3.
-    pub fn launch(&mut self, path: &str, args: &[String]) -> Result<usize, String> {
+    pub fn launch(&mut self, path: &str, args: &[String], caller: Option<usize>) -> Result<usize, String> {
         // Loading a program can take a while; Audio and Radio keep running.
         let _lowered = sys::Lowered::new();
         let st = self.fs.stat(path).ok_or_else(|| alloc::format!("{} not found", path))?;
@@ -382,6 +388,10 @@ impl Runtime {
         // The image is part of the file system, which outlives the copy below.
         let image: &'static [u8] = unsafe { core::slice::from_raw_parts(image.as_ptr(), image.len()) };
 
+        // A new foreground app needs both an app slot and room for its startup.
+        while (self.pool.available() < RESERVE_PAGES || self.apps.iter().all(Option::is_some))
+            && self.reclaim(caller)
+        {}
         let index = self.apps.iter().position(|a| a.is_none()).ok_or("too many apps running")?;
         let mut random = [0u8; 16];
         let (a, b) = (self.next_random(), self.next_random());
@@ -427,7 +437,11 @@ impl Runtime {
         };
         // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
         space.add(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
-        let stub_page = space.resolve(k, &mut self.pool, procmgr::STUBS).ok_or("out of memory")? as u32;
+        let Some(stub_page) = space.resolve(k, &mut self.pool, procmgr::STUBS) else {
+            space.destroy(k, &mut self.pool);
+            self.release_objects(index, core::mem::take(&mut space.object_slots));
+            return Err(String::from("out of memory"));
+        };
         let pid = self.next_pid;
         self.next_pid += 1;
         let mut app = App {
@@ -439,13 +453,14 @@ impl Runtime {
             threads: Vec::new(),
             fds: Vec::new(),
             cwd,
-            stub_page,
+            stub_page: stub_page as u32,
             events: Default::default(),
             surface: None,
             exit_code: None,
             digest,
             new_hash,
             frozen: None,
+            used_ns: sys::now_ns(),
         };
         for _ in 0..3 {
             app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
@@ -540,6 +555,25 @@ impl Runtime {
         }
     }
 
+    /// Reclaim an app slot and memory from the least recently used background app.
+    /// Prefer apps without an open audio stream so music can continue playing.
+    fn reclaim(&mut self, caller: Option<usize>) -> bool {
+        let victim = self.apps.iter().enumerate()
+            .filter(|(i, _)| Some(*i) != self.foreground && Some(*i) != self.home && Some(*i) != caller)
+            .filter_map(|(i, app)| app.as_ref().map(|app| (i, app)))
+            .filter(|(_, app)| app.path != appstore::INSTALLER && app.frozen.is_none())
+            .min_by_key(|(_, app)| {
+                let has_audio = app.fds.iter().flatten()
+                    .any(|fd| matches!(fd.borrow().kind, device::Kind::Audio { .. }));
+                (has_audio, app.used_ns)
+            })
+            .map(|(i, app)| (i, app.name.clone()));
+        let Some((index, name)) = victim else { return false };
+        self.reap(index);
+        log!("low on app memory: closed {} in the background ({} KiB free)", name, self.pool.available() * 64);
+        true
+    }
+
     /// Tear an app down: its threads stop and its memory returns to the pool.
     pub fn reap(&mut self, index: usize) {
         let Some(mut app) = self.apps[index].take() else { return };
@@ -598,11 +632,19 @@ impl Runtime {
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
                 let (pc, addr) = (r.mrs[0], r.mrs[1]);
+                let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr);
+                // Out of pages: close a background app and try again.
+                let can_reclaim = self.foreground == Some(index)
+                    && self.apps[index].as_ref().unwrap().space.find(addr).is_some_and(|v| v.prot != 0);
+                while !resolved && can_reclaim && self.pool.available() == 0 && self.reclaim(None) {
+                    resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr);
+                }
                 let app = self.apps[index].as_mut().unwrap();
-                if app.space.fault(&mut self.k, &mut self.pool, addr) {
+                if resolved {
                     sys::reply(&[]);
                 } else {
-                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x} ({} KiB free)", app.name, app.pid, addr, pc, self.pool.available() * 64);
+                    let (pages, tables) = app.space.usage();
+                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, addr, pc, self.pool.available() * 64, pages * 64, tables);
                     app.exit_code = Some(139);
                     self.reap(index);
                 }
@@ -672,7 +714,7 @@ impl Runtime {
         // "@sys frames" or "@sys bench tap X Y N": measurements, answered in the log.
         if let Some(line) = path.strip_prefix("@sys ") {
             // Shared settings too ("@sys set relay 192.168.1.20:8787" points the agent at a relay).
-            if line.starts_with("frames") || line.starts_with("bench ") || line.starts_with("set ") || line.starts_with("get ") || line == "installed" {
+            if line.starts_with("frames") || line.starts_with("bench ") || line.starts_with("set ") || line.starts_with("get ") || line == "installed" || line == "memory" {
                 let answer = self.system(self.foreground.unwrap_or(0), line);
                 log!("{}: {}", line, answer.trim_end());
             }
@@ -685,7 +727,7 @@ impl Runtime {
                 self.reap(i);
             }
         }
-        match self.launch(&path, &[]) {
+        match self.launch(&path, &[], None) {
             Ok(i) => {
                 if path == HOME_APP {
                     self.home = Some(i);

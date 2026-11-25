@@ -131,6 +131,11 @@ impl Space {
         }
     }
 
+    /// Pool pages owned by this space (64 KiB each), and page tables made.
+    pub fn usage(&self) -> (usize, usize) {
+        (self.pages.values().filter(|page| page.owned).count(), self.tables.len())
+    }
+
     pub fn find(&self, va: u32) -> Option<&Vma> {
         self.vmas.iter().find(|v| v.start <= va && va < v.end)
     }

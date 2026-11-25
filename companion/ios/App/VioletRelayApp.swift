@@ -19,14 +19,25 @@ struct StatusView: View {
     var body: some View {
         let s = model.status
         List {
-            ShieldSection()
             Section {
+                Button("Find Violet networks", systemImage: "wifi") { model.findNetworks() }
+                    .disabled(!model.canFindNetworks)
+                if !model.knownNetworks.isEmpty {
+                    Menu("Previously selected networks") {
+                        ForEach(model.knownNetworks, id: \.self) { network in
+                            Button(network) { model.selectNetwork(network) }
+                        }
+                    }
+                }
+                if let network = model.selectedNetwork {
+                    row("Selected Wi-Fi", network, id: "selected-network")
+                }
                 TextField("Pairing code", text: $code)
                     .font(.title3.monospaced())
                     .textInputAutocapitalization(.characters)
                     .autocorrectionDisabled()
                     .accessibilityIdentifier("pairing-code")
-                Button("Join VioletOS") { model.pair(code: code) }
+                Button(model.selectedNetwork == nil ? "Join by code" : "Connect relay") { model.pair(code: code) }
                     .disabled(RelayConfig.normalizedCode(code) == nil)
                     .accessibilityIdentifier("join")
                 row("Network", RelayConfig.pairingCode.map(RelayConfig.ssid(forCode:)) ?? "not paired", id: "network")
@@ -35,12 +46,14 @@ struct StatusView: View {
             } header: {
                 Text("VioletOS")
             } footer: {
-                Text("Enter the code from Phone Internet on VioletOS. The relay keeps running in the background and with the screen locked by playing silent audio. It shows under Now Playing, and starting other music or video pauses it.")
+                Text("Turn on Phone Internet in VioletOS Settings › Phone Link. Find its Wi-Fi network, then enter the code shown on VioletOS. For a connection that stays joined when you lock your iPhone, choose the Violet network in iPhone Settings › Wi-Fi.")
             }
             Section("SOCKS5 relay") {
                 row("Listener", "\(s.listenerState) :\(s.port)", id: "listener-state")
                 row("Wi-Fi IPv4 (en0)", s.wifiIPv4.isEmpty ? "none" : s.wifiIPv4.joined(separator: ", "), id: "wifi-ip")
                 row("Cellular", s.cellularAvailable ? "available" : "unavailable", id: "cellular")
+                Text("The relay uses silent audio to stay active with the screen locked. Playing other audio or video can pause it.")
+                    .font(.footnote)
             }
             Section("Traffic") {
                 row("Active connections", "\(s.activeConnections)", id: "active")
@@ -53,6 +66,11 @@ struct StatusView: View {
                 Text(s.lastError ?? "none")
                     .font(.footnote.monospaced())
                     .accessibilityIdentifier("last-error")
+            }
+        }
+        .onChange(of: model.selectedNetwork) { _, network in
+            if let network, let saved = RelayConfig.normalizedCode(code), RelayConfig.ssid(forCode: saved) != network {
+                code = ""
             }
         }
         .navigationTitle("Violet Relay")

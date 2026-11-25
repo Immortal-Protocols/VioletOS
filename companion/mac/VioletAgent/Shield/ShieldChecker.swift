@@ -1,11 +1,9 @@
 import Foundation
-#if os(macOS)
 import Darwin
-#endif
 import Network
 import os
 
-// Violet Shield on the iPhone companion (docs/violet-shield-rfc.md, docs/violet-shield-poc.md).
+// Violet Shield on the Mac companion (docs/violet-shield-rfc.md, docs/violet-shield-poc.md).
 //
 // - `sentinel.violet` is answered by this relay itself (next to `time.violet`):
 //   VioletOS's Sentinel streams syscall telemetry here and receives signed warnings.
@@ -414,9 +412,7 @@ final class Shield {
     }
 
     private func record(_ decision: ShieldDecision, scores: TrainingScores? = nil) {
-        #if os(macOS)
         appendVerdict(decision, scores: scores)
-        #endif
         snap.decisions.insert(decision, at: 0)
         if snap.decisions.count > 30 { snap.decisions.removeLast() }
         publish()
@@ -497,7 +493,6 @@ final class Shield {
         }
     }
 
-    #if os(macOS)
     private var verdictWriteFailed = false
 
     // This runs on the Shield queue, where decisions arrive in order.
@@ -536,7 +531,6 @@ final class Shield {
             }
         }
     }
-    #endif
 
     private func decisionFields(_ d: ShieldDecision) -> [String: Any] {
         ["id": d.id.uuidString, "time": ISO8601DateFormatter().string(from: d.time), "pid": d.pid, "app": d.app,
