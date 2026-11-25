@@ -3,8 +3,9 @@
 //! the volume: no decoder or URL lives in an OS service.
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering::Relaxed};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -180,6 +181,7 @@ impl Read for Pieces {
 }
 
 pub const BANDS: usize = 16;
+const VIOLET_AUDIO_NONBLOCK: i32 = 0o4000; // Linux ARM O_NONBLOCK
 /// Microseconds spent decoding and analysing (for the log).
 pub static DECODE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -190,15 +192,14 @@ pub struct Player {
     pub paused: Arc<AtomicBool>,
     pub failure: Arc<Mutex<String>>,
     bands: Arc<[AtomicU32; BANDS]>,
-    stop: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
-    finished_tx: Sender<i32>,
+    stop: Option<Arc<AtomicBool>>,
     pub finished: Receiver<i32>, // a track that played to its end
 }
 
 impl Player {
     pub fn new() -> io::Result<Player> {
-        let audio = File::options().write(true).open("/dev/violet/audio")?;
-        let (finished_tx, finished) = mpsc::channel();
+        let audio = File::options().write(true).custom_flags(VIOLET_AUDIO_NONBLOCK).open("/dev/violet/audio")?;
+        let (_, finished) = mpsc::channel();
         Ok(Player {
             audio: Arc::new(Mutex::new(audio)),
             track: Arc::new(AtomicI32::new(-1)),
@@ -207,15 +208,13 @@ impl Player {
             failure: Arc::new(Mutex::new(String::new())),
             bands: Arc::new(Default::default()),
             stop: None,
-            finished_tx,
             finished,
         })
     }
 
     pub fn stop(&mut self) {
-        if let Some((stop, handle)) = self.stop.take() {
+        if let Some(stop) = self.stop.take() {
             stop.store(true, Relaxed);
-            let _ = handle.join();
         }
         self.track.store(-1, Relaxed);
         self.paused.store(false, Relaxed);
@@ -225,13 +224,19 @@ impl Player {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
         self.track.store(index as i32, Relaxed);
-        self.frames.store(0, Relaxed);
-        self.failure.lock().unwrap().clear();
+        // A cancelled decoder may still be unwinding a read. Give the new
+        // track its own counters, status and completion channel.
+        self.frames = Arc::new(AtomicI64::new(0));
+        self.paused = Arc::new(AtomicBool::new(false));
+        self.failure = Arc::new(Mutex::new(String::new()));
+        self.bands = Arc::new(Default::default());
+        let (finished, receiver) = mpsc::channel();
+        self.finished = receiver;
         let local = c.tracks[index].audio == crate::locomo::TRACK;
         let url = format!("{}/{}", c.base, c.tracks[index].audio);
-        let (audio, frames, paused, failure, bands, finished, s) =
-            (self.audio.clone(), self.frames.clone(), self.paused.clone(), self.failure.clone(), self.bands.clone(), self.finished_tx.clone(), stop.clone());
-        let handle = thread::spawn(move || {
+        let (audio, frames, paused, failure, bands, s) =
+            (self.audio.clone(), self.frames.clone(), self.paused.clone(), self.failure.clone(), self.bands.clone(), stop.clone());
+        thread::spawn(move || {
             let ended = if local {
                 match crate::locomo::open() {
                     Ok((_, file)) => decode(file, &s, &audio, &frames, &paused, &bands, &failure),
@@ -254,7 +259,7 @@ impl Player {
                 let _ = finished.send(index as i32);
             }
         });
-        self.stop = Some((stop, handle));
+        self.stop = Some(stop);
     }
 
     /// Seconds heard: frames written less what is still queued in Audio's ring.
@@ -343,11 +348,29 @@ fn decode(
             }
         }
         DECODE_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
-        if let Err(e) = audio.lock().unwrap().write_all(&pcm) {
-            *failure.lock().unwrap() = format!("audio: {e}");
-            return false;
+        let mut queued = 0;
+        while queued < pcm.len() {
+            let result = {
+                let mut device = audio.lock().unwrap();
+                if stop.load(Relaxed) {
+                    return false;
+                }
+                device.write(&pcm[queued..])
+            };
+            match result {
+                Ok(n) if n > 0 => {
+                    queued += n;
+                    frames.fetch_add((n / 4) as i64, Relaxed);
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(4)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(4)),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    *failure.lock().unwrap() = format!("audio: {e}");
+                    return false;
+                }
+            }
         }
-        frames.fetch_add((pcm.len() / 4) as i64, Relaxed);
     }
 }
 
