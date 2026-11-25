@@ -11,6 +11,12 @@ networks) as zeros. Unless --wipe-storage is given, the image is sent as an
 Android sparse image whose storage window is a "don't care" chunk, so the
 bootloader leaves the handset's saved data where it is. A bootloader that
 refuses the sparse image gets the plain one (which wipes the data).
+
+--take-userdata ERASES ANDROID, once, when the owner has agreed: it writes
+VioletOS's claim to the start of Android's userdata partition (23 GiB), where
+the installed apps then live (they move from boot_b on the next start), and
+puts the image in boot_a too, so the phone never boots Android and a bad
+image in B falls back to a working VioletOS in A. --slot-a refreshes A later.
 """
 import argparse
 import json
@@ -173,6 +179,10 @@ def main():
                         help="stop in fastboot without flashing")
     parser.add_argument("--wipe-storage", action="store_true",
                         help="also erase the handset's saved app data and Wi-Fi networks")
+    parser.add_argument("--take-userdata", action="store_true",
+                        help="ERASES ANDROID: claim its userdata partition for VioletOS's apps and put VioletOS in slot A too")
+    parser.add_argument("--slot-a", action="store_true",
+                        help="also flash the image to slot A, VioletOS's fallback")
     args = parser.parse_args()
     if not args.fastboot_only and not args.image.is_file():
         raise SystemExit(f"{args.image} not found")
@@ -191,13 +201,24 @@ def main():
     if not flashed:
         log(f"Flashing {args.image} to boot_b")
         fastboot("flash", "boot_b", str(args.image))
+    if args.take_userdata:
+        # The claim: the tag in userdata's first sector, zeros after (no move recorded yet).
+        tag = b"VioletOS XT2163DL userdata v1\n"  # targets/moto-g-pure/storage_volume.rs
+        claim = BUILD / "moto-userdata-claim.img"
+        claim.write_bytes(tag + bytes(4096 - len(tag)))
+        log("Claiming userdata for VioletOS (Android's data is erased)")
+        fastboot("flash", "userdata", str(claim))
+    if args.take_userdata or args.slot_a:
+        log(f"Flashing {args.image} to boot_a, the fallback slot")
+        fastboot("flash", "boot_a", str(args.image))
     fastboot("set_active", "b")
     log("Slot B selected; rebooting")
     fastboot("reboot")
     # A first boot can fall back to Android (for example after a warm reset with
     # the Wi-Fi domain powered). Reselect B from fastboot once before giving up.
     for attempt in range(2):
-        deadline = time.monotonic() + 90
+        # The first start after --take-userdata copies the installed apps (about two minutes).
+        deadline = time.monotonic() + (300 if args.take_userdata else 90)
         while time.monotonic() < deadline:
             snapshot = violet()
             if snapshot and snapshot.get("runtime_ready"):

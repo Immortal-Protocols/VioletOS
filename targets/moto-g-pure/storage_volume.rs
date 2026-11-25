@@ -14,25 +14,32 @@ fn wide(b: &[u8], p: usize) -> u64 {
     u64::from_le_bytes(b[p..p + 8].try_into().unwrap())
 }
 /// Installed open apps (runtime/open/appstore.rs) keep the last 12 MiB of boot_b,
-/// which the flashed image (19,926,528 bytes) never reaches.
+/// which the flashed image (19,926,528 bytes) never reaches, until VioletOS has
+/// claimed Android's userdata partition (emmc.rs, Disk::adopt_userdata): then they
+/// live there (23 GiB), and this extent is only read once, to move them.
 pub const APPS: u32 = BOOT_B + 20 * 1024 * 1024 / 512;
 pub const APP_SECTORS: usize = (END_B + 1 - APPS) as usize;
-pub fn app_sector(index: usize) -> Result<u32, ()> {
-    if index >= APP_SECTORS {
-        return Err(());
-    }
-    Ok(APPS + index as u32)
-}
 pub fn sector(index: usize) -> Result<u32, ()> {
     if index >= SECTORS {
         return Err(());
     }
     Ok(MARKER + 1 + index as u32)
 }
+/// VioletOS's claim on Android's userdata partition, in its first sector. Only
+/// `moto-flash --take-userdata` writes it (after the user agreed to erase
+/// Android); without it the partition is never written.
+pub const USERDATA_TAG: &[u8] = b"VioletOS XT2163DL userdata v1\n";
+/// In userdata's second sector once the installed apps moved there from boot_b.
+pub const MOVED_TAG: &[u8] = b"VioletOS apps moved from boot_b v1\n";
+/// Sectors at the start of userdata before the installed apps: the claim, the move record, spare.
+pub const USERDATA_HEADER: u32 = 8;
+const USERDATA_NAME: &[u8] = b"u\0s\0e\0r\0d\0a\0t\0a\0";
+
+/// Check the live GPT and boot_b, and find userdata: its first and last sector.
 pub fn verify(
     mut read: impl FnMut(u32) -> Result<Sector, ()>,
     capacity: u32,
-) -> Result<(), &'static [u8]> {
+) -> Result<Option<(u32, u32)>, &'static [u8]> {
     let mut h = read(1).map_err(|_| b"GPT READ" as &[u8])?;
     let size = word(&h, 12) as usize;
     if &h[..8] != b"EFI PART"
@@ -55,6 +62,7 @@ pub fn verify(
     }
     let mut crc = !0u32;
     let mut found = false;
+    let mut userdata = None;
     for i in 0..32 {
         let block = read(2 + i).map_err(|_| b"GPT TABLE READ" as &[u8])?;
         crc = crate::journal::crc_update(crc, &block);
@@ -65,6 +73,14 @@ pub fn verify(
             let (first, last) = (wide(entry, 32), wide(entry, 40));
             if first > last {
                 return Err(b"GPT RANGE");
+            }
+            if &entry[56..56 + USERDATA_NAME.len()] == USERDATA_NAME
+                && entry[56 + USERDATA_NAME.len()..128].iter().all(|&b| b == 0)
+                && first > END_B as u64
+                && last < capacity as u64
+                && last - first > 1024 * 1024 * 2
+            {
+                userdata = Some((first as u32, last as u32));
             }
             if last < BOOT_B as u64 || first > END_B as u64 {
                 continue;
@@ -91,5 +107,5 @@ pub fn verify(
     if &marker[..TAG.len()] != TAG || marker[TAG.len()..].iter().any(|&b| b != 0) {
         return Err(b"VOLUME MARKER");
     }
-    Ok(())
+    Ok(userdata)
 }

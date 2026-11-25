@@ -65,8 +65,16 @@ fn apps(d: &mut Disk, write: bool, first: usize, count: usize) -> Message {
 pub extern "C" fn storage_task() {
     unsafe { clock_init() };
     let opened = Disk::open_checked();
-    let diagnostic = opened.as_ref().err().copied().unwrap_or(b"");
+    let mut diagnostic = opened.as_ref().err().copied().unwrap_or(b"");
     let mut disk = opened.ok();
+    // The installed apps move to Android's userdata partition once VioletOS has claimed it.
+    // Only a failed move is reported (the Open Runtime logs the room the apps have).
+    if let Some(device) = disk.as_mut() {
+        let adopted = device.adopt_userdata();
+        if adopted.starts_with(b"APPS MOVE") || adopted == b"USERDATA READ" {
+            diagnostic = adopted;
+        }
+    }
     let mut records = [None; 7];
     if let Some(device) = disk.as_mut() {
         #[cfg(boot_trace)]

@@ -433,6 +433,12 @@ final class AgentModel: ObservableObject {
         case .online(let up):
             if up != online { log(up ? "phone online" : "phone offline") }
             online = up
+            if !up {
+                // A transfer in flight is lost with the link: fail it now rather than at its timeout.
+                for (name, (_, done)) in installs { log("install of \(name) cut off"); done(["ok": false, "error": "the phone went offline during the transfer"]) }
+                installs.removeAll()
+                phonePython = nil
+            }
             if up {
                 link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac", "agent_name": agentName])
                 sayPending()
@@ -758,6 +764,19 @@ final class AgentModel: ObservableObject {
         }
         let app = { [weak self] in
             self?.send(name: name, title: title, data: data, timeout: 90) { ok, error in finish(ok, error) }
+        }
+        if python && phonePython == nil {
+            // Not known yet (the phone's hello may still be on its way): ask it.
+            appLists.append { [weak self] o in
+                self?.phonePython = o["python"] as? Bool
+                self?.install(args, done)
+            }
+            link.send(["t": "apps"])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, self.phonePython == nil, !self.appLists.isEmpty else { return }
+                self.appLists.removeFirst()(["python": false])
+            }
+            return
         }
         if python && phonePython != true {
             installPython { ok, error in

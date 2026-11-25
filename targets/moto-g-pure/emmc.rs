@@ -124,6 +124,11 @@ pub struct Disk {
     pub sectors: usize,
     cached: bool,
     retired: bool,
+    /// Android's userdata partition (first and last sector), from the live GPT.
+    userdata: Option<(u32, u32)>,
+    /// The installed apps' extent: the end of boot_b, or userdata once claimed.
+    apps_first: u32,
+    apps_count: usize,
 }
 impl Disk {
     pub fn open_checked() -> Result<Self, &'static [u8]> {
@@ -141,11 +146,14 @@ impl Disk {
         if capacity <= 4 * 1024 * 1024 || ext[179] & 7 != 0 || ext[61] != 0 || ext[15] & 1 != 0 {
             return Err(b"EMMC ACCESS MODE");
         }
-        volume::verify(|lba| read_card(17, lba), capacity)?;
+        let userdata = volume::verify(|lba| read_card(17, lba), capacity)?;
         Ok(Self {
             sectors: volume::SECTORS,
             cached: ext[33] & 1 != 0,
             retired: false,
+            userdata,
+            apps_first: volume::APPS,
+            apps_count: volume::APP_SECTORS,
         })
     }
     fn finish<T>(&mut self, r: Result<T, ()>) -> Result<T, ()> {
@@ -183,17 +191,57 @@ impl Disk {
         self.write(i, s)?;
         self.flush()
     }
-    /// The installed apps' extent, beyond the boot image.
+    /// Use Android's userdata partition for the installed apps when VioletOS has
+    /// claimed it (its tag in the first sector). The first time, the apps kept at
+    /// the end of boot_b are copied over, then the move is recorded. Returns
+    /// what happened, for the storage diagnostic.
+    #[allow(dead_code)]
+    pub fn adopt_userdata(&mut self) -> &'static [u8] {
+        let Some((first, last)) = self.userdata else { return b"NO USERDATA" };
+        let Ok(claim) = read_card(17, first) else { return b"USERDATA READ" };
+        if &claim[..volume::USERDATA_TAG.len()] != volume::USERDATA_TAG || claim[volume::USERDATA_TAG.len()..].iter().any(|&b| b != 0) {
+            return b"USERDATA NOT CLAIMED";
+        }
+        let start = first + volume::USERDATA_HEADER;
+        let Ok(state) = read_card(17, first + 1) else { return b"USERDATA READ" };
+        if &state[..volume::MOVED_TAG.len()] != volume::MOVED_TAG {
+            // Copy the old extent whole (a partial copy is simply redone next boot).
+            for i in 0..volume::APP_SECTORS as u32 {
+                let Ok(mut s) = read_card(17, volume::APPS + i) else { return b"APPS MOVE READ" };
+                if transfer(24, start + i, &mut s).is_err() {
+                    return b"APPS MOVE WRITE";
+                }
+            }
+            if self.flush().is_err() {
+                return b"APPS MOVE FLUSH";
+            }
+            let mut moved = [0u8; 512];
+            moved[..volume::MOVED_TAG.len()].copy_from_slice(volume::MOVED_TAG);
+            if transfer(24, first + 1, &mut moved).is_err() || self.flush().is_err() {
+                return b"APPS MOVE RECORD";
+            }
+        }
+        self.apps_first = start;
+        self.apps_count = (last + 1 - start) as usize;
+        b"APPS IN USERDATA"
+    }
+    /// The installed apps' extent: the end of boot_b, or userdata once claimed.
     #[allow(dead_code)]
     pub fn app_sectors(&self) -> usize {
-        volume::APP_SECTORS
+        self.apps_count
+    }
+    fn app_lba(&self, i: usize) -> Result<u32, ()> {
+        if i >= self.apps_count {
+            return Err(());
+        }
+        Ok(self.apps_first + i as u32)
     }
     #[allow(dead_code)]
     pub fn app_read(&mut self, i: usize) -> Result<Sector, ()> {
         if self.retired {
             return Err(());
         }
-        let lba = volume::app_sector(i)?;
+        let lba = self.app_lba(i)?;
         self.finish(read_card(17, lba))
     }
     #[allow(dead_code)]
@@ -201,7 +249,7 @@ impl Disk {
         if self.retired {
             return Err(());
         }
-        let lba = volume::app_sector(i)?;
+        let lba = self.app_lba(i)?;
         self.finish(transfer(24, lba, s))
     }
 }
