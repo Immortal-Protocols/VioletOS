@@ -19,6 +19,8 @@ mod wlan_axi;
 mod wlan_download;
 #[path = "wmt.rs"]
 mod wmt;
+#[path = "bt.rs"]
+mod bt;
 mod wpa;
 fn record(index: usize, word: u32) {
     unsafe {
@@ -224,6 +226,7 @@ pub fn run() -> ! {
                 joined.set(None);
                 unsafe { wpa::close() };
                 unsafe { RELAY_AP = None };
+                bt::power_off();
                 let stopped = unsafe { (*dev).shutdown() }
                     && Message::new(EXECUTE, 0x4054, 0).call(7).value == 1;
                 connected = 0;
@@ -432,6 +435,7 @@ pub fn run() -> ! {
                         return r;
                     }
                     unsafe { wpa::close() };
+                    bt::power_off();
                     let stopped = axi.shutdown()
                         && Message::new(EXECUTE, 0x4054, 0).call(7).value == 1;
                     record(15, if stopped { 0 } else { 44 });
@@ -535,6 +539,7 @@ pub fn run() -> ! {
                     r.arg = RADIO_RETAIN_POWER;
                     return r;
                 }
+                bt::power_off();
                 if axi.shutdown() {
                     let cleanup = Message::new(EXECUTE, 0x4054, 0).call(7);
                     record(15, cleanup.value);
@@ -699,6 +704,7 @@ pub fn run() -> ! {
         };
         unsafe { open_sockets_poll(SOCKETS, online) };
         if active.get() {
+            bt::service();
             let relaying = unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() };
             let leased = relaying && relay_step(dev);
             if relaying && !leased && run_test.get() != 0 {
@@ -901,6 +907,9 @@ fn scan_entry(scan: &passive_scan::Results, index: u32) -> Message {
 fn wmt_enable(patch: &[u8], profile: u32, stage: fn(u32)) -> Result<(), u32> {
     unsafe { crate::protocol::hold_cpu(1) };
     let result = wmt::enable(patch, profile, stage);
+    if result.is_ok() {
+        bt::power_on();
+    }
     unsafe { crate::protocol::hold_cpu(0) };
     result
 }

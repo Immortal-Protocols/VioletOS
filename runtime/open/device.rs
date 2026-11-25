@@ -27,6 +27,8 @@ pub enum Kind {
     Camera { seen: u32 },
     /// The microphone stream (16 kHz s16 mono); `seen` counts samples read.
     Mic { seen: u32 },
+    /// The Bluetooth controller's HCI (hci.rs): one H4 packet per read or write.
+    Hci,
     Events,
     Sys { pending: Vec<u8> },
     Log,
@@ -65,6 +67,9 @@ impl Drop for OpenFile {
         }
         if let Kind::Mic { .. } = self.kind {
             mic::close();
+        }
+        if let Kind::Hci = self.kind {
+            super::hci::close();
         }
         if let Kind::Tcp { slot: Some(slot), .. } = self.kind {
             super::net::close(slot);
@@ -699,7 +704,7 @@ impl Runtime {
             }
             Wait::Connect { fd } => self.connect_result(i, *fd),
             Wait::Send { fd, buf, len } => {
-                let r = self.socket_send(i, *fd, *buf, *len, None);
+                let r = self.write(i, *fd, *buf, *len, None);
                 (r != super::syscall::EAGAIN).then_some(r)
             }
             Wait::Read { fd, buf, len } => {
@@ -760,6 +765,7 @@ impl Runtime {
             Kind::Audio { .. } => if pcm_space() > 0 { 4 } else { 0 },
             Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i)) as u32,
             Kind::Mic { seen } => (mic::written() != *seen) as u32,
+            Kind::Hci => super::hci::readable() as u32 | if super::hci::space() >= 1028 { 4 } else { 0 },
             Kind::Udp { replies, .. } => 4 | (!replies.is_empty()) as u32,
             Kind::Tcp { slot: None, .. } => 4,
             Kind::Tcp { slot: Some(slot), .. } => {
@@ -935,6 +941,15 @@ impl Runtime {
                 }
                 let n = b.len().min(len as usize);
                 b.drain(..n).collect()
+            }
+            Kind::Hci => {
+                if !super::hci::up() {
+                    return ENETDOWN;
+                }
+                match super::hci::take(len as usize) {
+                    Some(v) => v,
+                    None => return EAGAIN,
+                }
             }
             Kind::Mic { seen } => {
                 let v = mic::take(seen, len as usize / 2);

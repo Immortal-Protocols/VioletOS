@@ -1,0 +1,10 @@
+[package]
+name = "bitchat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+violet.workspace = true
+ring = "0.17"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+miniz_oxide = "0.8"

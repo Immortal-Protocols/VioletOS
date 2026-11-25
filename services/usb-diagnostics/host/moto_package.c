@@ -71,7 +71,7 @@ int main(int argc,char **argv) {
     int diagnostics = argc == 3 && !strcmp(argv[1], "activate-diagnostics");
     int confirm = argc == 3 && !strcmp(argv[1], "confirm-diagnostics");
     int activate = radio || diagnostics;
-    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | audio-status | audio=HEX | camera-status | camera=HEX | camera-shot=FILE.pgm | camera-raw=FILE | open-log | open-run=PATH | open-push=NAME | screenshot[=SCALE] | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
+    if((argc!=2 && !activate && !confirm) || (!strcmp(argv[1],"--help"))){fputs("moto-package status | radio-state | stopwatch | provision-wpa2 | join-wifi | scan-wifi | reboot | reboot-bootloader | bt-state | audio-status | audio=HEX | camera-status | camera=HEX | camera-shot=FILE.pgm | camera-raw=FILE | open-log | open-run=PATH | open-push=NAME | screenshot[=SCALE] | FILE.vpk | activate-radio SIGNATURE | activate-diagnostics SIGNATURE | diagnostics-status | diagnostics-recovery | confirm-diagnostics GENERATION\n",stderr);return 2;}
     libusb_context *ctx;
     if(libusb_init(&ctx)<0)return 1;
     libusb_device **devices;
@@ -146,6 +146,25 @@ int main(int argc,char **argv) {
                     usleep(250000);
                 }
                 if(time(NULL)>=until) fputs("Timed out waiting for the handset Wi-Fi result\n",stderr);
+            }
+        } else if (!strcmp(argv[1],"bt-state")) {
+            // Radio's Bluetooth words (targets/moto-g-pure/bt.rs), then the first bytes the controller sent.
+            unsigned char page[64], extra[64];
+            rc=libusb_control_transfer(chosen,0xc0,0x74,0,0,page,64,3000)!=64 ||
+               libusb_control_transfer(chosen,0xc0,0x74,0,1,extra,64,3000)!=64;
+            if (!rc) {
+                static const char *states[]={"off","starting","on","failed"};
+                unsigned state=word(page+4);
+                printf("magic %08x state %s error %08x address %04x%08x version %08x %08x\n",word(page),
+                       state<4?states[state]:"?",word(page+8),word(page+52),word(page+48),word(page+56),word(page+60));
+                printf("commands %u/%u events %u/%u dropped %u; stp rx %u tx %u bad %u\n",word(page+20),word(page+16),
+                       word(page+28),word(page+24),word(page+32),word(page+36),word(page+40),word(page+44));
+                unsigned total=word(extra); if (total>1024) total=1024;
+                for (uint16_t p=8;p<24 && !rc && (p-8)*64u<total;p++) {
+                    rc=libusb_control_transfer(chosen,0xc0,0x74,0,p,page,64,3000)!=64;
+                    for (unsigned i=0;i<64 && (p-8)*64u+i<total && !rc;i++) printf("%02x%s",page[i],i%32==31?"\n":" ");
+                }
+                printf("\n");
             }
         } else if (!strcmp(argv[1],"audio-status")) {
             // Ninety-six status words from the Audio process, printed one per line.

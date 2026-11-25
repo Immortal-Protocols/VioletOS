@@ -3,7 +3,7 @@
 VioletOS is a smartphone operating system built on the seL4 microkernel. It runs on the Moto G Pure (XT2163DL) and in QEMU on a Mac, with no Linux kernel anywhere. Drivers and services are separate seL4 processes, mostly written in Rust. Apps come in two kinds:
 
 - **System components** (the classic launcher, Wi-Fi Setup, and the Stopwatch package used by the package-system tests) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
-- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Camera, Wi-Fi, Ladybird, Music, Weather, Stopwatch, Sounds) are open apps written in Rust. [Ladybird](apps/open/ladybird/README.md) is a web browser built on the Ladybird project's own Rust HTML parser. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
+- **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The built-in apps (Home, Camera, Wi-Fi, Ladybird, Music, Weather, Stopwatch, Sounds, [bitchat](apps/open/bitchat/README.md)) are open apps written in Rust. [Ladybird](apps/open/ladybird/README.md) is a web browser built on the Ladybird project's own Rust HTML parser. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -31,6 +31,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 | `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
+| `make bitchat-peer` | A Mac bitchat peer for testing the handset's [bitchat](apps/open/bitchat/README.md) app over Bluetooth. |
 
 ### Prerequisites
 
@@ -80,7 +81,7 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 4 | [Touch](services/touch/README.md) | Novatek touch controller over SPI. |
 | 5 | [Display](services/display/README.md) | Presents built-in apps' surfaces to the screen. The Open Runtime draws there itself while an open app is in front. |
 | 6 | [Storage](services/storage/README.md) | Checkpoints, per-app files and the package catalog on disk (virtio in QEMU, eMMC on the handset). |
-| 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets. |
+| 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets and, on the handset, Bluetooth HCI. |
 | 8 | [Power](services/power/README.md) | Battery, sleep and shutdown; brokers the PMIC for Audio and Camera. |
 | 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
 | 10 | [Wi-Fi Setup](apps/wifi/README.md) | Chooses a network and tests the connection. |
@@ -91,7 +92,7 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 24 | [Open Runtime](runtime/open/README.md) | Runs Linux ARM programs from `/apps`. |
 | 25 | [Camera](services/camera/README.md) | The rear camera's sensor, receiver and frames, for open apps' `/dev/violet/camera`. |
 
-Slot 23 is reserved for a Bluetooth service.
+Slot 23 is reserved for a Bluetooth service. Today Radio carries Bluetooth on the handset, since the controller shares the connectivity chip and its BTIF port with Wi-Fi ([bring-up notes](targets/moto-g-pure/bluetooth-bringup.md)).
 
 ### What runs today
 
@@ -103,6 +104,7 @@ Slot 23 is reserved for a Bluetooth service.
 | Wi-Fi | Virtual access points, open and WPA2; HTTPS through the Mac | Scan, choose and type the password in the Wi-Fi app (WPA2-Personal), or provision over USB; HTTPS UUID |
 | Phone Internet | — | Hosts a Wi-Fi network for the iPhone relay; traffic leaves over cellular |
 | Audio | Mac speakers and microphone | Speaker, headphones, jack, Volume Down and microphone (Volume Up not yet) |
+| Bluetooth LE | — (the app reports the controller off) | Raw HCI for open apps through `/dev/violet/hci` while Wi-Fi is joined; [bitchat](apps/open/bitchat/README.md) chats with the iOS app |
 | Camera | A synthetic sensor (colour bars) | Rear Hi-1336 at 1280 × 720, 30 frames per second; the Camera app shows about 19 |
 | Open apps | Rust, C, Go and Python, with screen, touch, audio and TCP | Rust, C, Go and Python; PCM audio; TCP over Wi-Fi |
 
@@ -153,6 +155,7 @@ Code that differs between QEMU and the handset lives under `targets/` behind a c
 | How a touch becomes a tap | [touch.rs](services/touch/touch.rs) and [spi.rs](services/touch/spi.rs); [spi_mmio.c](targets/moto-g-pure/spi_mmio.c) accesses real registers, [fixture.c](targets/qemu/fixture.c) models them, and [events.c](services/touch/events.c) carries events to Runtime. | Shared driver, one backend per target |
 | Durable app data | [storage.rs](services/storage/storage.rs), [files.rs](services/storage/files.rs), [journal.rs](services/storage/journal.rs); [block.rs](services/storage/block.rs) (virtio) or [emmc.rs](targets/moto-g-pure/emmc.rs). | Moto and QEMU |
 | Wi-Fi, TCP and TLS on the handset | [radio.rs](targets/moto-g-pure/radio.rs) (Radio's event loop), [wlan_axi.rs](targets/moto-g-pure/wlan_axi.rs) (the chip), [wpa.rs](targets/moto-g-pure/wpa.rs), and lwIP glue in [ip/](targets/moto-g-pure/ip/) ([sockets.c](targets/moto-g-pure/ip/sockets.c) serves open apps). | Moto |
+| Bluetooth on the handset | [bt.rs](targets/moto-g-pure/bt.rs) (the controller and the HCI pages) and [wmt.rs](targets/moto-g-pure/wmt.rs) (STP and WMT); [hci.rs](runtime/open/hci.rs) is `/dev/violet/hci`. | Moto |
 | Networking in QEMU | [services/radio](services/radio/README.md) with the Mac-side [emulator_endpoint.py](tools/emulator_endpoint.py) and, for open apps' sockets, [net_relay.py](tools/net_relay.py). | QEMU and the Mac |
 | Sound and the microphone | [services/audio](services/audio/README.md) and the board backend under `targets/`. | Moto and QEMU |
 | Watchdog behavior | [watchdog.c](platform/sel4/board/watchdog.c) | Moto and QEMU |

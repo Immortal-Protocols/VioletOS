@@ -12,6 +12,7 @@ pub mod display;
 pub mod device;
 pub mod frames;
 pub mod fs;
+pub mod hci;
 pub mod heap;
 pub mod inflate;
 pub mod net;

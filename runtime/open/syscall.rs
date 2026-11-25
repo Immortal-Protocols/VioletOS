@@ -41,6 +41,8 @@ pub const ERANGE: i32 = -34;
 pub const ENOSYS: i32 = -38;
 pub const ENOTEMPTY: i32 = -39;
 pub const ETIMEDOUT: i32 = -110;
+pub const ENETDOWN: i32 = -100;
+pub const EBUSY: i32 = -16;
 pub const EAFNOSUPPORT: i32 = -97;
 
 const AT_FDCWD: i32 = -100;
@@ -437,7 +439,7 @@ impl Runtime {
                 }
                 let blocking_socket = r == EAGAIN && self.file(i, a[0] as i32).map_or(false, |f| {
                     let f = f.borrow();
-                    matches!(f.kind, Kind::Tcp { .. }) && f.flags & O_NONBLOCK == 0
+                    matches!(f.kind, Kind::Tcp { .. } | Kind::Hci) && f.flags & O_NONBLOCK == 0
                 });
                 if blocking_socket {
                     return Block(Wait::Send { fd: a[0] as i32, buf: a[1], len: a[2] }, None);
@@ -917,6 +919,12 @@ impl Runtime {
                 }
                 Kind::Mic { seen: super::device::mic::open() }
             }
+            "/dev/violet/hci" => {
+                if !super::hci::open() {
+                    return Done(EBUSY);
+                }
+                Kind::Hci
+            }
             "/dev/null" => Kind::Null,
             "/dev/urandom" | "/dev/random" => Kind::Random,
             "/dev/tty" | "/dev/stdout" | "/dev/stderr" | "/dev/console" => Kind::Log,
@@ -971,7 +979,7 @@ impl Runtime {
         (t > 0).then(|| sys::now_ns() + t)
     }
 
-    fn write(&mut self, i: usize, fd: i32, buf: u32, len: u32, at: Option<u64>) -> i32 {
+    pub(crate) fn write(&mut self, i: usize, fd: i32, buf: u32, len: u32, at: Option<u64>) -> i32 {
         let Some(f) = self.file(i, fd) else { return EBADF };
         if matches!(f.borrow().kind, Kind::Audio { .. }) {
             let r = self.write_audio(i, fd, buf, len);
@@ -989,6 +997,17 @@ impl Runtime {
                 len as i32
             }
             Kind::Null | Kind::Random => len as i32,
+            Kind::Hci => {
+                if !super::hci::up() {
+                    ENETDOWN
+                } else if !super::hci::valid(&data) {
+                    EINVAL
+                } else if super::hci::send(&data) {
+                    len as i32
+                } else {
+                    EAGAIN
+                }
+            }
             Kind::File { path } => {
                 let path = path.clone();
                 let now = (self.clock(0) / 1_000_000_000) as u32;
