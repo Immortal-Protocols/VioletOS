@@ -1,6 +1,7 @@
-// The conversation and the builds, through the signed-in Codex app server
-// (`codex app-server`, JSON-RPC over stdio). One thread per run of the app,
-// in the app workspace, sandboxed to it (workspace-write, no approvals).
+// The signed-in Codex app server (`codex app-server`, JSON-RPC over stdio), one
+// thread per run of the app, in the app workspace. Violet Agent runs two: the
+// talker (the conversation, read-only) and the builder (writes and builds apps
+// in the workspace, sandboxed to it with workspace-write and no approvals).
 import Foundation
 
 final class Codex {
@@ -9,6 +10,10 @@ final class Codex {
     var onActivity: (String) -> Void = { _ in }               // "thinking", "building", "idle"
     var onTool: (String, [String: Any], @escaping ([String: Any]) -> Void) -> Void = { _, _, done in done(["success": false, "contentItems": []]) }
     var onLog: (String) -> Void = { _ in }
+    /// What the thread is doing: a command it runs or a file it changes.
+    var onProgress: (String) -> Void = { _ in }
+    /// A turn ended (true when it completed rather than failed or was interrupted).
+    var onTurnEnd: (Bool) -> Void = { _ in }
 
     private var process: Process?
     private var stdin: FileHandle?
@@ -22,11 +27,17 @@ final class Codex {
     private let workspace: URL
     private let instructions: String
     private let tools: [[String: Any]]
+    private let sandbox: String
+    private let effort: String
+    let label: String
 
-    init(workspace: URL, instructions: String, tools: [[String: Any]]) {
+    init(_ label: String, workspace: URL, instructions: String, tools: [[String: Any]], sandbox: String = "workspace-write", effort: String = "low") {
+        self.label = label
         self.workspace = workspace
         self.instructions = instructions
         self.tools = tools
+        self.sandbox = sandbox
+        self.effort = effort
     }
 
     static func binary() -> String? {
@@ -56,7 +67,7 @@ final class Codex {
         }
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.onLog("Codex stopped")
+                self?.onLog("Codex (\(self?.label ?? "")) stopped")
                 self?.thread = nil
                 self?.activeTurn = nil
             }
@@ -86,14 +97,14 @@ final class Codex {
 
     func newThread(_ ready: @escaping (String?) -> Void) {
         let params: [String: Any] = [
-            "cwd": workspace.path, "approvalPolicy": "never", "sandbox": "workspace-write",
+            "cwd": workspace.path, "approvalPolicy": "never", "sandbox": sandbox,
             "model": model, "serviceTier": tier, "developerInstructions": instructions, "dynamicTools": tools,
         ]
         call("thread/start", params) { [weak self] r, err in
             guard let self else { return }
             if let err { return ready(err) }
             self.thread = (r?["thread"] as? [String: Any])?["id"] as? String
-            self.onLog("Codex: \(self.model), \(self.tier)")
+            self.onLog("Codex \(self.label): \(self.model), \(self.tier), \(self.sandbox)")
             ready(self.thread == nil ? "Codex did not start a thread" : nil)
         }
     }
@@ -114,8 +125,8 @@ final class Codex {
     private func startTurn(_ input: [[String: Any]]) {
         guard let thread else { return }
         onActivity("thinking")
-        call("turn/start", ["threadId": thread, "input": input, "effort": "low", "serviceTierForTurn": tier]) { [weak self] r, err in
-            if let err { self?.onLog("Codex turn failed: \(err)"); self?.onActivity("idle"); return }
+        call("turn/start", ["threadId": thread, "input": input, "effort": effort, "serviceTierForTurn": tier]) { [weak self] r, err in
+            if let err { self?.onLog("Codex \(self?.label ?? "") turn failed: \(err)"); self?.onActivity("idle"); self?.onTurnEnd(false); return }
             if let id = (r?["turn"] as? [String: Any])?["id"] as? String { self?.activeTurn = id }
         }
     }
@@ -174,7 +185,19 @@ final class Codex {
         case "item/agentMessage/delta":
             if let item = p["itemId"] as? String, let delta = p["delta"] as? String { onDelta(item, delta) }
         case "item/started":
-            if let item = p["item"] as? [String: Any], item["type"] as? String == "commandExecution" { onActivity("building") }
+            guard let item = p["item"] as? [String: Any] else { break }
+            switch item["type"] as? String {
+            case "commandExecution":
+                onActivity("building")
+                onProgress("running " + String((item["command"] as? String ?? "a command").prefix(120)))
+            case "fileChange":
+                let paths = ((item["changes"] as? [[String: Any]]) ?? []).compactMap { $0["path"] as? String }
+                onProgress("editing " + (paths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")))
+            case "mcpToolCall", "dynamicToolCall":
+                onProgress("calling " + (item["tool"] as? String ?? "a tool"))
+            default:
+                break
+            }
         case "item/completed":
             if let item = p["item"] as? [String: Any], item["type"] as? String == "agentMessage",
                let id = item["id"] as? String, let text = item["text"] as? String {
@@ -185,6 +208,8 @@ final class Codex {
         case "turn/completed":
             activeTurn = nil
             onActivity("idle")
+            let status = (p["turn"] as? [String: Any])?["status"] as? String ?? "completed"
+            onTurnEnd(status == "completed")
         default:
             break
         }

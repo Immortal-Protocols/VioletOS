@@ -38,7 +38,7 @@ fn main() {
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut art = ui::Art::new();
-    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, shield: Default::default() };
+    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, shield: Default::default(), listening: false };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
     let refresh = move || {
@@ -50,6 +50,7 @@ fn main() {
     let status = |s: &mut ui::State, art: &mut ui::Art| {
         s.apps = ui::apps(&std::fs::read_to_string("/apps/.home").unwrap_or_default());
         art.prepare(&fonts, &s.apps);
+        s.listening = violet::fields(&violet::sys("status")).get("listening").is_some_and(|v| v == "1");
         s.running = violet::sys("running").split_whitespace().map(String::from).collect();
         let sh = violet::fields(&violet::sys("shield"));
         s.shield = ui::Shield {
@@ -142,10 +143,10 @@ fn main() {
         }
         if last_status.elapsed() > Duration::from_secs(2) {
             last_status = Instant::now();
-            let (apps, running, shield) = (s.apps.clone(), s.running.clone(), s.shield.clone());
+            let (apps, running, shield, listening) = (s.apps.clone(), s.running.clone(), s.shield.clone(), s.listening);
             status(&mut s, &mut art);
             let day = glance.as_ref().and_then(|g| g.now()).map(|t| t.day);
-            if day != shown_day || apps != s.apps || running != s.running || shield != s.shield {
+            if day != shown_day || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening {
                 shown_day = day;
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
             }
@@ -166,7 +167,7 @@ mod preview {
         }
         ui::State {
             now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None,
-            shield: ui::Shield { known: true, linked: true, frozen: vec![] },
+            shield: ui::Shield { known: true, linked: true, frozen: vec![] }, listening: true,
         }
     }
 

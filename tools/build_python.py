@@ -111,7 +111,13 @@ def build_python():
     build.mkdir(exist_ok=True)
     site = build / "config.site"
     # Answers configure cannot find out by running target programs.
-    site.write_text("ac_cv_file__dev_ptmx=no\nac_cv_file__dev_ptc=no\nac_cv_buggy_getaddrinfo=no\n")
+    # Modules a phone app does not need, left out so Python fits the handset's app
+    # space (tools/build_python_package.py): the CJK codecs alone are over a megabyte.
+    unused = ["_codecs_cn", "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
+              "_multibytecodec", "_xxsubinterpreters", "_xxinterpchannels", "_lsprof", "spwd", "syslog",
+              "termios", "_posixshmem", "_multiprocessing", "_crypt", "audioop", "_posixsubprocess"]
+    site.write_text("ac_cv_file__dev_ptmx=no\nac_cv_file__dev_ptc=no\nac_cv_buggy_getaddrinfo=no\n" +
+                    "".join(f"py_cv_module_{m}=n/a\n" for m in unused))
     # pkg-config sees only the target's libraries, never the Mac's.
     env = dict(os.environ, CC=str(cc), AR=str(b / "llvm-ar"), RANLIB=str(b / "llvm-ranlib"),
                READELF=str(b / "llvm-readelf"), CONFIG_SITE=str(site),

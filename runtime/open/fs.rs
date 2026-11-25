@@ -101,6 +101,14 @@ impl Fs {
         for d in ["/", "/apps", "/bin", "/lib", "/tmp", "/data", "/dev", "/dev/violet", "/proc", "/proc/self"] {
             fs.dirs.insert(String::from(d));
         }
+        fs.add_archive(image, |_| true);
+        fs
+    }
+    /// Add the files of a cpio "newc" archive to the image layer, those whose
+    /// path `keep` accepts (an installed package may only add to /bin and /lib).
+    /// Returns how many files were added.
+    pub fn add_archive(&mut self, image: &'static [u8], keep: impl Fn(&str) -> bool) -> usize {
+        let mut added = 0;
         let mut at = 0usize;
         while at + 110 <= image.len() && &image[at..at + 6] == b"070701" {
             let field = |i: usize| hex(&image[at + 6 + i * 8..at + 14 + i * 8]);
@@ -125,14 +133,20 @@ impl Fs {
                 break;
             }
             let path = normalize("/", name);
+            if !keep(&path) {
+                continue;
+            }
             if mode & S_IFMT == S_IFDIR {
-                fs.add_dir(&path);
+                self.add_dir(&path);
             } else {
-                fs.add_dir(parent(&path));
-                fs.image.insert(path, ImageEntry { mode, data: &image[data_start..data_end], mtime });
+                self.add_dir(parent(&path));
+                self.hidden.remove(&path);
+                self.layer.remove(&path);
+                self.image.insert(path, ImageEntry { mode, data: &image[data_start..data_end], mtime });
+                added += 1;
             }
         }
-        fs
+        added
     }
     fn add_dir(&mut self, path: &str) {
         let mut p = String::from(path);

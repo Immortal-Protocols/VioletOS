@@ -276,7 +276,7 @@ mod preview {
 
     #[test]
     fn installed_lines() {
-        let a = pages::parse_installed("dice\t2048\tDice\nbad\nraw\t10\t\n");
+        let a = pages::parse_installed("dice\t2048\tDice\nbad\nraw\t10\t\npython\t5000000\tPython\tpackage\n.free\t9000\t\n");
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].title, "Dice");
         assert_eq!(a[1].title, "raw");

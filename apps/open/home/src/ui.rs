@@ -53,6 +53,8 @@ pub struct State {
     pub running: HashSet<String>,
     pub pressed: Option<usize>,
     pub shield: Shield,
+    /// The voice agent is listening (in front or in the background).
+    pub listening: bool,
 }
 
 /// What a press landed on: an app, or the Shield pill.
@@ -135,6 +137,15 @@ pub fn draw(c: &mut Canvas, f: &Fonts, art: &Art, s: &State) {
     let date = s.now.as_ref().map(|t| t.date()).unwrap_or_else(|| "VioletOS".to_string());
     f.regular(50.0).draw(c, &date, 56, 152, CREAM);
     pill(c, f, s);
+    if s.listening {
+        // A green microphone left of the pill while the agent hears the room.
+        let (mx, top) = (pill_rect().x0 as f32 - 34.0, pill_rect().y0 as f32 + 18.0);
+        c.line(mx, top + 6.0, mx, top + 16.0, 12.0, paper::GOOD);
+        c.circle(mx, top + 6.0, 6.0, paper::GOOD);
+        c.circle(mx, top + 16.0, 6.0, paper::GOOD);
+        c.arc(mx, top + 15.0, 11.0, 3.0, -std::f32::consts::PI, 0.0, paper::GOOD);
+        c.line(mx, top + 26.0, mx, top + 31.0, 3.0, paper::GOOD);
+    }
     let label = f.regular(27.0);
     let count = s.apps.len();
     for (i, a) in s.apps.iter().enumerate() {

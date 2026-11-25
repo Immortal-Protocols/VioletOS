@@ -44,12 +44,16 @@ pub struct Installed {
     pub bytes: u64,
 }
 
-/// "name<TAB>bytes<TAB>title" lines from "installed".
+/// "name<TAB>bytes<TAB>title[<TAB>package]" lines from "installed": the apps,
+/// leaving out packages (Python, which the apps need) and the ".free" line.
 pub fn parse_installed(text: &str) -> Vec<Installed> {
     text.lines()
         .filter_map(|l| {
-            let mut f = l.splitn(3, '\t');
+            let mut f = l.split('\t');
             let (name, bytes, title) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+            if name.starts_with('.') || f.next() == Some("package") {
+                return None;
+            }
             Some(Installed { name: name.into(), bytes: bytes.parse().ok()?, title: if title.is_empty() { name.into() } else { title.into() } })
         })
         .collect()

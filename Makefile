@@ -69,7 +69,7 @@ test-wifi-app: qemu-image
 # The voice agent: QR pairing, an encrypted install that survives a restart, reconnect
 # and unpair, with the real Mac app (companion/mac) and a local relay.
 test-agent:
-	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 $(MAKE) qemu-image
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
 	$(PYTHON) targets/qemu/test_agent.py
 
 .PHONY: test-open-apps
@@ -86,6 +86,7 @@ test-unit:
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
 	build/tests/inflate
+	python3 apps/lib/python/test_violet.py
 	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p settings -p bitchat --target-dir ../build/host-tests
 
 # The QEMU tests CI runs: one boot of the supervisor and its services (touch,

@@ -421,7 +421,7 @@ impl Agent {
         self.session = Some(session);
         self.status = format!("Connected to {}", self.mac_name());
         let listening = !self.muted;
-        self.send_json(json!({"t": "hello", "name": "Moto G Pure", "version": 1, "listening": listening}));
+        self.send_json(json!({"t": "hello", "name": "Moto G Pure", "version": 1, "listening": listening, "python": has_python()}));
         self.update_mic();
         self.direct_fails = 0;
         self.start_direct();
@@ -526,6 +526,31 @@ impl Agent {
                 let _ = self.speech.send(voice::Speech::Control(kind, gain));
             }
             "install" => self.begin_install(&v),
+            // The installed apps and the room left, for the Mac to list or free space.
+            "apps" => {
+                let mut apps = Vec::new();
+                let mut free = 0u64;
+                for line in violet::sys("installed").lines() {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    match f.as_slice() {
+                        [".free", n, ..] => free = n.parse().unwrap_or(0),
+                        [name, n, title, ..] => apps.push(json!({"name": name, "bytes": n.parse::<u64>().unwrap_or(0), "title": title})),
+                        _ => {}
+                    }
+                }
+                self.send_json(json!({"t": "apps", "apps": apps, "free": free, "python": has_python()}));
+            }
+            "uninstall" => {
+                let name = text("name");
+                let r = if secure_name(&name) { violet::sys(&format!("uninstall {name}")) } else { "error bad name".into() };
+                let ok = r.starts_with("ok");
+                println!("agent: uninstall {name} -> {r}");
+                if ok && self.built.as_ref().is_some_and(|(n, _)| *n == name) {
+                    self.built = None;
+                }
+                let error = r.strip_prefix("error ").unwrap_or("").to_string();
+                self.send_json(json!({"t": "uninstalled", "name": name, "ok": ok, "error": error}));
+            }
             "install_end" => self.finish_install(),
             "open" => {
                 let name = text("name");
@@ -562,12 +587,22 @@ impl Agent {
         let data = if i.deflate {
             miniz_oxide::inflate::decompress_to_vec_with_limit(&i.data, 8 << 20).unwrap_or_default()
         } else {
-            i.data
+            i.data.clone()
         };
         let digest = secure::hex(&secure::sha256(&[&data]));
+        // Compressed programs are kept compressed ("VZ1", the length, the DEFLATE):
+        // the Open Runtime runs the program and stores half the bytes.
+        let stored = if i.deflate {
+            let mut v = b"VZ1\0".to_vec();
+            v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            v.extend_from_slice(&i.data);
+            v
+        } else {
+            data.clone()
+        };
         let r = if data.len() != i.bytes || digest != i.sha256 {
             format!("error the program arrived damaged ({} of {} bytes)", data.len(), i.bytes)
-        } else if let Err(e) = std::fs::write(&path, &data) {
+        } else if let Err(e) = std::fs::write(&path, &stored) {
             format!("error {e}")
         } else {
             violet::sys(&format!("install {} {}", i.name, i.title))
@@ -575,7 +610,11 @@ impl Agent {
         let ok = r.starts_with("ok");
         let ms = i.started.elapsed().as_millis() as u64;
         println!("agent: install {} -> {r} in {ms} ms", i.name);
-        if ok {
+        // A package (Python) has nothing to open.
+        let package = data.starts_with(b"VGZ1");
+        if ok && package {
+            self.status = format!("{} is installed", i.title);
+        } else if ok {
             self.built = Some((i.name.clone(), i.title.clone()));
             self.status = format!("{} is installed", i.title);
         } else {
@@ -609,8 +648,10 @@ impl Agent {
         self.connect();
     }
 
+    /// Listening whenever paired and not muted, in front or not: the runtime
+    /// keeps the agent's microphone on in the background (Home shows a mic).
     fn update_mic(&mut self) {
-        let on = self.session.is_some() && self.focused && !self.muted;
+        let on = self.session.is_some() && !self.muted;
         self.listening.store(on, Ordering::Relaxed);
     }
 
@@ -687,6 +728,11 @@ impl Agent {
         }
         self.dirty = true;
     }
+}
+
+/// Python apps need /bin/python3, which the handset gets as an installed package.
+fn has_python() -> bool {
+    std::path::Path::new("/bin/python3").exists()
 }
 
 fn secure_name(n: &str) -> bool {
@@ -912,7 +958,8 @@ fn main() {
         built: None,
         listening,
         muted: false,
-        focused: true,
+        // Started behind Home at boot when paired, so not necessarily in front.
+        focused: violet::fields(&violet::sys("status")).get("focused").map_or(true, |v| v == "1"),
         speech: speech_tx,
         speaking: false,
         tx,

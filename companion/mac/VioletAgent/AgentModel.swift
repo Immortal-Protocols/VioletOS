@@ -49,7 +49,16 @@ final class AgentModel: ObservableObject {
     private var nextReply = 1
     private var renamed = false
     private var roseAudible = false
+    /// The conversation: fast turns, read-only, never writes code.
     private var codex: Codex!
+    /// Apps: writes, builds and installs in the workspace while the talk goes on.
+    private var builder: Codex!
+    /// The build in progress: what was asked, when, and what the builder did.
+    private var building: (request: String, started: Date, progress: [String])?
+    private var lastBuild = ""
+    private var builderReply = ""
+    /// Whether the phone has Python (its hello says); nil until it says.
+    private var phonePython: Bool?
     let support: URL
     let repo: URL
     let workspace: URL
@@ -65,10 +74,14 @@ final class AgentModel: ObservableObject {
     private var requestAt: Date?
     private var request = ""
     private var installs: [String: (Date, ([String: Any]) -> Void)] = [:]
+    /// Answers the phone owes: its list of apps, and removals by name.
+    private var appLists: [([String: Any]) -> Void] = []
+    private var removals: [String: ([String: Any]) -> Void] = [:]
     private var timing: [String: Any] = [:]
-    private var pendingSay: String?
-    /// --install NAME=PATH: install a built program once the phone is online (tests).
-    private var pendingInstall: (String, String)?
+    /// --say TEXT (repeatable): typed requests once online, --say-gap seconds apart (default 10).
+    private var pendingSays: [String] = []
+    /// --install NAME=PATH (repeatable): install built programs once the phone is online (tests).
+    private var pendingInstalls: [(String, String)] = []
     /// --record-mic: the phone's microphone stream, kept as mic.wav (measurements).
     private var recording: Data?
     private var micBytes = 0
@@ -101,11 +114,13 @@ final class AgentModel: ObservableObject {
     func start() {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--unpair"), i >= 0 { saved.phones = []; Store.save(saved); phone = nil }
-        if let i = args.firstIndex(of: "--say"), i + 1 < args.count { pendingSay = args[i + 1] }
+        for (i, a) in args.enumerated() where a == "--say" && i + 1 < args.count { pendingSays.append(args[i + 1]) }
         if args.contains("--record-mic") { recording = Data() }
         if let i = args.firstIndex(of: "--name"), i + 1 < args.count { rename(args[i + 1]) }
-        if let i = args.firstIndex(of: "--install"), i + 1 < args.count, let eq = args[i + 1].firstIndex(of: "=") {
-            pendingInstall = (String(args[i + 1][..<eq]), String(args[i + 1][args[i + 1].index(after: eq)...]))
+        for (i, a) in args.enumerated() where a == "--install" && i + 1 < args.count {
+            if let eq = args[i + 1].firstIndex(of: "=") {
+                pendingInstalls.append((String(args[i + 1][..<eq]), String(args[i + 1][args[i + 1].index(after: eq)...])))
+            }
         }
         if let p = phone { link.connect(p) }
         if let i = args.firstIndex(of: "--pair"), i + 1 < args.count, let inv = Invitation(args[i + 1]) { pair(inv) }
@@ -213,34 +228,67 @@ final class AgentModel: ObservableObject {
     private static let instructions = """
     You are Violet, the voice agent of the user's VioletOS phone (a Moto G Pure). You run on their Mac. \
     Everything you write is spoken aloud on the phone, so answer like a person talking: one or two short sentences, \
-    no markdown, lists, code, paths or URLs. When the user asks for an app, follow AGENTS.md in this workspace: \
-    say one short line first, build it, call install_app, then say it is ready. Choose sensible defaults instead of asking. \
-    If the user asks to open an app you installed, call open_app. If they want to call you something else, call \
-    rename_assistant with the new name and use it from then on.
+    no markdown, lists, code, paths or URLs. You never write code or run commands yourself. \
+    When the user asks for an app or a change to one, call build_app with a clear description of what to make \
+    (say "in Python" when they asked for Python), then say one short line such as "Sure, building it now." \
+    The builder works in the background and you keep talking with the user meanwhile: answer questions, chat, \
+    take more requests (more changes to the app go to build_app too). If they ask how it is going, call build_status. \
+    A message starting with [builder] is a report from the builder, not from the user: give the user the news in \
+    one short sentence, for example that the app is ready and they can tap Open. Choose sensible defaults instead of asking. \
+    If the user asks to open an app, call open_app. If they want to call you something else, call rename_assistant \
+    with the new name and use it from then on. list_apps tells you the apps installed on the phone and the room left. \
+    When an install fails for lack of room, offer to remove apps the user no longer wants; call remove_app only for \
+    apps the user has agreed to remove, then build_app again if they still want the new app.
+    """
+
+    private static let builderInstructions = """
+    You build apps for the user's VioletOS phone, following AGENTS.md in this workspace. Requests come from the \
+    voice agent the user is talking with. Build the app, install it with install_app, then reply with one short plain \
+    sentence saying what you made, or what went wrong. Never ask questions; choose sensible defaults.
     """
 
     private static let tools: [[String: Any]] = [
-        ["type": "function", "name": "install_app",
-         "description": "Install a program built with ./build on the user's phone. Returns once it is installed and listed on the phone.",
+        ["type": "function", "name": "build_app",
+         "description": "Start building an app, or change one, in the background. Returns at once; a [builder] message arrives when it is installed on the phone.",
          "inputSchema": ["type": "object", "properties": [
-            "name": ["type": "string", "description": "The app's folder name under apps/"],
-            "title": ["type": "string", "description": "The title shown on the phone"],
-            "path": ["type": "string", "description": "The path ./build printed"]],
-                         "required": ["name", "title", "path"]]],
+            "request": ["type": "string", "description": "What to build or change, in plain words, with any details the user gave"]],
+                         "required": ["request"]]],
+        ["type": "function", "name": "build_status",
+         "description": "How the build in progress is going.",
+         "inputSchema": ["type": "object", "properties": [String: Any]()]],
+        ["type": "function", "name": "cancel_build",
+         "description": "Stop the build in progress.",
+         "inputSchema": ["type": "object", "properties": [String: Any]()]],
         ["type": "function", "name": "rename_assistant",
          "description": "Change the name the user calls you. It is saved and shown on the phone.",
          "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
         ["type": "function", "name": "open_app",
          "description": "Open an installed app on the phone's screen.",
          "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
+        ["type": "function", "name": "list_apps",
+         "description": "The apps installed on the phone (name, title, size) and the room left for more.",
+         "inputSchema": ["type": "object", "properties": [String: Any]()]],
+        ["type": "function", "name": "remove_app",
+         "description": "Remove an installed app from the phone. Only after the user agreed to remove that app.",
+         "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
+    ]
+
+    private static let builderTools: [[String: Any]] = [
+        ["type": "function", "name": "install_app",
+         "description": "Install a program built with ./build on the user's phone. Returns once it is installed and listed on the phone.",
+         "inputSchema": ["type": "object", "properties": [
+            "name": ["type": "string", "description": "The app's folder name"],
+            "title": ["type": "string", "description": "The title shown on the phone"],
+            "path": ["type": "string", "description": "The path ./build printed"]],
+                         "required": ["name", "title", "path"]]],
     ]
 
     private func startCodex() {
-        codex = Codex(workspace: workspace, instructions: instructions, tools: Self.tools)
+        codex = Codex("talker", workspace: workspace, instructions: instructions, tools: Self.tools, sandbox: "read-only")
         codex.onLog = { [weak self] s in self?.log(s) }
         codex.onDelta = { [weak self] id, d in self?.delta(id, d) }
         codex.onMessage = { [weak self] id, t in self?.message(id, t) }
-        codex.onActivity = { [weak self] a in self?.setActivity(a) }
+        codex.onActivity = { [weak self] a in self?.setActivity(a == "building" ? "thinking" : a) }
         codex.onTool = { [weak self] tool, args, done in self?.tool(tool, args, done) }
         codex.start { [weak self] err in
             guard let self else { return }
@@ -248,28 +296,85 @@ final class AgentModel: ObservableObject {
             self.log(self.codexState)
             self.sayPending()
         }
+        builder = Codex("builder", workspace: workspace, instructions: Self.builderInstructions, tools: Self.builderTools)
+        builder.onLog = { [weak self] s in self?.log(s) }
+        builder.onMessage = { [weak self] _, t in self?.builderReply = t }
+        builder.onProgress = { [weak self] p in
+            guard let self, self.building != nil else { return }
+            self.building!.progress.append(p)
+            self.log("builder: \(p)")
+        }
+        builder.onTool = { [weak self] tool, args, done in self?.tool(tool, args, done) }
+        builder.onTurnEnd = { [weak self] ok in self?.buildEnded(ok) }
+        builder.start { [weak self] err in
+            if let err { self?.log("builder: \(err)") }
+        }
+    }
+
+    // MARK: building in the background
+
+    private func startBuild(_ request: String) -> String {
+        guard builder.thread != nil else { return "The builder isn't ready on the Mac yet." }
+        if building != nil {
+            // More for the build in progress: the builder takes it into its turn.
+            building!.request += "; " + request
+            builder.say(request)
+            log("build: more for the build in progress: \(request)")
+            return "Added that to the build in progress; a [builder] message comes when it is done."
+        }
+        building = (request, Date(), [])
+        builderReply = ""
+        log("build: \(request)")
+        builder.say(request)
+        setActivity(activity)
+        return "Started. The builder works in the background, usually under a minute; a [builder] message comes when it is installed. Keep talking with the user meanwhile."
+    }
+
+    private func buildStatus() -> String {
+        guard let b = building else {
+            return lastBuild.isEmpty ? "No build is running." : "No build is running. The last one: \(lastBuild)"
+        }
+        let secs = Int(Date().timeIntervalSince(b.started))
+        let recent = b.progress.suffix(3).joined(separator: "; ")
+        return "Building for \(secs) s: \(b.request). " + (recent.isEmpty ? "It is still planning." : "Latest steps: \(recent).")
+    }
+
+    private func buildEnded(_ ok: Bool) {
+        guard let b = building else { return }
+        building = nil
+        let secs = Int(Date().timeIntervalSince(b.started))
+        let reply = builderReply.trimmingCharacters(in: .whitespacesAndNewlines)
+        lastBuild = reply.isEmpty ? (ok ? "finished" : "stopped before it finished") : reply
+        log("build ended (\(ok ? "done" : "stopped")) in \(secs) s: \(lastBuild)")
+        setActivity(activity)
+        codex.say("[builder] " + (ok ? "" : "The build stopped. ") + lastBuild)
     }
 
     /// --install NAME=PATH once online; with --wait-direct, once the direct
     /// path is open (or 20 s have passed), so a test sees a program cross it.
     private func installPending(waited: Double) {
-        guard let (name, path) = pendingInstall, online else { return }
+        guard let (name, path) = pendingInstalls.first, online else { return }
         if CommandLine.arguments.contains("--wait-direct") && directPath == nil && waited < 20 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.installPending(waited: waited + 0.5) }
             return
         }
-        pendingInstall = nil
+        pendingInstalls.removeFirst()
         let via = directPath.map { "direct path \($0)" } ?? "relay"
         install(["name": name, "title": name.capitalized, "path": path]) { [weak self] ok, text in
             self?.log("test install \(name): \(ok ? "ok" : "failed") \(text) (via \(via))")
+            self?.installPending(waited: 20)
         }
     }
 
     private func sayPending() {
-        guard let s = pendingSay, online, codex.thread != nil else { return }
-        pendingSay = nil
+        guard let s = pendingSays.first, online, codex.thread != nil else { return }
+        pendingSays.removeFirst()
         log("typed request: \(s)")
         userTurn(s)
+        guard !pendingSays.isEmpty else { return }
+        let args = CommandLine.arguments
+        let gap = args.firstIndex(of: "--say-gap").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil } ?? 10
+        DispatchQueue.main.asyncAfter(deadline: .now() + gap) { [weak self] in self?.sayPending() }
     }
 
     // MARK: pairing
@@ -365,6 +470,7 @@ final class AgentModel: ObservableObject {
     private func phoneMessage(_ o: [String: Any]) {
         switch o["t"] as? String {
         case "hello":
+            if let py = o["python"] as? Bool { phonePython = py }
             // A phone paired by reading our code is named once it says hello.
             if let name = o["name"] as? String, !name.isEmpty, var p = phone, p.name != name {
                 p.name = name
@@ -382,6 +488,12 @@ final class AgentModel: ObservableObject {
             if let (_, done) = installs.removeValue(forKey: name) {
                 done(o)
             }
+        case "apps":
+            if !appLists.isEmpty { appLists.removeFirst()(o) }
+        case "uninstalled":
+            let name = o["name"] as? String ?? ""
+            log("the phone removed \(name): \(o["ok"] ?? false)")
+            removals.removeValue(forKey: name)?(o)
         case "opened":
             let name = o["name"] as? String ?? ""
             if timing["name"] as? String == name, timing["opened_s"] == nil, let at = requestAt {
@@ -553,8 +665,10 @@ final class AgentModel: ObservableObject {
 
     private func setActivity(_ a: String) {
         var state = a
-        if a == "idle" && (speaker.speaking || (useRose && roseAudible)) { state = "speaking" }
-        if a == "thinking" && activity == "building" { state = "building" }
+        if state == "idle" && (speaker.speaking || (useRose && roseAudible)) { state = "speaking" }
+        // While the talker is quiet, the phone shows the build going on (it keeps listening).
+        if state == "idle" && building != nil { state = "building" }
+        if state == "building" && building == nil && codex.activeTurn == nil { state = "idle" }
         activity = state
         let phoneState = state == "idle" ? "listening" : state
         link.send(["t": "state", "state": phoneState])
@@ -567,6 +681,14 @@ final class AgentModel: ObservableObject {
             done(["success": ok, "contentItems": [["type": "inputText", "text": text]]])
         }
         switch name {
+        case "build_app":
+            reply(true, startBuild(args["request"] as? String ?? ""))
+        case "build_status":
+            reply(true, buildStatus())
+        case "cancel_build":
+            let was = building != nil
+            builder.interrupt()
+            reply(true, was ? "Stopped the build." : "No build was running.")
         case "install_app":
             install(args) { ok, text in reply(ok, text) }
         case "rename_assistant":
@@ -574,6 +696,32 @@ final class AgentModel: ObservableObject {
             rename(n)
             renamed = false
             reply(!n.isEmpty, n.isEmpty ? "No name given." : "Saved. Your name is now \(agentName), and the phone shows it.")
+        case "list_apps":
+            guard online else { return reply(false, "The phone is offline.") }
+            appLists.append { o in
+                let apps = (o["apps"] as? [[String: Any]] ?? []).filter { ($0["name"] as? String) != "python" }
+                let list = apps.map { "\($0["title"] ?? "") (\($0["name"] ?? ""), \(($0["bytes"] as? Int ?? 0) / 1024) KB)" }
+                let free = (o["free"] as? Int ?? 0) / 1024
+                let python = (o["python"] as? Bool ?? false) ? "Python is installed." : "Python is not installed yet (a Python app needs about 5 MB once)."
+                reply(true, (list.isEmpty ? "No apps are installed." : "Installed: " + list.joined(separator: "; ") + ".") + " Room left: \(free) KB. " + python)
+            }
+            link.send(["t": "apps"])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, !self.appLists.isEmpty else { return }
+                self.appLists.removeFirst()(["apps": [], "free": 0])
+            }
+        case "remove_app":
+            let app = args["name"] as? String ?? ""
+            guard online else { return reply(false, "The phone is offline.") }
+            removals[app] = { o in
+                let ok = o["ok"] as? Bool ?? false
+                reply(ok, ok ? "Removed \(app) from the phone." : "Could not remove \(app): \(o["error"] as? String ?? "no answer")")
+            }
+            link.send(["t": "uninstall", "name": app])
+            log("removing \(app) from the phone")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                if let d = self?.removals.removeValue(forKey: app) { d(["ok": false, "error": "the phone did not answer"]) }
+            }
         case "open_app":
             let app = args["name"] as? String ?? ""
             link.send(["t": "open", "name": app])
@@ -597,9 +745,61 @@ final class AgentModel: ObservableObject {
         timing["name"] = name
         timing["bytes"] = data.count
         setActivity("building")
+        let python = data.starts(with: Data("#!/bin/python3".utf8))
+        timing["language"] = python ? "python" : "rust"
+        let finish: (Bool, String) -> Void = { [weak self] ok, error in
+            guard let self else { return }
+            let secs = Date().timeIntervalSince(started)
+            self.timing["transfer_install_s"] = round(secs * 10) / 10
+            if let at = self.requestAt { self.timing["installed_s"] = round(Date().timeIntervalSince(at) * 10) / 10 }
+            self.log("installed \(name): \(ok) \(error) in \(String(format: "%.1f", secs)) s")
+            done(ok, ok ? "Installed \(title) on the phone. It has an icon on the phone's Home screen and survives a restart; the user can tap Open \(title) in the agent."
+                     : "The phone could not install it: \(error)")
+        }
+        let app = { [weak self] in
+            self?.send(name: name, title: title, data: data, timeout: 90) { ok, error in finish(ok, error) }
+        }
+        if python && phonePython != true {
+            installPython { ok, error in
+                ok ? app() : finish(false, "Python could not be installed on the phone: \(error)" +
+                                    (error.contains("no room") ? ". The phone's app space is full: say so; the voice agent can offer to remove apps." : ""))
+            }
+        } else {
+            app()
+        }
+    }
+
+    /// Python for the phone (tools/build_python_package.py), installed once as the "python" package.
+    private func installPython(_ done: @escaping (Bool, String) -> Void) {
+        let package = repo.appendingPathComponent("build/python-package.vgz")
+        log("the phone has no Python yet: installing it first")
+        DispatchQueue.global().async {
+            if !FileManager.default.fileExists(atPath: package.path) {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+                p.arguments = [self.repo.appendingPathComponent("tools/build_python_package.py").path, package.path]
+                p.standardOutput = FileHandle.nullDevice
+                try? p.run()
+                p.waitUntilExit()
+            }
+            let data = try? Data(contentsOf: package)
+            DispatchQueue.main.async {
+                guard let data, !data.isEmpty else { return done(false, "the Python package is missing on the Mac (tools/build_python_package.py)") }
+                let started = Date()
+                self.send(name: "python", title: "Python", data: data, timeout: 600) { ok, error in
+                    self.log("python package: \(ok ? "installed" : "failed \(error)") in \(Int(Date().timeIntervalSince(started))) s")
+                    if ok { self.phonePython = true }
+                    done(ok, error)
+                }
+            }
+        }
+    }
+
+    /// Send a program (or a package) to the phone; `done` gets the phone's answer.
+    private func send(name: String, title: String, data: Data, timeout: Double, _ done: @escaping (Bool, String) -> Void) {
         // Raw DEFLATE halves a Rust program; the phone's link is the slow part.
         let packed = (try? (data as NSData).compressed(using: .zlib) as Data) ?? data
-        let deflated = packed.count < data.count
+        let deflated = packed.count < data.count * 9 / 10
         let wire = deflated ? packed : data
         link.send(["t": "install", "name": name, "title": title, "size": wire.count, "bytes": data.count,
                    "encoding": deflated ? "deflate" : "none", "sha256": sha256(data).hex])
@@ -614,17 +814,10 @@ final class AgentModel: ObservableObject {
         }
         link.send(["t": "install_end"])
         log("sent \(name) (\(data.count) bytes, \(wire.count) on the wire)")
-        installs[name] = (started, { [weak self] o in
-            guard let self else { return }
-            let ok = o["ok"] as? Bool ?? false
-            let secs = Date().timeIntervalSince(started)
-            self.timing["transfer_install_s"] = round(secs * 10) / 10
-            if let at = self.requestAt { self.timing["installed_s"] = round(Date().timeIntervalSince(at) * 10) / 10 }
-            self.log("installed \(name): \(ok) \(o["error"] ?? "") in \(String(format: "%.1f", secs)) s")
-            done(ok, ok ? "Installed \(title) on the phone. It is listed in Programs and survives a restart; the user can tap Open \(title) in the agent."
-                     : "The phone could not install it: \(o["error"] as? String ?? "unknown error")")
+        installs[name] = (Date(), { o in
+            done(o["ok"] as? Bool ?? false, o["error"] as? String ?? "unknown error")
         })
-        DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
             if let (_, d) = self?.installs.removeValue(forKey: name) { d(["ok": false, "error": "the phone did not answer"]) }
         }
     }

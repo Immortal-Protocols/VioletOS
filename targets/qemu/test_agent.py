@@ -14,6 +14,12 @@ in /apps with an icon on Home and runs, and the pair reconnected without a new
 scan. Settings › Agent Apps then deletes it, and the Mac unpairs and the phone
 shows a new code.
 
+The image leaves Python out, as the handset's does: the Mac also installs a
+Python app (the workspace's Tally), sending the Python package first. With the
+agent sent to the background, its microphone stream keeps reaching the Mac. On
+the second boot nobody opens the agent: it starts behind Home by itself and
+reconnects, and the Python app runs from the installed package.
+
 Needs the image built with the test relay:
     VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu-image
 and the Mac app (xcodebuild, see companion/mac/README.md).
@@ -36,6 +42,7 @@ import run
 
 APP = ROOT / "build/mac-agent/Build/Products/Debug/Violet Agent.app/Contents/MacOS/Violet Agent"
 EXAMPLE = ROOT / "build/agent-workspace/target/armv7-unknown-linux-musleabihf/agent/example"
+TALLY = ROOT / "build/agent-workspace/target/python/tally"
 SUPPORT = Path.home() / "Library/Application Support/Violet Agent test"
 
 SCRIPT = r'''#!/usr/bin/env python3
@@ -43,8 +50,12 @@ import json, mmap, os, re, struct, subprocess, sys, time
 ram = open(sys.argv[1], "r+b")
 log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
 screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000, prot=mmap.PROT_READ)
+# The emulated sound card (as in test_audio.py): word 12 bit 0 is set while the microphone runs.
+card = mmap.mmap(ram.fileno(), 11 * 4096, offset=0x49204000 - 0x40000000, prot=mmap.PROT_READ)
+def mic_on(): return struct.unpack_from("<I", card, 48)[0] & 1
 STAGE = os.environ["AGENT_STAGE"]
 APP, EXAMPLE, SUPPORT = os.environ["AGENT_APP"], os.environ["AGENT_EXAMPLE"], os.environ["AGENT_SUPPORT"]
+TALLY = os.environ["AGENT_TALLY"]
 
 def text():
     n = struct.unpack_from("<I", log, 4)[0]
@@ -93,11 +104,11 @@ def launch_mac(*args):
 
 until("Home", lambda: "home: ready" in everything(), 60)
 time.sleep(3)
-open_icon("agent")
 if STAGE == "first":
+    open_icon("agent")
     until("pairing code", lambda: re.search(r"agent: pairing code (\S+)", everything()), 60)
     code = re.findall(r"agent: pairing code (\S+)", everything())[-1]
-    launch_mac("--unpair", "--pair", code, "--install", "example=" + EXAMPLE, "--wait-direct")
+    launch_mac("--unpair", "--pair", code, "--install", "example=" + EXAMPLE, "--install", "tally=" + TALLY, "--wait-direct")
     until("paired", lambda: "agent: paired with a new Mac" in everything(), 60)
     print("agent: paired through the relay", file=sys.stderr)
     until("direct path", lambda: "agent: direct path open to" in everything(), 60)
@@ -109,11 +120,29 @@ if STAGE == "first":
     if "(via direct path" not in mac_log():
         fail("the install did not cross the direct path")
     print("agent: the program crossed the direct path", file=sys.stderr)
+    # The Python app: Python goes first, as a package, then the script.
+    until("python package", lambda: "agent: install python -> ok" in everything(), 180)
+    print(re.findall(r"agent: install python: .* arrived .*", everything())[-1], file=sys.stderr)
+    until("python app", lambda: "test install tally: ok" in mac_log(), 60)
+    print("agent: Python installed as a package, then the Python app", file=sys.stderr)
+    # In the background the agent keeps listening: the stream reaches the Mac.
+    n = home_shown()
+    tap(100, 60)
+    until("agent in the background", lambda: "the agent keeps listening in the background" in everything(), 10)
+    until("back on Home", lambda: home_shown() > n, 10)
+    time.sleep(3)
+    if not mic_on():
+        fail("the microphone stopped when the agent went to the background")
+    print("agent: the microphone stayed on with the agent behind Home", file=sys.stderr)
     mac.terminate(); mac.wait()
     time.sleep(1)
     sys.exit(0)
-# Second boot: the install survived, and the pair reconnects by itself.
-until("installed apps loaded", lambda: re.search(r"installed apps: 1 loaded", everything()), 30)
+# Second boot: the installs survived, and the agent starts behind Home by itself.
+until("installed apps loaded", lambda: re.search(r"installed apps: 3 loaded", everything()), 30)
+if "installed apps: package python" not in everything():
+    fail("the Python package was not unpacked")
+# Nothing is opened; the agent must start behind Home by itself.
+until("agent started in the background", lambda: "started the agent in the background" in everything(), 30)
 launch_mac()
 until("reconnected", lambda: mac_log().count("phone online") >= 2, 90)
 print("agent: reconnected after the restart without a new scan", file=sys.stderr)
@@ -126,14 +155,24 @@ open_icon("example")
 until("the installed app runs", lambda: "stopwatch: starting at" in everything(), 60)
 print("agent: the installed example runs from its Home icon after the restart", file=sys.stderr)
 leave_to_home()
-# Settings › Agent Apps deletes it (Delete, then Confirm).
+open_icon("tally")
+time.sleep(8)
+if "Traceback" in everything():
+    fail("the Python app failed")
+if pixel(120, 1000) & 0xffffff != 0xe68cc8:
+    fail(f"the Python app's +1 button is not on screen ({pixel(120, 1000):#x})")
+print("agent: the Python app runs from the installed Python after the restart", file=sys.stderr)
+leave_to_home()
+# Settings › Agent Apps deletes the example (Delete, then Confirm on its row).
 open_icon("settings")
 until("Settings", lambda: "settings: ready" in everything(), 60)
 time.sleep(1)
 tap(360, 250 + 4 * 124 + 54)
 until("Agent Apps", lambda: "settings: AgentApps" in everything())
-tap(582, 250 + 62)
-tap(582, 250 + 62)
+time.sleep(1)
+row = [l.split("\t")[0] for l in INSTALLED.split(",")].index("example")
+tap(582, 250 + row * 124 + 62)
+tap(582, 250 + row * 124 + 62)
 until("deleted", lambda: "settings: uninstall example -> ok" in everything(), 15)
 print("agent: Settings deleted the installed example", file=sys.stderr)
 tap(100, 60)
@@ -163,6 +202,10 @@ def main():
         raise SystemExit(f"Build the Mac app first: {APP}")
     if not EXAMPLE.exists():
         subprocess.run([sys.executable, str(ROOT / "tools/agent_build.py"), "setup"], check=True)
+    subprocess.run([str(ROOT / "build/agent-workspace/build"), "tally"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run([sys.executable, str(ROOT / "tools/build_python_package.py")], check=True)
+    if b"bin/python3\0" in (ROOT / "build/sel4/qemu/initfs.cpio").read_bytes():
+        raise SystemExit("Build the image without Python: VIOLET_OPEN_NO_PYTHON=1 (make test-agent does)")
     original = ROOT / "build/sel4/qemu"
     cpio = (original / "initfs.cpio").read_bytes()
     if b"violet-relay.test" not in cpio or b"violet-relay.test:3478" not in cpio:
@@ -179,8 +222,10 @@ def main():
             viewer.chmod(0o755)
             # An installed app's icon follows the built-in apps.
             icons = json.loads(os.environ["HOME_ICONS"])
-            names = home_grid.apps(cpio) + ["example"]
-            icons["example"] = home_grid.icon(len(names) - 1, len(names))
+            # The agent's installs, in the order they arrive (Python itself is a package, with no icon).
+            names = home_grid.apps(cpio) + ["example", "tally"]
+            for name in ("example", "tally"):
+                icons[name] = home_grid.icon(names.index(name), len(names))
             os.environ["HOME_ICONS"] = json.dumps(icons)
             image = Path(tmp) / "image"
             image.mkdir()
@@ -188,7 +233,7 @@ def main():
                 (image / name).symlink_to(original / name)
             run.IMAGE = image
             os.environ.update(VIOLET_NET_HOSTS=json.dumps({"violet-relay.test": "127.0.0.1:8787", "violet-relay.test:3478": "127.0.0.1:3478"}),
-                              AGENT_APP=str(APP), AGENT_EXAMPLE=str(EXAMPLE), AGENT_SUPPORT=str(SUPPORT))
+                              AGENT_APP=str(APP), AGENT_EXAMPLE=str(EXAMPLE), AGENT_SUPPORT=str(SUPPORT), AGENT_TALLY=str(TALLY))
             for stage in ("first", "second"):
                 # The second boot's network blocks UDP: the pair falls back to the relay.
                 os.environ.update(AGENT_STAGE=stage, VIOLET_NET_UDP="0" if stage == "second" else "1")
@@ -198,7 +243,8 @@ def main():
     finally:
         relay.terminate()
     print("Agent verified: QR pairing through the relay, a direct UDP path carrying an encrypted install that survives a restart, "
-          "the relay when UDP is blocked, a Home icon, deleting it from Settings, reconnect, unpair")
+          "Python installed as a package with a Python app, listening from the background, starting at boot, "
+          "the relay when UDP is blocked, Home icons, deleting an app from Settings, reconnect, unpair")
 
 
 if __name__ == "__main__":

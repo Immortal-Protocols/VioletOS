@@ -22,7 +22,7 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 | `make test-wifi-app` | Drives Settings › Wi-Fi by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
 | `make test-open-apps` | Drives Home, Settings (a chosen city kept in `/data` across a restart, Wi-Fi, Agent Apps) and Music. |
 | `make test-shield` | Violet Shield end to end: the Sentinel streams telemetry to a companion that scores it with EmbeddingGemma 2 and freezes a data-stealing app with a signed Shield. `make test-shield-ios` uses the real app in the iOS Simulator. See [the proof of concept](docs/violet-shield-poc.md). |
-| `make test-agent` | The voice agent in QEMU with the real Mac app: QR pairing through a local relay, an encrypted install that survives a restart and gets a Home icon, deleting it from Settings, reconnect and unpair. See [the agent](apps/open/agent/README.md) and [Violet Agent for macOS](companion/mac/README.md). |
+| `make test-agent` | The voice agent in QEMU with the real Mac app: QR pairing through a local relay, an encrypted install that survives a restart and gets a Home icon, Python installed as a package with a Python app, listening from the background, deleting an app from Settings, reconnect and unpair. See [the agent](apps/open/agent/README.md) and [Violet Agent for macOS](companion/mac/README.md). |
 | `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
@@ -62,7 +62,7 @@ From the bottom up:
 
 USB Diagnostics runs only on the handset and serves developer tools on a connected Mac. The [iPhone companion](companion/ios/README.md) relays the handset's traffic over cellular data (Phone Internet).
 
-**The voice agent.** [Agent](apps/open/agent/README.md) on the phone pairs with [Violet Agent for macOS](companion/mac/README.md) by a one-time QR code and then meets it through a relay (a [Chariot](tools/chariot-relay/relay.py)) from any network, encrypted end to end ([protocol](docs/agent-protocol.md)). You talk to the phone; the Mac hears and speaks with RoseOS's voice models and answers with Codex, which builds the apps you ask for and installs them on the phone, where they stay. Say "Make me a simple scorekeeper" and it is on the phone in under 20 seconds.
+**The voice agent.** [Agent](apps/open/agent/README.md) on the phone pairs with [Violet Agent for macOS](companion/mac/README.md) by a one-time QR code and then meets it through a relay (a [Chariot](tools/chariot-relay/relay.py)) from any network, encrypted end to end ([protocol](docs/agent-protocol.md)). You talk to the phone; the Mac hears and speaks with RoseOS's voice models and answers with Codex, which builds the apps you ask for and installs them on the phone, where they stay. Say "Make me a simple scorekeeper" and it is on the phone in under 20 seconds; apps can be Rust or Python ("make it in Python"). It keeps listening when you leave the Agent app, and keeps talking with you while an app builds.
 
 ### Components
 
