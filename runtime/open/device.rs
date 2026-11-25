@@ -285,6 +285,12 @@ const ROWS: usize = (HOME_Y - 40 - ROW_Y) / ROW_H;
 const BG_ROW: u32 = 0xff231d2e;
 pub const HOME_Y: usize = 1380;
 
+/// Row height for a list of `n` programs: 80 px while they fit, then smaller
+/// (down to 40) so installed apps never fall off the end. QEMU tests use the same rule.
+pub fn row_height(n: usize) -> usize {
+    if n <= ROWS { ROW_H } else { ((HOME_Y - 40 - ROW_Y) / n).max(40) }
+}
+
 /// Shared settings (see "get" and "set" in /dev/violet/sys).
 const SETTINGS: &str = "/data/settings";
 
@@ -358,19 +364,24 @@ impl Runtime {
             text(42, ROW_Y, "NO APPS IN /APPS", 4, INK);
         }
         let titles = self.titles();
-        for (i, path) in entries.iter().take(ROWS).enumerate() {
-            let y = ROW_Y + i * ROW_H;
+        let h = row_height(entries.len());
+        let fits = (HOME_Y - 40 - ROW_Y) / h;
+        for (i, path) in entries.iter().take(fits).enumerate() {
+            let y = ROW_Y + i * h;
             let name = path.trim_start_matches("/apps/");
             let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_ascii_uppercase());
-            fill(42, y, WIDTH - 84, ROW_H - 12, if title.is_some() { PANEL } else { BG_ROW });
+            fill(42, y, WIDTH - 84, h - 12, if title.is_some() { PANEL } else { BG_ROW });
             let shown: String = title.as_deref().unwrap_or(name).chars().take(16).collect();
-            text(72, y + 16, &shown, if title.is_some() { 5 } else { 4 }, INK);
+            let scale = if h == ROW_H { if title.is_some() { 5 } else { 4 } } else if h >= 52 { 4 } else { 3 };
+            text(72, y + (h - 12 - 7 * scale) / 2, &shown, scale, INK);
             match self.apps.iter().flatten().find(|a| a.path == *path) {
                 Some(a) if a.frozen.is_some() => {
-                    fill(42, y, 10, ROW_H - 12, ALERT);
-                    text(72, y + 52, "FROZEN BY VIOLET SHIELD", 2, ALERT);
+                    fill(42, y, 10, h - 12, ALERT);
+                    if h == ROW_H {
+                        text(72, y + 52, "FROZEN BY VIOLET SHIELD", 2, ALERT);
+                    }
                 }
-                Some(_) => text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT),
+                Some(_) => text(WIDTH - 72 - 7 * 2 * 8, y + (h - 12 - 14) / 2, "RUNNING", 2, ACCENT),
                 None => {}
             }
         }
@@ -412,8 +423,9 @@ impl Runtime {
         if y < ROW_Y || x < 42 || x > (WIDTH - 42) as i32 {
             return;
         }
-        let row = (y - ROW_Y) / ROW_H;
-        let Some(path) = self.app_entries().into_iter().nth(row) else { return };
+        let entries = self.app_entries();
+        let row = (y - ROW_Y) / row_height(entries.len());
+        let Some(path) = entries.into_iter().nth(row) else { return };
         crate::log!("app list: tap at {},{} -> {}", x, y, path);
         if let Some(i) = (0..MAX_APPS).find(|&i| self.apps[i].as_ref().map_or(false, |a| a.path == path)) {
             self.set_foreground(Some(i));

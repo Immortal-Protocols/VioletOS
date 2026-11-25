@@ -120,6 +120,9 @@ def hold(seconds):
     while time.monotonic() < end:
         frame()
         time.sleep(0.04)
+def row_y(index, count):
+    h = 80 if count <= 13 else max(40, 1080 // count)
+    return 260 + index * h + (h - 12) // 2
 def tap(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
     hold(.15); os.write(1, bytes(6)); hold(.35)
@@ -145,7 +148,7 @@ def back_home():
     hold(1.4); os.write(1, bytes(6)); hold(.5)
     until("Home", on_home, 10)
 def start(name):
-    tap(360, 260 + APPS.index(name) * 80 + 34)
+    tap(360, row_y(APPS.index(name), len(APPS)))
 def status():
     try:
         return json.load(open(STATUS))

@@ -56,6 +56,9 @@ def until(what, check, timeout=10.0):
             return
         time.sleep(0.05)
     fail(what)
+def row_y(index, count):
+    h = 80 if count <= 13 else max(40, 1080 // count)
+    return 260 + index * h + (h - 12) // 2
 def tap(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
     time.sleep(.15); os.write(1, bytes(6)); time.sleep(.35)
@@ -77,7 +80,7 @@ def open_apps():
     tap(360, 1141)  # Home's Programs tile
     until("app list", on_list)
 def start(name):
-    tap(360, 260 + APPS.index(name) * 80 + 34)
+    tap(360, row_y(APPS.index(name), len(APPS)))
 def home():
     tap(100, 60)  # every app's "Home" button
     until("back on Home", on_home, 6)

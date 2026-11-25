@@ -193,6 +193,7 @@ pub fn speaker(input: Receiver<Speech>, played: Sender<Played>) {
         let mut next_id = 0u64;
         let mut reported = Instant::now();
         let mut audible = false;
+        let mut quiet_since: Option<Instant> = None;
         loop {
             let msg = match input.recv_timeout(Duration::from_millis(20)) {
                 Ok(m) => Some(m),
@@ -272,7 +273,15 @@ pub fn speaker(input: Receiver<Speech>, played: Sender<Played>) {
                     }
                 }
             }
-            let now_audible = !pieces.is_empty() && !paused;
+            // Audible while anything is queued or still playing; quiet only after
+            // half a second without (the gaps between synthesized pieces).
+            let playing = !paused && (!pieces.is_empty() || chunks.back().is_some_and(|c| c.end > now));
+            if playing {
+                quiet_since = None;
+            } else if audible && quiet_since.is_none() {
+                quiet_since = Some(now);
+            }
+            let now_audible = playing || quiet_since.is_some_and(|q| now - q < Duration::from_millis(500));
             if now_audible != audible {
                 audible = now_audible;
                 let _ = played.send(Played::Audible(audible));

@@ -9,7 +9,9 @@ The phone's agent ([apps/open/agent](../apps/open/agent)) and the Mac companion 
 - Binary messages are forwarded to the other role as they are, or dropped if it is not connected.
 - The relay sends a text message `{"peer":"up"}` to both sides when the second one connects, and `{"peer":"down"}` to the one left when the other goes.
 - Both sides ping every 20 s; the relay closes a connection silent for 60 s.
-- `GET /health` answers `ok`.
+- `GET /health` answers `ok` and counts rooms, connections and forwarded messages.
+
+**Plain HTTP.** A Chariot's proxy refuses WebSocket upgrades (403) and ends any request after about 12 s, so both ends fall back to polling when the upgrade is refused: `POST /v1/send/ROOM?role=R&id=ID` carries messages up and `GET /v1/recv/ROOM?role=R&id=ID` brings them down, held by the relay for up to 8 s. Each message in a body is a kind byte (1 text, 2 binary), a 4-byte big-endian length and the bytes. `ID` is random per connection: a new one is a new connection (and a `peer up`), and one that stops polling for 45 s is gone. The phone batches uploads every 200 ms; both ends simply ask again after a 5xx from the proxy.
 
 ## Identities and pairing
 
@@ -27,7 +29,7 @@ Unpairing on either side deletes the other's key and sends `{"t":"unpair"}` if c
 
 ## Handshake
 
-On `{"peer":"up"}`, each side makes a new X25519 key and sends HELLO (binary):
+The phone leads. On `{"peer":"up"}`, and every 4 s while it has no session, it makes a new X25519 key and sends a HELLO. The Mac answers every phone HELLO with its own, naming the key it answers, and takes that session; the phone completes only with the answer to its latest offer, so crossed reconnects cannot leave the two with different keys. HELLO (binary):
 
 | Bytes | |
 | --- | --- |
@@ -36,10 +38,9 @@ On `{"peer":"up"}`, each side makes a new X25519 key and sends HELLO (binary):
 | 1 | mode: 0 session, 1 pairing |
 | 32 | Ed25519 public key |
 | 32 | X25519 ephemeral public key |
-| 64 | Ed25519 signature of `"violet-agent hello v1" || role || mode || room (16 bytes) || ed || x` |
+| 64 | Ed25519 signature of `"violet-agent hello v1" || role || mode || room (16 bytes) || ed || x || answer` |
+| 32 | answer: the phone's X25519 key this Mac HELLO answers (zeros in the phone's) |
 | 32 | pairing only, Mac only: HMAC-SHA256(s, `"violet-agent pair" || ed || x`) |
-
-A side that receives a valid HELLO while its own is outstanding completes the handshake. One that receives a HELLO with none outstanding (the peer reconnected) makes a new X25519 key, answers with its own HELLO and completes.
 
 Keys: `HKDF-SHA256(salt = room, ikm = X25519(shared), info = "violet-agent v1" || phone_ed || mac_ed || phone_x || mac_x)`, 64 bytes: the phone-to-Mac key, then the Mac-to-phone key.
 
@@ -53,12 +54,18 @@ A plaintext is a kind byte and a body:
 | --- | --- | --- |
 | `0x10` | both | a JSON object (below) |
 | `0x20` | phone → Mac | microphone: 16 kHz s16le mono |
-| `0x21` | Mac → phone | speech: utterance id (u32 LE), then 24 kHz s16le mono |
+| `0x22` | phone → Mac | microphone: 16 kHz G.711 µ-law (what the phone sends) |
+| `0x23` | phone → Mac | silence: a sample count (u32 LE) the phone did not send |
+| `0x21` | Mac → phone | speech: segment id (u32 LE), then 24 kHz s16le mono (one piece) |
 | `0x30` | Mac → phone | app install data: offset (u32 LE), then bytes |
+
+**Microphone.** The phone's uplink through a relay cannot carry 32 KB/s, and silence needs none: a noise gate sends µ-law around speech (320 ms before it, 600 ms after) and a count of silent samples every 200 ms otherwise, so the Mac's endpointing, which counts samples, still sees time pass.
+
+**Speech** is RoseOS's: the phone plays it like Rose's browser player. Mac → phone `{"t":"audio","ctl":{"type":"duck","gain":0.25}}` (and `unduck`, `pause`, `resume`, `stop`); phone → Mac `{"t":"audio_report","msg":{"type":"played","seg":N,"samples":S,"done":B}}` every 100 ms for the piece playing (samples within that piece, 24 kHz) and when it ends, and `{"type":"stopped","seg":N,"samples":S}` after a stop.
 
 JSON messages carry `"t"`:
 
-- phone → Mac: `hello` (name, version, `listening`), `level` (mic level), `stop` (the user tapped to interrupt), `played` (`id`: an utterance finished), `installed` (`name`, `ok`, `error`, `ms`), `opened` (`name`), `unpair`.
-- Mac → phone: `hello` (name), `state` (`thinking`, `speaking`, `listening`, `building`), `transcript` (`who`: `user` or `agent`, `text`, `final`), `say_stop` (drop queued speech), `install` (`name`, `title`, `size`, `sha256`), `install_end`, `open` (`name`), `unpair`.
+- phone → Mac: `hello` (name, version, `listening`), `stop` (the user tapped to interrupt), `audio_report`, `installed` (`name`, `ok`, `error`, `ms`), `opened` (`name`), `unpair`.
+- Mac → phone: `hello` (`name`: the Mac's, `agent_name`: what the user calls the agent, "Violet" by default), `state` (`thinking`, `speaking`, `listening`, `building`), `transcript` (`who`: `user` or `agent`, `text`, `final`), `audio`, `say_stop`, `install` (`name`, `title`, `size` on the wire, `bytes` and `sha256` of the program, `encoding`: `deflate` or `none`), `install_end`, `open` (`name`), `unpair`.
 
-An install writes the program to `/apps/NAME`, checks its length and SHA-256, then asks the Open Runtime (`install NAME TITLE` in `/dev/violet/sys`) to keep it on disk. Only an authenticated session can deliver one, so the phone accepts installs only from its paired Mac.
+An install arrives (raw DEFLATE when `encoding` says so), is inflated and checked against its length and SHA-256, written to `/apps/NAME`, and then the agent asks the Open Runtime (`install NAME TITLE` in `/dev/violet/sys`) to keep it on disk. Only an authenticated session can deliver one, so the phone accepts installs only from its paired Mac.

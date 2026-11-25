@@ -36,6 +36,7 @@ final class AgentModel: ObservableObject {
     private var replySent: [String: Int] = [:]
     private var nextReply = 1
     private var renamed = false
+    private var roseAudible = false
     private var codex: Codex!
     let support: URL
     let repo: URL
@@ -71,7 +72,10 @@ final class AgentModel: ObservableObject {
             .appendingPathComponent(profile.isEmpty ? "Violet Agent" : "Violet Agent \(profile)")
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
         let path = Bundle.main.object(forInfoDictionaryKey: "VioletRepoPath") as? String ?? ""
-        repo = URL(fileURLWithPath: ProcessInfo.processInfo.environment["VIOLET_REPO"] ?? path).standardizedFileURL
+        // The checkout it was built from, else ~/VioletOS (a worktree may be gone).
+        let built = URL(fileURLWithPath: ProcessInfo.processInfo.environment["VIOLET_REPO"] ?? path).standardizedFileURL
+        let fallback = URL(fileURLWithPath: NSHomeDirectory() + "/VioletOS")
+        repo = fm.fileExists(atPath: built.appendingPathComponent("tools/agent_build.py").path) ? built : fallback
         workspace = repo.appendingPathComponent("build/agent-workspace")
         try? fm.createDirectory(at: workspace, withIntermediateDirectories: true)
         link = PhoneLink(identity: identity) { [weak self] e in self?.on(e) }
@@ -169,6 +173,7 @@ final class AgentModel: ObservableObject {
         rose.onPCM = { [weak self] seg, pcm in self?.sendSpeech(seg, pcm) }
         rose.onAudible = { [weak self] on in
             guard let self else { return }
+            self.roseAudible = on
             if on { self.setActivity("speaking") } else if self.codex.activeTurn == nil { self.setActivity("idle") }
         }
         rose.onLog = { [weak self] s in self?.log(s) }
@@ -492,7 +497,7 @@ final class AgentModel: ObservableObject {
 
     private func setActivity(_ a: String) {
         var state = a
-        if a == "idle" && speaker.speaking { state = "speaking" }
+        if a == "idle" && (speaker.speaking || (useRose && roseAudible)) { state = "speaking" }
         if a == "thinking" && activity == "building" { state = "building" }
         activity = state
         let phoneState = state == "idle" ? "listening" : state

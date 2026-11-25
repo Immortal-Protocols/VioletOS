@@ -92,7 +92,8 @@ def open_list():
     tap(360, 1141)  # Programs
     until("app list", on_list)
 def start(row):
-    tap(360, 260 + row * 80 + 34)
+    h = 80 if len(rows) <= 13 else max(40, 1080 // len(rows))
+    tap(360, 260 + row * h + (h - 12) // 2)
 def launch_mac(*args):
     global mac
     env = dict(os.environ, VIOLET_AGENT_PROFILE="test", VIOLET_AGENT_RELAY_MAP="http://violet-relay.test=http://127.0.0.1:8787")
