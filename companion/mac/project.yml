@@ -1,0 +1,38 @@
+name: VioletAgent
+options:
+  bundleIdPrefix: com.immortal.violet
+  deploymentTarget:
+    macOS: "15.0"
+settings:
+  DEVELOPMENT_TEAM: 3UGCLFLDJ6
+  CODE_SIGN_STYLE: Automatic
+  SWIFT_VERSION: "5.0"
+targets:
+  VioletAgent:
+    type: application
+    platform: macOS
+    sources: [VioletAgent]
+    settings:
+      PRODUCT_NAME: Violet Agent
+      PRODUCT_BUNDLE_IDENTIFIER: com.immortal.violet.agent
+      CODE_SIGN_ENTITLEMENTS: VioletAgent/VioletAgent.entitlements
+      ENABLE_HARDENED_RUNTIME: YES
+      MARKETING_VERSION: "1.0"
+      CURRENT_PROJECT_VERSION: "1"
+    info:
+      path: VioletAgent/Info.plist
+      properties:
+        CFBundleDisplayName: Violet Agent
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSCameraUsageDescription: Violet Agent reads your VioletOS phone's pairing code with the camera.
+        NSSpeechRecognitionUsageDescription: Violet Agent turns what you say to your phone into text on this Mac.
+        NSMicrophoneUsageDescription: Violet Agent listens through your phone's microphone, not this Mac's.
+        # The VioletOS checkout this app was built from: its tools and app workspace.
+        VioletRepoPath: $(SRCROOT)/../..
+schemes:
+  VioletAgent:
+    build:
+      targets:
+        VioletAgent: all
+    run:
+      config: Debug

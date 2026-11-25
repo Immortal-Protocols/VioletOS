@@ -785,6 +785,15 @@ static void open_runtime(void) {
   map_shared(request_frame, &procs[USB_DIAG].task, 0x09206000, seL4_AllRights);
   map_shared(request_frame, t, 0x09001000, seL4_CanRead);
 #endif
+  // Installed apps (runtime/open/appstore.rs): a 64 KiB window through which
+  // Storage reads and writes the app extent, at 0x0d300000 in Storage and
+  // 0x09130000 in the Open Runtime.
+  if (procs[STORAGE].task.pd)
+    for (unsigned i = 0; i < 16; i++) {
+      unsigned frame = create(ram, seL4_ARM_SmallPageObject);
+      map_shared(frame, &procs[STORAGE].task, 0x0d300000 + i * PAGE, seL4_AllRights);
+      map_shared(frame, t, 0x09130000 + i * PAGE, seL4_AllRights);
+    }
   grant(t, OPEN_SLOT_RUNTIME, procs[RUNTIME].ep, OPEN_RUNTIME_BADGE, false);
   open_setup[0] = 9;
   open_setup[1] = next_slot;
@@ -900,8 +909,9 @@ static void wire(void) {
     if (procs[POWER].package)
       grant(&procs[AUDIO].task, AUDIO_POWER_SLOT, procs[POWER].ep, AUDIO, false);
     // Raw PCM from open apps: a header page and a 16-page ring, at 0x09300000
-    // in Audio and 0x09100000 in the Open Runtime.
-    for (unsigned i = 0; i < 17; i++) {
+    // in Audio and 0x09100000 in the Open Runtime, then an 8-page ring of
+    // microphone samples for /dev/violet/mic.
+    for (unsigned i = 0; i < 25; i++) {
       unsigned frame = create(ram, seL4_ARM_SmallPageObject);
       map_shared(frame, &procs[AUDIO].task, 0x09300000 + i * PAGE, seL4_AllRights);
       if (procs[OPEN_RT].task.pd)

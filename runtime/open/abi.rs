@@ -9,6 +9,8 @@ pub const DEV_AUDIO: &str = "/dev/violet/audio";
 pub const DEV_EVENTS: &str = "/dev/violet/events";
 pub const DEV_SYS: &str = "/dev/violet/sys";
 pub const DEV_CAMERA: &str = "/dev/violet/camera";
+/// The microphone: `read` returns 16 kHz s16le mono samples as they arrive.
+pub const DEV_MIC: &str = "/dev/violet/mic";
 
 // ---------- /dev/violet/screen ----------
 //

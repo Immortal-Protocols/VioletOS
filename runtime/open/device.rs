@@ -25,6 +25,8 @@ pub enum Kind {
     Audio { channels: u32, pending: Vec<u8> },
     /// Frames from the Camera service; `seen` is the last frame returned.
     Camera { seen: u32 },
+    /// The microphone stream (16 kHz s16 mono); `seen` counts samples read.
+    Mic { seen: u32 },
     Events,
     Sys { pending: Vec<u8> },
     Log,
@@ -60,6 +62,9 @@ impl Drop for OpenFile {
         }
         if let Kind::Camera { .. } = self.kind {
             camera::want(false);
+        }
+        if let Kind::Mic { .. } = self.kind {
+            mic::close();
         }
         if let Kind::Tcp { slot: Some(slot), .. } = self.kind {
             super::net::close(slot);
@@ -183,6 +188,57 @@ pub mod camera {
         let h = [0x3146_4356, get(10), get(12), get(13), get(14), get(15), get(17), state | error << 8];
         let frame = (state == 2).then(|| (WINDOW + get(11) as usize, (h[4] * h[3]) as usize));
         (h, frame)
+    }
+}
+
+/// The microphone stream from Audio, in the pages after the PCM ring
+/// (services/audio/process.rs, mod stream). Audio copies samples while
+/// CAPTURE_WANTED is 1, which it is while any app has /dev/violet/mic open.
+pub mod mic {
+    use super::super::request;
+    use crate::protocol::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const HEADER: *mut u32 = 0x0910_0000 as *mut u32;
+    const RING: *const i16 = 0x0911_1000 as *const i16;
+    pub const SAMPLES: u32 = 8 * 4096 / 2;
+    static READERS: AtomicU32 = AtomicU32::new(0);
+    pub fn written() -> u32 {
+        unsafe { HEADER.add(17).read_volatile() }
+    }
+    /// Start (or keep) the microphone for one more reader.
+    pub fn open() -> u32 {
+        READERS.fetch_add(1, Ordering::Relaxed);
+        unsafe { HEADER.add(16).write_volatile(1) };
+        request(EXECUTE, MICROPHONE, MIC_LISTEN);
+        written()
+    }
+    /// The microphone again after the app in front changed (it turns off then).
+    pub fn resume() {
+        if READERS.load(Ordering::Relaxed) > 0 {
+            request(EXECUTE, MICROPHONE, MIC_LISTEN);
+        }
+    }
+    pub fn close() {
+        if READERS.fetch_sub(1, Ordering::Relaxed) == 1 {
+            unsafe { HEADER.add(16).write_volatile(0) };
+            request(EXECUTE, MICROPHONE, MIC_OFF);
+        }
+    }
+    /// Samples after `seen`, up to `max`; an overrun skips to the newest second.
+    pub fn take(seen: &mut u32, max: usize) -> alloc::vec::Vec<u8> {
+        let w = written();
+        core::sync::atomic::fence(Ordering::Acquire);
+        if w.wrapping_sub(*seen) > SAMPLES {
+            *seen = w.wrapping_sub(SAMPLES);
+        }
+        let n = (w.wrapping_sub(*seen) as usize).min(max);
+        let mut v = alloc::vec::Vec::with_capacity(n * 2);
+        for k in 0..n as u32 {
+            let s = unsafe { RING.add((seen.wrapping_add(k) % SAMPLES) as usize).read_volatile() };
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        *seen = seen.wrapping_add(n as u32);
+        v
     }
 }
 
@@ -459,6 +515,15 @@ impl Runtime {
             // An app that leaves the front stops recording, as with any app.
             request(EXECUTE, MICROPHONE, MIC_OFF);
         }
+        if value == LIFECYCLE_FOCUS_GAINED && self.audio {
+            // An app back in front that still holds the microphone hears again.
+            let holds = self.apps[i].as_ref().is_some_and(|a| {
+                a.fds.iter().flatten().any(|f| matches!(f.borrow().kind, Kind::Mic { .. }))
+            });
+            if holds {
+                mic::resume();
+            }
+        }
         if value == LIFECYCLE_FOCUS_LOST && self.camera {
             // And its camera: an app may only watch while it is on screen.
             camera::want(false);
@@ -682,6 +747,7 @@ impl Runtime {
             Kind::Pipe { write: true, .. } => 4,
             Kind::Audio { .. } => if pcm_space() > 0 { 4 } else { 0 },
             Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i)) as u32,
+            Kind::Mic { seen } => (mic::written() != *seen) as u32,
             Kind::Udp { replies, .. } => 4 | (!replies.is_empty()) as u32,
             Kind::Tcp { slot: None, .. } => 4,
             Kind::Tcp { slot: Some(slot), .. } => {
@@ -858,6 +924,13 @@ impl Runtime {
                 let n = b.len().min(len as usize);
                 b.drain(..n).collect()
             }
+            Kind::Mic { seen } => {
+                let v = mic::take(seen, len as usize / 2);
+                if v.is_empty() {
+                    return if len < 2 { EINVAL } else { EAGAIN };
+                }
+                v
+            }
             Kind::Camera { seen } => {
                 // Only the app on screen sees frames (not while the phone
                 // sleeps or another screen is up); reading keeps the camera on.
@@ -1002,6 +1075,42 @@ impl Runtime {
                 }
             }
             // The programs running now, as paths.
+            // Installed apps (runtime/open/appstore.rs): "install NAME TITLE" keeps
+            // /apps/NAME, which the app wrote, across restarts and lists it under
+            // TITLE; "uninstall NAME" removes it; "installed" lists them. Only the
+            // agent (/apps/agent), which takes installs from the paired Mac, may
+            // change them.
+            Some(verb @ ("install" | "uninstall")) => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                if path != super::appstore::INSTALLER {
+                    return String::from("error only the agent installs apps\n");
+                }
+                let Some(name) = words.next().filter(|n| super::appstore::valid_name(n)) else {
+                    return alloc::format!("error usage: {} NAME{}\n", verb, if verb == "install" { " TITLE" } else { "" });
+                };
+                let image = self.fs.stat(&alloc::format!("/apps/{}", name)).is_some()
+                    && !self.fs.from_layer(&alloc::format!("/apps/{}", name));
+                if image || alloc::format!("/apps/{}", name) == super::appstore::INSTALLER {
+                    return String::from("error a built-in app has that name\n");
+                }
+                let title: Vec<&str> = words.collect();
+                let now = (self.clock(0) / 1_000_000_000) as u32;
+                let _lowered = sys::Lowered::new();
+                let r = if verb == "install" {
+                    self.store.install(&mut self.fs, name, &title.join(" "), now).map(|n| alloc::format!("ok {}\n", n))
+                } else {
+                    self.store.remove(&mut self.fs, name).map(|_| String::from("ok\n"))
+                };
+                self.shell.dirty = true;
+                match r {
+                    Ok(s) => {
+                        crate::log!("{} {}", verb, name);
+                        s
+                    }
+                    Err(e) => alloc::format!("error {}\n", e),
+                }
+            }
+            Some("installed") => self.store.list(),
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
                 alloc::format!("{}\n", paths.join(" "))

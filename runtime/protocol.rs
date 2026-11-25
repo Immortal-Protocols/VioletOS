@@ -124,6 +124,12 @@ pub const FILE_WRITE: u32 = 23;
 pub const FILE_TRUNCATE: u32 = 24;
 pub const FILE_DELETE: u32 = 25;
 pub const STORAGE_FILE: u32 = 0x200;
+/// APPSTORE: the installed apps' disk extent, for the Open Runtime only
+/// (runtime/open/appstore.rs). GET reads `arg` sectors (at most 128) from sector
+/// `value` into the shared window; EXECUTE writes them from it; EXECUTE with
+/// `arg` 0 flushes. GET with `arg` 0 answers the extent's size in sectors.
+pub const APPSTORE: u32 = 33;
+pub const STORAGE_APPS: u32 = 0x210;
 pub fn region(who: u32) -> u32 {
     match who {
         WATCH => 0,

@@ -115,6 +115,10 @@ def main(viewer):
                 stream.truncate(1024**2)
         except FileExistsError:
             pass
+        # Sectors 4096 onward hold installed apps (runtime/open/appstore.rs).
+        if disk.stat().st_size < 16 * 1024**2:
+            with disk.open("r+b") as stream:
+                stream.truncate(16 * 1024**2)
         state_dir=IMAGE/"installed"
         catalogs=launch_catalogs(state_dir)
         selected=catalogs[0]

@@ -95,6 +95,10 @@ fn execute(lane: u32, owner: u32, mut m: Message) -> Message {
                 Message::error(OFFLINE)
             }
         }
+        6 if m.key == APPSTORE => {
+            m.op = STORAGE_APPS + (m.op == EXECUTE) as u32;
+            m.call(3)
+        }
         6 => {
             m.op = STORAGE_FILE + region(owner);
             m.call(3)

@@ -5,6 +5,7 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+pub mod appstore;
 pub mod data;
 #[cfg(moto_board)]
 pub mod display;
@@ -173,6 +174,8 @@ pub struct Runtime {
     pub k: Kernel,
     pub pool: Pool,
     pub fs: fs::Fs,
+    /// Installed apps kept on disk (appstore.rs).
+    pub store: appstore::Store,
     pub apps: [Option<App>; MAX_APPS],
     untypeds: Vec<u32>,
     pub policy: OpenPolicy,
@@ -273,10 +276,12 @@ impl Runtime {
         }
         let mut fs = fs::Fs::new(image);
         data::load(&mut fs);
+        let store = appstore::Store::load(&mut fs);
         Ok(Runtime {
             k,
             pool,
             fs,
+            store,
             apps: core::array::from_fn(|_| None),
             home: None,
             home_tried: false,

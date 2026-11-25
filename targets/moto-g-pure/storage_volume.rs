@@ -13,6 +13,16 @@ fn word(b: &[u8], p: usize) -> u32 {
 fn wide(b: &[u8], p: usize) -> u64 {
     u64::from_le_bytes(b[p..p + 8].try_into().unwrap())
 }
+/// Installed open apps (runtime/open/appstore.rs) keep the last 12 MiB of boot_b,
+/// which the flashed image (19,926,528 bytes) never reaches.
+pub const APPS: u32 = BOOT_B + 20 * 1024 * 1024 / 512;
+pub const APP_SECTORS: usize = (END_B + 1 - APPS) as usize;
+pub fn app_sector(index: usize) -> Result<u32, ()> {
+    if index >= APP_SECTORS {
+        return Err(());
+    }
+    Ok(APPS + index as u32)
+}
 pub fn sector(index: usize) -> Result<u32, ()> {
     if index >= SECTORS {
         return Err(());

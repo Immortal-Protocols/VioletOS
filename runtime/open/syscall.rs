@@ -198,7 +198,7 @@ impl Runtime {
             self.wr(i, ptr, &b)
         }
     }
-    fn clock(&self, id: u32) -> u64 {
+    pub fn clock(&self, id: u32) -> u64 {
         let mono = sys::now_ns();
         match id {
             0 | 5 | 8 | 11 => epoch() * 1_000_000_000 + mono,
@@ -891,6 +891,12 @@ impl Runtime {
                 }
                 // Only frames that complete after the open.
                 Kind::Camera { seen: super::device::camera::frames() }
+            }
+            "/dev/violet/mic" => {
+                if !super::device::audio_present(self.audio) {
+                    return Done(ENODEV);
+                }
+                Kind::Mic { seen: super::device::mic::open() }
             }
             "/dev/null" => Kind::Null,
             "/dev/urandom" | "/dev/random" => Kind::Random,
