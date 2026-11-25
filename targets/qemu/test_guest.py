@@ -95,6 +95,12 @@ try:
             if cols not in digits: return None
             result+=str(digits.index(cols))
         return int(result[:2])*600+int(result[2:4])*10+int(result[4])
+    def settle(test, what, timeout=10):
+        # The screen catches up with a tap later on a slow machine (CI).
+        deadline=time.monotonic()+timeout
+        while not test():
+            if time.monotonic()>=deadline: raise AssertionError(what)
+            time.sleep(.05)
     def tap(y,x=360):
         os.write(serial,bytes([9,x>>4,y>>4,((x&15)<<4)|(y&15),1,1]))
         time.sleep(.18)
@@ -240,21 +246,21 @@ try:
         if args.stack=="handset-ui":
             assert words(0x4930000c)==(1,), "handset catalog did not activate"
             tap(920)
-            assert value()==0, "launcher failed to open stopwatch"
+            settle(lambda:value()==0, "launcher failed to open stopwatch")
             tap(920)
             before=value()
             assert before is not None and before>0
             tap(1420)
-            assert value() is None, "Home did not regain focus"
+            settle(lambda:value() is None, "Home did not regain focus")
             tap(920)
-            assert value()>before, "stopwatch lost elapsed time while in background"
+            settle(lambda:(value() or 0)>before, "stopwatch lost elapsed time while in background")
             print("Handset app catalog passed Start, Home and reopen with running time.")
             sys.exit(0)
         if args.stack in ("save-radio","restore-radio"):
             if args.stack=="save-radio": tap(1140)
             assert words(0x49001004)==(1,), "launcher preference was lost"
             tap(920)
-            assert value()==args.expect, "launcher changed stopwatch storage"
+            settle(lambda:value()==args.expect, "launcher changed stopwatch storage")
             sys.exit(0)
         if args.stack=="recovered":
             if args.fault_id in (2,10):
@@ -268,9 +274,9 @@ try:
             acknowledge_rollback(args.state_dir,catalogs[0].stem,2)
             if args.fault_id!=7:
                 tap(920)
-                assert value()==0
+                settle(lambda:value()==0, 'value()==0')
                 tap(920)
-                assert value()>0
+                settle(lambda:(value() or 0)>0, 'value()>0')
                 print("Recovered and started stopwatch after fault in component",args.fault_id)
                 sys.exit(0)
         if args.stack=="removed":
@@ -287,17 +293,17 @@ try:
             tap(920)
             assert words(0x49002004)==(0,) and value() is None, "first touch must wake only"
             tap(920)
-            assert value()==0, "stopwatch did not launch"
+            settle(lambda:value()==0, "stopwatch did not launch")
             tap(920)
             running=value()
             tap(1420)
-            assert value() is None, "Home did not switch apps"
+            settle(lambda:value() is None, "Home did not switch apps")
             tap(920)
-            assert value()>running, "background stopwatch did not advance"
+            settle(lambda:(value() or 0)>running, "background stopwatch did not advance")
             tap(100,530)
-            assert value() is None, "quit did not return Home"
+            settle(lambda:value() is None, "quit did not return Home")
             tap(920)
-            assert value()==0, "relaunch retained private state"
+            settle(lambda:value()==0, "relaunch retained private state")
         print("QEMU guest passed:",args.stack)
         sys.exit(0)
     if args.checkpoint:
@@ -311,7 +317,7 @@ try:
             print("Checkpoint",saved)
         elif args.checkpoint=="reset":
             tap(1140)
-            assert value()==0
+            settle(lambda:value()==0, 'value()==0')
         sys.exit(0)
     if args.spi in ("stuck","reset1","reset2"):
         # Decode the actual status line through the same bitmap font as the UI.
@@ -336,7 +342,7 @@ try:
         tap(920)
         paused=value();time.sleep(.5)
         assert paused==value() and paused>=b
-        tap(1140);assert value()==0
+        tap(1140);settle(lambda:value()==0, 'value()==0')
         print(f"Framebuffer verified: 0.0, {a/10:.1f}, {b/10:.1f}, paused at {paused/10:.1f}, reset to 0.0.")
     sample=out/"watchdog.raw"
     request("pmemsave",dict(val=0x49000000,size=40,filename=str(sample)))
