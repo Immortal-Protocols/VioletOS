@@ -64,6 +64,16 @@ loop:
 			break loop
 		}
 	}
+	// When the timer and the first ticks are all due by the time this
+	// goroutine runs (a slow machine), select may take the timer first;
+	// a working ticker still delivers within a second.
+	if ticks == 0 {
+		select {
+		case <-tick.C:
+			ticks++
+		case <-time.After(time.Second):
+		}
+	}
 	tick.Stop()
 	fmt.Println("timer fired after at least 30ms:", time.Since(start) >= 30*time.Millisecond, "ticks>0:", ticks > 0)
 

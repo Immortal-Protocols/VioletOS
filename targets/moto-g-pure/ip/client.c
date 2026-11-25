@@ -119,9 +119,13 @@ static int serve_dhcp(const unsigned char *f, int len) {
     leased = 1;
   return 1;
 }
+extern void station_wpa_poll(void);
 void station_net_poll(void) {
   if (!attached)
     return;
+  // Every blocking wait in this file and in sockets.c spins on this call, so the
+  // supplicant's timers (group rekeys, retransmits) keep running during them.
+  station_wpa_poll();
   for (unsigned i = 0; i < 8; i++) {
     int len = radio_l2_recv(frame, sizeof(frame));
     if (!len)

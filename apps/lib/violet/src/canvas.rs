@@ -108,6 +108,14 @@ impl std::ops::Deref for Pixels {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
+// `for p in &canvas.px`, as with the Vec it replaced.
+impl<'a> IntoIterator for &'a Pixels {
+    type Item = &'a Color;
+    type IntoIter = std::slice::Iter<'a, Color>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 impl std::ops::DerefMut for Pixels {
     fn deref_mut(&mut self) -> &mut [Color] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }

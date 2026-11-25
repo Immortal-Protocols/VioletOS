@@ -159,6 +159,7 @@ pub fn reason(code: u32) -> &'static str {
         53 => "Connected, but the network gave no address.",
         49 => "The network is out of range. Scan again.",
         47 | 48 => "The network didn't answer. Move closer and try again.",
+        57 => "The network didn't finish connecting. Try again.",
         50 => "This network needs its password.",
         2 => "Radio refused this network.",
         3 => "Wi-Fi is unavailable right now.",

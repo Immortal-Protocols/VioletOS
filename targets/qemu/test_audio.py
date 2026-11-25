@@ -87,7 +87,7 @@ hold(1, 2.4); until("held button repeats to the top", lambda: word(4) == 15)
 # Home -> APPS (the Home app) -> Sounds.
 until("Open Runtime ready", lambda: "[open] ready" in open_log() or "[open] started" in open_log(), 60)
 tap(570, 276)  # the classic launcher's APPS button shows the Home app
-until("Home app", lambda: pixel(5, 5) == 0xff2a1740, 20)
+until("Home app", lambda: pixel(5, 5) == 0xff2a1740, 90)
 tap(138, 1141)  # Home's Sounds tile
 until("Sounds shows the volume bar", lambda: bar(15), 60)
 

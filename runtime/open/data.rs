@@ -1,5 +1,5 @@
 //! /data: files that survive a restart. Each file directly in /data is kept
-//! by the Storage service in the open apps' private directory (four files of
+//! by the Storage service in the open apps' private directory (32 files of
 //! up to 4 KiB, names of up to 16 letters, digits, '.', '_' or '-'). The
 //! runtime loads them at startup and writes a file back after it changes.
 use crate::log;
@@ -11,6 +11,8 @@ use super::fs::Fs;
 
 pub const DIR: &str = "/data";
 const MAX: usize = 4096;
+/// How many files Storage keeps for open apps (services/storage/files.rs).
+const FILES: u32 = 32;
 
 /// The Storage name for a path, if the path is one /data can keep.
 pub fn key(path: &str) -> Option<&str> {
@@ -45,7 +47,7 @@ fn file(op: u32, key: u32, name: &str, offset: u32, data: &[u8]) -> Message {
 pub fn load(fs: &mut Fs) {
     let _ = fs.mkdir(DIR);
     let mut count = 0;
-    for slot in 0..4 {
+    for slot in 0..FILES {
         let entry = file(GET, FILE_LIST, "", slot, &[]);
         if entry.op != OK || entry.value == 0 {
             continue;
@@ -121,7 +123,7 @@ pub fn flush(fs: &mut Fs) {
             } else {
                 // What Storage holds is unknown now: rewrite all of it next time.
                 fs.stored.remove(&path);
-                log!("could not save {} (Storage keeps four files for open apps)", path);
+                log!("could not save {} (Storage keeps {} files for open apps)", path, FILES);
             }
         }
     }

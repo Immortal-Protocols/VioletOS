@@ -6,7 +6,6 @@
 mod keyboard;
 mod ui;
 
-use std::collections::HashMap;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -18,27 +17,60 @@ use violet::{Fonts, Screen};
 
 const SAVED: &str = "/data/networks";
 
-/// Known networks: SSID -> WPA2 key.
+/// Known networks, most recently joined first: SSID and its WPA2 key (None for an
+/// open network). Stored one per line as "SSID KEY" in hex, or "SSID open"; the
+/// Open Runtime reads the same file to rejoin them on its own after a restart.
 #[derive(Default)]
-struct Saved(HashMap<Vec<u8>, [u8; 32]>);
+struct Saved(Vec<(Vec<u8>, Option<[u8; 32]>)>);
 
 impl Saved {
     fn load() -> Saved {
         let mut s = Saved::default();
         for line in std::fs::read_to_string(SAVED).unwrap_or_default().lines() {
             let mut w = line.split_whitespace();
-            let (Some(ssid), Some(key)) = (w.next().and_then(unhex), w.next().and_then(unhex)) else { continue };
-            if let Ok(key) = key.try_into() {
-                s.0.insert(ssid, key);
+            let (Some(ssid), Some(key)) = (w.next().and_then(unhex), w.next()) else { continue };
+            let key = if key == "open" {
+                None
+            } else {
+                match unhex(key).and_then(|k| <[u8; 32]>::try_from(k).ok()) {
+                    Some(k) => Some(k),
+                    None => continue,
+                }
+            };
+            if s.get(&ssid).is_none() {
+                s.0.push((ssid, key));
             }
         }
         s
     }
     fn store(&self) {
-        let text: String = self.0.iter().map(|(ssid, key)| format!("{} {}\n", wifi::hex(ssid), wifi::hex(key))).collect();
+        let text: String = self
+            .0
+            .iter()
+            .map(|(ssid, key)| match key {
+                Some(k) => format!("{} {}\n", wifi::hex(ssid), wifi::hex(k)),
+                None => format!("{} open\n", wifi::hex(ssid)),
+            })
+            .collect();
         if let Err(e) = std::fs::write(SAVED, text) {
             println!("wifi: could not save networks: {e}");
         }
+    }
+    fn get(&self, ssid: &[u8]) -> Option<&Option<[u8; 32]>> {
+        self.0.iter().find(|(s, _)| s == ssid).map(|(_, k)| k)
+    }
+    fn contains(&self, ssid: &[u8]) -> bool {
+        self.get(ssid).is_some()
+    }
+    /// Keep `ssid` (with its key) as the most recently joined network.
+    fn put_first(&mut self, ssid: &[u8], key: Option<[u8; 32]>) {
+        self.remove(ssid);
+        self.0.insert(0, (ssid.to_vec(), key));
+    }
+    fn remove(&mut self, ssid: &[u8]) -> bool {
+        let before = self.0.len();
+        self.0.retain(|(s, _)| s != ssid);
+        self.0.len() != before
     }
 }
 
@@ -92,7 +124,7 @@ impl App {
             hosting: self.state.hosting,
             busy: self.state.busy.as_deref(),
             joining: self.joining.as_ref().map(|j| j.net.id),
-            saved: self.saved.0.keys().map(Vec::as_slice).collect(),
+            saved: self.saved.0.iter().map(|(s, _)| s.as_slice()).collect(),
             message: self.message.as_deref(),
             scroll: self.scroll,
             pressed: self.pressed,
@@ -115,6 +147,7 @@ impl App {
                 self.state.busy = Some("scanning".into());
                 println!("wifi: scanning");
             }
+            Err(e) if e == "busy" => {} // the runtime is already rejoining a saved network
             Err(e) => self.message = Some(format!("Couldn't scan: {e}")),
         }
     }
@@ -130,6 +163,7 @@ impl App {
                 self.state.busy = Some("joining".into());
                 self.joining = Some(Joining { net, key, typed });
             }
+            Err(e) if e == "busy" => self.message = Some("Wi-Fi is busy. Try again in a moment.".into()),
             Err(e) => self.message = Some(format!("Couldn't connect: {e}")),
         }
     }
@@ -146,7 +180,7 @@ impl App {
         }
         match net.security {
             Security::Open => self.join(net, None, None),
-            Security::Wpa2 => match self.saved.0.get(&net.ssid).copied() {
+            Security::Wpa2 => match self.saved.get(&net.ssid).copied().flatten() {
                 Some(key) => self.join(net, Some(key), None),
                 None => self.ask_password(net, String::new(), None),
             },
@@ -167,6 +201,12 @@ impl App {
         let was = std::mem::replace(&mut self.state, s);
         let finished = self.state.busy.is_none();
         let mut changed = was != self.state;
+        // Something else (the runtime rejoining a saved network) finished: show its scan.
+        if finished && was.busy.is_some() && !self.scanning && self.joining.is_none() && !self.leaving {
+            self.nets = wifi::networks();
+            self.scroll = self.scroll.min(ui::max_scroll(self.nets.len()));
+            changed = true;
+        }
         if finished && self.scanning {
             self.scanning = false;
             match &self.state.last {
@@ -194,8 +234,9 @@ impl App {
                 && matches!(&self.state.last, Some((what, true, _)) if what == "join");
             if ok {
                 println!("wifi: joined {}", j.net.name());
-                if let Some(key) = j.key {
-                    self.saved.0.insert(j.net.ssid.clone(), key);
+                let key = if j.net.security == Security::Open { None } else { j.key };
+                if j.net.security == Security::Open || key.is_some() {
+                    self.saved.put_first(&j.net.ssid, key);
                     self.saved.store();
                 }
                 self.message = None;
@@ -204,10 +245,10 @@ impl App {
                 let code = self.state.last.as_ref().map_or(0, |l| l.2);
                 println!("wifi: joining {} failed ({code})", j.net.name());
                 let why = wifi::reason(code).to_string();
-                // A saved key that stopped working (the password changed): ask again.
-                let refused = code == 52 || code == 50;
-                if refused && j.typed.is_none() && self.saved.0.remove(&j.net.ssid).is_some() {
-                    self.saved.store();
+                // Only a refused handshake (52) means the password may be wrong. The
+                // saved key stays saved either way: a timeout or a weak signal must
+                // not lose it, and a new password replaces it only once it works.
+                if code == 52 && j.typed.is_none() && self.saved.contains(&j.net.ssid) {
                     self.ask_password(j.net, String::new(), Some("The saved password didn't work. Enter it again.".into()));
                 } else if let Some(text) = j.typed {
                     if let Page::Password { error, text: t, .. } = &mut self.page {
@@ -250,7 +291,7 @@ impl App {
                 let here = self.state.is_joined(net);
                 if here && ui::DISCONNECT.contains(x, y) {
                     Some(Hit::Disconnect)
-                } else if self.saved.0.contains_key(&net.ssid) && ui::FORGET.contains(x, y) {
+                } else if self.saved.contains(&net.ssid) && ui::FORGET.contains(x, y) {
                     Some(Hit::Forget)
                 } else {
                     None
@@ -304,8 +345,9 @@ impl App {
             Hit::Forget => {
                 let Page::Details { net } = &self.page else { return };
                 let net = net.clone();
-                self.saved.0.remove(&net.ssid);
-                self.saved.store();
+                if self.saved.remove(&net.ssid) {
+                    self.saved.store();
+                }
                 if self.state.is_joined(&net) && !self.busy() && wifi::leave().is_ok() {
                     self.leaving = true;
                     self.state.busy = Some("leaving".into());

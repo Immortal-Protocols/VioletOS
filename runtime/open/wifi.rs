@@ -10,11 +10,19 @@
 //!   wifi join ID [PMK]      join a network; PMK is 64 hex digits for WPA2
 //!   wifi leave              leave the joined network
 //!
+//! Saved networks rejoin on their own: the Wi-Fi app keeps them in
+//! /data/networks (most recently joined first), and the auto-connector here
+//! scans and joins the first one in range a few seconds after boot, and again
+//! with a growing wait (30 s up to 10 min) while none is in range or the link
+//! is gone. A leave from the Wi-Fi app pauses it until the app joins again.
+//! It never changes the saved keys: only the Wi-Fi app does.
+//!
 //! Radio's requests can take seconds on the handset (it boots the Wi-Fi chip,
 //! scans and runs the WPA2 handshake), so they run as Runtime tickets polled
 //! from here, and other apps keep running meanwhile. Only /apps/wifi may join
 //! or leave a network: the others can look but not change it.
-use super::{request, sys};
+use super::{fs::Fs, request, sys};
+use crate::log;
 use crate::protocol::*;
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -29,6 +37,9 @@ enum Step {
     Scan,
     Join,
     Leave,
+    /// The auto-connector asks which network is joined (GET PROFILE), as a
+    /// ticket like the others: Radio may be busy rejoining for many seconds.
+    Check,
 }
 
 impl Step {
@@ -37,6 +48,7 @@ impl Step {
             Step::Scan => "scan",
             Step::Join => "join",
             Step::Leave => "leave",
+            Step::Check => "check",
         }
     }
 }
@@ -52,6 +64,46 @@ pub struct Wifi {
     connected: u32,
     /// The joined network's SSID, by profile ID.
     name: (u32, Vec<u8>),
+    /// The running chain was started by the auto-connector, not by an app.
+    auto_job: bool,
+    auto: Auto,
+}
+
+/// Where the auto-connector is (see the module comment).
+#[derive(Default)]
+struct Auto {
+    /// When it looks next (ns since boot); 0 until the first tick.
+    next_ns: u64,
+    /// Failed attempts in a row, for the growing wait.
+    tries: u32,
+    /// The Wi-Fi app left the network on purpose: wait for it to join again.
+    paused: bool,
+    /// Saved networks (SSID in hex) that failed since the last scan round.
+    /// A refused handshake (JOIN_AUTH) is retried on later rounds too: an access
+    /// point also repeats its first message when our answer was lost, so one 52
+    /// does not prove the key is wrong (seen on the handset after a reboot).
+    skip: Vec<String>,
+    /// The network a running auto-join is for (its SSID in hex).
+    target: String,
+    /// An auto scan finished: choose a network on the next tick.
+    scanned: bool,
+}
+
+/// How many scan results Radio reports (targets/moto-g-pure/passive_scan.rs).
+const SCAN_ROWS: u32 = 32;
+
+/// Saved networks, as the Wi-Fi app writes them: one per line, "SSID KEY" in
+/// hex, or "SSID open". Most recently joined first.
+pub const SAVED: &str = "/data/networks";
+/// How long after boot before the first look: Home turns Phone Internet back
+/// on in its first seconds, and that wins over a saved network.
+const FIRST_LOOK_NS: u64 = 8_000_000_000;
+/// While joined, how often to check the link is still there.
+const WATCH_NS: u64 = 30_000_000_000;
+
+/// The wait after `tries` failed attempts in a row: 30 s, 60 s, ... up to 10 min.
+fn backoff_ns(tries: u32) -> u64 {
+    (30_000_000_000u64 << tries.saturating_sub(1).min(5)).min(600_000_000_000)
 }
 
 /// The profile ID Radio reports while it hosts Phone Internet (targets/moto-g-pure/radio.rs).
@@ -93,7 +145,7 @@ impl Wifi {
                 self.job = None;
                 let ok = p.op == OK;
                 match step {
-                    Step::Join if ok => self.connected = p.value,
+                    Step::Join | Step::Check if ok => self.connected = p.value,
                     Step::Leave if ok => self.connected = 0,
                     _ => {}
                 }
@@ -102,7 +154,12 @@ impl Wifi {
                     self.queue.clear();
                 }
                 if self.queue.is_empty() {
-                    self.last = Some((step, ok, if ok { 0 } else { p.value }));
+                    if self.auto_job {
+                        self.auto_job = false;
+                        self.auto_done(step, ok, if ok { 0 } else { p.value });
+                    } else {
+                        self.last = Some((step, ok, if ok { 0 } else { p.value }));
+                    }
                 }
             }
             let Some((step, m)) = self.queue.pop_front() else { return };
@@ -110,7 +167,11 @@ impl Wifi {
                 Ok(ticket) => self.job = Some((step, ticket)),
                 Err(code) => {
                     self.queue.clear();
-                    self.last = Some((step, false, code));
+                    if core::mem::take(&mut self.auto_job) {
+                        self.auto_done(step, false, code);
+                    } else {
+                        self.last = Some((step, false, code));
+                    }
                     return;
                 }
             }
@@ -123,9 +184,110 @@ impl Wifi {
             return String::from("error busy\n");
         }
         self.last = None;
+        self.auto_job = false;
+        self.auto.scanned = false;
         self.queue.extend(steps.iter().copied());
         self.poll();
         String::from("ok\n")
+    }
+
+    /// The auto-connector's turn, from the runtime's poll (every 50 ms or so).
+    pub fn tick(&mut self, fs: &Fs, now: u64) {
+        self.poll();
+        if self.auto.next_ns == 0 {
+            self.auto.next_ns = now + FIRST_LOOK_NS;
+        }
+        if self.job.is_some() || self.auto.paused || now < self.auto.next_ns {
+            return;
+        }
+        let saved = core::str::from_utf8(fs.contents(SAVED).unwrap_or(&[])).unwrap_or("");
+        if core::mem::take(&mut self.auto.scanned) {
+            self.auto_join(saved, now);
+        } else if saved.trim().is_empty() {
+            self.auto.next_ns = now + WATCH_NS;
+        } else {
+            self.auto_start(Step::Check, Message::new(GET, PROFILE, 0));
+        }
+        self.poll();
+    }
+
+    /// Queue an auto-connector request; poll() sends it.
+    fn auto_start(&mut self, step: Step, m: Message) {
+        self.auto_job = true;
+        self.auto.next_ns = u64::MAX; // auto_done sets the next look
+        self.queue.push_back((step, m));
+    }
+
+    /// After an auto scan: join the first saved network in range. `saved` is
+    /// the Wi-Fi app's file, most recently joined first: "SSID KEY" in hex, or
+    /// "SSID open".
+    fn auto_join(&mut self, saved: &str, now: u64) {
+        let pick = saved.lines().find_map(|line| {
+            let mut w = line.split_whitespace();
+            let (ssid, key) = (w.next()?, w.next()?);
+            let key = if key == "open" { None } else { Some(unhex(key)?) };
+            let flag = if key.is_some() { SCAN_WPA2 } else { SCAN_OPEN };
+            if self.auto.skip.iter().any(|r| r == ssid) {
+                return None;
+            }
+            (0..SCAN_ROWS)
+                .map(|i| request(GET, SCAN, i))
+                .take_while(|r| r.op == OK && r.value != 0)
+                .find(|r| {
+                    let text = r.text();
+                    let n = text.iter().position(|&b| b == 0).unwrap_or(text.len()).min(32);
+                    r.arg & flag != 0 && hex(&text[..n]) == ssid
+                })
+                .map(|r| (r.value, ssid, key))
+        });
+        let Some((id, ssid, key)) = pick else {
+            self.auto.skip.clear();
+            self.auto.tries += 1;
+            self.auto.next_ns = now + backoff_ns(self.auto.tries);
+            return;
+        };
+        let mut join = Message::new(EXECUTE, PROFILE, id);
+        join.data = key.unwrap_or([0; 32]);
+        self.auto.target = String::from(ssid);
+        self.auto_start(Step::Join, join);
+        join.data = [0; 32];
+    }
+
+    /// An auto-connector request finished.
+    fn auto_done(&mut self, step: Step, ok: bool, reason: u32) {
+        let now = sys::now_ns();
+        let name = core::mem::take(&mut self.auto.target);
+        if step == Step::Join {
+            log!("wifi: auto-join {} result {}", name, reason);
+        }
+        if step == Step::Check {
+            if ok && self.connected == 0 {
+                // Nothing joined: scan first, as the handset joins only what its
+                // last scan found.
+                return self.auto_start(Step::Scan, Message::new(EXECUTE, RADIO, 1));
+            }
+            // Joined (or hosting Phone Internet, or Radio is busy): look again later.
+            self.auto.next_ns = now + WATCH_NS;
+            return;
+        }
+        if ok {
+            // A scan: choose a network on the next tick. A join: watch the link.
+            self.auto.scanned = step == Step::Scan;
+            if step != Step::Scan {
+                self.auto.tries = 0;
+            }
+            self.auto.next_ns = if step == Step::Scan { now } else { now + WATCH_NS };
+            return;
+        }
+        if step == Step::Join {
+            self.auto.skip.push(name);
+            // Try the next saved network the last scan found.
+            self.auto.scanned = true;
+            self.auto.next_ns = now;
+            return;
+        }
+        self.auto.tries += 1;
+        self.auto.next_ns = now + backoff_ns(self.auto.tries);
     }
 
     /// Answer one "wifi ..." command from `path`.
@@ -144,7 +306,7 @@ impl Wifi {
                     }
                 }
                 let state = match self.job.map(|j| j.0) {
-                    None => "idle",
+                    None | Some(Step::Check) => "idle",
                     Some(Step::Scan) => "scanning",
                     Some(Step::Join) => "joining",
                     Some(Step::Leave) => "leaving",
@@ -155,7 +317,7 @@ impl Wifi {
                 };
                 if self.job.is_none() && self.connected != 0 && self.connected != HOSTING && self.name.0 != self.connected {
                     self.name = (self.connected, Vec::new());
-                    if let Some(n) = (0..16).map(|i| request(GET, SCAN, i)).take_while(|r| r.op == OK && r.value != 0).find(|r| r.value == self.connected) {
+                    if let Some(n) = (0..SCAN_ROWS).map(|i| request(GET, SCAN, i)).take_while(|r| r.op == OK && r.value != 0).find(|r| r.value == self.connected) {
                         let text = n.text();
                         let len = text.iter().position(|&b| b == 0).unwrap_or(text.len()).min(32);
                         self.name.1 = text[..len].to_vec();
@@ -174,7 +336,7 @@ impl Wifi {
                     return String::from("error busy\n");
                 }
                 let mut out = String::new();
-                for i in 0..16 {
+                for i in 0..SCAN_ROWS {
                     let r = request(GET, SCAN, i);
                     if r.op != OK || r.value == 0 {
                         break;
@@ -225,9 +387,21 @@ impl Wifi {
                     self.start(&[(Step::Join, join)])
                 };
                 join.data = [0; 32];
+                if answer == "ok\n" {
+                    // The app chose a network: rejoin on its own again from now on.
+                    self.auto.paused = false;
+                    self.auto.skip.clear();
+                    self.auto.tries = 0;
+                }
                 answer
             }
-            Some("leave") => self.start(&[(Step::Leave, Message::new(EXECUTE, PROFILE, 0))]),
+            Some("leave") => {
+                let answer = self.start(&[(Step::Leave, Message::new(EXECUTE, PROFILE, 0))]);
+                if answer == "ok\n" {
+                    self.auto.paused = true;
+                }
+                answer
+            }
             Some(_) => String::from("error usage: wifi [state|scan|list|join ID [PMK]|leave]\n"),
         }
     }

@@ -5,9 +5,16 @@ From VioletOS, USB Diagnostics marks the MT6357 RTC fast-boot flag and resets,
 so the bootloader starts fastboot. From Android on slot A, adb requests the
 bootloader. If the running image cannot request fastboot, repeated VioletOS
 reboots use up slot B's retries until the bootloader falls back to Android A.
+
+The boot image carries VioletOS's 1 MiB storage volume (app files, saved Wi-Fi
+networks) as zeros. Unless --wipe-storage is given, the image is sent as an
+Android sparse image whose storage window is a "don't care" chunk, so the
+bootloader leaves the handset's saved data where it is. A bootloader that
+refuses the sparse image gets the plain one (which wipes the data).
 """
 import argparse
 import json
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -121,6 +128,36 @@ def fastboot(*args):
     return output
 
 
+STORAGE_MARKER = b"VioletOS XT2163DL boot_b storage v1\n"
+MARKER_OFFSET = 16 * 1024 * 1024  # platform/sel4/loader/build.py
+STORAGE_BYTES = 1024 * 1024
+
+
+def keep_storage(image):
+    """A sparse copy of `image` that skips the storage window, or None."""
+    data = image.read_bytes()
+    marker = data[MARKER_OFFSET:MARKER_OFFSET + 512]
+    if not marker.startswith(STORAGE_MARKER) or any(marker[len(STORAGE_MARKER):]):
+        return None
+    block = 512  # the window starts one sector after the marker
+    start = (MARKER_OFFSET + 512) // block
+    count = STORAGE_BYTES // block
+    if len(data) % block or (start + count) * block > len(data):
+        return None
+    total = len(data) // block
+    chunks = []
+    def raw(first, n):
+        body = data[first * block:(first + n) * block]
+        chunks.append(struct.pack("<HHII", 0xCAC1, 0, n, 12 + len(body)) + body)
+    raw(0, start)
+    chunks.append(struct.pack("<HHII", 0xCAC3, 0, count, 12))  # don't care: left as it is
+    raw(start + count, total - start - count)
+    header = struct.pack("<IHHHHIIII", 0xED26FF3A, 1, 0, 28, 12, block, total, len(chunks), 0)
+    out = BUILD / "moto-flash-keep-storage.simg"
+    out.write_bytes(header + b"".join(chunks))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("image", nargs="?", type=Path, default=BUILD / "sel4/moto/boot.img")
@@ -128,14 +165,26 @@ def main():
                         help="VioletOS reboots to try if fastboot is not requested directly")
     parser.add_argument("--fastboot-only", action="store_true",
                         help="stop in fastboot without flashing")
+    parser.add_argument("--wipe-storage", action="store_true",
+                        help="also erase the handset's saved app data and Wi-Fi networks")
     args = parser.parse_args()
     if not args.fastboot_only and not args.image.is_file():
         raise SystemExit(f"{args.image} not found")
     to_fastboot(args.fallback_reboots)
     if args.fastboot_only:
         return
-    log(f"Flashing {args.image} to boot_b")
-    fastboot("flash", "boot_b", str(args.image))
+    sparse = None if args.wipe_storage else keep_storage(args.image)
+    flashed = False
+    if sparse:
+        log(f"Flashing {args.image} to boot_b, keeping the saved data")
+        try:
+            fastboot("flash", "boot_b", str(sparse))
+            flashed = True
+        except SystemExit as refused:
+            log(f"The sparse image was refused ({refused}); flashing the plain image, which wipes saved data")
+    if not flashed:
+        log(f"Flashing {args.image} to boot_b")
+        fastboot("flash", "boot_b", str(args.image))
     fastboot("set_active", "b")
     log("Slot B selected; rebooting")
     fastboot("reboot")

@@ -99,7 +99,9 @@ fn boot_rom(report: &mut [u8; 32]) -> u32 {
     }
 }
 pub fn run() -> ! {
-    let mut scan = passive_scan::Results::default();
+    // 32 access points are about 11 KiB: keep them out of Radio's stack.
+    static mut SCAN_RESULTS: passive_scan::Results = unsafe { core::mem::zeroed() };
+    let scan = unsafe { &mut *core::ptr::addr_of_mut!(SCAN_RESULTS) };
     let mut requested = false;
     let mut join_target = None;
     // The supplicant retains its device context for group rekeys across IPC calls.
@@ -122,6 +124,10 @@ pub fn run() -> ! {
     let active = core::cell::Cell::new(false);
     // The access point of the current station connection, to rejoin when the link fails.
     let joined: core::cell::Cell<Option<passive_scan::AccessPoint>> = core::cell::Cell::new(None);
+    // The joined network's link failed and the event loop is rejoining it. The
+    // network stays joined (GET PROFILE) until an app leaves it: a status poll
+    // must never end a reconnect.
+    let reconnecting = core::cell::Cell::new(false);
     let mut dispatch = |m: Message| {
         if (m.op, m.key, m.value) == (EXECUTE, RELAY, 2) {
             let mut bytes = [0u8; RELAY_CODE_LEN / 2];
@@ -206,8 +212,16 @@ pub fn run() -> ! {
                 }
                 usb_job = Message::default();
             }
-            let alive = unsafe { wpa::poll() };
-            if !alive || leave_relay || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO | RELAY) && m.value == 0) {
+            let leave = leave_relay || (m.op == EXECUTE && matches!(m.key, PROFILE | RADIO | RELAY) && m.value == 0);
+            let alive = reconnecting.get() || unsafe { wpa::poll() };
+            let relaying = unsafe { (*core::ptr::addr_of!(RELAY_AP)).is_some() };
+            if !alive && !relaying && joined.get().is_some() {
+                // Leave it to the event loop's rejoin (radio::relink).
+                reconnecting.set(true);
+            }
+            if leave || (!alive && (relaying || joined.get().is_none())) {
+                reconnecting.set(false);
+                joined.set(None);
                 unsafe { wpa::close() };
                 unsafe { RELAY_AP = None };
                 let stopped = unsafe { (*dev).shutdown() }
@@ -236,7 +250,8 @@ pub fn run() -> ! {
                     let mut r = Message::result(1);
                     r.arg = RADIO_DIAGNOSTIC;
                     r.put_text(match relay_state() {
-                        RELAY_OFF => b"WIFI CONNECTED" as &[u8],
+                        RELAY_OFF if reconnecting.get() => b"WIFI RECONNECTING" as &[u8],
+                        RELAY_OFF => b"WIFI CONNECTED",
                         RELAY_ONLINE => b"PHONE INTERNET ON",
                         RELAY_JOINED => b"PHONE JOINED",
                         _ => b"WAITING FOR PHONE",
@@ -257,7 +272,7 @@ pub fn run() -> ! {
                     }
                     r
                 }
-                (GET, SCAN) => scan_entry(&scan, m.value),
+                (GET, SCAN) => scan_entry(scan, m.value),
                 _ => Message::error(BUSY),
             };
         }
@@ -272,12 +287,12 @@ pub fn run() -> ! {
             let Some(ap) = matches.next().copied() else {
                 return Message::error(INVALID);
             };
-            if matches.next().is_some() || !ap.wpa2_psk_ccmp {
+            if matches.next().is_some() || !(ap.wpa2_psk_ccmp || ap.open) {
                 return Message::error(INVALID);
             }
             // A key from the app (Settings derives it from the password) is kept for
             // this boot, for this join and for rejoining after a link failure.
-            if m.data != [0; 32] {
+            if m.data != [0; 32] && ap.wpa2_psk_ccmp {
                 wpa::remember_key(&ap.ssid[..ap.ssid_len], &m.data);
             }
             join_target = Some(ap);
@@ -368,7 +383,7 @@ pub fn run() -> ! {
                     dev.write(wlan_axi::Axi::new());
                 }
                 let axi = unsafe { &mut *dev };
-                scan = passive_scan::Results::default();
+                scan.clear();
                 if let Some(target) = join_target {
                     scan.preferred_ssid = target.ssid;
                     scan.preferred_len = target.ssid_len;
@@ -431,13 +446,13 @@ pub fn run() -> ! {
                     return reply;
                 }
                 let result = wmt::enable(files[2], profile, stage)
-                    .and_then(|()| axi.scan(files[3], &mut scan, stage))
+                    .and_then(|()| axi.scan(files[3], scan, stage))
                     .and_then(|()| {
                         if usb_job.arg != 0 {
                             join_target = scan.aps[..scan.ap_count]
                                 .iter()
                                 .find(|ap| {
-                                    ap.wpa2_psk_ccmp
+                                    (ap.wpa2_psk_ccmp || ap.open)
                                         && ap.ssid_len == usb_job.value as usize
                                         && ap.ssid[..ap.ssid_len] == usb_job.data[..ap.ssid_len]
                                 })
@@ -449,11 +464,13 @@ pub fn run() -> ! {
                         if let Some(target) = join_target.take() {
                             // Every access point with this name is a candidate, 2.4 GHz first:
                             // one that does not answer authentication should not end the join.
-                            let mut order = [0usize; 16];
+                            let mut order = [0usize; passive_scan::MAX_APS];
                             let mut count = 0;
                             for pass in 0..2 {
                                 for (k, ap) in scan.aps[..scan.ap_count].iter().enumerate() {
-                                    let same = ap.wpa2_psk_ccmp && ap.ssid_len == target.ssid_len
+                                    let same = ap.open == target.open
+                                        && (ap.wpa2_psk_ccmp || ap.open)
+                                        && ap.ssid_len == target.ssid_len
                                         && ap.ssid[..ap.ssid_len] == target.ssid[..target.ssid_len];
                                     if same && ((ap.channel <= 14) == (pass == 0)) && count < order.len() {
                                         order[count] = k;
@@ -482,7 +499,9 @@ pub fn run() -> ! {
                             record(42, tried);
                             let ap = &scan.aps[chosen.ok_or(last)?];
                             stage(52);
-                            wpa::authorize(axi, ap)?;
+                            if !ap.open {
+                                wpa::authorize(axi, ap)?;
+                            }
                             stage(53);
                             if !unsafe { wpa::join_ip(dev) } {
                                 unsafe { wpa::close() };
@@ -490,6 +509,7 @@ pub fn run() -> ! {
                             }
                             connected = ap.profile_id();
                             joined.set(Some(*ap));
+                            reconnecting.set(false);
                             active.set(true);
                         }
                         Ok(())
@@ -551,7 +571,7 @@ pub fn run() -> ! {
             return reply;
         }
         if (m.op, m.key) == (GET, SCAN) {
-            return scan_entry(&scan, m.value);
+            return scan_entry(scan, m.value);
         }
         if (m.op, m.key) == (GET, PROFILE) {
             let mut reply = Message::result(0);
@@ -665,12 +685,12 @@ pub fn run() -> ! {
     }
     const SOCKETS: *mut u8 = 0x0b00_0000 as *mut u8;
     let (mut relink_failures, mut relink_last) = (0u32, 0u32);
-    let relink_wait = |failures: u32| (2000u32 << failures.min(5)).min(60_000);
+    let relink_wait = |failures: u32| if failures < 3 { 500 } else { (2000u32 << (failures - 3).min(5)).min(60_000) };
     loop {
         let mut m = Message::default();
         wpa::tick_clock();
         // 1 on a joined network, 2 through the phone's relay once it reaches the internet.
-        let online = if !active.get() {
+        let online = if !active.get() || reconnecting.get() {
             0
         } else if let Some(relay) = unsafe { (*core::ptr::addr_of!(RELAY_AP)).as_ref() } {
             if relay.online { 2 } else { 0 }
@@ -699,24 +719,22 @@ pub fn run() -> ! {
                 record(65, if ok { 1 } else { 55 });
             }
             if unsafe { ipc_try_receive(SERVER, &mut m) } == 0 {
-                let alive = unsafe { wpa::poll() };
+                let alive = !reconnecting.get() && unsafe { wpa::poll() };
                 // A station link that failed (deauthentication or a driver error):
                 // associate again, redo the handshake and DHCP, with the firmware
                 // still running. Apps' connections reset and they reconnect.
-                // Three attempts in a row, as before; after a burst fails, wait
-                // 2 s, then 4, 8... up to a minute (out of range) before the next.
+                // One attempt per pass, so requests are answered between them:
+                // the first three 500 ms apart, then 2 s, 4, 8... up to a minute
+                // (out of range), for as long as the network stays joined.
                 if !alive && !relaying {
                     if let Some(ap) = joined.get() {
+                        reconnecting.set(true);
                         if relink_failures == 0 || radio_io::expired(relink_last, relink_wait(relink_failures)) {
-                            let mut ok = false;
-                            for attempt in 0..3 {
-                                stage(70 + attempt);
-                                if unsafe { relink(dev, &ap) } {
-                                    stage(73);
-                                    ok = true;
-                                    break;
-                                }
-                                unsafe { delay_ms(500) };
+                            stage(70 + relink_failures.min(2));
+                            let ok = unsafe { relink(dev, &ap) };
+                            if ok {
+                                stage(73);
+                                reconnecting.set(false);
                             }
                             relink_last = radio_io::now();
                             relink_failures = if ok { 0 } else { relink_failures.saturating_add(1) };
@@ -745,7 +763,8 @@ pub fn run() -> ! {
 unsafe fn relink(dev: *mut wlan_axi::Axi, ap: &passive_scan::AccessPoint) -> bool {
     wpa::close();
     let axi = &mut *dev;
-    axi.associate(ap).is_ok() && wpa::authorize(axi, ap).is_ok() && wpa::join_ip(dev)
+    // associate() drops the old link's key state, so the handshake starts clean.
+    axi.associate(ap).is_ok() && (ap.open || wpa::authorize(axi, ap).is_ok()) && wpa::join_ip(dev)
 }
 
 /// Relay access point that stays up between requests while the phone comes and goes.
@@ -869,7 +888,9 @@ fn scan_entry(scan: &passive_scan::Results, index: u32) -> Message {
     if let Some(ap) = scan.aps[..scan.ap_count].get(index as usize) {
         // Persist an identifier for the AP, never its position in a scan.
         reply.value = ap.profile_id();
-        reply.arg = ap.channel as u32 | if ap.wpa2_psk_ccmp { SCAN_WPA2 } else { 0 };
+        reply.arg = ap.channel as u32
+            | if ap.wpa2_psk_ccmp { SCAN_WPA2 } else { 0 }
+            | if ap.open { SCAN_OPEN } else { 0 };
         reply.put_text(&ap.ssid[..ap.ssid_len]);
     }
     reply

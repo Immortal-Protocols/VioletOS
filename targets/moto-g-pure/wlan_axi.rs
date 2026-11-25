@@ -42,6 +42,8 @@ pub struct Axi {
     peer: [u8; 6],
     basic_rate: u8,
     pairwise_ready: bool,
+    /// Joined to an open network: data frames go and come unencrypted.
+    open_link: bool,
     sequence: u8,
     /// Access-point role: configuration, and 0 idle / 1 authenticated / 2 associated client.
     pub ap: softap::Config,
@@ -67,6 +69,7 @@ impl Axi {
             peer: [0; 6],
             basic_rate: 0,
             pairwise_ready: false,
+            open_link: false,
             sequence: 0,
             ap: softap::Config::empty(),
             ap_mode: false,
@@ -439,7 +442,11 @@ impl Axi {
         {
             return Err(54);
         }
-        self.transmit_ethernet(ethernet, true)
+        self.transmit_ethernet(ethernet, !self.open_link)
+    }
+    /// The station link can carry data: keys installed, or an open network.
+    pub fn link_keyed(&self) -> bool {
+        self.pairwise_ready
     }
     fn transmit_ethernet(&mut self, ethernet: &[u8], protected: bool) -> Result<(), u32> {
         let mut p = [0; 1582];
@@ -469,7 +476,7 @@ impl Axi {
                     return Ok((0, frame.len()));
                 }
             }
-            if let Some(n) = super::station::ethernet(p, &self.station, &self.peer, out) {
+            if let Some(n) = super::station::ethernet(p, &self.station, &self.peer, out, self.open_link) {
                 return Ok((n, 0));
             }
             if let Some(f) = passive_scan::management_frame(p) {
@@ -707,9 +714,14 @@ impl Axi {
         Ok((0, 0))
     }
     pub fn associate(&mut self, ap: &passive_scan::AccessPoint) -> Result<u16, u32> {
-        if !ap.wpa2_psk_ccmp || ap.rate_count == 0 {
+        if !(ap.wpa2_psk_ccmp || ap.open) || ap.rate_count == 0 {
             return Err(49);
         }
+        // A rejoin starts unkeyed. The keys of the last link are gone on the access
+        // point's side, so message 2 of the new handshake must go out in the clear
+        // (transmit_eapol protects it only once a pairwise key is installed).
+        self.pairwise_ready = false;
+        self.open_link = false;
         let token = self.sequence.wrapping_add(1);
         let result = self
             .channel(ap.channel, token, false)
@@ -717,6 +729,11 @@ impl Axi {
             .and_then(|_| self.management_exchange(ap, true))
             .and_then(|aid| self.commit_peer(ap, aid));
         self.channel(ap.channel, token, true)?;
+        if result.is_ok() && ap.open {
+            // No handshake on an open network: association alone admits us.
+            self.open_link = true;
+            self.pairwise_ready = true;
+        }
         result
     }
     /// Upload and start the WLAN firmware, then read the station address.
