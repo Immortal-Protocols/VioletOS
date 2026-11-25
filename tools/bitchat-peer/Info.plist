@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>org.violetos.bitchat-peer</string>
+	<key>CFBundleName</key>
+	<string>bitchat-peer</string>
+	<key>CFBundleExecutable</key>
+	<string>bitchat-peer</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Tests VioletOS's bitchat app over Bluetooth LE.</string>
+</dict>
+</plist>

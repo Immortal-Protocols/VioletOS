@@ -458,7 +458,11 @@ static struct device_page devices[] = {
     {OPEN_RT, 0x4925d000, 0x0942d000, 0},
     {OPEN_RT, 0x4925e000, 0x0942e000, 0},
     {OPEN_RT, 0x4925f000, 0x0942f000, 0},
-    {OPEN_RT, 0x49260000, 0x09430000, 0}};
+    {OPEN_RT, 0x49260000, 0x09430000, 0},
+    // Bluetooth HCI (runtime/open/hci.rs), served by the emulator's virtual
+    // controller (tools/bluetooth_controller.py).
+    {OPEN_RT, 0x49270000, 0x09440000, 0},
+    {OPEN_RT, 0x49271000, 0x09441000, 0}};
 #else
 static unsigned handset_report[6];
 static unsigned uploaded, upload_size, upload_crc;
@@ -769,6 +773,15 @@ static void open_runtime(void) {
     unsigned frame = create(ram, seL4_ARM_SmallPageObject);
     map_shared(frame, &procs[RADIO].task, 0x0b000000 + i * PAGE, seL4_AllRights);
     map_shared(frame, t, 0x09400000 + i * PAGE, seL4_AllRights);
+  }
+  // Bluetooth HCI for open apps (runtime/open/hci.rs): a control page with the
+  // command ring and an event ring, served by Radio at 0x0b040000 (bt.rs) and
+  // used by the Open Runtime at 0x09440000. A third page, Radio's alone, holds
+  // the STP frame being received.
+  for (unsigned i = 0; i < 3; i++) {
+    unsigned frame = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(frame, &procs[RADIO].task, 0x0b040000 + i * PAGE, seL4_AllRights);
+    if (i < 2) map_shared(frame, t, 0x09440000 + i * PAGE, seL4_AllRights);
   }
   // Installs over USB: a control page and a 64 KiB data window, written by USB
   // Diagnostics at 0x09210000 and appended to /apps by the Open Runtime at 0x09500000.

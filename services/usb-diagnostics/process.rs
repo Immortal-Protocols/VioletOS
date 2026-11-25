@@ -425,6 +425,15 @@ pub fn run() -> ! {
             (0xc0, 0x53, 0, 0) => send(&radio_snapshot(), len),
             (0xc0, 0x52, 0, 0) => send(&runtime_snapshot(), len),
             (0xc0, 0x51, 0, 0) => send(&snapshot(), len),
+            // Bluetooth telemetry from Radio (targets/moto-g-pure/bt.rs): 64 bytes per page.
+            (0xc0, 0x74, 0, page) if page < 24 => {
+                let mut out = [0; 64];
+                let src = (0x09200800 + usize::from(page) * 64) as *const u32;
+                for (i, dest) in out.chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { src.add(i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
             // Audio status page, 16 words per request selected by the index.
             (0xc0, 0x4f, 0, page) if page < 6 => {
                 let mut out = [0; 64];

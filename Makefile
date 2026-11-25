@@ -118,7 +118,7 @@ test-unit:
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
 	build/tests/inflate
-	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home --target-dir ../build/host-tests
+	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p bitchat --target-dir ../build/host-tests
 
 # The QEMU tests CI runs: one boot of the supervisor and its services (touch,
 # storage, the watchdog, the classic launcher), then the open apps (Home,
@@ -163,6 +163,17 @@ test-moto-radio: moto
 .PHONY: test-moto-ip-live
 test-moto-ip-live: moto
 	$(PYTHON) targets/moto-g-pure/test_ip_live.py
+
+# A Mac bitchat peer for over-the-air tests of apps/open/bitchat. macOS keeps
+# its Bluetooth grant across rebuilds while it is signed with one identity:
+# BITCHAT_PEER_IDENTITY, by default the first Apple Development identity (else ad hoc).
+.PHONY: bitchat-peer
+bitchat-peer: build/BitchatPeer.app/Contents/MacOS/bitchat-peer
+build/BitchatPeer.app/Contents/MacOS/bitchat-peer: tools/bitchat-peer/main.swift tools/bitchat-peer/Info.plist
+	@mkdir -p $(@D)
+	cp tools/bitchat-peer/Info.plist build/BitchatPeer.app/Contents/Info.plist
+	swiftc -O $< -o $@
+	codesign --force -s "$${BITCHAT_PEER_IDENTITY:-$$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/{print $$2; exit}')}" build/BitchatPeer.app 2>/dev/null || codesign --force -s - build/BitchatPeer.app
 
 build/moto-package: services/usb-diagnostics/host/moto_package.c
 	@mkdir -p build
