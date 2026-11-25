@@ -31,8 +31,7 @@ final class RelayCounters {
 final class RelayServer {
     let queue = DispatchQueue(label: "com.immortal.violet.relay.net")
     let counters = RelayCounters()
-    /// Port asked for (default 1080). On iOS 27 something in the OS already holds *:1080
-    /// (bind gives EADDRINUSE, LAN connects are refused), so we walk up to `port + 9`.
+    /// The Moto dials a fixed port. Only the Mac's loopback relay can publish an alternate.
     let port: UInt16
     private var tryPort: UInt16
     private var listener: NWListener?
@@ -101,7 +100,8 @@ final class RelayServer {
                     self.counters.listenerState = "failed"
                     self.counters.boundPort = nil
                     l.cancel()
-                    if case .posix(.EADDRINUSE) = err, listenPort < self.port &+ 9 {
+                    if case .posix(.EADDRINUSE) = err, self.loopbackOnly, listenPort < UInt16.max,
+                       Int(listenPort) < Int(self.port) + 9 {
                         self.tryPort = listenPort + 1
                         self.counters.noteError("port \(listenPort) in use; trying \(self.tryPort)")
                         self.startListener()

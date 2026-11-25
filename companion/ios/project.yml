@@ -29,6 +29,15 @@ targets:
         UIFileSharingEnabled: true
         UIBackgroundModes: [audio]
         LSSupportsOpeningDocumentsInPlace: true
+  VioletRelayTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: VioletRelay
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.immortal.violet.relay.tests
+      GENERATE_INFOPLIST_FILE: YES
   VioletRelayUITests:
     type: bundle.ui-testing
     platform: iOS
@@ -44,6 +53,7 @@ schemes:
     build:
       targets:
         VioletRelay: all
+        VioletRelayTests: [test]
         VioletRelayUITests: [test]
     test:
-      targets: [VioletRelayUITests]
+      targets: [VioletRelayTests, VioletRelayUITests]
