@@ -330,7 +330,7 @@ impl Runtime {
         if self.fs.stat(super::HOME_APP).is_none() {
             return;
         }
-        match self.launch(super::HOME_APP, &[]) {
+        match self.launch(super::HOME_APP, &[], None) {
             Ok(i) => {
                 self.home = Some(i);
                 self.set_foreground(Some(i));
@@ -341,7 +341,7 @@ impl Runtime {
         // being opened first (its state is /data/agent; "peer" once paired).
         let paired = self.fs.contents("/data/agent").is_some_and(|d| d.split(|&b| b == b'\n').any(|l| l.starts_with(b"peer ")));
         if paired && self.fs.stat(super::appstore::INSTALLER).is_some() {
-            match self.launch(super::appstore::INSTALLER, &[]) {
+            match self.launch(super::appstore::INSTALLER, &[], None) {
                 Ok(_) => crate::log!("started the agent in the background"),
                 Err(e) => crate::log!("could not start the agent: {}", e),
             }
@@ -440,7 +440,7 @@ impl Runtime {
             self.lifecycle(i, LIFECYCLE_FOCUS_GAINED);
             return;
         }
-        match self.launch(&path, &[]) {
+        match self.launch(&path, &[], None) {
             Ok(i) => {
                 self.shell.message.clear();
                 self.set_foreground(Some(i));
@@ -521,12 +521,28 @@ impl Runtime {
         if self.foreground == next {
             return;
         }
+        let now = sys::now_ns();
         if let Some(f) = self.foreground {
-            if self.apps[f].is_some() {
+            if let Some(app) = self.apps[f].as_mut() {
+                app.used_ns = now;
                 self.lifecycle(f, LIFECYCLE_FOCUS_LOST);
             }
         }
+        if let Some(app) = next.and_then(|n| self.apps[n].as_mut()) {
+            app.used_ns = now;
+        }
         self.foreground = next;
+    }
+    /// App memory in KiB: the pool left, and per running app its pages plus its
+    /// screen surface, and its page tables.
+    pub fn memory_report(&self) -> String {
+        let mut out = alloc::format!("free={} total={}", self.pool.available() * 64, self.pool.total * 64);
+        for a in self.apps.iter().flatten() {
+            let (pages, tables) = a.space.usage();
+            let surface = a.surface.as_ref().map_or(0, |s| s.pages.len());
+            out += &alloc::format!(" {}={}+{}(t{})", a.name, pages * 64, surface * 64, tables);
+        }
+        out
     }
     fn holds_mic(&self, i: usize) -> bool {
         self.apps[i].as_ref().is_some_and(|a| a.fds.iter().flatten().any(|f| matches!(f.borrow().kind, Kind::Mic { .. })))
@@ -663,6 +679,9 @@ impl Runtime {
         }
         let mut pages = Vec::new();
         for _ in 0..2 * BUFFER_BYTES / PAGE {
+            if self.pool.available() == 0 && self.foreground == Some(i) {
+                self.reclaim(None);
+            }
             match self.pool.take() {
                 Some(p) => pages.push(p),
                 None => {
@@ -1093,7 +1112,7 @@ impl Runtime {
                         }
                         return String::from("ok\n");
                     }
-                    match self.launch(path, &[]) {
+                    match self.launch(path, &[], Some(i)) {
                         Ok(n) => {
                             self.set_foreground(Some(n));
                             fill(0, 0, WIDTH, HEIGHT, 0xff000000);
@@ -1173,6 +1192,9 @@ impl Runtime {
                 }
             }
             Some("installed") => self.store.list(),
+            // App memory: the pool left, and what each running app holds (its pages,
+            // its screen surface), in KiB. "@sys memory" over USB.
+            Some("memory") => alloc::format!("{}\n", self.memory_report()),
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
                 alloc::format!("{}\n", paths.join(" "))
@@ -1304,7 +1326,7 @@ impl Runtime {
                 if r.op == OK { String::from("ok\n") } else { alloc::format!("error {}\n", r.op) }
             }
             Some("launch") => match words.next() {
-                Some(path) => match self.launch(path, &[]) {
+                Some(path) => match self.launch(path, &[], Some(i)) {
                     Ok(n) => {
                         self.set_foreground(Some(n));
                         String::from("ok\n")

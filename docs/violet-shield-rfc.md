@@ -1,7 +1,8 @@
 # RFC: Violet Shield — Local AI Threat Monitoring & Signed Live Shields on Pure seL4
 
 **Status:** Draft RFC (code skeleton — assumes [PR #14 (`rfc/open-app-model`)](https://github.com/Immortal-Protocols/VioletOS/pull/14) is in; intentionally not wired into the build yet)  
-**Proof of concept:** [violet-shield-poc.md](violet-shield-poc.md) — built and tested in QEMU and the iOS Simulator (`make test-shield-ios`).  
+**Current implementation:** [violet-shield-poc.md](violet-shield-poc.md) covers monitor mode on the Mac and the QEMU test. The architecture below describes the original iPhone proposal.
+
 **Inspiration:** [Shirudo](https://github.com/shirudo-dev/shirudo) (signed live runtime shields + tamper-resistant observability), adapted to VioletOS's pure-seL4 Open Runtime and iPhone companion relay — **with no Linux kernel, no cloud server, and no API key required**.
 
 ## Motivation
@@ -53,7 +54,7 @@ On Linux, [Shirudo](https://github.com/shirudo-dev/shirudo) solves live detectio
                              │  Local Wi-Fi (192.168.77.0/24 — zero cellular data)
                              ▼
   ┌──────────────────────────────────────────────────────────────────┐
-  │  iPhone Companion Relay (companion/ios/Shield/)                  │
+  │  iPhone Companion Relay (companion/mac/VioletAgent/Shield/)                  │
   │   • `Socks5Server` ground-truth network log + `0x02` instant ban │
   │   • `CanonicalWindowFormatter` (`violet-log-v1` + SOCKS5 cross-  │
   │     correlation flag `SOCKS5_SEEN=0/1` + numeric side-features)  │
@@ -81,7 +82,7 @@ On Linux, [Shirudo](https://github.com/shirudo-dev/shirudo) solves live detectio
 | --- | --- |
 | `runtime/open/shield.rs` | `ShieldPolicy` implementing PR #14's `Policy` trait, TOCTOU-safe arg-copy note, active `VSH1` Shield rule table, `FREEZE_APP`/`KILL_APP` verdicts, and 64-byte lock-free `TelemetryEvent` ring |
 | `services/sentinel/mod.rs` | Separate seL4 `Sentinel` process: `MeasurementChain` (per-boot SHA-256 PCR chain), P-256 `SignedShield` verifier + trial-and-rollback timer, `OfflineEventRing`, and `sentinel.violet` transport |
-| `companion/ios/Shield/ShieldChecker.swift` | iPhone `sentinel.violet` handler (beside `time.violet`), `violet-log-v1` formatter + explicit side-features, SOCKS5 ↔ Sentinel cross-checker, EmbeddingGemma 2 + 256-d Matryoshka novelty + Hybrid MLP runner, Secure Enclave P-256 signer, and feedback store |
+| `companion/mac/VioletAgent/Shield/ShieldChecker.swift` | iPhone `sentinel.violet` handler (beside `time.violet`), `violet-log-v1` formatter + explicit side-features, SOCKS5 ↔ Sentinel cross-checker, EmbeddingGemma 2 + 256-d Matryoshka novelty + Hybrid MLP runner, Secure Enclave P-256 signer, and feedback store |
 | `tools/shield-trainer/schema.py` | Shared `violet-log-v1` canonical window serializer, numeric side-feature extractor, verdict/action/tag taxonomy, and red-team attack scenarios (including prompt-injection and SOCKS5-mismatch cases) |
 | `tools/shield-trainer/distill_lora.py` | Mac training skeleton: Teacher soft-logit KL + focal/BCE distillation for Stage 1 (frozen EmbeddingGemma 2 270M + Hybrid MLP head) and Stage 2 (light LoRA on the 130M transformer with cosine-anchor regularization), temperature calibration, and CoreML/LiteRT export |
 

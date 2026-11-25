@@ -104,7 +104,9 @@ impl App {
 
     fn activate(&mut self, hit: Hit) {
         match hit {
-            Hit::Back if self.section == Section::Menu => violet::home(),
+            // Saved settings and Phone Internet are managed by the runtime.
+            // Release this screen's memory when the user returns to Home.
+            Hit::Back if self.section == Section::Menu => std::process::exit(0),
             Hit::Back => self.go(Section::Menu),
             Hit::Row(i) => self.go(MENU[i].0),
             Hit::Relay => {

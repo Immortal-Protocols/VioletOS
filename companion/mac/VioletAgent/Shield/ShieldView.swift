@@ -1,7 +1,6 @@
 import SwiftUI
 
-/// Violet Shield's part of the companion screen: model, link to VioletOS,
-/// what was contained, and every recent verdict.
+/// The Mac's Shield model, VioletOS link, and recent verdicts.
 struct ShieldSection: View {
     @ObservedObject var ui = ShieldUI.shared
 
@@ -31,11 +30,7 @@ struct ShieldSection: View {
         } header: {
             Text("Violet Shield")
         } footer: {
-            #if os(macOS)
             Text("Checks run on this Mac. VioletOS shows warnings on Home.")
-            #else
-            Text("Checks run on this iPhone. VioletOS shows warnings on Home.")
-            #endif
         }
         if !s.decisions.isEmpty {
             Section("Verdicts") {

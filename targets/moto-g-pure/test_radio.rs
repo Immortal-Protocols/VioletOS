@@ -357,12 +357,12 @@ fn authorized_ip_requires_hardware_ccmp_and_accepts_translated_frames() {
     p[22..28].copy_from_slice(&ap);
     p[28..30].copy_from_slice(&[8, 0]);
     let mut out = [0; 64];
-    assert_eq!(station::ethernet(&p, &mac, &ap, &mut out), Some(48));
+    assert_eq!(station::ethernet(&p, &mac, &ap, &mut out, false), Some(48));
     assert_eq!(&out[..48], &p[16..]);
     for (offset, wrong) in [(9, 0), (10, 16), (8, 7), (16, 4), (0, 70)] {
         let mut bad = p;
         bad[offset] = wrong;
-        assert!(station::ethernet(&bad, &mac, &ap, &mut out).is_none());
+        assert!(station::ethernet(&bad, &mac, &ap, &mut out, false).is_none());
     }
     p[28..30].copy_from_slice(&[0x88, 0x8e]);
     p[30..36].copy_from_slice(&[2, 3, 0, 2, 1, 2]);

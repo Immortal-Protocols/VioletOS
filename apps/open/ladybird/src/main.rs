@@ -509,7 +509,7 @@ pub fn register_names() {
 #[cfg(target_os = "macos")]
 fn render_to_file(input: &str, output: &str, scroll: i32) {
     let (tx, _rx) = mpsc::channel::<Loaded>();
-    let mut b = Browser { fonts: Fonts::load(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, keyboard: Keyboard::address(), tx, serial: 0 };
+    let mut b = Browser { fonts: Fonts::regular_and_bold(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, keyboard: Keyboard::address(), tx, serial: 0 };
     let body = std::fs::read(input).expect("input");
     let url = Url::parse("http://localhost/").unwrap();
     let sheets: Vec<String> = std::env::args().skip(5).map(|p| std::fs::read_to_string(p).expect("style sheet")).collect();
@@ -543,7 +543,7 @@ fn main() {
     let view = comp.add_view(Rect::new(0, TOOLBAR, W as i32, H as i32));
     let (tx, results) = mpsc::channel::<Loaded>();
     let mut b = Browser {
-        fonts: Fonts::load(),
+        fonts: Fonts::regular_and_bold(),
         c: Canvas::new(1, 1), // swapped for the screen while chrome is drawn
         page: None,
         scroll: 0,

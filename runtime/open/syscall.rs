@@ -1205,7 +1205,12 @@ impl Runtime {
                 let saved = app.space.find(start).map(|v| v.prot);
                 // Write the file in even if the mapping is read-only.
                 app.space.add(start, start + len, PROT_READ | PROT_WRITE);
-                let ok = app.space.write(&mut self.k, &mut self.pool, start, &data);
+                let mut ok = app.space.write(&mut self.k, &mut self.pool, start, &data);
+                // Out of pages: close a background app and try again.
+                while !ok && self.foreground == Some(i) && self.pool.available() == 0 && self.reclaim(None) {
+                    ok = self.apps[i].as_mut().unwrap().space.write(&mut self.k, &mut self.pool, start, &data);
+                }
+                let app = self.apps[i].as_mut().unwrap();
                 app.space.add(start, start + len, saved.unwrap_or(prot & 7));
                 if prot & 4 != 0 {
                     app.space.sync_code(start, start + len);

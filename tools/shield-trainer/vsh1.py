@@ -4,7 +4,7 @@ Header, little endian, 32 bytes:
     magic "VSH1" | version u16 = 1 | tier u8 | op u8 | shield_id u32 | seq u64 |
     ttl_secs u32 | target_pid u32 | payload_len u16 | sig_len u16
 then the payload, then an ASN.1 DER ECDSA P-256 / SHA-256 signature over the
-header and payload. The companion in companion/ios/Shield/ShieldSigner.swift
+header and payload. The companion in companion/mac/VioletAgent/Shield/ShieldSigner.swift
 writes the same bytes.
 
     python3 vsh1.py fixtures KEY.pem OUT.txt   # test vectors for the Rust tests

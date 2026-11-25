@@ -241,9 +241,9 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             let (head, tint) = if !s.frozen.is_empty() {
                 (format!("Froze {}", s.frozen.join(", ")), ALERT)
             } else if s.shield_linked {
-                ("Linked to your iPhone".to_string(), VIOLET)
+                ("Linked to your Mac".to_string(), VIOLET)
             } else {
-                ("Waiting for your iPhone".to_string(), CREAM)
+                ("Waiting for your Mac".to_string(), CREAM)
             };
             let big = f.medium(34.0);
             big.draw(c, &big.fit(&head, card.width() - 80), 80, 336, tint);

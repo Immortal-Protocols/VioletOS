@@ -22,6 +22,10 @@
 	<string>1</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSAccessorySetupKitSupports</key>
+	<array>
+		<string>WiFi</string>
+	</array>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_violetrelay._tcp</string>
