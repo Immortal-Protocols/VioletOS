@@ -80,6 +80,11 @@ test-agent:
 	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
 	$(PYTHON) targets/qemu/test_agent.py
 
+# Rose as the agent, end to end (needs Codex signed in and companion/mac/violet_rose/setup.sh).
+test-rose:
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
+	$(PYTHON) targets/qemu/test_rose.py
+
 # Uses the downloaded Mac app and its installed models. Runs locally only.
 LOCOMO_APP ?= /Applications/Locomo Music.app
 .PHONY: test-locomo

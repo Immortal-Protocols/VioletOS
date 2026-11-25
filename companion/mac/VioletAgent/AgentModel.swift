@@ -1,5 +1,7 @@
-// Violet Agent's state: the paired phone, speech in and out, Codex, and the
-// installs it asks for. Everything runs on the main queue.
+// Violet Agent's state: the paired phone and its encrypted link, the agent
+// (Rose, RoseAgent.swift: her voice, conversation, tasks, identity and life),
+// the builder that makes the apps she is asked for, and their installs.
+// Everything runs on the main queue.
 import CryptoKit
 import Foundation
 import SwiftUI
@@ -18,8 +20,12 @@ final class AgentModel: ObservableObject {
     @Published var phone: PairedPhone?
     @Published var lines: [Line] = []
     @Published var heard = ""
-    @Published var codexState = "Starting Codex…"
-    @Published var speechState = "Starting speech recognition…"
+    @Published var codexState = "Starting the builder…"
+    @Published var speechState = "Starting Rose…"
+    /// Rose's own dashboard (her life, journal, tasks and transcripts) on this Mac.
+    @Published var dashboard: String?
+    /// Rose's tasks (builds among them), newest last, as her bus reports them.
+    @Published var tasks: [Int: [String: Any]] = [:]
     @Published var workspaceState = "Preparing the app workspace…"
     @Published var activity = "idle"
     @Published var scanning = false
@@ -51,37 +57,19 @@ final class AgentModel: ObservableObject {
     private var localInvite: UUID?
     private var shieldSession: UUID?
     private var started = false
-    private let listener = Listener()
-    private let speaker = Speaker()
-    /// RoseOS's listener and speaker (voice/violet_voice.py); Apple's speech when unavailable.
-    private let rose = RoseVoice()
-    private var useRose = false
-    private var replyIDs: [String: Int] = [:]
-    private var replySent: [String: Int] = [:]
-    private var nextReply = 1
-    private var renamed = false
-    private var roseAudible = false
-    /// The conversation: fast turns, read-only, never writes code.
-    private var codex: Codex!
-    /// Apps: writes, builds and installs in the workspace while the talk goes on.
+    /// The agent: Rose, from RoseOS.
+    private let rose = RoseAgent()
+    private var roseReady = false
+    /// Apps: Codex writes, builds and installs them in the workspace, for a task Rose started.
     private var builder: Codex!
-    /// The build in progress: what was asked, when, and what the builder did.
-    private var building: (request: String, started: Date, progress: [String])?
-    private var lastBuild = ""
+    /// The build Rose asked for: her task id, when it started, whether she stopped it.
+    private var building: (task: Int, started: Date, cancelled: Bool)?
     private var builderReply = ""
     /// Whether the phone has Python (its hello says); nil until it says.
     private var phonePython: Bool?
     let support: URL
     let repo: URL
     let workspace: URL
-
-    // Speech the phone is playing, for the echo guard.
-    private var playingUntil = Date.distantPast
-    private var spoken: [(Date, Set<String>)] = []
-    private var bargedIn = false
-    // Streaming replies: what was already said of each message.
-    private var said: [String: Int] = [:]
-    private var texts: [String: String] = [:]
     // Installs and the request they answer, for timing.
     private var requestAt: Date?
     private var request = ""
@@ -99,7 +87,6 @@ final class AgentModel: ObservableObject {
     private var recording: Data?
     private var micBytes = 0
     private var micSince = Date()
-    private var speechBytes = 0
 
     init() {
         saved = Store.load()
@@ -131,7 +118,7 @@ final class AgentModel: ObservableObject {
         if let i = args.firstIndex(of: "--unpair"), i >= 0 { saved.phones = []; Store.save(saved); phone = nil }
         for (i, a) in args.enumerated() where a == "--say" && i + 1 < args.count { pendingSays.append(args[i + 1]) }
         if args.contains("--record-mic") { recording = Data() }
-        if let i = args.firstIndex(of: "--name"), i + 1 < args.count { rename(args[i + 1]) }
+        if let i = args.firstIndex(of: "--name"), i + 1 < args.count { agentName = args[i + 1]; saved.name = agentName; Store.save(saved) }
         for (i, a) in args.enumerated() where a == "--install" && i + 1 < args.count {
             if let eq = args[i + 1].firstIndex(of: "=") {
                 let spec = args[i + 1]
@@ -164,30 +151,13 @@ final class AgentModel: ObservableObject {
                   FileManager.default.fileExists(atPath: LocomoSetup.installedApp.path) {
             enableLocomo(LocomoSetup.installedApp)
         }
-        speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
-        speaker.onEnd = { [weak self] id in
-            guard let self else { return }
-            self.log("spoke utterance \(id): \(self.speechBytes) bytes of speech sent")
-            self.speechBytes = 0
-            self.link.send(["t": "say_end", "id": id])
-            // Back to listening once the last sentence is out and Codex is done.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                if !self.speaker.speaking && self.codex.activeTurn == nil && self.activity == "speaking" { self.setActivity("idle") }
-            }
-        }
-        listener.onPartial = { [weak self] t in self?.partial(t) }
-        listener.onFinal = { [weak self] t in self?.final(t) }
         if args.contains("--no-speech") {
-            speechState = "Speech recognition off (--no-speech)"
-        } else if !args.contains("--apple-speech") && RoseVoice.available() {
-            startRose()
+            speechState = "No agent (--no-speech)"
         } else {
-            listener.start { [weak self] ok in
-                self?.speechState = ok ? "Speech recognition on this Mac (\(self?.speaker.voiceName ?? "") voice)" : "Allow Speech Recognition in System Settings › Privacy"
-            }
+            startRose()
         }
         prepareWorkspace()
-        startCodex()
+        startBuilder()
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.writeStatus() }
     }
 
@@ -214,103 +184,113 @@ final class AgentModel: ObservableObject {
         }
     }
 
+    // MARK: the agent (Rose)
+
+    /// Rose keeps her state with this profile: her name and voice, her life and journal, transcripts.
+    var roseProfile: URL { support.appendingPathComponent("rose") }
+
     private func startRose() {
-        useRose = true
-        speechState = "Loading the RoseOS voice (Silero, smart-turn, Nemotron, Parakeet, Phonon)…"
-        rose.onReady = { [weak self] voice in
-            self?.speechState = "RoseOS voice ready (Phonon \(voice))"
-            self?.log("RoseOS voice ready: \(voice)")
-        }
-        rose.onFailed = { [weak self] why in
-            guard let self else { return }
-            self.log("RoseOS voice failed: \(why); using the Mac's speech")
-            self.useRose = false
-            self.listener.start { ok in
-                self.speechState = ok ? "Speech recognition on this Mac (RoseOS voice unavailable)" : "Allow Speech Recognition in System Settings › Privacy"
-            }
-        }
-        rose.onTurn = { [weak self] text, hold in
-            guard let self else { return }
-            self.heard = ""
-            if hold { self.log("user: \(text) (holding)"); return }
-            self.userTurn(text)
-        }
-        rose.onPartial = { [weak self] t in self?.heard = t }
+        rose.onBus = { [weak self] m in self?.bus(m) }
         rose.onControl = { [weak self] m in self?.link.send(["t": "audio", "ctl": m]) }
         rose.onPCM = { [weak self] seg, pcm in self?.sendSpeech(seg, pcm) }
-        rose.onAudible = { [weak self] on in
-            guard let self else { return }
-            self.roseAudible = on
-            if on { self.setActivity("speaking") } else if self.codex.activeTurn == nil { self.setActivity("idle") }
+        rose.onCall = { [weak self] id, name, args in self?.call(id, name, args) }
+        rose.onBuild = { [weak self] task, request in self?.startBuild(task, request) }
+        rose.onBuildUpdate = { [weak self] task, instruction in
+            guard let self, self.building?.task == task else { return }
+            self.log("build \(task): more from the owner: \(instruction)")
+            self.builder.say(instruction)
         }
-        rose.onLog = { [weak self] s in self?.log(s) }
-        let script = repo.appendingPathComponent("companion/mac/voice/violet_voice.py")
-        rose.start(script: script, voice: saved.voice ?? "zoey")
+        rose.onBuildCancel = { [weak self] task in
+            guard let self, self.building?.task == task else { return }
+            self.building?.cancelled = true
+            self.builder.interrupt()
+        }
+        rose.onDashboard = { [weak self] url in self?.dashboard = url; self?.log("Rose's dashboard: \(url)") }
+        rose.onFailed = { [weak self] why in
+            guard let self else { return }
+            self.roseReady = false
+            self.speechState = why
+            self.log("Rose: \(why)")
+        }
+        speechState = "Starting Rose (her voice models and Codex)…"
+        _ = rose.start(repo: repo, profile: roseProfile, name: agentName, voice: saved.voice,
+                       log: support.appendingPathComponent("rose.log"))
     }
 
-    /// Give the agent a new name (the Mac's setting, shown on the phone).
+    /// A typed turn from the Mac window, heard by Rose as if spoken.
+    func userTurn(_ t: String) {
+        guard roseReady else { return log("typed while Rose is not ready: \(t)") }
+        rose.text(t)
+    }
+
+    /// Give the agent a new name from the Mac window: Rose keeps it, and says it everywhere.
     func rename(_ name: String) {
         let n = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(24))
         guard !n.isEmpty else { return }
-        agentName = n
-        saved.name = n
-        Store.save(saved)
-        renamed = true
-        link?.send(["t": "hello", "name": Host.current().localizedName ?? "Mac", "agent_name": n])
-        log("the agent is now called \(n)")
+        rose.rename(n)
     }
 
-    private var instructions: String {
-        Self.instructions.replacingOccurrences(of: "You are Violet,", with: "You are \(agentName),")
+    /// An event on Rose's bus.
+    private func bus(_ m: [String: Any]) {
+        switch m["kind"] as? String {
+        case "ready":
+            roseReady = true
+            speechState = "Rose is listening (ready in \(m["seconds"] ?? "?") s)"
+            log("Rose ready")
+            sayPending()
+        case "status":
+            setActivity(m["state"] as? String ?? "listening")
+        case "rose_audio_start":
+            setActivity("speaking")
+        case "partial":
+            heard = m["text"] as? String ?? ""
+        case "user_turn":
+            let t = m["text"] as? String ?? ""
+            heard = ""
+            lines.append(Line(user: true, text: t))
+            link.send(["t": "transcript", "who": "user", "text": t, "final": true])
+            log("user: \(t)")
+            if requestAt == nil || activity == "listening" {
+                requestAt = Date()
+                request = t
+                timing = ["request": t, "at": ISO8601DateFormatter().string(from: Date())]
+            }
+        case "rose_partial":
+            link.send(["t": "transcript", "who": "agent", "text": m["text"] as? String ?? "", "final": false])
+        case "rose_turn":
+            let t = m["text"] as? String ?? ""
+            lines.append(Line(user: false, text: t))
+            link.send(["t": "transcript", "who": "agent", "text": t, "final": true])
+            log("agent: \(t)\((m["interrupted"] as? Bool ?? false) ? " (interrupted)" : "")")
+        case "task":
+            if let t = m["task"] as? [String: Any], let id = t["id"] as? Int { tasks[id] = t }
+        case "assistant_name":
+            let n = m["name"] as? String ?? agentName
+            agentName = n
+            saved.name = n
+            Store.save(saved)
+            link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac", "agent_name": n, "shield": true])
+            log("the agent is now called \(n)")
+        case "voice":
+            saved.voice = m["voice"] as? String
+            Store.save(saved)
+        case "barge", "speech_start", "turn_end", "warning":
+            log("Rose \(m["kind"] ?? ""): \(m["stage"] ?? m["text"] ?? m["message"] ?? "") \(m["reason"] ?? "")")
+        case "error":
+            log("Rose: \(m["message"] ?? "")")
+            if !roseReady { speechState = "Rose could not start: \(m["message"] ?? "")" }
+        default:
+            break
+        }
     }
 
-    private static let instructions = """
-    You are Violet, the voice agent of the user's VioletOS phone (a Moto G Pure). You run on their Mac. \
-    Everything you write is spoken aloud on the phone, so answer like a person talking: one or two short sentences, \
-    no markdown, lists, code, paths or URLs. You never write code or run commands yourself. \
-    When the user asks for an app or a change to one, call build_app with a clear description of what to make \
-    (say "in Python" when they asked for Python), then say one short line such as "Sure, building it now." \
-    The builder works in the background and you keep talking with the user meanwhile: answer questions, chat, \
-    take more requests (more changes to the app go to build_app too). If they ask how it is going, call build_status. \
-    A message starting with [builder] is a report from the builder, not from the user: give the user the news in \
-    one short sentence, for example that the app is ready and they can tap Open. Choose sensible defaults instead of asking. \
-    If the user asks to open an app, call open_app. If they want to call you something else, call rename_assistant \
-    with the new name and use it from then on. list_apps tells you the apps installed on the phone and the room left. \
-    When an install fails for lack of room, offer to remove apps the user no longer wants; call remove_app only for \
-    apps the user has agreed to remove, then build_app again if they still want the new app.
-    """
+    // MARK: building the apps Rose is asked for
 
     private static let builderInstructions = """
     You build apps for the user's VioletOS phone, following AGENTS.md in this workspace. Requests come from the \
     voice agent the user is talking with. Build the app, install it with install_app, then reply with one short plain \
-    sentence saying what you made, or what went wrong. Never ask questions; choose sensible defaults.
+    sentence saying what you made and that it is on the phone, or what went wrong. Never ask questions; choose sensible defaults.
     """
-
-    private static let tools: [[String: Any]] = [
-        ["type": "function", "name": "build_app",
-         "description": "Start building an app, or change one, in the background. Returns at once; a [builder] message arrives when it is installed on the phone.",
-         "inputSchema": ["type": "object", "properties": [
-            "request": ["type": "string", "description": "What to build or change, in plain words, with any details the user gave"]],
-                         "required": ["request"]]],
-        ["type": "function", "name": "build_status",
-         "description": "How the build in progress is going.",
-         "inputSchema": ["type": "object", "properties": [String: Any]()]],
-        ["type": "function", "name": "cancel_build",
-         "description": "Stop the build in progress.",
-         "inputSchema": ["type": "object", "properties": [String: Any]()]],
-        ["type": "function", "name": "rename_assistant",
-         "description": "Change the name the user calls you. It is saved and shown on the phone.",
-         "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
-        ["type": "function", "name": "open_app",
-         "description": "Open an installed app on the phone's screen.",
-         "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
-        ["type": "function", "name": "list_apps",
-         "description": "The apps installed on the phone (name, title, size) and the room left for more.",
-         "inputSchema": ["type": "object", "properties": [String: Any]()]],
-        ["type": "function", "name": "remove_app",
-         "description": "Remove an installed app from the phone. Only after the user agreed to remove that app.",
-         "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
-    ]
 
     private static let builderTools: [[String: Any]] = [
         ["type": "function", "name": "install_app",
@@ -322,71 +302,52 @@ final class AgentModel: ObservableObject {
                          "required": ["name", "title", "path"]]],
     ]
 
-    private func startCodex() {
-        codex = Codex("talker", workspace: workspace, instructions: instructions, tools: Self.tools, sandbox: "read-only")
-        codex.onLog = { [weak self] s in self?.log(s) }
-        codex.onDelta = { [weak self] id, d in self?.delta(id, d) }
-        codex.onMessage = { [weak self] id, t in self?.message(id, t) }
-        codex.onActivity = { [weak self] a in self?.setActivity(a == "building" ? "thinking" : a) }
-        codex.onTool = { [weak self] tool, args, done in self?.tool(tool, args, done) }
-        codex.start { [weak self] err in
-            guard let self else { return }
-            self.codexState = err ?? "Codex ready (\(self.codex.model))"
-            self.log(self.codexState)
-            self.sayPending()
-        }
+    private func startBuilder() {
         builder = Codex("builder", workspace: workspace, instructions: Self.builderInstructions, tools: Self.builderTools)
         builder.onLog = { [weak self] s in self?.log(s) }
         builder.onMessage = { [weak self] _, t in self?.builderReply = t }
         builder.onProgress = { [weak self] p in
-            guard let self, self.building != nil else { return }
-            self.building!.progress.append(p)
+            guard let self, let b = self.building else { return }
             self.log("builder: \(p)")
+            self.rose.buildProgress(b.task, p)
         }
-        builder.onTool = { [weak self] tool, args, done in self?.tool(tool, args, done) }
+        builder.onTool = { [weak self] tool, args, done in
+            guard let self, tool == "install_app" else {
+                return done(["success": false, "contentItems": [["type": "inputText", "text": "Unknown tool \(tool)"]]])
+            }
+            if let b = self.building { self.rose.buildProgress(b.task, "Installing \(args["title"] ?? "the app") on the phone.") }
+            self.install(args) { ok, text in done(["success": ok, "contentItems": [["type": "inputText", "text": text]]]) }
+        }
         builder.onTurnEnd = { [weak self] ok in self?.buildEnded(ok) }
         builder.start { [weak self] err in
+            self?.codexState = err.map { "Builder: \($0)" } ?? "Builder ready (\(self?.builder.model ?? ""))"
             if let err { self?.log("builder: \(err)") }
         }
     }
 
-    // MARK: building in the background
-
-    private func startBuild(_ request: String) -> String {
-        guard builder.thread != nil else { return "The builder isn't ready on the Mac yet." }
+    /// Rose started a build task: the builder takes it, and reports back to her task.
+    private func startBuild(_ task: Int, _ request: String) {
+        guard builder.thread != nil else {
+            return rose.buildDone(task, status: "failed", result: "The builder on the Mac isn't ready yet.")
+        }
         if building != nil {
-            // More for the build in progress: the builder takes it into its turn.
-            building!.request += "; " + request
             builder.say(request)
-            log("build: more for the build in progress: \(request)")
-            return "Added that to the build in progress; a [builder] message comes when it is done."
+            return
         }
-        building = (request, Date(), [])
+        building = (task, Date(), false)
         builderReply = ""
-        log("build: \(request)")
+        log("build \(task): \(request)")
         builder.say(request)
-        setActivity(activity)
-        return "Started. The builder works in the background, usually under a minute; a [builder] message comes when it is installed. Keep talking with the user meanwhile."
-    }
-
-    private func buildStatus() -> String {
-        guard let b = building else {
-            return lastBuild.isEmpty ? "No build is running." : "No build is running. The last one: \(lastBuild)"
-        }
-        let secs = Int(Date().timeIntervalSince(b.started))
-        let recent = b.progress.suffix(3).joined(separator: "; ")
-        return "Building for \(secs) s: \(b.request). " + (recent.isEmpty ? "It is still planning." : "Latest steps: \(recent).")
     }
 
     private func buildEnded(_ ok: Bool) {
         guard let b = building else { return }
         building = nil
-        let secs = Int(Date().timeIntervalSince(b.started))
         let reply = builderReply.trimmingCharacters(in: .whitespacesAndNewlines)
-        lastBuild = reply.isEmpty ? (ok ? "finished" : "stopped before it finished") : reply
-        log("build ended (\(ok ? "done" : "stopped")) in \(secs) s: \(lastBuild)")
-        setActivity(activity)
-        codex.say("[builder] " + (ok ? "" : "The build stopped. ") + lastBuild)
+        let status = b.cancelled ? "cancelled" : ok ? "done" : "failed"
+        let result = b.cancelled ? "Stopped the build." : reply.isEmpty ? (ok ? "The app is built." : "The build stopped before it finished.") : reply
+        log("build \(b.task) \(status) in \(Int(Date().timeIntervalSince(b.started))) s: \(result)")
+        rose.buildDone(b.task, status: status, result: result)
     }
 
     /// Process queued installs once online; with --wait-direct, once the direct
@@ -406,10 +367,10 @@ final class AgentModel: ObservableObject {
     }
 
     private func sayPending() {
-        guard let s = pendingSays.first, online, codex.thread != nil else { return }
+        guard let s = pendingSays.first, online, roseReady else { return }
         pendingSays.removeFirst()
         log("typed request: \(s)")
-        userTurn(s)
+        rose.text(s)
         guard !pendingSays.isEmpty else { return }
         let args = CommandLine.arguments
         let gap = args.firstIndex(of: "--say-gap").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil } ?? 10
@@ -497,14 +458,11 @@ final class AgentModel: ObservableObject {
                 installs.removeAll()
                 phonePython = nil
             }
+            rose.phone(online: up)
             if up {
                 link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac",
                            "agent_name": agentName, "shield": true, "locomo": locomoApp != nil])
                 sayPending()
-                if let i = CommandLine.arguments.firstIndex(of: "--speak"), i + 1 < CommandLine.arguments.count {
-                    let line = CommandLine.arguments[i + 1]
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.say(line) }
-                }
                 if CommandLine.arguments.contains("--unpair-remote") {
                     log("unpairing (--unpair-remote)")
                     unpair()
@@ -516,10 +474,10 @@ final class AgentModel: ObservableObject {
         case .direct(let addr):
             directPath = addr
         case .mic(let pcm):
-            if useRose { rose.feed(pcm) } else { listener.feed(pcm) }
+            rose.feed(pcm)
             micBytes += pcm.count
             if Date().timeIntervalSince(micSince) >= 10 {
-                log(String(format: "microphone: %.1f KB/s from the phone, peak %.2f", Double(micBytes) / Date().timeIntervalSince(micSince) / 1000, listener.level))
+                log(String(format: "microphone: %.1f KB/s from the phone", Double(micBytes) / Date().timeIntervalSince(micSince) / 1000))
                 micBytes = 0
                 micSince = Date()
             }
@@ -715,9 +673,12 @@ final class AgentModel: ObservableObject {
             receiveLocomo(o)
         case "stop":
             log("tapped to interrupt")
-            if useRose { rose.stop("tapped") } else { bargeIn() }
+            rose.interrupt()
         case "audio_report":
-            if useRose, let m = o["msg"] as? [String: Any] { rose.client(m) }
+            if let m = o["msg"] as? [String: Any] {
+                if m["type"] as? String == "stopped" { log("the phone's player stopped: \(m)") }
+                rose.client(m)
+            }
         case "installed":
             let name = o["name"] as? String ?? ""
             if let (_, done) = installs.removeValue(forKey: name) {
@@ -748,198 +709,19 @@ final class AgentModel: ObservableObject {
         }
     }
 
-    // MARK: listening
+    // MARK: Rose's calls for the phone
 
-    private func words(_ s: String) -> [String] {
-        s.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 }
-    }
-
-    private var agentAudible: Bool { speaker.speaking || Date() < playingUntil }
-
-    /// Words heard that the agent is not saying itself.
-    private func novel(_ s: String) -> Int {
-        let recent = spoken.filter { Date().timeIntervalSince($0.0) < 15 }.reduce(into: Set<String>()) { $0.formUnion($1.1) }
-        return words(s).filter { !recent.contains($0) }.count
-    }
-
-    private func partial(_ t: String) {
-        heard = t
-        if agentAudible && !bargedIn && novel(t) >= 2 {
-            log("barge-in: \(t)")
-            bargeIn()
-        }
-    }
-
-    private func final(_ t: String) {
-        heard = ""
-        if agentAudible && !bargedIn && novel(t) < 2 {
-            log("ignored our own voice: \(t)")
-            return
-        }
-        bargedIn = false
-        userTurn(t)
-    }
-
-    func userTurn(_ t: String) {
-        lines.append(Line(user: true, text: t))
-        link.send(["t": "transcript", "who": "user", "text": t, "final": true])
-        log("user: \(t)")
-        if requestAt == nil || activity == "idle" {
-            requestAt = Date()
-            request = t
-            timing = ["request": t, "at": ISO8601DateFormatter().string(from: Date())]
-        }
-        guard codex.thread != nil else {
-            say("Codex isn't ready on the Mac yet.")
-            return
-        }
-        if renamed {
-            // A name changed in the app or by --name: tell Codex with the next turn.
-            renamed = false
-            codex.say("(Your name is now \(agentName).) " + t)
-            return
-        }
-        codex.say(t)
-    }
-
-    private func bargeIn() {
-        bargedIn = agentAudible
-        speaker.stop()
-        playingUntil = .distantPast
-        link.send(["t": "say_stop"])
-        setActivity(codex.activeTurn != nil ? "thinking" : "idle")
-    }
-
-    // MARK: speaking
-
-    private func clean(_ s: String) -> String {
-        var t = s.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: "")
-        t = t.replacingOccurrences(of: "#", with: "").replacingOccurrences(of: "\n", with: " ")
-        return t.trimmingCharacters(in: .whitespaces)
-    }
-
-    private func say(_ s: String) {
-        let t = clean(s)
-        guard !t.isEmpty else { return }
-        if useRose {
-            let rid = nextReply
-            nextReply += 1
-            rose.reply(rid, t)
-            rose.replyEnd(rid)
-            return
-        }
-        spoken.append((Date(), Set(words(t))))
-        spoken.removeAll { Date().timeIntervalSince($0.0) > 30 }
-        speaker.say(t)
-        setActivity("speaking")
-    }
-
-    private func sendSpeech(_ id: UInt32, _ pcm: Data) {
-        var body = Data()
-        withUnsafeBytes(of: id.littleEndian) { body.append(contentsOf: $0) }
-        body.append(pcm)
-        link.send(kind: 0x21, body)
-        speechBytes += pcm.count
-        let seconds = Double(pcm.count / 2) / 24000
-        playingUntil = max(playingUntil, Date()) + seconds
-        // The phone's ring and the relay add about half a second.
-        playingUntil = max(playingUntil, Date() + 0.6)
-    }
-
-    private func rid(_ item: String) -> Int {
-        if let r = replyIDs[item] { return r }
-        let r = nextReply
-        nextReply += 1
-        replyIDs[item] = r
-        return r
-    }
-
-    /// Speak whole sentences of a reply as they stream in.
-    private func delta(_ id: String, _ d: String) {
-        if useRose {
-            // Rose's speaker cuts clauses and sentences itself.
-            rose.reply(rid(id), d.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: ""))
-            replySent[id, default: 0] += d.count
-            texts[id] = (texts[id] ?? "") + d
-            link.send(["t": "transcript", "who": "agent", "text": clean(texts[id] ?? ""), "final": false])
-            return
-        }
-        let text = (texts[id] ?? "") + d
-        texts[id] = text
-        var from = said[id] ?? 0
-        let chars = Array(text)
-        var i = from
-        while i < chars.count {
-            let c = chars[i]
-            if ".!?".contains(c), i + 1 < chars.count, chars[i + 1] == " " {
-                say(String(chars[from...i]))
-                from = i + 1
-            }
-            i += 1
-        }
-        said[id] = from
-        link.send(["t": "transcript", "who": "agent", "text": clean(text), "final": false])
-    }
-
-    private func message(_ id: String, _ full: String) {
-        if useRose {
-            if replySent[id] == nil { rose.reply(rid(id), clean(full)) }
-            rose.replyEnd(rid(id))
-            lines.append(Line(user: false, text: clean(full)))
-            link.send(["t": "transcript", "who": "agent", "text": clean(full), "final": true])
-            log("agent: \(full)")
-            return
-        }
-        let from = said[id] ?? 0
-        let chars = Array(full)
-        if from < chars.count { say(String(chars[from...])) }
-        said[id] = chars.count
-        lines.append(Line(user: false, text: clean(full)))
-        link.send(["t": "transcript", "who": "agent", "text": clean(full), "final": true])
-        log("agent: \(full)")
-    }
-
-    private func setActivity(_ a: String) {
-        var state = a
-        if state == "idle" && (speaker.speaking || (useRose && roseAudible)) { state = "speaking" }
-        // While the talker is quiet, the phone shows the build going on (it keeps listening).
-        if state == "idle" && building != nil { state = "building" }
-        if state == "building" && building == nil && codex.activeTurn == nil { state = "idle" }
-        activity = state
-        let phoneState = state == "idle" ? "listening" : state
-        link.send(["t": "state", "state": phoneState])
-    }
-
-    // MARK: tools
-
-    private func tool(_ name: String, _ args: [String: Any], _ done: @escaping ([String: Any]) -> Void) {
-        func reply(_ ok: Bool, _ text: String) {
-            done(["success": ok, "contentItems": [["type": "inputText", "text": text]]])
-        }
+    /// open_app, list_apps, remove_app from Rose's conversation, answered from the phone.
+    private func call(_ id: Int, _ name: String, _ args: [String: Any]) {
+        let answer: ([String: Any]) -> Void = { [weak self] result in self?.rose.answer(id, result) }
+        guard online else { return answer(["ok": false, "reason": "The phone is offline."]) }
         switch name {
-        case "build_app":
-            reply(true, startBuild(args["request"] as? String ?? ""))
-        case "build_status":
-            reply(true, buildStatus())
-        case "cancel_build":
-            let was = building != nil
-            builder.interrupt()
-            reply(true, was ? "Stopped the build." : "No build was running.")
-        case "install_app":
-            install(args) { ok, text in reply(ok, text) }
-        case "rename_assistant":
-            let n = args["name"] as? String ?? ""
-            rename(n)
-            renamed = false
-            reply(!n.isEmpty, n.isEmpty ? "No name given." : "Saved. Your name is now \(agentName), and the phone shows it.")
         case "list_apps":
-            guard online else { return reply(false, "The phone is offline.") }
             appLists.append { o in
                 let apps = (o["apps"] as? [[String: Any]] ?? []).filter { ($0["name"] as? String) != "python" }
-                let list = apps.map { "\($0["title"] ?? "") (\($0["name"] ?? ""), \(($0["bytes"] as? Int ?? 0) / 1024) KB)" }
-                let free = (o["free"] as? Int ?? 0) / 1024
-                let python = (o["python"] as? Bool ?? false) ? "Python is installed." : "Python is not installed yet (a Python app needs about 5 MB once)."
-                reply(true, (list.isEmpty ? "No apps are installed." : "Installed: " + list.joined(separator: "; ") + ".") + " Room left: \(free) KB. " + python)
+                answer(["ok": true, "apps": apps.map { ["name": $0["name"] ?? "", "title": $0["title"] ?? "",
+                                                         "kilobytes": ($0["bytes"] as? Int ?? 0) / 1024] },
+                        "free_kilobytes": (o["free"] as? Int ?? 0) / 1024, "python_installed": o["python"] as? Bool ?? false])
             }
             link.send(["t": "apps"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -948,10 +730,9 @@ final class AgentModel: ObservableObject {
             }
         case "remove_app":
             let app = args["name"] as? String ?? ""
-            guard online else { return reply(false, "The phone is offline.") }
             removals[app] = { o in
                 let ok = o["ok"] as? Bool ?? false
-                reply(ok, ok ? "Removed \(app) from the phone." : "Could not remove \(app): \(o["error"] as? String ?? "no answer")")
+                answer(ok ? ["ok": true, "removed": app] : ["ok": false, "reason": o["error"] as? String ?? "no answer"])
             }
             link.send(["t": "uninstall", "name": app])
             log("removing \(app) from the phone")
@@ -960,13 +741,11 @@ final class AgentModel: ObservableObject {
             }
         case "open_app":
             let app = args["name"] as? String ?? ""
-            guard online else { return reply(false, "The phone is offline.") }
-            guard opens[app] == nil else { return reply(false, "An open request for \(app) is already pending.") }
+            guard opens[app] == nil else { return answer(["ok": false, "reason": "An open request for \(app) is already pending."]) }
             let request = UUID()
-            opens[app] = (request, { answer in
-                let ok = answer["ok"] as? Bool == true
-                let reason = answer["error"] as? String ?? "the device refused the launch"
-                reply(ok, ok ? "Opened \(app) on the phone." : "Could not open \(app): \(reason)")
+            opens[app] = (request, { o in
+                let ok = o["ok"] as? Bool == true
+                answer(ok ? ["ok": true, "opened": app] : ["ok": false, "reason": o["error"] as? String ?? "the phone refused the launch"])
             })
             link.send(["t": "open", "name": app])
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -974,8 +753,23 @@ final class AgentModel: ObservableObject {
                 self.opens.removeValue(forKey: app)?.1(["ok": false, "error": "the phone did not answer"])
             }
         default:
-            reply(false, "Unknown tool \(name)")
+            answer(["ok": false, "reason": "Unknown call \(name)"])
         }
+    }
+
+    private func sendSpeech(_ id: UInt32, _ pcm: Data) {
+        var body = Data()
+        withUnsafeBytes(of: id.littleEndian) { body.append(contentsOf: $0) }
+        body.append(pcm)
+        link.send(kind: 0x21, body)
+    }
+
+    /// Rose's state, shown on the phone: listening, thinking, speaking, or building while she listens.
+    private func setActivity(_ a: String) {
+        var state = a == "idle" ? "listening" : a
+        if state == "listening" && building != nil { state = "building" }
+        activity = state
+        link.send(["t": "state", "state": state])
     }
 
     private func install(_ args: [String: Any], _ done: @escaping (Bool, String) -> Void) {
@@ -986,12 +780,20 @@ final class AgentModel: ObservableObject {
               let data = try? Data(contentsOf: path), !data.isEmpty else {
             return done(false, "That program is not in the workspace's build output.")
         }
-        guard online else { return done(false, "The phone is offline, so the app could not be installed.") }
+        guard online else {
+            // The link can drop for a moment (a network change, a relay hiccup): wait for it before giving up.
+            let deadline = (args["_wait_until"] as? Date) ?? Date().addingTimeInterval(20)
+            guard Date() < deadline else { return done(false, "The phone is offline, so the app could not be installed.") }
+            log("install of \(name) waits for the phone to come back")
+            var retry = args
+            retry["_wait_until"] = deadline
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.install(retry, done) }
+            return
+        }
         let started = Date()
         if let at = requestAt { timing["install_called_s"] = round(started.timeIntervalSince(at) * 10) / 10 }
         timing["name"] = name
         timing["bytes"] = data.count
-        setActivity("building")
         let python = data.starts(with: Data("#!/bin/python3".utf8))
         timing["language"] = python ? "python" : "rust"
         let finish: (Bool, String) -> Void = { [weak self] ok, error in
