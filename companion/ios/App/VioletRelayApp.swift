@@ -3,11 +3,15 @@ import SwiftUI
 @main
 struct VioletRelayApp: App {
     @StateObject private var model = RelayModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             StatusView(model: model)
                 .onAppear { model.start() }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active { model.becameActive() }
+                }
         }
     }
 }
@@ -15,6 +19,14 @@ struct VioletRelayApp: App {
 struct StatusView: View {
     @ObservedObject var model: RelayModel
     @State private var code = RelayConfig.pairingCode ?? ""
+    @FocusState private var enteringCode: Bool
+
+    private var joinLabel: String {
+        if let saved = RelayConfig.pairingCode, RelayConfig.normalizedCode(code) == saved {
+            return "Reconnect"
+        }
+        return model.selectedNetwork == nil ? "Join by code" : "Connect relay"
+    }
 
     var body: some View {
         let s = model.status
@@ -36,9 +48,12 @@ struct StatusView: View {
                     .font(.title3.monospaced())
                     .textInputAutocapitalization(.characters)
                     .autocorrectionDisabled()
+                    .focused($enteringCode)
                     .accessibilityIdentifier("pairing-code")
-                Button(model.selectedNetwork == nil ? "Join by code" : "Connect relay") { model.pair(code: code) }
-                    .disabled(RelayConfig.normalizedCode(code) == nil)
+                Button(joinLabel) {
+                    if model.pair(code: code) { enteringCode = false }
+                }
+                    .disabled(model.isJoining || RelayConfig.normalizedCode(code) == nil)
                     .accessibilityIdentifier("join")
                 row("Network", RelayConfig.pairingCode.map(RelayConfig.ssid(forCode:)) ?? "not paired", id: "network")
                 row("Wi-Fi", s.hotspot ?? "—", id: "hotspot")
@@ -46,7 +61,7 @@ struct StatusView: View {
             } header: {
                 Text("VioletOS")
             } footer: {
-                Text("Turn on Phone Internet in VioletOS Settings › Phone Link. Find its Wi-Fi network, then enter the code shown on VioletOS. For a connection that stays joined when you lock your iPhone, choose the Violet network in iPhone Settings › Wi-Fi.")
+                Text("Turn on Phone Internet in VioletOS Settings › Phone Link and enter the code here. If the accessory connection drops when you lock your iPhone, join the Violet network in iPhone Wi-Fi Settings for a persistent connection.")
             }
             Section("SOCKS5 relay") {
                 row("Listener", "\(s.listenerState) :\(s.port)", id: "listener-state")

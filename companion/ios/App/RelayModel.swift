@@ -9,9 +9,11 @@ import UIKit
 enum RelayConfig {
     static let username = "violet"
     static let ssidPrefix = "VioletRelayOpen-"
+    // Keep in sync with the Moto's relay clients in targets/moto-g-pure/ip.
+    static let handsetPort: UInt16 = 1081
     static var port: UInt16 {
         let v = UserDefaults.standard.integer(forKey: "port")
-        return (1...65535).contains(v) ? UInt16(v) : 1080
+        return (1...65535).contains(v) ? UInt16(v) : handsetPort
     }
 
     static var pairingSecret: String {
@@ -113,14 +115,36 @@ final class RelayModel: ObservableObject {
     private let accessories = ASAccessorySession()
     private var pendingNetwork: String?
     private var pickerOpen = false
+    private enum JoinPhase {
+        case configuring
+        case waiting(ContinuousClock.Instant)
+        case needsSettings
+        case failed
+    }
+
     private var started = false
-    private var joinedVioletNetwork = false
+    private let clock = ContinuousClock()
+    private var targetSSID = RelayConfig.pairingCode.map(RelayConfig.ssid(forCode:))
+    private var joinPhase: JoinPhase?
+    private var currentSSID: String?
+    private var wifiIPv4: [String] = []
+    private var wifiRevision = 0
+    private var checkingSSID = false
+    private var nextSSIDCheck: ContinuousClock.Instant?
+    // Every VioletOS access point assigns the same address. When changing
+    // targets, a lease already on en0 still belongs to the old connection.
+    private var needsNewLease = false
     private let launchedAt = Date()
-    private var hotspotState: String?
+    private var hotspotMessage: String?
     private var cellularAvailable = false
     private let cellMonitor = NWPathMonitor(requiredInterfaceType: .cellular)
     private var tick = 0
     private let keepAlive = KeepAlive()
+
+    var isJoining: Bool {
+        if case .configuring = joinPhase { return true }
+        return false
+    }
 
     static var statusURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("status.json")
@@ -154,11 +178,13 @@ final class RelayModel: ObservableObject {
                 NEHotspotConfigurationManager.shared.getConfiguredSSIDs { [weak self] ssids in
                     let matches = ssids.filter { $0.hasPrefix(prefix) }
                     matches.forEach { NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: $0) }
-                    self?.hotspotState = "removed \(matches.count) configurations matching \(ssid)"
+                    Task { @MainActor in
+                        self?.hotspotMessage = "removed \(matches.count) configurations matching \(ssid)"
+                    }
                 }
             } else {
                 NEHotspotConfigurationManager.shared.removeConfiguration(forSSID: ssid)
-                hotspotState = "removed configuration for \(ssid)"
+                hotspotMessage = "removed configuration for \(ssid)"
             }
         }
         if let join = RelayConfig.joinRequest { joinNetwork(ssid: join.ssid, passphrase: join.passphrase) }
@@ -208,7 +234,7 @@ final class RelayModel: ObservableObject {
                 guard let self else { return }
                 self.pickerOpen = false
                 guard (error as? ASError)?.code != .userCancelled else { return }
-                self.hotspotState = "Couldn't find Violet networks. Check Phone Internet on VioletOS or join by code."
+                self.hotspotMessage = "Couldn't find Violet networks. Check Phone Internet on VioletOS or join by code."
                 self.refresh()
             }
         }
@@ -217,21 +243,22 @@ final class RelayModel: ObservableObject {
     func selectNetwork(_ ssid: String) {
         guard RelayConfig.isVioletNetwork(ssid) else { return }
         selectedNetwork = ssid
-        hotspotState = "Enter the pairing code shown on VioletOS"
+        hotspotMessage = "Enter the pairing code shown on VioletOS"
         refresh()
     }
 
     /// Save a pairing code from VioletOS and join its network. Returns false for a bad code.
     @discardableResult
     func pair(code text: String) -> Bool {
+        guard !isJoining else { return false }
         guard let code = RelayConfig.normalizedCode(text) else {
-            hotspotState = "That code isn't 12 letters and numbers (0-9, A-F)"
+            hotspotMessage = "That code isn't 12 letters and numbers (0-9, A-F)"
             refresh()
             return false
         }
         let ssid = RelayConfig.ssid(forCode: code)
         if let selectedNetwork, selectedNetwork != ssid {
-            hotspotState = "That code is for a different Violet network"
+            hotspotMessage = "That code is for a different Violet network"
             refresh()
             return false
         }
@@ -241,34 +268,78 @@ final class RelayModel: ObservableObject {
         return true
     }
 
-    // VioletOS's Phone Internet DHCP server gives the iPhone this fixed lease.
-    private static let violetLease = "192.168.77.2"
-
-    private static func isJoined(_ ssid: String, currentSSID: String?) -> Bool {
-        if let currentSSID { return currentSSID == ssid }
-        return RelayConfig.isVioletNetwork(ssid) && ipv4Addresses()["en0"]?.contains(violetLease) == true
+    /// Recheck immediately on returning from the system picker or Settings.
+    func becameActive() {
+        nextSSIDCheck = nil
+        refresh()
     }
 
-    private func recordJoin(_ ssid: String) {
-        joinedVioletNetwork = RelayConfig.isVioletNetwork(ssid)
-        hotspotState = "joined \(ssid)"
+    private func observeSSID() {
+        guard UIApplication.shared.applicationState == .active, targetSSID != nil, !checkingSSID,
+              nextSSIDCheck.map({ clock.now >= $0 }) ?? true else { return }
+        checkingSSID = true
+        let revision = wifiRevision
+        Task {
+            let ssid = await NEHotspotNetwork.fetchCurrent()?.ssid
+            checkingSSID = false
+            if revision == wifiRevision {
+                currentSSID = ssid
+                nextSSIDCheck = clock.now.advanced(by: .seconds(2))
+                refresh()
+            }
+        }
     }
 
-    /// Join a Wi-Fi network. The accessory picker uses iOS's temporary join.
+    private var connectionMessage: String? {
+        if let hotspotMessage { return hotspotMessage }
+        guard let targetSSID else { return nil }
+        let violet = RelayConfig.isVioletNetwork(targetSSID)
+        let observed = RelayWiFiStatus.observed(targetSSID: targetSSID, currentSSID: currentSSID,
+                                               wifiIPv4: needsNewLease ? [] : wifiIPv4, requiresVioletLease: violet)
+        switch observed {
+        case .connected:
+            if !isJoining { joinPhase = nil }
+            return "Connected to \(targetSSID)"
+        case .awaitingAddress:
+            return "Waiting for a Wi-Fi address from VioletOS…"
+        case .waitingForNetwork:
+            switch joinPhase {
+            case .configuring:
+                return "Joining \(targetSSID)…"
+            case .waiting(let until) where clock.now < until:
+                return "Connecting to \(targetSSID)…"
+            case .needsSettings:
+                return "iOS couldn’t join \(targetSSID). Try Reconnect or join it in iPhone Wi-Fi Settings."
+            case .waiting, .failed:
+                return "Still waiting for \(targetSSID). Check Phone Internet on VioletOS, then try Reconnect."
+            case nil:
+                return "Waiting for \(targetSSID). Tap Reconnect if needed."
+            }
+        }
+    }
+
+    /// Use the system accessory join for approved accessories. A code-only join
+    /// can use iOS's persistent configuration when the network permits it.
     func joinNetwork(ssid: String, passphrase: String) {
-        joinedVioletNetwork = false
-        hotspotState = "joining \(ssid)…"
+        guard !isJoining else { return }
+        let hasLease = Self.ipv4Addresses()["en0"]?.contains(RelayWiFiStatus.violetLease) == true
+        if let targetSSID, targetSSID != ssid, hasLease { needsNewLease = true }
+        targetSSID = ssid
+        hotspotMessage = nil
+        joinPhase = .configuring
+        refresh()
         relayLog.info("joining \(ssid, privacy: .public)")
         Task {
-            if Self.isJoined(ssid, currentSSID: await NEHotspotNetwork.fetchCurrent()?.ssid) {
-                recordJoin(ssid)
-                refresh()
+            defer { refresh() }
+            let currentSSID = await NEHotspotNetwork.fetchCurrent()?.ssid
+            let hasLease = Self.ipv4Addresses()["en0"]?.contains(RelayWiFiStatus.violetLease) == true
+            if currentSSID == ssid || (currentSSID == nil && hasLease && !needsNewLease && RelayConfig.isVioletNetwork(ssid)) {
+                if currentSSID == ssid { needsNewLease = false }
+                joinPhase = .waiting(clock.now.advanced(by: .seconds(15)))
                 return
             }
             let manager = NEHotspotConfigurationManager.shared
             do {
-                // AccessorySetupKit authorization belongs to the accessory,
-                // so a plain SSID configuration is denied for that network.
                 if passphrase.isEmpty, let accessory = accessories.accessories.first(where: { $0.ssid == ssid }) {
                     try await manager.joinAccessoryHotspotWithoutSecurity(accessory)
                 } else {
@@ -278,38 +349,20 @@ final class RelayModel: ObservableObject {
                     config.joinOnce = false
                     try await manager.apply(config)
                 }
-                hotspotState = "verifying \(ssid)…"
-                verifyJoined(ssid, attempt: 1)
+                joinPhase = .waiting(clock.now.advanced(by: .seconds(15)))
             } catch {
                 let error = error as NSError
                 switch (error.domain, error.code) {
                 case (NEHotspotConfigurationErrorDomain, NEHotspotConfigurationError.alreadyAssociated.rawValue):
-                    recordJoin(ssid)
+                    needsNewLease = false
+                    joinPhase = .waiting(clock.now.advanced(by: .seconds(15)))
                 case (NEHotspotConfigurationErrorDomain, NEHotspotConfigurationError.systemDenied.rawValue),
                      (NEHotspotConfigurationErrorDomain, NEHotspotConfigurationError.userUnauthorized.rawValue):
-                    hotspotState = "Join \(ssid) in iPhone Settings › Wi-Fi, then return to Violet Relay."
+                    joinPhase = .needsSettings
                 default:
-                    hotspotState = "join \(ssid) failed: \(error.localizedDescription) [\(error.code)]"
+                    joinPhase = .failed
                 }
-                relayLog.info("hotspot: \(self.hotspotState ?? "", privacy: .public)")
-            }
-            refresh()
-        }
-    }
-
-    private func verifyJoined(_ ssid: String, attempt: Int) {
-        NEHotspotNetwork.fetchCurrent { [weak self] network in
-            Task { @MainActor in
-                guard let self else { return }
-                if Self.isJoined(ssid, currentSSID: network?.ssid) {
-                    self.recordJoin(ssid)
-                } else if attempt < 10 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.verifyJoined(ssid, attempt: attempt + 1) }
-                    return
-                } else {
-                    self.hotspotState = "Couldn't confirm \(ssid). Join it in iPhone Settings › Wi-Fi, then return to Violet Relay."
-                }
-                relayLog.info("hotspot: \(self.hotspotState ?? "", privacy: .public)")
+                relayLog.info("hotspot join returned \(error.localizedDescription, privacy: .public) [\(error.code)]")
             }
         }
     }
@@ -327,18 +380,24 @@ final class RelayModel: ObservableObject {
             return c
         }
         let ifs = Self.ipv4Addresses()
-        if joinedVioletNetwork, ifs["en0"]?.contains(Self.violetLease) != true {
-            hotspotState = "Waiting for VioletOS to assign a Wi-Fi address."
-        } else if joinedVioletNetwork, let code = RelayConfig.pairingCode {
-            hotspotState = "joined \(RelayConfig.ssid(forCode: code))"
+        let addresses = (ifs["en0"] ?? []).sorted()
+        if addresses != wifiIPv4 {
+            wifiIPv4 = addresses
+            wifiRevision += 1
+            currentSSID = nil
+            nextSSIDCheck = nil
         }
+        if !wifiIPv4.contains(RelayWiFiStatus.violetLease) || (targetSSID != nil && currentSSID == targetSSID) {
+            needsNewLease = false
+        }
+        observeSSID()
         status = RelayStatus(updatedAt: Date(), launchedAt: launchedAt, listenerState: snapshot.listenerState,
-                             port: snapshot.boundPort ?? 0, requestedPort: RelayConfig.port, wifiIPv4: ifs["en0"] ?? [], allIPv4: ifs,
+                             port: snapshot.boundPort ?? 0, requestedPort: RelayConfig.port, wifiIPv4: wifiIPv4, allIPv4: ifs,
                              cellularAvailable: cellularAvailable,
                              activeConnections: snapshot.activeConnections, totalConnections: snapshot.totalConnections,
                              failedConnections: snapshot.failedConnections, authFailures: snapshot.authFailures,
                              bytesUp: snapshot.bytesUp, bytesDown: snapshot.bytesDown,
-                             lastError: snapshot.lastError, lastErrorAt: snapshot.lastErrorAt, hotspot: hotspotState, background: keepAlive.state, backgroundEvents: keepAlive.events,
+                             lastError: snapshot.lastError, lastErrorAt: snapshot.lastErrorAt, hotspot: connectionMessage, background: keepAlive.state, backgroundEvents: keepAlive.events,
                              recentErrors: snapshot.recentErrors)
         tick += 1
         if tick % 4 == 1 { writeStatus() }

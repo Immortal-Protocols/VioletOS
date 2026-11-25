@@ -64,7 +64,7 @@ final class RelayUITests: XCTestCase {
         while Date() < deadline {
             handled += acceptSystemAlerts()
             let hotspot = app.staticTexts["hotspot"].label
-            let joinSettled = !joining || hotspot.hasPrefix("joined") || hotspot.contains("failed")
+            let joinSettled = !joining || hotspot.hasPrefix("Connected to") || hotspot.hasPrefix("Still waiting") || hotspot.hasPrefix("iOS couldn’t join")
             if listener.label.hasPrefix("listening"), joinSettled, Date() > deadline.addingTimeInterval(-12) { break }
             sleep(1)
         }
