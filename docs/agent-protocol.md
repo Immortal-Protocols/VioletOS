@@ -81,7 +81,7 @@ An install arrives (raw DEFLATE when `encoding` says so), is inflated and checke
 
 A Python app is a `#!/bin/python3` script installed the same way. The handset image has no Python, so before the first one the Mac installs the package `python` ([tools/build_python_package.py](../tools/build_python_package.py)): data starting with `VGZ1` that the Open Runtime unpacks into `/bin` and `/lib` at every start rather than keeping as `/apps/python`. The phone's next `hello` says `python: true`.
 
-**Locomo Music.** The Mac advertises the enabled plugin as `locomo: true` in `hello` or sends `locomo_available` when it is enabled during the session. The device sends `locomo_make` with a request UUID in `id` and includes `resume: true` when reconnecting for that request. The Mac responds with `locomo_status` (`id`, `message`, `done`), or `locomo_track` (`id`, `title`, `durationMs`, `size`, `sha256`), MP3 records, then `locomo_end` with the request ID. The device publishes the file to Music after checking its SHA-256.
+**Locomo Music.** The Mac advertises the enabled plugin as `locomo: true` in `hello` and sends `locomo_available` with an `enabled` boolean when availability changes during the session. The device sends `locomo_make` with a request UUID in `id` and includes `resume: true` when reconnecting for that request. The Mac responds with `locomo_status` (`id`, `message`, `done`), or `locomo_track` (`id`, `title`, `durationMs`, `size`, `sha256`), MP3 records, then `locomo_end` with the request ID. The device publishes the file to Music after checking its SHA-256.
 
 ## Direct path
 

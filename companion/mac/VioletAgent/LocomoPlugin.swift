@@ -7,6 +7,10 @@ import Security
 enum LocomoPlugin {
     static let maxBytes = 4 * 1024 * 1024
     private static let bundleID = "com.locomomusic.mac"
+    static var encoder: String? {
+        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            .first(where: FileManager.default.isExecutableFile(atPath:))
+    }
 
     struct Song {
         let title: String
@@ -38,7 +42,7 @@ enum LocomoPlugin {
         guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess,
               SecRequirementCreateWithString(rule as CFString, [], &requirement) == errSecSuccess,
               let code, let requirement,
-              SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess else {
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckNestedCode | kSecCSStrictValidate), requirement) == errSecSuccess else {
             throw Failure.release
         }
     }
@@ -69,13 +73,19 @@ enum LocomoPlugin {
     private static func startStation(pid: pid_t) async -> Bool {
         guard AXIsProcessTrusted() else { return false }
         let app = AXUIElementCreateApplication(pid)
-        let elements = controls(app)
-        // Selecting another station can start its own automatic run. Require the open station.
-        guard let station = elements.first(where: { label($0) == "Cool Jazz, Jazz" }),
-              value(station, kAXValueAttribute) as? NSNumber == 1,
-              elements.contains(where: { label($0) == "Make a new song" }),
-              let start = elements.first(where: { label($0) == "Start continuous generation" }),
-              AXUIElementPerformAction(start, kAXPressAction as CFString) == .success else { return false }
+        var elements = controls(app)
+        guard let station = elements.first(where: { label($0) == "Cool Jazz, Jazz" }) else { return false }
+        if value(station, kAXValueAttribute) as? NSNumber == 0 {
+            guard AXUIElementPerformAction(station, kAXPressAction as CFString) == .success else { return false }
+            try? await Task.sleep(for: .milliseconds(300))
+            elements = controls(app)
+        }
+        guard elements.contains(where: { label($0) == "Cool Jazz" }) else { return false }
+        if let start = elements.first(where: { label($0) == "Start continuous generation" }) {
+            guard AXUIElementPerformAction(start, kAXPressAction as CFString) == .success else { return false }
+        } else if !elements.contains(where: { label($0) == "Stop continuous generation" }) {
+            return false
+        }
 
         // Locomo has already started the first job. Stop clears its pending automatic queue.
         for _ in 0..<20 {
@@ -145,8 +155,7 @@ enum LocomoPlugin {
     }
 
     private static func encode(_ source: URL) throws -> Data {
-        let candidates = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-        guard let ffmpeg = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else { throw Failure.encoder }
+        guard let ffmpeg = encoder else { throw Failure.encoder }
         let child = Process()
         child.executableURL = URL(fileURLWithPath: ffmpeg)
         child.arguments = ["-v", "error", "-nostdin", "-i", source.path, "-map", "0:a:0",

@@ -6,20 +6,52 @@ import SwiftUI
 @main
 struct VioletAgentApp: App {
     @StateObject private var model = AgentModel()
+    @State private var tab = Tab.agent
+    private enum Tab { case agent, shield, locomo, add }
 
     var body: some Scene {
         WindowGroup("Violet Agent") {
-            TabView {
+            TabView(selection: $tab) {
                 ContentView()
                     .tabItem { Label("Agent", systemImage: "waveform") }
+                    .tag(Tab.agent)
                 List { ShieldSection() }
                     .tabItem { Label("Violet Shield", systemImage: "shield") }
-                LocomoView()
+                    .tag(Tab.shield)
+                if model.locomoApp != nil {
+                    LocomoView {
+                        tab = .add
+                        model.removeLocomo()
+                    }
                     .tabItem { Label("Locomo Music", systemImage: "music.note") }
+                    .tag(Tab.locomo)
+                }
+                Form {
+                    Section("Local Plugins") {
+                        Label("Locomo Music", systemImage: "music.note")
+                        Text("Generate songs on this Mac and play them on your paired device.")
+                            .foregroundStyle(.secondary)
+                        if model.locomoApp == nil {
+                            Button("Set Up Locomo Music") { model.setupLocomo() }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.locomoInstalling)
+                            if model.locomoInstalling { ProgressView().controlSize(.small) }
+                            Text(model.locomoStatus).foregroundStyle(.secondary)
+                        } else {
+                            Button("Open Locomo Music Tab") { tab = .locomo }
+                        }
+                    }
+                }
+                .formStyle(.grouped)
+                .tabItem { Text("+").accessibilityLabel("Add Local Plugin") }
+                .tag(Tab.add)
             }
                 .environmentObject(model)
                 .frame(minWidth: 560, minHeight: 640)
                 .onAppear { model.start() }
+                .onChange(of: model.locomoApp) { _, app in
+                    if app != nil && tab == .add { tab = .locomo }
+                }
         }
         .windowResizability(.contentMinSize)
     }
@@ -27,12 +59,15 @@ struct VioletAgentApp: App {
 
 struct LocomoView: View {
     @EnvironmentObject var model: AgentModel
+    let remove: () -> Void
 
     var body: some View {
         Form {
             Section("Locomo Music") {
                 Text(model.locomoStatus)
-                Button("Choose Locomo Music…") { model.chooseLocomo() }
+                Button("Enable One-Tap Generation…") { LocomoSetup.requestAccessibility() }
+                Button("Remove Plugin", action: remove)
+                    .disabled(model.locomoRunning)
             }
         }
         .formStyle(.grouped)

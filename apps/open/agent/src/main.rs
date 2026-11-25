@@ -493,7 +493,7 @@ impl Agent {
         let t = v["t"].as_str().unwrap_or("");
         let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
         match t {
-            "locomo_available" => self.locomo.set_available(true),
+            "locomo_available" => self.locomo.set_available(v["enabled"].as_bool().unwrap_or(true)),
             "locomo_status" | "locomo_track" | "locomo_end" => self.locomo.record(&v),
             "hello" => {
                 self.locomo.set_available(v["locomo"] == true);

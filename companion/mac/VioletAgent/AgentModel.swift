@@ -3,7 +3,6 @@
 import CryptoKit
 import Foundation
 import SwiftUI
-import UniformTypeIdentifiers
 import CoreImage
 import AppKit
 
@@ -38,10 +37,12 @@ final class AgentModel: ObservableObject {
     @Published var lastTiming: String?
     @Published var agentName = "Violet"
 
-    @Published var locomoStatus = "Choose the official Locomo Music app to enable this plugin."
+    @Published var locomoStatus = "Downloads Locomo Music and prepares its local models."
     @Published private(set) var locomoApp: URL?
+    @Published private(set) var locomoInstalling = false
     private var locomoJob: (id: UUID, phone: String, status: String, song: LocomoPlugin.Song?)?
-    private var locomoRunning = false
+    @Published private(set) var locomoRunning = false
+    private var locomoRegistration: URL { support.appendingPathComponent("locomo-plugin") }
 
     private var saved: Saved
     private let identity: Curve25519.Signing.PrivateKey
@@ -159,6 +160,9 @@ final class AgentModel: ObservableObject {
         if args.contains("--show-code") { showCode() }
         if let i = args.firstIndex(of: "--locomo-app"), i + 1 < args.count {
             enableLocomo(URL(fileURLWithPath: args[i + 1]))
+        } else if FileManager.default.fileExists(atPath: locomoRegistration.path),
+                  FileManager.default.fileExists(atPath: LocomoSetup.installedApp.path) {
+            enableLocomo(LocomoSetup.installedApp)
         }
         speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
         speaker.onEnd = { [weak self] id in
@@ -536,11 +540,41 @@ final class AgentModel: ObservableObject {
         }
     }
 
-    func chooseLocomo() {
-        let picker = NSOpenPanel()
-        picker.allowedContentTypes = [.applicationBundle]
-        picker.prompt = "Enable Locomo"
-        if picker.runModal() == .OK, let url = picker.url { enableLocomo(url) }
+    func setupLocomo() {
+        guard !locomoInstalling, locomoApp == nil else { return }
+        locomoInstalling = true
+        locomoStatus = "Downloading and verifying Locomo Music…"
+        Task { @MainActor in
+            defer { locomoInstalling = false }
+            do {
+                let app = try await LocomoSetup.installApp()
+                if LocomoPlugin.encoder == nil {
+                    locomoStatus = "Installing ffmpeg for phone playback…"
+                    try await LocomoSetup.installEncoder()
+                }
+                locomoStatus = "Preparing Locomo’s music models…"
+                try await LocomoSetup.prepareModels(app) { self.locomoStatus = $0 }
+                try Data().write(to: locomoRegistration, options: .atomic)
+                enableLocomo(app)
+            } catch {
+                locomoStatus = error.localizedDescription
+            }
+        }
+    }
+
+    func removeLocomo() {
+        guard !locomoRunning else { return }
+        do {
+            if FileManager.default.fileExists(atPath: locomoRegistration.path) {
+                try FileManager.default.removeItem(at: locomoRegistration)
+            }
+            locomoApp = nil
+            locomoJob = nil
+            locomoStatus = "Downloads Locomo Music and prepares its local models."
+            link.send(["t": "locomo_available", "enabled": false])
+        } catch {
+            locomoStatus = error.localizedDescription
+        }
     }
 
     private func enableLocomo(_ url: URL) {
@@ -548,7 +582,7 @@ final class AgentModel: ObservableObject {
             try LocomoPlugin.verify(url)
             locomoApp = url
             locomoStatus = "Cool Jazz is ready to request from Locomo Music on the paired device."
-            link.send(["t": "locomo_available"])
+            link.send(["t": "locomo_available", "enabled": true])
         } catch {
             locomoStatus = error.localizedDescription
         }
