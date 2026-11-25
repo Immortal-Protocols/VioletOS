@@ -170,6 +170,11 @@ impl Disk {
         self.request(1, index, bytes)?;
         self.request(4, 0, bytes)
     }
+    /// The emulator has no Android userdata partition to claim.
+    #[allow(dead_code)]
+    pub fn adopt_userdata(&mut self) -> &'static [u8] {
+        b"NO USERDATA"
+    }
     /// The installed apps' extent: sectors 4096 onward of a disk large enough
     /// (tools/run.py makes it 16 MiB), up to 12 MiB.
     #[allow(dead_code)]
