@@ -152,6 +152,7 @@ fn download(url: String, stop: Arc<AtomicBool>, status: Arc<Mutex<String>>, out:
 /// The decoder's side of the download.
 struct Pieces {
     rx: Mutex<Receiver<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
     buf: Vec<u8>,
     pos: usize,
 }
@@ -159,12 +160,16 @@ struct Pieces {
 impl Read for Pieces {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         while self.pos >= self.buf.len() {
-            match self.rx.lock().unwrap().recv() {
+            if self.stop.load(Relaxed) {
+                return Ok(0);
+            }
+            match self.rx.lock().unwrap().recv_timeout(Duration::from_millis(100)) {
                 Ok(b) => {
                     self.buf = b;
                     self.pos = 0;
                 }
-                Err(_) => return Ok(0),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
             }
         }
         let n = out.len().min(self.buf.len() - self.pos);
@@ -222,18 +227,28 @@ impl Player {
         self.track.store(index as i32, Relaxed);
         self.frames.store(0, Relaxed);
         self.failure.lock().unwrap().clear();
+        let local = c.tracks[index].audio == crate::locomo::TRACK;
         let url = format!("{}/{}", c.base, c.tracks[index].audio);
         let (audio, frames, paused, failure, bands, finished, s) =
             (self.audio.clone(), self.frames.clone(), self.paused.clone(), self.failure.clone(), self.bands.clone(), self.finished_tx.clone(), stop.clone());
         let handle = thread::spawn(move || {
-            // Eight pieces of 128 KiB: about a minute at 128 kbps.
-            let (tx, rx) = mpsc::sync_channel(8);
-            let (dl_stop, dl_status) = (s.clone(), failure.clone());
-            let downloader = thread::spawn(move || download(url, dl_stop, dl_status, tx));
-            let source = Pieces { rx: Mutex::new(rx), buf: Vec::new(), pos: 0 };
-            let ended = decode(source, &s, &audio, &frames, &paused, &bands, &failure);
-            s.store(true, Relaxed); // stop the download if the song ended early
-            drop(downloader);
+            let ended = if local {
+                match crate::locomo::open() {
+                    Ok((_, file)) => decode(file, &s, &audio, &frames, &paused, &bands, &failure),
+                    Err(e) => {
+                        *failure.lock().unwrap() = format!("Could not open the Locomo track: {e}");
+                        false
+                    }
+                }
+            } else {
+                // Eight pieces of 128 KiB: about a minute at 128 kbps.
+                let (tx, rx) = mpsc::sync_channel(8);
+                let (dl_stop, dl_status) = (s.clone(), failure.clone());
+                thread::spawn(move || download(url, dl_stop, dl_status, tx));
+                let source = Pieces { rx: Mutex::new(rx), stop: s.clone(), buf: Vec::new(), pos: 0 };
+                decode(source, &s, &audio, &frames, &paused, &bands, &failure)
+            };
+            s.store(true, Relaxed);
             if ended {
                 println!("music: song ended after {} s", frames.load(Relaxed) / 48_000);
                 let _ = finished.send(index as i32);
@@ -255,7 +270,7 @@ impl Player {
 
 /// Decode and play until the song ends (true) or is stopped (false).
 fn decode(
-    source: Pieces,
+    source: impl Read + Send + Sync + 'static,
     stop: &AtomicBool,
     audio: &Mutex<File>,
     frames: &AtomicI64,

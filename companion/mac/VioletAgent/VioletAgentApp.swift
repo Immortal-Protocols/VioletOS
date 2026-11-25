@@ -14,12 +14,28 @@ struct VioletAgentApp: App {
                     .tabItem { Label("Agent", systemImage: "waveform") }
                 List { ShieldSection() }
                     .tabItem { Label("Violet Shield", systemImage: "shield") }
+                LocomoView()
+                    .tabItem { Label("Locomo Music", systemImage: "music.note") }
             }
                 .environmentObject(model)
                 .frame(minWidth: 560, minHeight: 640)
                 .onAppear { model.start() }
         }
         .windowResizability(.contentMinSize)
+    }
+}
+
+struct LocomoView: View {
+    @EnvironmentObject var model: AgentModel
+
+    var body: some View {
+        Form {
+            Section("Locomo Music") {
+                Text(model.locomoStatus)
+                Button("Choose Locomo Music…") { model.chooseLocomo() }
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 

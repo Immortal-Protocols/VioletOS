@@ -2,6 +2,7 @@
 //! Wi-Fi and plays it. HTTPS with rustls, MP3 decoding in the app
 //! (symphonia), PCM to /dev/violet/audio, and a full 720x1600 interface
 //! drawn into /dev/violet/screen.
+mod locomo;
 mod player;
 mod ui;
 
@@ -19,6 +20,7 @@ fn main() {
     let fonts = Fonts::load();
     let mut frame = screen.canvas();
     let mut layer = Canvas::new(W, H);
+    let emulator = violet::fields(&violet::sys("status")).get("emulator").is_some_and(|v| v == "1");
     let splash = |screen: &mut Screen, frame: &mut Canvas, line: &str| {
         let b = frame.bounds();
         frame.fill(b, rgb(20, 14, 30));
@@ -30,17 +32,16 @@ fn main() {
     };
     // Until something can play, the splash answers Home and focus changes.
     let wait_on_splash = |screen: &mut Screen, frame: &mut Canvas, line: &str, timeout: Duration| {
-        let mut line = line.to_string();
-        splash(screen, frame, &line);
+        splash(screen, frame, line);
         let deadline = Instant::now() + timeout;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match events.recv_timeout(left) {
-                Ok(e) if e.focus_gained() => splash(screen, frame, &line),
+                Ok(e) if e.focus_gained() => splash(screen, frame, line),
                 Ok(e) if e.kind == TOUCH_DOWN && ui::HOME.inset(-12).contains(e.x, e.y) => violet::home(),
                 Ok(_) => {}
                 Err(_) => break,
             }
-                    }
+        }
     };
     // The catalog loads on its own thread, retrying while offline.
     let (catalog_tx, catalog_rx) = mpsc::channel();
@@ -56,19 +57,16 @@ fn main() {
             }
         }
     });
-    let mut line = "Connecting to the library…".to_string();
-    let catalog = loop {
-        match catalog_rx.try_recv() {
-            Ok(Ok(c)) => break c,
-            Ok(Err(e)) => {
-                println!("music: catalog: {e}");
-                line = "Waiting for the network…".into();
-            }
-            Err(_) => {}
-        }
-        wait_on_splash(&mut screen, &mut frame, &line, Duration::from_millis(500));
+    let mut catalog = player::Catalog {
+        name: "Locomo Music".into(),
+        album: "Connecting to the library…".into(),
+        base: String::new(),
+        tracks: Vec::new(),
     };
-    println!("music: {}, {} songs", catalog.album, catalog.tracks.len());
+    let mut local_track = None;
+    let mut local_id = None;
+    let mut plugin_status = String::new();
+    let mut last_locomo_check = Instant::now() - Duration::from_secs(1);
     let mut player = match player::Player::new() {
         Ok(p) => p,
         Err(e) => {
@@ -83,8 +81,8 @@ fn main() {
     let mut covers: HashMap<usize, ui::Cover> = HashMap::new();
     let mut requested: HashSet<usize> = HashSet::new();
     let (cover_tx, cover_rx) = mpsc::channel::<(usize, Option<ui::Cover>)>();
-    let want_cover = |i: usize, requested: &mut HashSet<usize>| {
-        if requested.insert(i) {
+    let want_cover = |catalog: &player::Catalog, i: usize, requested: &mut HashSet<usize>| {
+        if !catalog.tracks[i].cover.is_empty() && requested.insert(i) {
             let url = format!("{}/{}", catalog.base, catalog.tracks[i].cover);
             let tx = cover_tx.clone();
             std::thread::spawn(move || {
@@ -95,14 +93,16 @@ fn main() {
     };
 
     let mut shown: Option<Option<usize>> = None;
-    let play = |player: &mut player::Player, i: isize| {
+    let play = |player: &mut player::Player, catalog: &player::Catalog, i: isize| {
+        if catalog.tracks.is_empty() {
+            return;
+        }
         let n = catalog.tracks.len() as isize;
         let i = ((i % n + n) % n) as usize;
-        player.play(&catalog, i);
+        player.play(catalog, i);
         let t = &catalog.tracks[i];
         println!("music: playing {} {} ({} BPM, {})", t.number, t.title, t.bpm, t.key);
     };
-    play(&mut player, 0); // start the album right away
 
     let mut last_log = Instant::now();
     let mut last_look: Option<(u32, [u8; player::BANDS], bool, Option<usize>, String)> = None;
@@ -112,6 +112,50 @@ fn main() {
     let mut focused = true;
     loop {
         let wait = Duration::from_millis(if focused { 100 } else { 1000 });
+        while let Ok(result) = catalog_rx.try_recv() {
+            match result {
+                Ok(mut remote) => {
+                    println!("music: {}, {} songs", remote.album, remote.tracks.len());
+                    let was_empty = catalog.tracks.is_empty();
+                    catalog.tracks.append(&mut remote.tracks);
+                    catalog.base = remote.base;
+                    catalog.album = remote.album;
+                    catalog.name = remote.name;
+                    shown = None;
+                    if was_empty {
+                        play(&mut player, &catalog, 0);
+                    }
+                }
+                Err(e) => {
+                    println!("music: catalog: {e}");
+                    if catalog.tracks.is_empty() && catalog.album != "Waiting for the network…" {
+                        catalog.album = "Waiting for the network…".into();
+                        shown = None;
+                    }
+                }
+            }
+        }
+        if emulator && last_locomo_check.elapsed() >= Duration::from_millis(500) {
+            last_locomo_check = Instant::now();
+            let status = locomo::status();
+            if status != plugin_status {
+                plugin_status = status;
+                shown = None;
+            }
+            if let Ok((song, _)) = locomo::open() {
+                if local_id.as_ref() != Some(&song.id) {
+                    let i = *local_track.get_or_insert(catalog.tracks.len());
+                    if i == catalog.tracks.len() {
+                        catalog.tracks.push(song.track());
+                    } else {
+                        catalog.tracks[i] = song.track();
+                    }
+                    local_id = Some(song.id);
+                    shown = None;
+                    play(&mut player, &catalog, i as isize);
+                }
+            }
+        }
         match events.recv_timeout(wait) {
             Ok(e) if e.focus_gained() => {
                 focused = true;
@@ -119,26 +163,37 @@ fn main() {
                 last_look = None;
             }
             Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
+            Ok(e) if e.kind == TOUCH_DOWN && emulator && ui::LATEST.contains(e.x, e.y) => {
+                if let Some(i) = local_track {
+                    play(&mut player, &catalog, i as isize);
+                }
+            }
+            Ok(e) if e.kind == TOUCH_DOWN && emulator && ui::LOCOMO.contains(e.x, e.y) => {
+                if locomo::request().is_ok() {
+                    plugin_status = "Requesting a Cool Jazz song…".into();
+                    shown = None;
+                }
+            }
             Ok(e) if e.kind == TOUCH_DOWN => {
                 let current = player.track.load(Relaxed);
                 match ui::hit(e.x, e.y, catalog.tracks.len()) {
                     Some(ui::Hit::Home) => violet::home(),
                     Some(ui::Hit::Play) => {
                         if current < 0 {
-                            play(&mut player, 0);
+                            play(&mut player, &catalog, 0);
                         } else {
                             player.paused.store(!player.paused.load(Relaxed), Relaxed);
                         }
                     }
                     Some(ui::Hit::Prev) => {
                         if current >= 0 && player.position() > 3.0 {
-                            play(&mut player, current as isize);
+                            play(&mut player, &catalog, current as isize);
                         } else {
-                            play(&mut player, current as isize - 1);
+                            play(&mut player, &catalog, current as isize - 1);
                         }
                     }
-                    Some(ui::Hit::Next) => play(&mut player, current as isize + 1),
-                    Some(ui::Hit::Song(i)) => play(&mut player, i as isize),
+                    Some(ui::Hit::Next) => play(&mut player, &catalog, current as isize + 1),
+                    Some(ui::Hit::Song(i)) => play(&mut player, &catalog, i as isize),
                     None => {}
                 }
             }
@@ -147,7 +202,11 @@ fn main() {
         }
         while let Ok(done) = player.finished.try_recv() {
             if player.track.load(Relaxed) == done {
-                play(&mut player, done as isize + 1); // the album repeats
+                if local_track == Some(done as usize) {
+                    player.stop();
+                } else {
+                    play(&mut player, &catalog, done as isize + 1);
+                }
             }
         }
         while let Ok((i, c)) = cover_rx.try_recv() {
@@ -159,7 +218,9 @@ fn main() {
         let current = player.track.load(Relaxed);
         let current = (current >= 0).then_some(current as usize);
         let art = current.unwrap_or(0);
-        want_cover(art, &mut requested);
+        if !catalog.tracks.is_empty() {
+            want_cover(&catalog, art, &mut requested);
+        }
         if last_log.elapsed() > Duration::from_secs(10) {
             if let Some(i) = current {
                 last_log = Instant::now();
@@ -177,6 +238,9 @@ fn main() {
         let full = shown != Some(current);
         if full {
             ui::draw_static(&mut layer, &fonts, &catalog, covers.get(&art), current);
+            if emulator {
+                ui::draw_locomo(&mut layer, &fonts, &plugin_status, local_track.is_some());
+            }
             frame.px.copy_from_slice(&layer.px);
             shown = Some(current);
         }

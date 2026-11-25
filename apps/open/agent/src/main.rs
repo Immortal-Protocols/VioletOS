@@ -7,6 +7,7 @@
 //! docs/agent-protocol.md.
 mod direct;
 mod link;
+mod locomo;
 mod scan;
 mod secure;
 mod voice;
@@ -161,6 +162,7 @@ struct Agent {
     /// The agent's words so far this turn, shown as they arrive.
     partial: Option<String>,
     install: Option<Install>,
+    locomo: locomo::Locomo,
     /// The newest installed app: (name, title).
     built: Option<(String, String)>,
     listening: Arc<AtomicBool>,
@@ -188,6 +190,7 @@ impl Agent {
 
     /// (Re)connect to the room this phone belongs in.
     fn connect(&mut self) {
+        self.locomo.available = false;
         self.generation += 1;
         self.session = None;
         self.shield_requested = false;
@@ -457,6 +460,7 @@ impl Agent {
                 let seg = u32::from_le_bytes(body[..4].try_into().unwrap());
                 let _ = self.speech.send(voice::Speech::Pcm(seg, body[4..].to_vec()));
             }
+            0x33 if self.emulator => self.locomo.part(body),
             0x32 if self.shield_requested && body.len() <= 512 => {
                 violet::sys(&format!("shield-agent push {}", secure::hex(body)));
             }
@@ -489,7 +493,15 @@ impl Agent {
         let t = v["t"].as_str().unwrap_or("");
         let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
         match t {
+            "locomo_available" if self.emulator => self.locomo.available = true,
+            "locomo_status" | "locomo_track" | "locomo_end" if self.emulator => self.locomo.record(&v),
             "hello" => {
+                if self.emulator {
+                    self.locomo.available = v["locomo"] == true;
+                    if let Some(request) = self.locomo.resume() {
+                        self.send_json(request);
+                    }
+                }
                 self.shield_requested = !self.emulator && v["shield"].as_bool() == Some(true);
                 if !self.shield_requested { self.shield_polled = None; }
                 let name = text("name");
@@ -682,6 +694,7 @@ impl Agent {
     }
 
     fn unpair(&mut self, tell: bool) {
+        self.locomo = locomo::Locomo::default();
         if tell {
             self.send_json(json!({"t": "unpair"}));
             std::thread::sleep(Duration::from_millis(300));
@@ -1037,6 +1050,7 @@ fn main() {
         lines: Vec::new(),
         partial: None,
         install: None,
+        locomo: locomo::Locomo::default(),
         built: None,
         listening,
         muted: false,
@@ -1142,6 +1156,12 @@ fn main() {
             Err(_) => return,
         }
         a.poll_shield();
+        if a.emulator {
+            a.locomo.available &= a.session.is_some();
+            if let Some(request) = a.locomo.request() {
+                a.send_json(request);
+            }
+        }
         if a.session.is_some() && a.direct.is_none() && a.direct_next.is_some_and(|t| Instant::now() > t) {
             a.direct_next = None;
             a.start_direct();

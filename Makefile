@@ -80,6 +80,13 @@ test-agent:
 	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
 	$(PYTHON) targets/qemu/test_agent.py
 
+# Uses the downloaded Mac app and its installed models. Runs locally only.
+LOCOMO_APP ?= /Applications/Locomo Music.app
+.PHONY: test-locomo
+test-locomo:
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=off VIOLET_OPEN_SKIP=ladybird VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
+	$(PYTHON) targets/qemu/test_locomo.py "$(LOCOMO_APP)"
+
 .PHONY: test-open-apps
 test-open-apps: qemu-image
 	$(PYTHON) targets/qemu/test_open_apps.py
