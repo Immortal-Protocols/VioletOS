@@ -68,15 +68,15 @@ The builder works in `build/agent-workspace` ([tools/agent_build.py](../../tools
 
 `VIOLET_AGENT_PROFILE=test` keeps a separate identity; `make test-agent` uses it to pair with the phone in QEMU through a local relay, install a program, restart the phone, check the program is still there and runs, and unpair.
 
-## Locomo Music in QEMU
+## Locomo Music
 
 1. On an Apple-silicon Mac with macOS 15 or later, install the [signed Locomo Music 0.1.14 release](https://github.com/wonderdawg/locomo-music-releases/releases/tag/v0.1.14) and run `brew install ffmpeg`. Open Locomo Music and finish its local model setup. The download is about 10.9 GB and setup requires 16 GB free.
 2. In Locomo Music on the Mac, select **Cool Jazz** and turn off continuous generation so the station shows **Start**.
 3. Build and open Violet Agent using the instructions above. In its **Locomo Music** tab, click **Choose Locomo Music…** and select the installed app. Choose it again after relaunching the companion.
-4. From the same VioletOS checkout, run `make emulator`. In QEMU, open **Violet Agent → Connect to this Mac**. For a Mac that already has a handset paired, launch the companion from Terminal with `VIOLET_AGENT_PROFILE=emulator` to give QEMU its own pairing.
-5. Return to QEMU Home, open **Locomo Music**, and tap **Make a Cool Jazz song**. The track plays on arrival. Tap **Latest** to replay it during the same QEMU boot.
+4. On a Moto running the updated VioletOS Agent and Music apps, connect the phone to Wi-Fi and pair **Violet Agent** with the Mac using the QR flow above. For QEMU, run `make emulator` from the same checkout, then open **Violet Agent → Connect to this Mac**. Launch the Mac companion with `VIOLET_AGENT_PROFILE=emulator` if you want to keep a separate handset pairing.
+5. Return to Home, open **Locomo Music**, and tap **Make a Cool Jazz song** in the upper-right. The track plays on arrival. Tap **Latest** to replay it during the current boot.
 
-For one-tap generation, enable **Violet Agent** under **System Settings → Privacy & Security → Accessibility** on the Mac. If the companion asks for a Mac-side click, click **Start** in Locomo's Cool Jazz station, then click **Stop** once generation has started to limit the run to one track. The adapter reads the 0.1.14 library in read-only mode and sends the finished audio over Agent's existing encrypted connection. The generation control is available in QEMU.
+For one-tap generation, enable **Violet Agent** under **System Settings → Privacy & Security → Accessibility** on the Mac. If the companion asks for a Mac-side click, click **Start** in Locomo's Cool Jazz station, then click **Stop** once generation has started to limit the run to one track. The adapter reads the 0.1.14 library in read-only mode and sends the finished audio over Agent's existing encrypted connection.
 
 The smoke test uses a separate pairing and disposable QEMU disk. Build the Mac companion in Debug under `build/mac-agent` and run these commands from the repo root with Locomo ready.
 

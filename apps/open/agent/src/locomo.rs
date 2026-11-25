@@ -1,8 +1,9 @@
-//! QEMU prototype mailbox between the built-in Music and Agent apps.
+//! Session files shared between the built-in Music and Agent apps.
 //! The Agent holds the pairing keys and receives the audio over its encrypted link.
 use crate::secure;
 use serde_json::{json, Value};
 use std::{fs, io::Write};
+use std::time::{Duration, Instant};
 
 const REQUEST: &str = "/tmp/locomo-make";
 const STATUS: &str = "/tmp/locomo-status";
@@ -11,7 +12,8 @@ const MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct Locomo {
-    pub available: bool,
+    available: bool,
+    last_poll: Option<Instant>,
     job: Option<String>,
     transfer: Option<Transfer>,
 }
@@ -24,12 +26,26 @@ struct Transfer {
 }
 
 impl Locomo {
+    pub fn set_available(&mut self, available: bool) {
+        if self.available == available {
+            return;
+        }
+        self.available = available;
+        if self.job.is_none() {
+            self.status(if available { "Ready to make a Cool Jazz song" } else { "Waiting for Violet Agent on the Mac…" });
+        }
+    }
+
     pub fn request(&mut self) -> Option<Value> {
+        if self.last_poll.is_some_and(|last| last.elapsed() < Duration::from_millis(250)) {
+            return None;
+        }
+        self.last_poll = Some(Instant::now());
         if fs::remove_file(REQUEST).is_err() || self.job.is_some() {
             return None;
         }
         if !self.available {
-            self.status("Enable Locomo in Violet Agent on the Mac.");
+            self.status("Connect to Violet Agent on the Mac and enable Locomo there.");
             return None;
         }
         let data = secure::hex(&secure::random::<16>());

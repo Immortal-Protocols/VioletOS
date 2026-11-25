@@ -1,4 +1,4 @@
-//! The paired Agent publishes one verified song for this QEMU session.
+//! The paired Agent publishes one verified song for the current boot.
 use crate::player::Track;
 use serde::Deserialize;
 use std::fs::{File, OpenOptions};
@@ -35,7 +35,8 @@ pub fn request() -> io::Result<()> {
 }
 
 pub fn status() -> String {
-    std::fs::read_to_string("/tmp/locomo-status").unwrap_or_default()
+    std::fs::read_to_string("/tmp/locomo-status")
+        .unwrap_or_else(|_| "Connect Violet Agent to the Mac to make songs.".into())
 }
 
 pub fn open() -> io::Result<(Song, BufReader<File>)> {

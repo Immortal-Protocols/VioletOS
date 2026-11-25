@@ -20,7 +20,6 @@ fn main() {
     let fonts = Fonts::load();
     let mut frame = screen.canvas();
     let mut layer = Canvas::new(W, H);
-    let emulator = violet::fields(&violet::sys("status")).get("emulator").is_some_and(|v| v == "1");
     let splash = |screen: &mut Screen, frame: &mut Canvas, line: &str| {
         let b = frame.bounds();
         frame.fill(b, rgb(20, 14, 30));
@@ -135,7 +134,7 @@ fn main() {
                 }
             }
         }
-        if emulator && last_locomo_check.elapsed() >= Duration::from_millis(500) {
+        if last_locomo_check.elapsed() >= Duration::from_millis(500) {
             last_locomo_check = Instant::now();
             let status = locomo::status();
             if status != plugin_status {
@@ -163,12 +162,12 @@ fn main() {
                 last_look = None;
             }
             Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
-            Ok(e) if e.kind == TOUCH_DOWN && emulator && ui::LATEST.contains(e.x, e.y) => {
+            Ok(e) if e.kind == TOUCH_DOWN && ui::LATEST.contains(e.x, e.y) => {
                 if let Some(i) = local_track {
                     play(&mut player, &catalog, i as isize);
                 }
             }
-            Ok(e) if e.kind == TOUCH_DOWN && emulator && ui::LOCOMO.contains(e.x, e.y) => {
+            Ok(e) if e.kind == TOUCH_DOWN && ui::LOCOMO.contains(e.x, e.y) => {
                 if locomo::request().is_ok() {
                     plugin_status = "Requesting a Cool Jazz song…".into();
                     shown = None;
@@ -238,9 +237,7 @@ fn main() {
         let full = shown != Some(current);
         if full {
             ui::draw_static(&mut layer, &fonts, &catalog, covers.get(&art), current);
-            if emulator {
-                ui::draw_locomo(&mut layer, &fonts, &plugin_status, local_track.is_some());
-            }
+            ui::draw_locomo(&mut layer, &fonts, &plugin_status, local_track.is_some());
             frame.px.copy_from_slice(&layer.px);
             shown = Some(current);
         }
