@@ -68,10 +68,16 @@ enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN
        OPEN_SLOT_RUNTIME = 2, OPEN_SLOT_CNODE = 3, OPEN_SLOT_PD = 4, OPEN_SLOT_ASID = 5,
        OPEN_SLOT_KERNEL = 6, OPEN_SLOT_AUTHORITY = 7, OPEN_SLOT_TIMER = 10, OPEN_SLOT_WAKE = 11,
        OPEN_SLOT_SCHED_CONTROL = 13, OPEN_SLOT_SCHED_CORES = 20,
-       OPEN_SLOT_POOL = 16, OPEN_KERNEL_BITS = 22,
+       OPEN_SLOT_POOL = 16,
        // The Open Runtime's priority while it waits for events (it starts at the
        // 100 every process runs at), and the badge its timer signals with.
        OPEN_EVENT_PRIORITY = 150, OPEN_TIMER_BADGE = 1u << 27, OPEN_TIMER_IRQ = 30 };
+// Each resident app needs 512 KiB, with room left over for shared runtime objects.
+#ifdef VIOLET_QEMU
+enum { OPEN_KERNEL_BITS = 23 };
+#else
+enum { OPEN_KERNEL_BITS = 22 };
+#endif
 // The supervisor's own Reply object (MCS), for answering on `life`.
 static seL4_CPtr root_reply;
 #ifdef CONFIG_KERNEL_MCS

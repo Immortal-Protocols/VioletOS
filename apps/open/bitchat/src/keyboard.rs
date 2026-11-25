@@ -42,9 +42,9 @@ const KEY_H: i32 = 104;
 const UNIT: f32 = 63.0;
 const GAP: f32 = 8.0;
 
-const BED: Color = rgb(0x1c, 0x15, 0x29);
-const LETTER: Color = rgb(0x3a, 0x2f, 0x52);
-const SPECIAL: Color = rgb(0x2a, 0x20, 0x3c);
+const BED: Color = rgb(0x1f, 0x1e, 0x1d);
+const LETTER: Color = rgb(0x43, 0x40, 0x3b);
+const SPECIAL: Color = rgb(0x30, 0x2e, 0x2b);
 
 fn chars(s: &str) -> Vec<(Key, f32)> {
     s.chars().map(|c| (Key::Char(c), 1.0)).collect()

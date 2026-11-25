@@ -12,6 +12,7 @@ final class PhoneLink {
         case online(Bool)
         case json([String: Any])
         case mic(Data)
+        case shield(Data)
         case note(String)
         /// The direct path opened (its address) or closed (nil).
         case direct(String?)
@@ -27,6 +28,7 @@ final class PhoneLink {
     private var inviting: (secret: Data, relay: String)?
     private var direct: DirectPath?
     private(set) var phone: PairedPhone?
+    var localRelayPort: UInt16?
 
     var online: Bool { session != nil }
 
@@ -72,6 +74,10 @@ final class PhoneLink {
     private func open(_ given: String) {
         // VIOLET_AGENT_RELAY_MAP="FROM=TO" reaches a relay the phone names differently (tests).
         var relayURL = given
+        if given == LocalCompanion.relay {
+            guard let localRelayPort else { return }
+            relayURL = "http://127.0.0.1:\(localRelayPort)"
+        }
         if let map = ProcessInfo.processInfo.environment["VIOLET_AGENT_RELAY_MAP"], let eq = map.firstIndex(of: "=") {
             let from = String(map[..<eq]), to = String(map[map.index(after: eq)...])
             if relayURL.hasPrefix(from) { relayURL = to + relayURL.dropFirst(from.count) }
@@ -129,9 +135,10 @@ final class PhoneLink {
             let o = Offer(identity: identity, role: Wire.mac, mode: Wire.pairing, room: room, answering: h.x)
             relay?.send(o.message)
             guard Session(ours: o, theirs: h, role: Wire.mac, room: room, phone: h.ed, mac: macKey) != nil else { return }
-            let p = PairedPhone(key: h.ed.hex, name: "VioletOS phone", relay: inv.relay)
+            let name = inv.relay == LocalCompanion.relay ? "VioletOS emulator" : "VioletOS phone"
+            let p = PairedPhone(key: h.ed.hex, name: name, relay: inv.relay)
             inviting = nil
-            onEvent(.note("paired: the phone read this Mac's code"))
+            onEvent(.note(inv.relay == LocalCompanion.relay ? "paired with the local emulator" : "paired: the phone read this Mac's code"))
             onEvent(.paired(p))
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.connect(p) }
             return
@@ -239,6 +246,8 @@ final class PhoneLink {
             }
         case 0x20:
             onEvent(.mic(Data(body)))
+        case 0x31 where body.count <= 1900:
+            onEvent(.shield(Data(body)))
         case 0x22:
             // µ-law (G.711) at 16 kHz.
             var out = Data(capacity: body.count * 2)

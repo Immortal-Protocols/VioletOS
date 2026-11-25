@@ -177,11 +177,9 @@ final class AppTrack {
     var records: [SentinelRecord] = []
     var knownHosts: [String] = []
     var exited = false
-    var frozen = false
     var dirtySince: Date?
     var lastScored: Date?
-    var lastDecision: ShieldDecision?
-    var contained = false
+    var lastWarning = Date.distantPast
 
     init(pid: UInt32, name: String, sha8: String) {
         self.pid = pid

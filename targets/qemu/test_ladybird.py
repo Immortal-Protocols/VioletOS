@@ -26,6 +26,8 @@ import threading
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "targets/qemu"))
+import home_grid
 import run
 
 FIRST = """<!doctype html>
@@ -61,7 +63,6 @@ import json, mmap, os, re, struct, sys, time
 ram = open(sys.argv[1], "r+b")
 log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
 screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000, prot=mmap.PROT_READ)
-APPS = json.loads(os.environ["OPEN_APPS"])
 ONLINE = os.environ["OPEN_ONLINE"] == "1"
 
 def text():
@@ -95,9 +96,6 @@ def touch(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
 def release():
     os.write(1, bytes(6))
-def row_y(index, count):
-    h = 80 if count <= 13 else max(40, 1080 // count)
-    return 260 + index * h + (h - 12) // 2
 def tap(x, y, pause=.35):
     touch(x, y); time.sleep(.15); release(); time.sleep(pause)
 def pixel(x, y):
@@ -105,39 +103,47 @@ def pixel(x, y):
 def rows_with(color, y0=130, y1=1600, x=None):
     xs = range(0, 720, 8) if x is None else [x]
     return [y for y in range(y0, y1, 2) if any(pixel(px, y) == color for px in xs)]
-def on_list():
-    return pixel(60, 300) == 0x302a39 and pixel(5, 5) == 0x191620
-def on_home():
-    return pixel(5, 5) == 0x2a1740
 def count(pattern):
     return len(re.findall(pattern, everything()))
 def loaded(url, title):
     return re.search(r"ladybird: loaded " + re.escape(url) + r" status=200 .*title=" + re.escape(json.dumps(title)), everything())
 
-KEYBOARD_TOP = 1600 - 5 * 96 - 16
-ROWS = ["1234567890", "qwertyuiop", "asdfghjkl:", "zxcvbnm.-/"]
-def key(k):
-    special = {".com": 72, "_": 180, " ": 324, "back": 504, "go": 648}
-    if k in special:
-        tap(special[k], KEYBOARD_TOP + 8 + 4 * 96 + 48, .25)
-        return
-    row = next(i for i, r in enumerate(ROWS) if k in r)
-    tap(ROWS[row].index(k) * 72 + 36, KEYBOARD_TOP + 8 + row * 96 + 48, .25)
-def type_address(keys):
+# Address mode of the shared VioletOS keyboard (left to right, with widths).
+ADDRESS_BOTTOM = [("mode", 2), (" ", 3), (".", 1), ("/", 1), ("go", 2)]
+LETTERS = [list(zip(row, [1] * len(row))) for row in ("qwertyuiop", "asdfghjkl")]
+LETTERS += [[("shift", 1.5)] + [(c, 1) for c in "zxcvbnm"] + [("back", 1.5)], ADDRESS_BOTTOM]
+NUMBERS = [[(c, 1) for c in row] for row in ("1234567890", '-/:;()$&@"')]
+NUMBERS += [[], ADDRESS_BOTTOM]
+
+def key(k, page):
+    for row, keys in enumerate(page):
+        width = sum(units * 63 for _, units in keys) + max(0, len(keys)-1) * 8
+        x = (720 - width) / 2
+        for name, units in keys:
+            if name == k:
+                tap(round(x + units * 63 / 2), 1072 + row * 120 + 52, .25)
+                return
+            x += units * 63 + 8
+    fail(f"{k!r} is missing from the address keyboard")
+
+def type_address(text):
+    old = everything().count("ladybird: editing address")
     tap(500, 63)
-    until("address editing", lambda: "ladybird: editing address" in everything())
-    for k in keys:
-        key(k)
-    key("go")
+    until("address editing", lambda: everything().count("ladybird: editing address") > old)
+    page = LETTERS
+    for k in text:
+        if k not in "./ ":
+            next_page = LETTERS if k.isalpha() else NUMBERS
+            if page is not next_page:
+                key("mode", page)
+                page = next_page
+        key(k, page)
+    key("go", page)
 
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 60)
 time.sleep(3)
-if not on_home():
-    tap(570, 276)  # the classic launcher's APPS button shows Home
-    until("Home app", on_home, 90)
-tap(360, 1141)  # Home's Programs tile
-until("app list", on_list)
-tap(360, row_y(APPS.index("ladybird"), len(APPS)))
+until("Home", lambda: "home: ready" in everything(), 60)
+open_icon("ladybird")
 
 # 1. The start page.
 until("start page parsed", lambda: re.search(r"ladybird: loaded about:home status=200 elements=\d+ rules=7 links=\d+", everything()), 60)
@@ -179,17 +185,17 @@ until("banner scrolled away", lambda: len(rows_with(0xcc2266)) == 0, 10)
 print(f"scroll: dragged to {scrolled}", file=sys.stderr)
 
 # 5. The address bar and keyboard.
-type_address(list("http://typed.test/form"))
+type_address("http://typed.test/form")
 until("typed address", lambda: loaded("http://typed.test/form", "Typed"), 60)
 
 # 6. HTTPS on the real web.
 if ONLINE:
-    type_address(list("example") + [".com"])
+    type_address("example.com")
     until("example.com over HTTPS", lambda: loaded("https://example.com/", "Example Domain"), 90)
     print("https:", re.findall(r"ladybird: loaded https://example.com.*", everything())[-1], file=sys.stderr)
     # A large real page with linked style sheets. It depends on Wikipedia, so
     # it is reported, not required.
-    type_address(list("en.m.wikipedia.org/wiki/html"))
+    type_address("en.m.wikipedia.org/wiki/html")
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not re.search(r"ladybird: (loaded|failed) https://en(?:\.m)?\.wikipedia\.org/wiki/HTML", everything(), re.I):
         time.sleep(0.2)
@@ -203,8 +209,7 @@ else:
     print("https: skipped (the Mac is offline)", file=sys.stderr)
 
 # 7. Home.
-tap(100, 60)
-until("back on Home", on_home, 10)
+leave_to_home()
 '''
 
 
@@ -259,10 +264,8 @@ with TemporaryDirectory() as tmp:
     for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):
         (image / name).symlink_to(original / name)
     run.IMAGE = image
-    folders = sorted(p for p in (ROOT / "apps/open").iterdir() if p.is_dir() and p.name != "home")
-    apps = [p.name for p in folders if (p / "app.txt").exists()] + [p.name for p in folders if not (p / "app.txt").exists()]
+    viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
     os.environ.update(
-        OPEN_APPS=json.dumps(apps),
         OPEN_ONLINE="1" if online() else "0",
         VIOLET_NET_HOSTS=json.dumps({"info.cern.ch": f"127.0.0.1:{port}", "typed.test": f"127.0.0.1:{port}"}),
     )

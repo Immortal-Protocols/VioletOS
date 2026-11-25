@@ -2,25 +2,10 @@
 // supervisor alone can create processes or grant capabilities to their CSpaces.
 use crate::protocol::*;
 pub fn run() -> ! {
-    let available = Message::new(GET, INVENTORY, 0).call(7).value;
     serve(|m| match (m.op, m.key) {
         (GET, INVENTORY) => m.call(7),
         (GET, INBOX) | (EXECUTE, INSTALL | REMOVE) => m.call(7),
-        (GET, CATALOG) => {
-            if m.value != 0 && m.value != WATCH && m.value != WIFI {
-                return m.call(7);
-            }
-            let app = if m.value == WIFI { WIFI } else { WATCH };
-            let mut r = Message::result(if available & (1 << app) != 0 { app } else { 0 });
-            if r.value != 0 {
-                r.put_text(if app == WIFI {
-                    env!("VIOLET_WIFI_TITLE").as_bytes()
-                } else {
-                    env!("VIOLET_WATCH_TITLE").as_bytes()
-                });
-            }
-            r
-        }
+        (GET, CATALOG) => m.call(7),
         _ => Message::error(DENIED),
     })
 }

@@ -14,17 +14,10 @@ handset, and the Sentinel links to `sentinel.violet` on the companion.
                    PyTorch, for runs without Xcode.
 
 A scripted viewer taps through the demo and checks the Open Runtime's log:
-  1. notes, weather (the built-in app, live from wttr.in) and Home: ordinary
-     apps; nothing is blocked.
-  2. photosync: reads another app's secrets and uploads from the background; the
-     model flags it, the relay cuts the upload, and VioletOS freezes it on a
-     signed Shield, then thaws it when the Shield's TTL runs out.
-  3. themes: maps W+X memory, then tries to overwrite /apps/home: frozen inside
-     the write call by a baseline Shield the companion signed when it linked.
-  4. A connection that reaches the relay without the Sentinel reporting it
-     (telemetry missing or tampered) is blocked as unattributed.
-Then it checks the companion's status (verdicts) and that the sink received
-less than the 4 MiB photosync tried to send.
+  1. A benign notes fixture runs and gets scored.
+  2. Photosync's fixture upload is flagged while the upload completes.
+  3. Themes' cross-app write attempt is reported as a warning.
+  4. An unreported fixture connection is flagged by the relay.
 """
 from __future__ import annotations
 
@@ -44,17 +37,15 @@ from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "targets/qemu"))
+import home_grid  # noqa: E402
 import run  # noqa: E402
 
 SIM = os.environ.get("VIOLET_SIM", "D4AE7E80-FFC5-4AD7-B810-33E3FFD396EA")
 BUNDLE = "com.immortal.violet.relay"
-# As the Programs list shows them: titled apps, sorted by folder name.
-# The shell lists titled apps first, in the order of the image's apps/.home
-# (read from the image this test builds; Ladybird, when built, comes first).
-APPS = ["music", "notes", "photosync", "sounds", "stopwatch", "themes", "weather"]
-# The test programs stay out of the demo image so the list fits on one screen.
-SKIP = "canvas,chello,gohello,gonet,hello,pyhello,pynet,pypaint,pytone"
-FREEZE_TTL = 30
+# The demo apps (apps/shield-demo) get icons on Home after the built-in ones.
+APPS = ["music", "notes", "photosync", "themes"]
+SKIP = ""
 
 SCRIPT = r'''#!PYTHON
 import json, mmap, os, socket, struct, sys, time
@@ -65,7 +56,6 @@ APPS = json.loads(os.environ["SHIELD_APPS"])
 STATUS = os.environ["SHIELD_STATUS"]
 SOCKS = int(os.environ["SHIELD_SOCKS_PORT"])
 REC = os.environ.get("SHIELD_RECORD")
-TTL = int(os.environ["SHIELD_TTL"])
 frames = open(os.path.join(REC, "qemu.bgra"), "wb") if REC else None
 events = open(os.path.join(REC, "qemu.jsonl"), "w") if REC else None
 t0 = time.time()
@@ -120,35 +110,28 @@ def hold(seconds):
     while time.monotonic() < end:
         frame()
         time.sleep(0.04)
-def row_y(index, count):
-    h = 80 if count <= 13 else max(40, 1080 // count)
-    return 260 + index * h + (h - 12) // 2
 def tap(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
     hold(.15); os.write(1, bytes(6)); hold(.35)
 def pixel(x, y):
     return struct.unpack_from("<I", screen, (y * 720 + x) * 4)[0]
-def on_list():
-    return pixel(60, 300) == 0xff302a39 and pixel(5, 5) == 0xff191620
 def on_home():
-    # The Home app (apps/open/home): its gradient starts at 2a1740.
-    return pixel(5, 5) == 0xff2a1740
+    # Home logs each time it comes to the front.
+    return home_shown() > seen_home[0]
+seen_home = [0]
+def mark():
+    seen_home[0] = home_shown()
 def open_apps():
-    # Home's Programs tile shows the list of every program (with Shield's line).
-    if on_list():
-        return
-    if not on_home():
-        tap(570, 276)  # the classic launcher's APPS button shows Home
-        until("Home", on_home, 90)
-    tap(360, 1141)
-    until("app list", on_list)
+    pass
 def back_home():
-    # Holding the top edge for a second leaves the app in front (even a frozen one).
+    # Holding the top edge for a second leaves the app in front.
+    mark()
     os.write(1, bytes([9, 360 >> 4, 20 >> 4, ((360 & 15) << 4) | (20 & 15), 1, 1]))
     hold(1.4); os.write(1, bytes(6)); hold(.5)
     until("Home", on_home, 10)
 def start(name):
-    tap(360, row_y(APPS.index(name), len(APPS)))
+    mark()
+    open_icon(name)
 def status():
     try:
         return json.load(open(STATUS))
@@ -162,51 +145,32 @@ def count(s):
 until("Open Runtime ready", lambda: "[open] ready" in everything(), 90)
 caption("VioletOS boots on seL4 in QEMU; its Sentinel links to the iPhone companion")
 until("Sentinel links to the companion", lambda: "sentinel: linked" in everything(), 90)
-until("baseline Shields verified", lambda: count("installed") >= 3, 30)
-hold(2)
-open_apps()
-caption("The companion signed 3 baseline Shields; VioletOS verified them with BearSSL P-256")
-hold(3)
-
 caption("notes: an ordinary app saves notes (with an API key) and syncs to its server")
 start("notes")
 until("notes runs", lambda: "notes done" in everything(), 90)
 until("Home after notes", on_home, 15)
 open_apps()
-caption("weather: the built-in Weather app fetches live conditions from wttr.in")
-start("weather")
-hold(2)
-tap(195, 894)  # Oakland
-until("weather runs", lambda: "weather: Oakland" in everything(), 90)
-hold(2)
-back_home()
+caption("Home fetches the time for your city from wttr.in")
 caption("The companion scores each app's telemetry window on the phone: benign, nothing blocked")
-until("benign verdicts", lambda: decisions("notes") and decisions("weather"), 45)
+until("benign verdicts", lambda: decisions("notes") and decisions("home"), 90)
 hold(3)
 open_apps()
 
-frozen_before = count("froze pid")
 caption("photosync: 'syncs photos', then quietly reads notes' secrets...")
 start("photosync")
 until("photosync hides", lambda: "going to the background" in everything(), 90)
 until("Home", on_home, 15)
 caption("...slips into the background and uploads 4 MiB to drop.c2-exfil.test")
-until("photosync frozen by a signed Shield", lambda: count("froze pid") > frozen_before, 120)
-caption("Model on the iPhone: exfiltration. Relay cut the upload; VioletOS froze photosync mid-call")
+until("photosync warning", lambda: any(d.get("warned") for d in decisions("photosync")), 120)
+until("signed warning verified by VioletOS", lambda: "op 6 seq" in everything(), 30)
+caption("The model warns on Home while photosync keeps running")
 hold(4)
-open_apps()
-hold(3)
-caption(f"The freeze is reversible and TTL-bounded: it thaws on its own after {TTL} s")
-until("photosync thaws", lambda: "thawed pid" in everything(), TTL + 30)
-until("photosync's upload fails", lambda: "photosync: upload stopped" in everything() or "photosync (pid" in everything(), 60)
-hold(2)
 
-frozen_before = count("froze pid")
 caption("themes: maps W+X memory, then tries to overwrite Home's program, /apps/home")
 open_apps()
 start("themes")
-until("themes frozen inside its write", lambda: count("froze pid") > frozen_before, 60)
-caption("Frozen inside the write call by a baseline Shield: the hook never lands")
+until("themes warning", lambda: any(d.get("warned") for d in decisions("themes")), 60)
+caption("Violet Shield flags the write on Home")
 hold(5)
 back_home()
 hold(4)
@@ -223,11 +187,11 @@ try:
     s.sendall(b"x" * 20000)
 except OSError:
     pass
-until("unreported connection blocked", lambda: decisions("unattributed"), 40)
-caption("...and is blocked as unattributed: the relay is a second, independent ground truth")
+until("unreported connection warning", lambda: any(d.get("warned") for d in decisions("unattributed")), 40)
+caption("...and is flagged as unattributed by the relay")
 hold(6)
 s.close()
-caption("Violet Shield: local model, signed live Shields, zero reboots")
+caption("Violet Shield: local model and signed Home warnings")
 hold(3)
 print("shield scripted run complete", file=sys.stderr)
 '''
@@ -313,7 +277,7 @@ def start_ios(host_map, record_dir):
     # Grant notifications up front so the permission alert does not cover the recording.
     subprocess.run(["xcrun", "simctl", "privacy", SIM, "grant", "notifications", BUNDLE], capture_output=True)
     subprocess.run(["xcrun", "simctl", "launch", "--terminate-running-process", SIM, BUNDLE, "-pairingSecret", "violet-dev", "-upstream", "any",
-                    "-shieldDevKey", base64.b64encode(key).decode(), "-shieldFreezeTTL", str(FREEZE_TTL), "-shieldComputeUnits", "gpu",
+                    "-shieldDevKey", base64.b64encode(key).decode(), "-shieldComputeUnits", "gpu",
                     "-hostMapB64", base64.b64encode(json.dumps(host_map).encode()).decode()], check=True, capture_output=True)
     status = data / "Documents/status.json"
     deadline = time.time() + 60
@@ -333,7 +297,7 @@ def start_sim(host_map, tmp: Path):
     port = free_port()
     status = tmp / "shield-status.json"
     proc = subprocess.Popen([str(ROOT / "build/shield/venv/bin/python"), str(ROOT / "tools/shield-trainer/companion_sim.py"), "--port", str(port),
-                             "--model", "--status", str(status), "--ttl", str(FREEZE_TTL), "--host-map", json.dumps(host_map),
+                             "--model", "--status", str(status), "--host-map", json.dumps(host_map),
                              "--record", str(tmp / "records.jsonl")])
     deadline = time.time() + 120
     while time.time() < deadline:
@@ -386,10 +350,11 @@ def main():
         else:
             port, status, helper = start_sim(host_map, tmp)
         viewer = tmp / "viewer.py"
-        viewer.write_text(SCRIPT.replace("#!PYTHON", "#!" + str(ROOT / "build/shield/venv/bin/python")))
+        script = SCRIPT.replace("#!PYTHON", "#!" + str(ROOT / "build/shield/venv/bin/python"))
+        viewer.write_text(home_grid.viewer(script, (image / "initfs.cpio").read_bytes()))
         viewer.chmod(0o755)
         os.environ.update(VIOLET_NET_SOCKS=f"127.0.0.1:{port}", VIOLET_NET_SOCKS_PASS="violet-dev", SHIELD_APPS=json.dumps(APPS),
-                          SHIELD_STATUS=str(status), SHIELD_SOCKS_PORT=str(port), SHIELD_PASS="violet-dev", SHIELD_TTL=str(FREEZE_TTL))
+                          SHIELD_STATUS=str(status), SHIELD_SOCKS_PORT=str(port), SHIELD_PASS="violet-dev")
         if record:
             os.environ["SHIELD_RECORD"] = str(record)
             (record / "qemu.start").write_text(str(time.time()))
@@ -413,22 +378,22 @@ def main():
     by_app = {}
     for d in st.get("decisions", []):
         by_app.setdefault(d["app"], []).append(d)
-    for benign in ("notes", "weather", "home"):
-        if any(d.get("contained") for d in by_app.get(benign, [])):
-            problems.append(f"{benign} was contained: {by_app[benign]}")
-    if not any(d.get("contained") and d.get("tier") == "model" for d in by_app.get("photosync", [])):
-        problems.append(f"photosync was not contained by the model: {by_app.get('photosync')}")
-    if not any(d.get("contained") for d in by_app.get("unattributed", [])):
-        problems.append("the unreported connection was not blocked")
-    if got["bytes"] >= 4 * 1024 * 1024:
-        problems.append(f"the sink received the whole upload ({got['bytes']} bytes)")
+    if any(d.get("contained") for d in st.get("decisions", [])):
+        problems.append("monitoring mode contained an app")
+    for app in ("photosync", "themes", "unattributed"):
+        if not any(d.get("warned") for d in by_app.get(app, [])):
+            problems.append(f"{app} warning was not sent")
+    if got["bytes"] < 4 * 1024 * 1024:
+        problems.append(f"the fixture upload was interrupted ({got['bytes']} bytes)")
+    if not st.get("shields_accepted"):
+        problems.append("no signed warning was accepted")
     if st.get("shields_rejected"):
         problems.append(f"VioletOS rejected {st['shields_rejected']} Shields")
     print(f"sink received {got['bytes'] // 1024} KiB of photosync's 4096 KiB", file=sys.stderr)
     for app, ds in sorted(by_app.items()):
-        d = next((x for x in ds if x.get("contained")), ds[0])
+        d = next((x for x in ds if x.get("warned")), ds[0])
         print(f"  {app:12s} {d['tier']:6s} {d['verdict']:22s} p_mal={d['p_malicious']:.2f} {d['action']:10s}"
-              f" {'CONTAINED' if d.get('contained') else ''} {d.get('note', '')[:90]}", file=sys.stderr)
+              f" {'WARNED' if d.get('warned') else ''} {d.get('note', '')[:90]}", file=sys.stderr)
     print(f"  shields sent {st.get('shields_sent')} verified {st.get('shields_accepted')} rejected {st.get('shields_rejected')}", file=sys.stderr)
     if problems:
         print("Violet Shield test FAILED:\n  " + "\n  ".join(problems), file=sys.stderr)

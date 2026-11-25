@@ -88,9 +88,6 @@ impl Runtime {
         let mut ev = TelemetryEvent::new(now, AppId(pid), EventKind::Frozen, shield::FLAG_HIGH_PRIORITY, text.as_bytes());
         ev.aux_u32 = shield_id;
         self.shield.ring.emit(ev);
-        if self.focused && self.foreground == Some(i) {
-            super::device::frozen_banner(true);
-        }
         self.shell.dirty = true;
     }
 
@@ -197,6 +194,7 @@ impl Runtime {
 
     fn apply(&mut self, cmd: Command, now: u64) {
         match cmd {
+            Command::Warning => self.sentinel.warnings = self.sentinel.warnings.saturating_add(1),
             Command::Install(rule) => {
                 let id = rule.shield_id;
                 if self.shield.install_rule(rule) {

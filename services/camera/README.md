@@ -15,7 +15,7 @@ Camera keeps a simple auto-exposure: every third frame it measures the frame's m
 
 ## Boards
 
-- **QEMU** ([targets/qemu/camera.rs](../../targets/qemu/camera.rs)): a synthetic sensor that paints 640 × 480 RAW8 frames (BGGR) at about 15 per second. They show eight colour bars and a white square that crosses them every four seconds, at a brightness that follows the exposure. Its frame window is guest RAM at `0x78000000`. `make test-camera` opens Camera from Home and checks the bars' colours on screen and that the picture moves.
+- **QEMU** ([targets/qemu/camera.rs](../../targets/qemu/camera.rs)): a synthetic sensor that paints 640 × 480 RAW8 frames (BGGR) at about 15 per second. They show eight colour bars and a white square that crosses them every four seconds, at a brightness that follows the exposure. Its frame window is guest RAM at `0x78000000`.
 - **Moto G Pure** ([targets/moto-g-pure/camera.rs](../../targets/moto-g-pure/camera.rs)): the rear SK Hynix Hi-1336 delivers 1280 × 720 RAW8 (GBRG) at 30 frames per second, through the CSI1 receiver, SENINF3 and CAMSV1 into physical `0xe0000000`. The [bring-up notes](../../targets/moto-g-pure/camera-bringup.md) describe the path and what the handset showed.
 
 On the handset Camera has no direct access to the PMIC, the shared clocks or the pins:

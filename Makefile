@@ -14,13 +14,16 @@ $(VENV)/.deps: tools/requirements-sel4.txt
 	touch $@
 build/sel4/viewer: tools/emulator/viewer.c
 	mkdir -p $(@D)
-	$(CC) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) $< -o $@ $(shell sdl2-config --libs)
+	$(CC) $(VIEWER_FLAGS) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) $< -o $@ $(shell sdl2-config --libs)
 VIEWER := build/sel4/viewer
 ifeq ($(shell uname -s),Darwin)
+VIEWER_FLAGS := -x objective-c
 VIEWER := build/sel4/VioletOS.app/Contents/MacOS/viewer
-$(VIEWER): build/sel4/viewer tools/emulator/Info.plist
+$(VIEWER): build/sel4/viewer tools/emulator/Info.plist tools/emulator/VioletOS.icns
 	mkdir -p $(@D)
+	mkdir -p build/sel4/VioletOS.app/Contents/Resources
 	cp tools/emulator/Info.plist build/sel4/VioletOS.app/Contents/
+	cp tools/emulator/VioletOS.icns build/sel4/VioletOS.app/Contents/Resources/
 	cp $< $@
 endif
 emulator: qemu-image $(VIEWER)
@@ -35,60 +38,33 @@ build/simulator: src/screen.c src/screen.h src/glyphs.h targets/mac-simulator/si
 sim: build/simulator
 	./build/simulator
 
-.PHONY: test-storage test-isolation
-test-storage: qemu-image
-	$(PYTHON) targets/qemu/test_storage.py
+.PHONY: test-isolation component
 test-isolation: setup
 	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu
 	@set -e; for region in touch storage dma scanout peer radio radio-dma; do \
 	  $(PYTHON) targets/qemu/test_guest.py --probe $$region; \
 	done
 
-.PHONY: test-stack component
-test-stack: qemu-image
-	$(PYTHON) targets/qemu/test_packages.py
 component: setup
 	@test -n "$(NAME)" || (echo "Set NAME to the component name"; exit 1)
 	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py qemu
 
-.PHONY: test-wifi
-test-wifi: qemu-image
-	$(PYTHON) targets/qemu/test_wifi.py
-
-.PHONY: test-wifi-live
-test-wifi-live: qemu-image
-	$(PYTHON) targets/qemu/test_guest.py --wifi live
-
-.PHONY: app
-app: setup
-	@test -n "$(APP)" || (echo "Set APP to an application directory"; exit 1)
-	VIOLET_APP_DIR="$(abspath $(APP))" $(PYTHON) tools/build_sel4.py qemu
-
-.PHONY: test-apps
-test-apps: qemu-image
-	$(MAKE) app APP=targets/qemu/test-app
-	$(PYTHON) targets/qemu/test_library.py
-
-.PHONY: test-power
-test-power: qemu-image
-	$(PYTHON) targets/qemu/test_power.py
-
 .PHONY: test-audio
-test-audio: qemu-image
+test-audio: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) targets/qemu/test_audio.py
 
+# The test programs (Rust, C, Go, Python) live in targets/qemu/open-test-apps
+# and go into this image only; they show up on Home as extra icons.
 .PHONY: test-open
-test-open: qemu-image
+test-open: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) targets/qemu/test_open.py
 
 .PHONY: test-ladybird
 test-ladybird: qemu-image
 	$(PYTHON) targets/qemu/test_ladybird.py
 
-.PHONY: test-camera
-test-camera: qemu-image
-	$(PYTHON) targets/qemu/test_camera.py
-.PHONY: test-open-apps
 .PHONY: test-wifi-app
 test-wifi-app: qemu-image
 	$(PYTHON) targets/qemu/test_wifi_app.py
@@ -99,31 +75,26 @@ test-agent:
 	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
 	$(PYTHON) targets/qemu/test_agent.py
 
+.PHONY: test-open-apps
 test-open-apps: qemu-image
 	$(PYTHON) targets/qemu/test_open_apps.py
-	@mkdir -p build/tests
-	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
-	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
-	build/tests/inflate
 
 # Host unit tests (CI): each test finishes in well under a second.
 HOST_CARGO ?= $(or $(shell command -v cargo),$(dir $(HOST_RUSTC))cargo)
 .PHONY: test-unit
 test-unit:
 	@mkdir -p build/tests
-	"$(HOST_RUSTC)" --edition=2021 --test -O apps/stopwatch/state.rs -o build/tests/stopwatch-state
-	build/tests/stopwatch-state
 	"$(HOST_RUSTC)" --edition=2021 --test -O services/audio/mic.rs -o build/tests/mic
 	build/tests/mic
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
 	build/tests/inflate
 	python3 apps/lib/python/test_violet.py
-	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p bitchat --target-dir ../build/host-tests
+	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p settings -p bitchat --target-dir ../build/host-tests
 
 # The QEMU tests CI runs: one boot of the supervisor and its services (touch,
-# storage, the watchdog, the classic launcher), then the open apps (Home,
-# Stopwatch keeping its time across a restart, Sounds playing).
+# the watchdog, Home answering a tap), then Home, Settings and Music across
+# two boots (a setting kept in /data across the restart).
 .PHONY: test-ci
 test-ci: qemu-image
 	$(PYTHON) targets/qemu/test_guest.py --spi normal --watchdog-enabled

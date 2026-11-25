@@ -1,17 +1,19 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 import Network
-import UserNotifications
 import os
 
 // Violet Shield on the iPhone companion (docs/violet-shield-rfc.md, docs/violet-shield-poc.md).
 //
 // - `sentinel.violet` is answered by this relay itself (next to `time.violet`):
-//   VioletOS's Sentinel streams syscall telemetry here and receives signed Shields.
+//   VioletOS's Sentinel streams syscall telemetry here and receives signed warnings.
 // - The SOCKS5 relay is the second, independent ground truth: every connection
 //   VioletOS makes passes through it, so a connection the Sentinel never reported
 //   is itself evidence of tampering.
 // - Tier 0: deterministic rules. Tier 1: EmbeddingGemma 2 + hybrid head + per-app
-//   novelty, on the phone. Tier 2: containment, signed with the phone's key.
+//   novelty, on the phone. Warnings are signed before they appear on VioletOS Home.
 
 let shieldLog = Logger(subsystem: "com.immortal.violet.relay", category: "shield")
 
@@ -30,8 +32,16 @@ struct ShieldDecision: Identifiable {
     let latencyMs: Double
     let hosts: [String]
     let window: String
-    var contained: Bool
+    var warned: Bool
     var note: String
+}
+
+private struct TrainingScores {
+    let input: String
+    let sideFeatures: [Float]
+    let verdict: [Float]
+    let action: [Float]
+    let tags: [Float]
 }
 
 struct ShieldSnapshot {
@@ -48,9 +58,6 @@ struct ShieldSnapshot {
     var shieldsSent = 0
     var shieldsAccepted = 0
     var shieldsRejected = 0
-    var blocked: [String] = []
-    var frozen: [String] = []
-    var autoContain = true
     var decisions: [ShieldDecision] = []
     var lastLatencyMs: Double = 0
 }
@@ -61,28 +68,29 @@ final class ShieldUI: ObservableObject {
     @Published var snap = ShieldSnapshot()
 }
 
-final class Shield: NSObject, UNUserNotificationCenterDelegate {
+final class Shield {
     static let shared = Shield()
 
     let queue = DispatchQueue(label: "com.immortal.violet.shield")
     private let modelQueue = DispatchQueue(label: "com.immortal.violet.shield.model", qos: .userInitiated)
     private var model: ShieldModel?
-    private let signer = ShieldSigner()
+    private var signer: ShieldSigner!
     private let novelty = AppNoveltyIndex()
-    private let feedback = AlertFeedbackStore()
+    private var dataDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    private lazy var feedback = AlertFeedbackStore(directory: dataDirectory)
     private var tracks: [UInt32: AppTrack] = [:]
     private var link: SentinelLink?
+    private var agentSession: UUID?
+    private var lastAgentFrame: Date?
+    private var verdictTransport = ""
     private var linkUpSince: Date?
     private var snap = ShieldSnapshot()
     private var pending: [UInt64: String] = [:]
     private var scoring = Set<UInt32>()
-    private weak var relay: RelayServer?
     private var flaggedFlows = Set<Int>()
 
     // SOCKS flows, touched from the relay queue under `lock`.
     private let lock = NSLock()
-    private var blockedTargets = Set<String>()
-    private var blockedHosts = Set<String>()
     private var flows: [Int: FlowEntry] = [:]
     private var nextFlow = 1
     private var reported: [String: Date] = [:]
@@ -98,25 +106,10 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         var target: String { "\(host):\(port)" }
     }
 
-    var freezeTTL: UInt32 {
-        let v = UserDefaults.standard.integer(forKey: "shieldFreezeTTL")
-        return v > 0 ? UInt32(min(v, 3600)) : 600
-    }
-
-    // MARK: - Start
-
-    func start(relay: RelayServer) {
-        self.relay = relay
+    func start(emulatorKey: URL? = nil, dataDirectory: URL? = nil) {
+        if let dataDirectory { self.dataDirectory = dataDirectory }
+        signer = ShieldSigner(emulatorKey: emulatorKey)
         snap.signer = signer.keyDescription
-        snap.autoContain = !UserDefaults.standard.bool(forKey: "shieldNotifyOnly")
-        UNUserNotificationCenter.current().delegate = self
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
-        let release = UNNotificationAction(identifier: "RELEASE", title: "Release")
-        let benign = UNNotificationAction(identifier: "BENIGN", title: "Allow & Learn")
-        let threat = UNNotificationAction(identifier: "THREAT", title: "Confirmed Threat", options: [.destructive])
-        UNUserNotificationCenter.current().setNotificationCategories([
-            UNNotificationCategory(identifier: "VIOLET_SHIELD_ALERT", actions: [threat, benign, release], intentIdentifiers: []),
-        ])
         Task.detached { [weak self] in
             do {
                 let m = try await ShieldModel.load()
@@ -153,11 +146,6 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: - SOCKS hooks (relay queue)
 
-    func isBlocked(host: String, port: UInt16) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return blockedHosts.contains(host.lowercased()) || blockedTargets.contains("\(host.lowercased()):\(port)")
-    }
-
     func flowStarted(host: String, port: UInt16) -> Int {
         lock.lock(); defer { lock.unlock() }
         let id = nextFlow
@@ -182,15 +170,58 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
 
     func attachSentinel(_ conn: NWConnection) {
         queue.async {
-            self.link?.close()
-            let l = SentinelLink(conn: conn, queue: self.queue, shield: self)
-            self.link = l
-            self.linkUpSince = Date()
-            self.snap.link = "linked"
-            self.snap.linkUp = true
-            l.start()
-            self.publish()
+            guard self.agentSession == nil else {
+                conn.cancel()
+                return
+            }
+            let next = SentinelLink(conn: conn, queue: self.queue, shield: self)
+            self.replaceLink(next, route: "SOCKS relay")
+            next.start()
         }
+    }
+
+    /// The handset has an authenticated Agent session with this Mac. Use its
+    /// Sentinel stream ahead of the emulator's local SOCKS endpoint.
+    func receiveAgent(_ data: Data, session: UUID, send: @escaping (Data) -> Void) {
+        queue.async {
+            if self.agentSession != session {
+                guard data.first == 0x01 else { return }  // new streams begin with VSL1 HELLO
+                self.replaceLink(SentinelLink(queue: self.queue, shield: self, forward: send), route: "Mac Agent")
+                self.agentSession = session
+            }
+            self.lastAgentFrame = Date()
+            self.link?.feed(data)
+        }
+    }
+
+    func disconnectAgent(_ session: UUID) {
+        queue.async {
+            guard self.agentSession == session, let link = self.link else { return }
+            link.close()
+            self.linkClosed(link, "Agent disconnected")
+        }
+    }
+
+    private func replaceLink(_ next: SentinelLink, route: String) {
+        link?.close()
+        link = next
+        tracks.removeAll()
+        scoring.removeAll()
+        pending.removeAll()
+        snap.bootId = ""
+        snap.chain = ""
+        snap.heartbeat = ""
+        snap.events = 0
+        snap.windowsScored = 0
+        snap.shieldsSent = 0
+        snap.shieldsAccepted = 0
+        snap.shieldsRejected = 0
+        snap.decisions.removeAll()
+        linkUpSince = Date()
+        snap.link = route
+        verdictTransport = route
+        snap.linkUp = true
+        publish()
     }
 
     // MARK: - Sentinel frames (shield queue)
@@ -198,6 +229,9 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
     fileprivate func linkClosed(_ l: SentinelLink, _ why: String) {
         guard link === l else { return }
         link = nil
+        agentSession = nil
+        lastAgentFrame = nil
+        pending.removeAll()
         linkUpSince = nil
         snap.linkUp = false
         snap.link = "offline (\(why))"
@@ -214,7 +248,6 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
                 if part.hasPrefix("chain=") { snap.chain = String(part.dropFirst(6).prefix(16)) }
             }
             shieldLog.info("sentinel hello: \(text, privacy: .public)")
-            pushBaseline()
         case 0x02:
             let now = Date()
             var n = 0
@@ -229,7 +262,7 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
             let f = text.split(separator: " ")
             if f.count >= 8 {
                 snap.chain = String(f[2].prefix(16))
-                snap.heartbeat = "up \(Int(f[0]).map { $0 / 1000 } ?? 0)s · \(f[4]) rules · \(f[5]) frozen · chain #\(f[1]) · \(f[3]) dropped"
+                snap.heartbeat = "up \(Int(f[0]).map { $0 / 1000 } ?? 0)s · chain #\(f[1]) · \(f[3]) dropped"
             }
         case 0x04:
             let f = text.split(separator: " ")
@@ -237,35 +270,16 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
                 let what = pending.removeValue(forKey: seq) ?? "shield"
                 if f[0] == "ok" {
                     snap.shieldsAccepted += 1
-                    note("VioletOS verified and applied \(what)")
+                    shieldLog.info("VioletOS verified \(what, privacy: .public)")
                 } else {
                     snap.shieldsRejected += 1
-                    note("VioletOS rejected \(what): \(f.dropFirst(2).joined(separator: " "))")
+                    shieldLog.error("VioletOS rejected \(what, privacy: .public): \(f.dropFirst(2).joined(separator: " "), privacy: .public)")
                 }
             }
         default:
             break
         }
         publish()
-    }
-
-    private var baselineIds: [UInt32] = []
-    private var baselineAt = Date.distantPast
-
-    private func pushBaseline() {
-        if baselineIds.isEmpty { baselineIds = ShieldSigner.baseline.map { _ in signer.newShieldId() } }
-        for (id, rule) in zip(baselineIds, ShieldSigner.baseline) {
-            let payload = ShieldSigner.rulePayload(rule.0, rule.1, rule.2, writeOnly: rule.3, crossAppOnly: rule.4)
-            send(op: .install, pid: 0, ttl: 3600, payload: payload, what: "baseline: freeze writes to \(rule.2)\(rule.4 ? " of other apps" : "")", shieldId: id)
-        }
-        baselineAt = Date()
-    }
-
-    private func note(_ s: String) {
-        shieldLog.info("\(s, privacy: .public)")
-        if let i = snap.decisions.indices.first {
-            snap.decisions[i].note = s
-        }
     }
 
     private func ingest(_ r: SentinelRecord) {
@@ -280,8 +294,6 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         t.add(r)
         switch r.kind {
         case "EXIT": t.exited = true
-        case "FROZEN": t.frozen = true
-        case "THAWED": t.frozen = false; t.contained = false
         case "SOCK_CONN":
             lock.lock(); reported[r.target.lowercased()] = r.arrived; lock.unlock()
             t.dirtySince = t.dirtySince ?? Date()
@@ -295,9 +307,12 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
 
     private func tick() {
         let now = Date()
-        if link != nil, now.timeIntervalSince(baselineAt) > 3000 { pushBaseline() }
+        if let frame = lastAgentFrame, now.timeIntervalSince(frame) > 8, let link {
+            link.close()
+            linkClosed(link, "Mac Agent telemetry timed out")
+        }
         checkUnreportedFlows(now)
-        for t in tracks.values where !t.exited && !t.frozen && !scoring.contains(t.pid) {
+        for t in tracks.values where !t.exited && !scoring.contains(t.pid) {
             guard let since = t.dirtySince else { continue }
             let quiet = (t.records.last.map { now.timeIntervalSince($0.arrived) } ?? 1) >= 0.3
             // Score when the app pauses, or every second while it keeps going.
@@ -306,13 +321,11 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
                 evaluate(t)
             }
         }
-        var frozen: [String] = []
-        for t in tracks.values where t.frozen && !t.exited { frozen.append("\(t.name) (pid \(t.pid))") }
-        snap.frozen = frozen
         publish()
     }
 
     private func socksSeen(_ now: Date) -> Set<String> {
+        guard agentSession == nil else { return [] }
         lock.lock(); defer { lock.unlock() }
         return Set(flows.values.filter { now.timeIntervalSince($0.started) < 180 }.map(\.target))
     }
@@ -324,7 +337,7 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         if let rule = tier0(t, window) {
             let d = ShieldDecision(time: now, pid: t.pid, app: t.name, tier: "tier0", verdict: "exploit_or_persistence", pMalicious: 1,
                                    action: "freeze_app", tags: [("persistence_write", 1)], novelty: 0, tokens: 0, latencyMs: 0,
-                                   hosts: t.newTargets(in: window), window: window.canonicalText(), contained: false, note: rule)
+                                   hosts: t.newTargets(in: window), window: window.canonicalText(), warned: false, note: rule)
             decide(t, d)
             return
         }
@@ -336,7 +349,7 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
             let t0 = CFAbsoluteTimeGetCurrent()
             let text = window.fitText(countTokens: model.countTokens)
             guard let e = try? model.embed(text) else {
-                self.queue.async { self.scoring.remove(t.pid) }
+                self.queue.async { if self.tracks[t.pid] === t { self.scoring.remove(t.pid) } }
                 return
             }
             self.queue.async {
@@ -346,6 +359,7 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
                     let out = try? model.score(embedding: e.embedding, side: side)
                     let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
                     self.queue.async {
+                        guard self.tracks[t.pid] === t else { return }
                         self.scoring.remove(t.pid)
                         guard let out, out.verdict.count == 4, out.action.count == 4 else { return }
                         self.snap.windowsScored += 1
@@ -358,8 +372,8 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
                         if hosts.isEmpty { hosts = window.events.filter { $0.kind == "SOCK_CONN" }.map(\.detail) }
                         let d = ShieldDecision(time: Date(), pid: t.pid, app: t.name, tier: "model", verdict: ShieldSchema.verdicts[vi],
                                                pMalicious: pMal, action: ShieldSchema.actions[ai], tags: tags.map { ($0.0, $0.1) }, novelty: dist,
-                                               tokens: e.tokens, latencyMs: ms, hosts: Array(Set(hosts)).sorted(), window: text,
-                                               contained: false, note: "")
+                                               tokens: e.tokens, latencyMs: ms, hosts: Array(Set(hosts)).sorted(), window: window.canonicalText(),
+                                               warned: false, note: "")
                         shieldLog.info("scored \(t.name, privacy: .public) pid \(t.pid): \(d.verdict, privacy: .public) p_mal=\(pMal) \(d.action, privacy: .public) \(Int(ms))ms")
                         if out.verdict[0] >= 0.9 {
                             // Confidently benign: it becomes this app's history.
@@ -368,7 +382,8 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
                                 t.knownHosts.append(h.detail)
                             }
                         }
-                        self.decide(t, d)
+                        self.decide(t, d, scores: TrainingScores(input: text, sideFeatures: side,
+                                                                verdict: out.verdict, action: out.action, tags: out.tags))
                     }
                 }
             }
@@ -386,82 +401,47 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         return nil
     }
 
-    private func decide(_ t: AppTrack, _ d0: ShieldDecision) {
+    private func decide(_ t: AppTrack, _ d0: ShieldDecision, scores: TrainingScores? = nil) {
         var d = d0
         let malicious = d.pMalicious >= 0.9 && (d.action == "freeze_app" || d.action == "block_host")
-        t.lastDecision = d
-        if malicious && !t.contained {
-            if snap.autoContain {
-                contain(t, &d)
-            } else {
-                d.note = "notify-only mode: nothing blocked"
-            }
-            alert(d)
+        if malicious {
+            d.warned = warn(t)
+            if d.note.isEmpty { d.note = "Monitoring only" }
         } else if d.pMalicious >= 0.5 {
             d.note = "watching"
         }
-        snap.decisions.insert(d, at: 0)
+        record(d, scores: scores)
+    }
+
+    private func record(_ decision: ShieldDecision, scores: TrainingScores? = nil) {
+        #if os(macOS)
+        appendVerdict(decision, scores: scores)
+        #endif
+        snap.decisions.insert(decision, at: 0)
         if snap.decisions.count > 30 { snap.decisions.removeLast() }
-        if malicious { feedback.recordPending(d) }
         publish()
     }
 
-    /// Block in the relay at once, then ask VioletOS (signed) to freeze the app and deny its hosts.
-    private func contain(_ t: AppTrack, _ d: inout ShieldDecision) {
-        t.contained = true
-        d.contained = true
-        let hosts = d.hosts
-        // New connections are refused at once. A live upload is cut a moment after the
-        // freeze goes out, so VioletOS stops the app inside its send rather than on an error.
-        let freezing = d.action == "freeze_app" && signer.canSign && link != nil
-        block(hosts, cutAfter: freezing ? 1.0 : 0)
-        var notes: [String] = []
-        if !hosts.isEmpty { notes.append("relay blocked \(hosts.joined(separator: ", "))") }
-        guard signer.canSign, link != nil else {
-            d.note = notes.joined(separator: "; ") + (link == nil ? "; VioletOS offline" : "; no signing key")
-            return
-        }
-        let ttl = freezeTTL
-        if d.action == "freeze_app" {
-            send(op: .freeze, pid: t.pid, ttl: ttl, payload: Data(), what: "freeze of \(t.name) (pid \(t.pid)) for \(ttl)s")
-            notes.append("signed FREEZE_APP pid \(t.pid) ttl \(ttl)s")
-        }
-        for h in hosts {
-            let host = h.split(separator: ":").dropLast().joined(separator: ":")
-            let payload = ShieldSigner.rulePayload(.host, .deny, host.isEmpty ? h : host)
-            send(op: .install, pid: 0, ttl: ttl, payload: payload, what: "DENY \(host) for \(ttl)s")
-            notes.append("signed DENY \(host)")
-        }
-        d.note = notes.joined(separator: "; ")
-    }
-
-    private func send(op: ShieldSigner.Op, pid: UInt32, ttl: UInt32, payload: Data, what: String, shieldId: UInt32? = nil) {
-        guard let link else { return }
+    /// Repeated windows from one app share a warning for one minute.
+    private func warn(_ track: AppTrack) -> Bool {
+        let now = Date()
+        guard let link, now.timeIntervalSince(track.lastWarning) >= 60 else { return false }
         do {
-            let (env, seq) = try signer.envelope(op: op, shieldId: shieldId ?? signer.newShieldId(), ttlSecs: ttl, pid: pid, payload: payload)
-            pending[seq] = what
-            link.send(kind: 0x10, payload: env)
+            let (envelope, seq) = try signer.warning()
+            pending[seq] = "Home warning"
+            link.send(kind: 0x10, payload: envelope)
+            track.lastWarning = now
             snap.shieldsSent += 1
+            return true
         } catch {
-            shieldLog.error("sign failed: \(error.localizedDescription, privacy: .public)")
+            shieldLog.error("warning signature failed: \(error.localizedDescription, privacy: .public)")
+            return false
         }
-    }
-
-    private func block(_ targets: [String], cutAfter delay: Double = 0) {
-        lock.lock()
-        for t in targets {
-            blockedTargets.insert(t.lowercased())
-            if let host = t.split(separator: ":").first { blockedHosts.insert(String(host).lowercased()) }
-        }
-        snap.blocked = Array(blockedHosts).sorted()
-        lock.unlock()
-        let hosts = targets.compactMap { $0.split(separator: ":").first.map { String($0).lowercased() } }
-        relay?.queue.asyncAfter(deadline: .now() + delay) { self.relay?.abortSessions(toHosts: Set(hosts)) }
     }
 
     /// The relay saw a connection VioletOS never reported: telemetry is missing or tampered.
     private func checkUnreportedFlows(_ now: Date) {
-        guard let up = linkUpSince, now.timeIntervalSince(up) > 5 else { return }
+        guard agentSession == nil, let up = linkUpSince, now.timeIntervalSince(up) > 5 else { return }
         lock.lock()
         let candidates = flows.values.filter { f in
             !flaggedFlows.contains(f.id) && f.started > up.addingTimeInterval(2) && now.timeIntervalSince(f.started) > 3
@@ -478,21 +458,11 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         tracks[0] = ghost
         let window = ghost.window(socksSeen: [], unreported: unreported.map { SocksOnlyFlow(target: $0.target, tx: $0.up, rx: $0.down) })
         let hosts = unreported.map(\.target)
-        var d = ShieldDecision(time: now, pid: 0, app: "unattributed", tier: "relay", verdict: "exfil_or_c2", pMalicious: 1,
+        let d = ShieldDecision(time: now, pid: 0, app: "unattributed", tier: "relay", verdict: "exfil_or_c2", pMalicious: 1,
                                action: "block_host", tags: [("socks_sentinel_mismatch", 1)], novelty: 0, tokens: 0, latencyMs: 0,
-                               hosts: hosts, window: window.canonicalText(), contained: true,
+                               hosts: hosts, window: window.canonicalText(), warned: warn(ghost),
                                note: "relay saw a connection the Sentinel never reported")
-        block(hosts)
-        if signer.canSign, link != nil {
-            for h in hosts {
-                let host = h.split(separator: ":").first.map(String.init) ?? h
-                send(op: .install, pid: 0, ttl: freezeTTL, payload: ShieldSigner.rulePayload(.host, .deny, host), what: "DENY \(host)")
-            }
-            d.note += "; signed DENY " + hosts.joined(separator: ", ")
-        }
-        alert(d)
-        snap.decisions.insert(d, at: 0)
-        publish()
+        record(d)
         // The model's own view of the same evidence, for the record.
         if let model {
             let text = window.fitText(countTokens: model.countTokens)
@@ -509,70 +479,10 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    // MARK: - User actions
-
-    func release(_ d: ShieldDecision) {
+    func label(_ decision: ShieldDecision, benign: Bool) {
         queue.async {
-            self.lock.lock()
-            for h in d.hosts {
-                self.blockedTargets.remove(h.lowercased())
-                if let host = h.split(separator: ":").first { self.blockedHosts.remove(String(host).lowercased()) }
-            }
-            self.snap.blocked = Array(self.blockedHosts).sorted()
-            self.lock.unlock()
-            if d.pid != 0 {
-                self.send(op: .unfreeze, pid: d.pid, ttl: 0, payload: Data(), what: "release of \(d.app)")
-                self.tracks[d.pid]?.contained = false
-            }
-            self.publish()
+            self.feedback.label(decision, as: benign ? "benign_allow" : "confirmed_threat")
         }
-    }
-
-    func label(_ d: ShieldDecision, benign: Bool) {
-        queue.async {
-            self.feedback.label(d, as: benign ? "benign_allow" : "confirmed_threat")
-            if benign { self.release(d) }
-        }
-    }
-
-    func setAutoContain(_ on: Bool) {
-        queue.async {
-            self.snap.autoContain = on
-            UserDefaults.standard.set(!on, forKey: "shieldNotifyOnly")
-            self.publish()
-        }
-    }
-
-    private func alert(_ d: ShieldDecision) {
-        let content = UNMutableNotificationContent()
-        content.title = d.contained ? "Violet Shield contained \(d.app)" : "Violet Shield flagged \(d.app)"
-        content.body = "\(d.verdict.replacingOccurrences(of: "_", with: " ")) · p=\(String(format: "%.2f", d.pMalicious)) · "
-            + (d.hosts.isEmpty ? d.action : d.hosts.joined(separator: ", "))
-        content.categoryIdentifier = "VIOLET_SHIELD_ALERT"
-        content.userInfo = ["decision": d.id.uuidString]
-        content.sound = .default
-        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: d.id.uuidString, content: content, trigger: nil))
-    }
-
-    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound, .list])
-    }
-
-    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
-                                withCompletionHandler completionHandler: @escaping () -> Void) {
-        let id = response.notification.request.content.userInfo["decision"] as? String
-        queue.async {
-            if let d = self.snap.decisions.first(where: { $0.id.uuidString == id }) {
-                switch response.actionIdentifier {
-                case "RELEASE": self.release(d)
-                case "BENIGN": self.label(d, benign: true)
-                case "THREAT": self.label(d, benign: false)
-                default: break
-                }
-            }
-        }
-        completionHandler()
     }
 
     // MARK: - Status
@@ -587,18 +497,62 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func writeStatus(_ s: ShieldSnapshot) {
-        let decisions: [[String: Any]] = s.decisions.prefix(30).map { d in
-            ["time": ISO8601DateFormatter().string(from: d.time), "pid": d.pid, "app": d.app, "tier": d.tier, "verdict": d.verdict,
-             "p_malicious": d.pMalicious, "action": d.action, "tags": d.tags.map(\.0), "novelty": d.novelty, "tokens": d.tokens,
-             "latency_ms": Int(d.latencyMs), "hosts": d.hosts, "contained": d.contained, "note": d.note, "window": d.window]
+    #if os(macOS)
+    private var verdictWriteFailed = false
+
+    // This runs on the Shield queue, where decisions arrive in order.
+    private func appendVerdict(_ d: ShieldDecision, scores: TrainingScores?) {
+        let url = dataDirectory.appendingPathComponent("shield-verdicts.jsonl")
+        var row = decisionFields(d)
+        row["schema_version"] = 1
+        row["boot_id"] = snap.bootId
+        row["transport"] = verdictTransport
+        row["model"] = d.tier == "model" ? snap.modelState : ""
+        row["tag_scores"] = Dictionary(uniqueKeysWithValues: d.tags)
+        if let scores {
+            row["model_input"] = scores.input
+            row["side_features"] = scores.sideFeatures
+            row["verdict_probs"] = scores.verdict
+            row["action_probs"] = scores.action
+            row["tag_probs"] = scores.tags
         }
+
+        do {
+            var line = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+            line.append(0x0a)
+            let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+                          S_IRUSR | S_IWUSR)
+            guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            var info = stat()
+            guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == getuid(),
+                  fchmod(fd, S_IRUSR | S_IWUSR) == 0 else { throw CocoaError(.fileWriteNoPermission) }
+            try file.write(contentsOf: line)
+            verdictWriteFailed = false
+        } catch {
+            if !verdictWriteFailed {
+                shieldLog.error("Could not save verdicts: \(error.localizedDescription, privacy: .public)")
+                verdictWriteFailed = true
+            }
+        }
+    }
+    #endif
+
+    private func decisionFields(_ d: ShieldDecision) -> [String: Any] {
+        ["id": d.id.uuidString, "time": ISO8601DateFormatter().string(from: d.time), "pid": d.pid, "app": d.app,
+         "tier": d.tier, "verdict": d.verdict, "p_malicious": d.pMalicious, "action": d.action, "tags": d.tags.map(\.0),
+         "novelty": d.novelty, "tokens": d.tokens, "latency_ms": Int(d.latencyMs), "hosts": d.hosts,
+         "contained": false, "warned": d.warned, "note": d.note, "window": d.window]
+    }
+
+    private func writeStatus(_ s: ShieldSnapshot) {
+        let decisions = s.decisions.prefix(30).map(decisionFields)
         let obj: [String: Any] = ["model": s.modelState, "compute_units": s.computeUnits, "signer": s.signer, "link": s.link, "link_up": s.linkUp,
                                   "boot_id": s.bootId, "chain": s.chain, "heartbeat": s.heartbeat, "events": s.events,
                                   "windows_scored": s.windowsScored, "shields_sent": s.shieldsSent, "shields_accepted": s.shieldsAccepted,
-                                  "shields_rejected": s.shieldsRejected, "blocked": s.blocked, "frozen": s.frozen, "auto_contain": s.autoContain,
+                                  "shields_rejected": s.shieldsRejected, "auto_contain": false,
                                   "last_latency_ms": Int(s.lastLatencyMs), "decisions": decisions]
-        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("shield-status.json")
+        let url = dataDirectory.appendingPathComponent("shield-status.json")
         if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: url, options: .atomic)
         }
@@ -637,19 +591,22 @@ final class Shield: NSObject, UNUserNotificationCenterDelegate {
 /// One TCP stream from VioletOS's Sentinel, handed over by the SOCKS5 session.
 /// Frames: [type u8][len u32 LE][payload].
 final class SentinelLink {
-    private let conn: NWConnection
+    private let conn: NWConnection?
+    private let forward: ((Data) -> Void)?
     private let queue: DispatchQueue
     private weak var shield: Shield?
     private var buf = Data()
     private var closed = false
 
-    init(conn: NWConnection, queue: DispatchQueue, shield: Shield) {
+    init(conn: NWConnection? = nil, queue: DispatchQueue, shield: Shield, forward: ((Data) -> Void)? = nil) {
         self.conn = conn
+        self.forward = forward
         self.queue = queue
         self.shield = shield
     }
 
     func start() {
+        guard let conn else { return }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
@@ -662,17 +619,19 @@ final class SentinelLink {
     }
 
     private func receive() {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
+        conn?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
             guard let self else { return }
             self.queue.async {
-                if let data { self.buf.append(data); self.drain() }
+                if let data { self.feed(data) }
                 if done || error != nil { self.finish(error.map { "\($0)" } ?? "VioletOS closed the link"); return }
                 self.receive()
             }
         }
     }
 
-    private func drain() {
+    func feed(_ data: Data) {
+        guard !closed else { return }
+        buf.append(data)
         while buf.count >= 5 {
             let b = [UInt8](buf.prefix(5))
             let len = Int(b[1]) | Int(b[2]) << 8 | Int(b[3]) << 16 | Int(b[4]) << 24
@@ -688,41 +647,41 @@ final class SentinelLink {
         var f = Data([kind])
         f.appendLE(UInt32(payload.count))
         f.append(payload)
-        conn.send(content: f, completion: .contentProcessed { _ in })
+        if let forward { forward(f) } else { conn?.send(content: f, completion: .contentProcessed { _ in }) }
     }
 
     func close() {
         closed = true
-        conn.cancel()
+        conn?.cancel()
     }
 
     private func finish(_ why: String) {
         guard !closed else { return }
         closed = true
-        conn.cancel()
+        conn?.cancel()
         shield?.linkClosed(self, why)
     }
 }
 
-// MARK: - Active learning
+/// Labels are stored locally for training feedback.
+private final class AlertFeedbackStore {
+    private let url: URL
 
-/// Alerts the user labels, kept as `Documents/shield-feedback.jsonl` for the Mac trainer.
-final class AlertFeedbackStore {
-    private var pending: [UUID: ShieldDecision] = [:]
-    private let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("shield-feedback.jsonl")
-
-    func recordPending(_ d: ShieldDecision) { pending[d.id] = d }
+    init(directory: URL) {
+        url = directory.appendingPathComponent("shield-feedback.jsonl")
+    }
 
     func label(_ d: ShieldDecision, as label: String) {
-        let entry: [String: Any] = ["timestamp": ISO8601DateFormatter().string(from: Date()), "canonicalWindow": d.window,
+        let entry: [String: Any] = ["verdictID": d.id.uuidString, "timestamp": ISO8601DateFormatter().string(from: Date()), "canonicalWindow": d.window,
                                     "modelVerdict": d.verdict, "pMalicious": d.pMalicious, "userLabel": label]
         guard var line = try? JSONSerialization.data(withJSONObject: entry) else { return }
         line.append(0x0a)
-        if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(line); try? h.close()
+        if let file = try? FileHandle(forWritingTo: url) {
+            file.seekToEndOfFile()
+            file.write(line)
+            try? file.close()
         } else {
             try? line.write(to: url)
         }
-        pending.removeValue(forKey: d.id)
     }
 }

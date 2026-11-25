@@ -279,9 +279,11 @@ def main(out, python=True, compress=False, skip=()):
             if path.is_file():
                 rel = f"apps/{app.name}/{path.relative_to(app)}"
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
-    # Apps with an app.txt are listed first, under their titles, by the shell.
+    # Apps with an app.txt get an icon on Home under their titles (a script
+    # app is a folder: /apps/NAME/main.py).
+    built = lambda name: f"apps/{name}" in files or any(k.startswith(f"apps/{name}/") for k in files)
     titles = [f"{a.name}\t{(a / 'app.txt').read_text().strip()}" for a in apps
-              if (a / "app.txt").exists() and f"apps/{a.name}" in files]
+              if (a / "app.txt").exists() and built(a.name)]
     files["apps/.home"] = ("\n".join(titles).encode() + b"\n", 0o100644)
     # Name lookups go to the Open Runtime's own DNS answerer; certificates for TLS.
     files["etc/resolv.conf"] = (b"nameserver 10.0.0.53\noptions attempts:2 timeout:2\n", 0o100644)

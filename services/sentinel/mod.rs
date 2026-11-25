@@ -71,6 +71,7 @@ pub enum Op {
     Unfreeze = 3,
     Kill = 4,
     Freeze = 5,
+    Warning = 6,
 }
 
 /// Parsed `VSH1` header (little endian):
@@ -103,6 +104,7 @@ pub enum SentinelErr {
     BadRule,
     RuleTableFull,
     NoSuchApp,
+    MonitoringOnly,
 }
 
 impl SentinelErr {
@@ -119,6 +121,7 @@ impl SentinelErr {
             SentinelErr::BadRule => "bad-rule",
             SentinelErr::RuleTableFull => "rule-table-full",
             SentinelErr::NoSuchApp => "no-such-app",
+            SentinelErr::MonitoringOnly => "monitoring-only",
         }
     }
 }
@@ -131,6 +134,7 @@ pub enum Command {
     Freeze { pid: u32, until_ns: u64, shield_id: u32 },
     Unfreeze { pid: u32 },
     Kill { pid: u32, shield_id: u32 },
+    Warning,
 }
 
 pub fn parse_header(b: &[u8]) -> Result<SignedShieldHeader, SentinelErr> {
@@ -282,8 +286,18 @@ pub fn command_for(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Resul
         3 => Command::Unfreeze { pid: h.target_pid },
         4 => Command::Kill { pid: h.target_pid, shield_id: h.shield_id },
         5 => Command::Freeze { pid: h.target_pid, until_ns: now_ns + u64::from(h.ttl_secs) * 1_000_000_000, shield_id: h.shield_id },
+        6 if payload.is_empty() && h.ttl_secs == 0 => Command::Warning,
         _ => return Err(SentinelErr::BadOp),
     })
+}
+
+/// Older companions can still report telemetry and revoke a rule, but their
+/// signed enforcement commands cannot change an app's behavior.
+fn monitoring_command_for(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result<Command, SentinelErr> {
+    match command_for(h, payload, now_ns)? {
+        cmd @ (Command::Warning | Command::Revoke(_) | Command::Unfreeze { .. }) => Ok(cmd),
+        _ => Err(SentinelErr::MonitoringOnly),
+    }
 }
 
 // ---- link framing: [type:u8][len:u32 LE][payload] ----
@@ -389,6 +403,7 @@ enum Link {
     Down { retry_at_ns: u64 },
     Connecting { slot: usize, since_ns: u64 },
     Up { slot: usize },
+    Agent { last_poll_ns: u64 },
 }
 
 pub struct Sentinel {
@@ -406,6 +421,7 @@ pub struct Sentinel {
     pub accepted: u32,
     pub rejected: u32,
     pub frozen_apps: u16,
+    pub warnings: u32,
     pub connected_once: bool,
 }
 
@@ -427,6 +443,7 @@ impl Sentinel {
             accepted: 0,
             rejected: 0,
             frozen_apps: 0,
+            warnings: 0,
             connected_once: false,
         }
     }
@@ -453,7 +470,7 @@ impl Sentinel {
     }
 
     pub fn online(&self) -> bool {
-        matches!(self.link, Link::Up { .. })
+        matches!(self.link, Link::Up { .. } | Link::Agent { .. })
     }
 
     fn heartbeat(&self, now_ns: u64, active: usize, telemetry_dropped: u32) -> String {
@@ -475,6 +492,97 @@ impl Sentinel {
         self.tx.extend_from_slice(&f);
     }
 
+    fn start_link(&mut self) {
+        self.connected_once = true;
+        self.rx.clear();
+        self.tx.clear();
+        let hello = format!("VSL1 boot={} chain={} key={}", hex(&self.chain.boot_id), hex(&self.chain.chain_digest),
+                            hex(&sha256(&self.verifier.companion_key)[..8]));
+        self.tx.extend_from_slice(&frame(FRAME_HELLO, hello.as_bytes()));
+        self.last_heartbeat_ns = 0;
+    }
+
+    /// The stock handset Agent forwards this stream only over its paired Mac session.
+    pub fn agent_pull(&mut self, now_ns: u64, reset: bool) -> String {
+        if reset || !matches!(self.link, Link::Agent { .. }) {
+            if let Link::Up { slot } | Link::Connecting { slot, .. } = self.link {
+                net::close(slot);
+            }
+            self.start_link();
+            crate::log!("sentinel: linked through Mac Agent");
+        }
+        self.link = Link::Agent { last_poll_ns: now_ns };
+        // /dev/violet/sys has a 4096-byte response buffer; hex doubles the size.
+        let n = self.tx.len().min(1900);
+        let output = hex(&self.tx[..n]);
+        self.tx.drain(..n);
+        output
+    }
+
+    pub fn agent_push(&mut self, text: &str) -> bool {
+        if !matches!(self.link, Link::Agent { .. }) || text.is_empty() || text.len() > 1024
+            || text.len() % 2 != 0 || self.rx.len() + text.len() / 2 > 4096 {
+            return false;
+        }
+        let data: Option<Vec<u8>> = text.as_bytes().chunks_exact(2).map(|pair| {
+            u8::from_str_radix(core::str::from_utf8(pair).ok()?, 16).ok()
+        }).collect();
+        if let Some(data) = data {
+            self.rx.extend_from_slice(&data);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn receive(&mut self, now_ns: u64, commands: &mut Vec<Command>) {
+        for (kind, payload) in take_frames(&mut self.rx) {
+            if kind != FRAME_SHIELD {
+                continue;
+            }
+            match self.verifier.verify(&payload).and_then(|(h, body)| Ok((h, monitoring_command_for(&h, body, now_ns)?))) {
+                Ok((h, cmd)) => {
+                    self.accepted += 1;
+                    if cmd != Command::Warning {
+                        self.chain.extend(MEASURE_SHIELD_LOAD, &sha256(&payload));
+                    }
+                    crate::log!("sentinel: shield {} op {} seq {} accepted", h.shield_id, h.op, h.seq_no);
+                    self.result(&format!("ok {} {} {}", h.seq_no, h.op, h.shield_id));
+                    commands.push(cmd);
+                }
+                Err(e) => {
+                    self.rejected += 1;
+                    let seq = parse_header(&payload).map(|h| h.seq_no).unwrap_or(0);
+                    crate::log!("sentinel: shield rejected: {}", e.name());
+                    self.result(&format!("err {} {}", seq, e.name()));
+                }
+            }
+        }
+    }
+
+    fn collect(&mut self, now_ns: u64, active_shields: usize, telemetry_dropped: u32) {
+        // Events: as many whole lines as fit.
+        if !self.offline.is_empty() && self.tx.len() < 4096 {
+            let mut text = String::new();
+            while let Some(line) = self.offline.front() {
+                if text.len() + line.len() + 1 > 3000 {
+                    break;
+                }
+                text.push_str(line);
+                text.push('\n');
+                self.offline.pop_front();
+            }
+            if !text.is_empty() {
+                self.tx.extend_from_slice(&frame(FRAME_EVENTS, text.as_bytes()));
+            }
+        }
+        if now_ns.wrapping_sub(self.last_heartbeat_ns) >= 2_000_000_000 {
+            self.last_heartbeat_ns = now_ns;
+            let hb = self.heartbeat(now_ns, active_shields, telemetry_dropped);
+            self.tx.extend_from_slice(&frame(FRAME_HEARTBEAT, hb.as_bytes()));
+        }
+    }
+
     /// Move the link along; returns verified commands for the runtime.
     pub fn tick(&mut self, net: &mut Net, now_ns: u64, active_shields: usize, telemetry_dropped: u32) -> Vec<Command> {
         let mut commands = Vec::new();
@@ -491,13 +599,7 @@ impl Sentinel {
             Link::Connecting { slot, since_ns } => match net.state(slot) {
                 (net::OPEN, _) => {
                     self.link = Link::Up { slot };
-                    self.connected_once = true;
-                    self.rx.clear();
-                    self.tx.clear();
-                    let hello = format!("VSL1 boot={} chain={} key={}", hex(&self.chain.boot_id), hex(&self.chain.chain_digest),
-                                        hex(&sha256(&self.verifier.companion_key)[..8]));
-                    self.tx.extend_from_slice(&frame(FRAME_HELLO, hello.as_bytes()));
-                    self.last_heartbeat_ns = 0;
+                    self.start_link();
                     crate::log!("sentinel: linked to {}", ENDPOINT);
                 }
                 (net::CONNECTING, _) if now_ns - since_ns < 10_000_000_000 => {}
@@ -516,49 +618,20 @@ impl Sentinel {
                 }
                 let incoming = net.recv(slot, 8192);
                 self.rx.extend_from_slice(&incoming);
-                for (kind, payload) in take_frames(&mut self.rx) {
-                    if kind != FRAME_SHIELD {
-                        continue;
-                    }
-                    match self.verifier.verify(&payload).and_then(|(h, body)| Ok((h, command_for(&h, body, now_ns)?))) {
-                        Ok((h, cmd)) => {
-                            self.accepted += 1;
-                            self.chain.extend(MEASURE_SHIELD_LOAD, &sha256(&payload));
-                            crate::log!("sentinel: shield {} op {} seq {} accepted", h.shield_id, h.op, h.seq_no);
-                            self.result(&format!("ok {} {} {}", h.seq_no, h.op, h.shield_id));
-                            commands.push(cmd);
-                        }
-                        Err(e) => {
-                            self.rejected += 1;
-                            let seq = parse_header(&payload).map(|h| h.seq_no).unwrap_or(0);
-                            crate::log!("sentinel: shield rejected: {}", e.name());
-                            self.result(&format!("err {} {}", seq, e.name()));
-                        }
-                    }
-                }
-                // Events: as many whole lines as fit.
-                if !self.offline.is_empty() && self.tx.len() < 4096 {
-                    let mut text = String::new();
-                    while let Some(line) = self.offline.front() {
-                        if text.len() + line.len() + 1 > 3000 {
-                            break;
-                        }
-                        text.push_str(line);
-                        text.push('\n');
-                        self.offline.pop_front();
-                    }
-                    if !text.is_empty() {
-                        self.tx.extend_from_slice(&frame(FRAME_EVENTS, text.as_bytes()));
-                    }
-                }
-                if now_ns.wrapping_sub(self.last_heartbeat_ns) >= 2_000_000_000 {
-                    self.last_heartbeat_ns = now_ns;
-                    let hb = self.heartbeat(now_ns, active_shields, telemetry_dropped);
-                    self.tx.extend_from_slice(&frame(FRAME_HEARTBEAT, hb.as_bytes()));
-                }
+                self.receive(now_ns, &mut commands);
+                self.collect(now_ns, active_shields, telemetry_dropped);
                 if !self.tx.is_empty() {
                     let n = net.send(slot, &self.tx);
                     self.tx.drain(..n);
+                }
+            }
+            Link::Agent { last_poll_ns } => {
+                if now_ns.saturating_sub(last_poll_ns) > 5_000_000_000 {
+                    self.link = Link::Down { retry_at_ns: now_ns };
+                    crate::log!("sentinel: Mac Agent link lost");
+                } else {
+                    self.receive(now_ns, &mut commands);
+                    self.collect(now_ns, active_shields, telemetry_dropped);
                 }
             }
         }
@@ -611,6 +684,24 @@ mod tests {
             }
         }
         let _ = le16(0);
+    }
+
+    #[test]
+    fn monitoring_accepts_warnings_and_rejects_enforcement() {
+        let (key, cases) = fixtures();
+        let mut v = Verifier { companion_key: key.try_into().unwrap(), last_seq: 0 };
+        for (_, env) in &cases {
+            let Ok((h, body)) = v.verify(env) else { continue };
+            if matches!(command_for(&h, body, 1_000), Ok(Command::Install(_) | Command::Freeze { .. } | Command::Kill { .. })) {
+                assert_eq!(monitoring_command_for(&h, body, 1_000), Err(SentinelErr::MonitoringOnly));
+            }
+        }
+        let warning = SignedShieldHeader {
+            version: 1, tier: 1, op: Op::Warning as u8, shield_id: 1, seq_no: 1,
+            ttl_secs: 0, target_pid: 0, payload_len: 0, sig_len: 0,
+        };
+        assert_eq!(monitoring_command_for(&warning, &[], 1_000), Ok(Command::Warning));
+        assert_eq!(monitoring_command_for(&warning, b"unexpected", 1_000), Err(SentinelErr::BadOp));
     }
 
     #[test]

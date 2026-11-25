@@ -134,16 +134,6 @@ pub const ACCENT: u32 = 0xffd1b0fe;
 pub const ALERT: u32 = 0xffff5a5f;
 pub const OK_GREEN: u32 = 0xff6ee7a8;
 
-/// Drawn over a frozen app's last frame while it is on screen.
-pub fn frozen_banner(on: bool) {
-    if !on {
-        return;
-    }
-    fill(0, 0, WIDTH, 150, ALERT);
-    text(36, 30, "FROZEN BY VIOLET SHIELD", 4, 0xff1a0b0d);
-    text(36, 90, "SIGNED BY YOUR IPHONE - MEMORY KEPT", 2, 0xff1a0b0d);
-}
-
 fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
     // Scanout is mapped cached, so plain stores (written back by the clean
     // below or by the caller) are as visible as volatile ones, and a row is
@@ -1085,10 +1075,12 @@ impl Runtime {
                 self.shell.dirty = true;
                 String::from("ok\n")
             }
-            // System settings: Wi-Fi, Phone Internet, packages and power.
-            Some("system") => {
-                request(EXECUTE, OPEN, LAUNCHER);
-                String::from("ok\n")
+            // Bluetooth: whether the controller is on, and whether an app has its HCI open.
+            Some("bluetooth") => alloc::format!("on={} open={}\n", super::hci::up() as u32, super::hci::is_open() as u32),
+            // Phone Internet (runtime/open/wifi.rs).
+            Some("relay") => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                self.wifi.relay(&path, &mut words)
             }
             // Bring an app to the front, starting it if it is not running.
             Some("open") => match words.next() {
@@ -1134,29 +1126,41 @@ impl Runtime {
             }
             // The programs running now, as paths.
             // Installed apps (runtime/open/appstore.rs): "install NAME TITLE" keeps
-            // /apps/NAME, which the app wrote, across restarts and lists it under
+            // the staged program as /apps/NAME across restarts and lists it under
             // TITLE; "uninstall NAME" removes it; "installed" lists them. Only the
             // agent (/apps/agent), which takes installs from the paired Mac, may
-            // change them.
+            // install them; the agent and Settings may remove them.
             Some(verb @ ("install" | "uninstall")) => {
                 let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
-                if path != super::appstore::INSTALLER {
+                let allowed = path == super::appstore::INSTALLER || (verb == "uninstall" && path == super::wifi::SETTINGS_APP);
+                if !allowed {
                     return String::from("error only the agent installs apps\n");
                 }
                 let Some(name) = words.next().filter(|n| super::appstore::valid_name(n)) else {
                     return alloc::format!("error usage: {} NAME{}\n", verb, if verb == "install" { " TITLE" } else { "" });
                 };
-                let image = self.fs.stat(&alloc::format!("/apps/{}", name)).is_some()
-                    && !self.fs.from_layer(&alloc::format!("/apps/{}", name));
-                if image || alloc::format!("/apps/{}", name) == super::appstore::INSTALLER {
+                let installed = alloc::format!("/apps/{}", name);
+                let image = self.fs.stat(&installed).is_some() && !self.fs.from_layer(&installed);
+                if image || installed == super::appstore::INSTALLER {
                     return String::from("error a built-in app has that name\n");
                 }
                 let title: Vec<&str> = words.collect();
                 let now = (self.clock(0) / 1_000_000_000) as u32;
                 let _lowered = sys::Lowered::new();
+                let running = self.apps.iter().position(|app| app.as_ref().is_some_and(|a| a.path == installed));
                 let r = if verb == "install" {
-                    self.store.install(&mut self.fs, name, &title.join(" "), now).map(|n| alloc::format!("ok {}\n", n))
+                    self.store.install(&mut self.fs, name, &title.join(" "), now).map(|bytes| {
+                        // A successful install invalidates only this app's old process.
+                        if let Some(n) = running {
+                            self.reap(n);
+                        }
+                        alloc::format!("ok {}\n", bytes)
+                    })
                 } else {
+                    // A running copy ends first.
+                    if let Some(n) = running {
+                        self.reap(n);
+                    }
                     self.store.remove(&mut self.fs, name).map(|_| String::from("ok\n"))
                 };
                 self.shell.dirty = true;
@@ -1196,14 +1200,25 @@ impl Runtime {
                 }
                 _ => String::from("error\n"),
             },
+            Some("shield-agent") if cfg!(moto_board)
+                && self.apps[i].as_ref().is_some_and(|app| app.path == super::appstore::INSTALLER) =>
+            {
+                match words.next() {
+                    Some("pull") => self.sentinel.agent_pull(sys::now_ns(), false),
+                    Some("start") => self.sentinel.agent_pull(sys::now_ns(), true),
+                    Some("push") if words.next().is_some_and(|text| self.sentinel.agent_push(text)) => String::from("ok"),
+                    _ => String::from("error"),
+                }
+            }
             // Violet Shield: the companion link, live rules and frozen apps, for Home.
             Some("shield") => {
                 let frozen: Vec<&str> = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).map(|a| a.name.as_str()).collect();
                 alloc::format!(
-                    "linked={} rules={} frozen={}\n",
+                    "linked={} rules={} frozen={} warnings={}\n",
                     self.sentinel.online() as u32,
                     self.shield.active(),
-                    if frozen.is_empty() { String::from("-") } else { frozen.join(",") }
+                    if frozen.is_empty() { String::from("-") } else { frozen.join(",") },
+                    self.sentinel.warnings
                 )
             }
             Some("status") => {
@@ -1211,12 +1226,13 @@ impl Runtime {
                 let volume = request(GET, VOLUME, 0);
                 // listening=1 while the agent holds the microphone (in front or not).
                 alloc::format!(
-                    "battery={} volume={} headphones={} focused={} listening={}\n",
+                    "battery={} volume={} headphones={} focused={} listening={} emulator={}\n",
                     if power.op == OK { power.value as i32 } else { -1 },
                     if volume.op == OK { volume.value as i32 } else { -1 },
                     (volume.op == OK && volume.arg & AUDIO_HEADPHONES != 0) as u32,
                     (self.focused && self.foreground == Some(i)) as u32,
-                    self.background_listener().is_some() as u32
+                    self.background_listener().is_some() as u32,
+                    (!cfg!(moto_board)) as u32
                 )
             }
             Some("volume") if line.split_whitespace().nth(1).map_or(false, |w| w == "up" || w == "down") => {

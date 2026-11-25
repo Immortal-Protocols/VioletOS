@@ -30,7 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// The program allowed to change the network.
-pub const SETTINGS_APP: &str = "/apps/wifi";
+pub const SETTINGS_APP: &str = "/apps/settings";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
@@ -40,6 +40,8 @@ enum Step {
     /// The auto-connector asks which network is joined (GET PROFILE), as a
     /// ticket like the others: Radio may be busy rejoining for many seconds.
     Check,
+    /// Phone Internet (RELAY): turn it on or off, or ask how it is.
+    Relay,
 }
 
 impl Step {
@@ -49,6 +51,7 @@ impl Step {
             Step::Join => "join",
             Step::Leave => "leave",
             Step::Check => "check",
+            Step::Relay => "relay",
         }
     }
 }
@@ -67,7 +70,17 @@ pub struct Wifi {
     /// The running chain was started by the auto-connector, not by an app.
     auto_job: bool,
     auto: Auto,
+    /// Phone Internet: Radio's last answer (op, state, failure code), and
+    /// whether the saved choice was restored after boot.
+    relay: Option<(u32, u32, u32)>,
+    relay_restored: bool,
 }
+
+/// The Phone Internet pairing Settings keeps: "on CODE" or "off CODE".
+pub const RELAY_SAVED: &str = "/data/relay";
+/// When after boot to turn a saved Phone Internet back on (before the
+/// auto-connector looks, so it wins over a saved network).
+const RELAY_RESTORE_NS: u64 = 3_000_000_000;
 
 /// Where the auto-connector is (see the module comment).
 #[derive(Default)]
@@ -143,6 +156,10 @@ impl Wifi {
                     return;
                 }
                 self.job = None;
+                if step == Step::Relay {
+                    self.relay = Some((p.op, p.value, p.arg));
+                    continue;
+                }
                 let ok = p.op == OK;
                 match step {
                     Step::Join | Step::Check if ok => self.connected = p.value,
@@ -196,6 +213,20 @@ impl Wifi {
         self.poll();
         if self.auto.next_ns == 0 {
             self.auto.next_ns = now + FIRST_LOOK_NS;
+        }
+        if !self.relay_restored && now >= RELAY_RESTORE_NS && self.job.is_none() {
+            self.relay_restored = true;
+            let saved = core::str::from_utf8(fs.contents(RELAY_SAVED).unwrap_or(&[])).unwrap_or("");
+            let mut w = saved.split_whitespace();
+            if let (Some("on"), Some(code)) = (w.next(), w.next()) {
+                if valid_relay_code(code.as_bytes()) {
+                    log!("phone internet: turning it back on");
+                    let mut m = Message::new(EXECUTE, RELAY, 1);
+                    m.put_text(code.as_bytes());
+                    self.queue.push_back((Step::Relay, m));
+                    self.poll();
+                }
+            }
         }
         if self.job.is_some() || self.auto.paused || now < self.auto.next_ns {
             return;
@@ -310,6 +341,7 @@ impl Wifi {
                     Some(Step::Scan) => "scanning",
                     Some(Step::Join) => "joining",
                     Some(Step::Leave) => "leaving",
+                    Some(Step::Relay) => "idle",
                 };
                 let (last, result, reason) = match self.last {
                     None => ("-", "-", 0),
@@ -403,6 +435,66 @@ impl Wifi {
                 answer
             }
             Some(_) => String::from("error usage: wifi [state|scan|list|join ID [PMK]|leave]\n"),
+        }
+    }
+
+    /// Phone Internet ("relay" in /dev/violet/sys): the iPhone running Violet
+    /// Relay joins a network this phone hosts and lends it cellular data.
+    ///
+    ///   relay              state=off|starting|waiting|joined|online|unavailable|busy failure=N
+    ///   relay on CODE      host the network for a 12-character pairing code
+    ///   relay off          stop hosting
+    ///
+    /// Only Settings may turn it on or off; Settings saves the choice in
+    /// /data/relay, and the runtime turns it back on after a restart.
+    pub fn relay(&mut self, path: &str, words: &mut core::str::SplitWhitespace) -> String {
+        let sub = words.next();
+        if sub.is_some() && path != SETTINGS_APP {
+            return String::from("error denied: only Settings changes Phone Internet\n");
+        }
+        self.poll();
+        match sub {
+            None => {
+                let busy = self.job.is_some_and(|j| j.0 == Step::Relay);
+                if self.job.is_none() {
+                    self.queue.push_back((Step::Relay, Message::new(GET, RELAY, 0)));
+                    self.poll();
+                }
+                let state = match self.relay {
+                    _ if busy => "busy",
+                    None => "busy",
+                    Some((op, _, _)) if op != OK => "unavailable",
+                    Some((_, RELAY_STARTING, _)) => "starting",
+                    Some((_, RELAY_WAITING, _)) => "waiting",
+                    Some((_, RELAY_JOINED, _)) => "joined",
+                    Some((_, RELAY_ONLINE, _)) => "online",
+                    Some(_) => "off",
+                };
+                format!("state={} failure={}\n", state, self.relay.map_or(0, |r| r.2))
+            }
+            Some("on") => {
+                let Some(code) = words.next().filter(|c| valid_relay_code(c.as_bytes())) else {
+                    return String::from("error usage: relay on CODE (12 of 0-9 A-F)\n");
+                };
+                if self.job.is_some() {
+                    return String::from("error busy\n");
+                }
+                let mut m = Message::new(EXECUTE, RELAY, 1);
+                m.put_text(code.as_bytes());
+                self.relay = Some((OK, RELAY_STARTING, 0));
+                self.queue.push_back((Step::Relay, m));
+                self.poll();
+                String::from("ok\n")
+            }
+            Some("off") => {
+                if self.job.is_some() {
+                    return String::from("error busy\n");
+                }
+                self.queue.push_back((Step::Relay, Message::new(EXECUTE, RELAY, 0)));
+                self.poll();
+                String::from("ok\n")
+            }
+            Some(_) => String::from("error usage: relay [on CODE|off]\n"),
         }
     }
 }

@@ -326,7 +326,7 @@ def main():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((args.host, args.port))
     s.listen(64)
-    log(f"Violet Agent relay on {args.host}:{args.port}")
+    log(f"Violet Agent relay on {args.host}:{s.getsockname()[1]}")
     threading.Thread(target=reaper, daemon=True).start()
     if args.stun:
         threading.Thread(target=stun_server, args=(args.host, args.stun), daemon=True).start()

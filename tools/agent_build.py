@@ -84,7 +84,7 @@ def setup(work):
     example = work / "apps/example"
     if example.exists():
         shutil.rmtree(example)
-    shutil.copytree(ROOT / "apps/open/stopwatch", example)
+    shutil.copytree(ROOT / "tools/agent-example/stopwatch", example)
     toml = (example / "Cargo.toml").read_text().replace('name = "stopwatch"', 'name = "example"')
     (example / "Cargo.toml").write_text(toml)
     (example / "app.txt").write_text("Example\n")

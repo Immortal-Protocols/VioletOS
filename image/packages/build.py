@@ -59,8 +59,6 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
     os.environ["VIOLET_GLYPHS_RS"] = str(out / "glyphs.rs")
     scripts = {
         "launcher": repo / "apps/launcher/process.rs",
-        "wifi": repo / "apps/wifi/process.rs",
-        "stopwatch": repo / "apps/stopwatch/process.rs",
         "runtime": repo / "runtime/process.rs",
         "display": repo / "services/display/process.rs",
         "radio": repo / "services/radio/process.rs",
@@ -90,7 +88,6 @@ SECTIONS {
         + ["-DNDEBUG", "-I", platform_include, "-c", repo / "runtime/transport.c", "-o", transport]
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
-    titles = {item["name"]: item.get("title") for item in manifest}
     # Built-in library apps (IDs 11–14) name their source; they ship with the APP1 trailer.
     for item in manifest:
         if "entry" in item:
@@ -124,8 +121,6 @@ SECTIONS {
     if "VIOLET_BUILD_EPOCH" not in os.environ:
         stamp = subprocess.run(["git", "log", "-1", "--format=%ct"], cwd=repo, capture_output=True, text=True).stdout.strip()
         os.environ["VIOLET_BUILD_EPOCH"] = os.environ.get("SOURCE_DATE_EPOCH", stamp or "1795000000")
-    os.environ["VIOLET_WATCH_TITLE"] = titles["stopwatch"]
-    os.environ["VIOLET_WIFI_TITLE"] = titles["wifi"]
     # Package manager is always loaded from the factory recovery image.
     manifest.append({"id": 9, "name": "package_manager"})
     scripts["package_manager"] = repo / "system/package-manager/process.rs"
@@ -150,12 +145,10 @@ SECTIONS {
                 modules["sensor_tables"] = dest / "sensor_tables.rs"
         if name in scripts:
             modules["process"] = scripts[name]
-        if name in ("stopwatch", "launcher", "wifi") or "entry" in item:
+        if name == "launcher" or "entry" in item:
             modules.update(
                 sdk=repo / "runtime/sdk.rs", drawing=repo / "apps/drawing.rs"
             )
-        if name == "stopwatch":
-            modules["watch"] = repo / "apps/stopwatch/state.rs"
         if name == "open":
             modules["companion_key"] = companion_key(repo, dest)
         body = "process::run()"
