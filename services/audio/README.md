@@ -58,3 +58,5 @@ The speaker runs without its vendor preset (`fs1603s.fsm`), which only root can 
 | `10`–`17` | Board debugging: amplifier volume, DSP word, re-init, refresh, codec readback, amplifier register write (`15RRVVVV`) and read (`160000RR`, into word 57), and the microphone PGA gain (`170000GG`, 0 to 5 in 6 dB steps). |
 
 These requests bypass Runtime's rule that only the app on screen may play sound. They exist for testing on the bench.
+
+**Microphone stream.** While an open app has `/dev/violet/mic` open, the Open Runtime sets word 16 of the PCM header page and Audio appends every settled 16 kHz sample to an 8-page ring after the PCM ring, counting them in word 17; the Open Runtime reads from there.

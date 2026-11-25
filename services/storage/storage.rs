@@ -20,6 +20,47 @@ extern "C" {
     fn clock_init();
 }
 
+/// The 64 KiB window shared with the Open Runtime for the app extent.
+const APP_WINDOW: *mut u8 = 0x0d30_0000 as *mut u8;
+const APP_WINDOW_SECTORS: usize = 128;
+
+/// Read or write `count` sectors of the installed apps' extent at `first`
+/// through the shared window. A count of 0 asks the size (read) or flushes (write).
+fn apps(d: &mut Disk, write: bool, first: usize, count: usize) -> Message {
+    if count == 0 {
+        return if !write {
+            Message::result(d.app_sectors() as u32)
+        } else if d.flush().is_ok() {
+            Message::result(0)
+        } else {
+            Message::error(OFFLINE)
+        };
+    }
+    if count > APP_WINDOW_SECTORS || first.checked_add(count).map_or(true, |end| end > d.app_sectors()) {
+        return Message::error(DENIED);
+    }
+    for k in 0..count {
+        let at = unsafe { APP_WINDOW.add(k * 512) };
+        let ok = if write {
+            let mut s = [0u8; 512];
+            unsafe { core::ptr::copy_nonoverlapping(at, s.as_mut_ptr(), 512) };
+            d.app_write(first + k, &mut s).is_ok()
+        } else {
+            match d.app_read(first + k) {
+                Ok(s) => {
+                    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), at, 512) };
+                    true
+                }
+                Err(()) => false,
+            }
+        };
+        if !ok {
+            return Message::error(OFFLINE);
+        }
+    }
+    Message::result(count as u32)
+}
+
 #[no_mangle]
 pub extern "C" fn storage_task() {
     unsafe { clock_init() };
@@ -64,6 +105,17 @@ pub extern "C" fn storage_task() {
             let mut r = Message::result(0);
             r.put_text(diagnostic);
             r.reply();
+            continue;
+        }
+        if (STORAGE_APPS..STORAGE_APPS + 2).contains(&m.op) {
+            let response = if badge != 3 {
+                Message::error(DENIED)
+            } else if let Some(d) = disk.as_mut() {
+                apps(d, m.op == STORAGE_APPS + 1, m.value as usize, m.arg as usize)
+            } else {
+                Message::error(OFFLINE)
+            };
+            response.reply();
             continue;
         }
         if (STORAGE_FILE..STORAGE_FILE + 8).contains(&m.op) {

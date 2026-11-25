@@ -5,6 +5,7 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+pub mod appstore;
 pub mod data;
 #[cfg(moto_board)]
 pub mod display;
@@ -173,6 +174,8 @@ pub struct Runtime {
     pub k: Kernel,
     pub pool: Pool,
     pub fs: fs::Fs,
+    /// Installed apps kept on disk (appstore.rs).
+    pub store: appstore::Store,
     pub apps: [Option<App>; MAX_APPS],
     untypeds: Vec<u32>,
     pub policy: OpenPolicy,
@@ -273,10 +276,12 @@ impl Runtime {
         }
         let mut fs = fs::Fs::new(image);
         data::load(&mut fs);
+        let store = appstore::Store::load(&mut fs);
         Ok(Runtime {
             k,
             pool,
             fs,
+            store,
             apps: core::array::from_fn(|_| None),
             home: None,
             home_tried: false,
@@ -660,7 +665,8 @@ impl Runtime {
         // The panel's scan line, sampled for 200 ms (frames seen, period).
         // "@sys frames" or "@sys bench tap X Y N": measurements, answered in the log.
         if let Some(line) = path.strip_prefix("@sys ") {
-            if line.starts_with("frames") || line.starts_with("bench ") {
+            // Shared settings too ("@sys set relay 192.168.1.20:8787" points the agent at a relay).
+            if line.starts_with("frames") || line.starts_with("bench ") || line.starts_with("set ") || line.starts_with("get ") {
                 let answer = self.system(self.foreground.unwrap_or(0), line);
                 log!("{}: {}", line, answer.trim_end());
             }
@@ -929,6 +935,17 @@ impl Runtime {
             return;
         }
         let Some(i) = self.foreground.filter(|_| self.focused) else {
+            // `bench press` on the app list taps it like a finger would.
+            if b.release && self.focused && self.foreground.is_none() {
+                self.touch(b.x, b.y, !b.pressed);
+                b.pressed = !b.pressed;
+                if !b.pressed {
+                    b.left -= 1;
+                }
+                b.next_ns = now + if b.pressed { 120_000_000 } else { 600_000_000 };
+                self.frames.bench = (b.left > 0).then_some(b);
+                return;
+            }
             self.frames.bench = None;
             return;
         };
@@ -947,6 +964,11 @@ impl Runtime {
                 b.left -= 1;
                 b.next_ns = now + 1_500_000_000;
             }
+        } else if b.pressed && b.release {
+            self.event(i, touch(abi::EVENT_TOUCH_UP, b.y));
+            b.pressed = false;
+            b.left -= 1;
+            b.next_ns = now + 600_000_000;
         } else if b.pressed {
             self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
             b.pressed = false;

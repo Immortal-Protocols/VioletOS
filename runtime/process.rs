@@ -19,7 +19,7 @@ struct Job {
 }
 fn service(key: u32) -> u32 {
     match key {
-        SAVE | FILE_LIST..=FILE_DELETE => 6,
+        SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         PRESENT => 5,
         SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | RELAY => 7,
         POWER => 8,
@@ -37,7 +37,7 @@ fn component(key: u32) -> u32 {
     match key {
         RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | RELAY => 7,
         POWER => 8,
-        SAVE | FILE_LIST..=FILE_DELETE => 6,
+        SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         VOLUME | PLAYBACK | MICROPHONE => AUDIO_COMPONENT,
         _ => 0,
     }
@@ -188,6 +188,7 @@ impl Runtime {
             (GET, FILE_LIST | FILE_READ)
             | (EXECUTE, FILE_WRITE | FILE_TRUNCATE | FILE_DELETE)
             | (GET | EXECUTE, SAVE) => self.forward(who, 6, m),
+            (GET | EXECUTE, APPSTORE) if who == OPEN_APPS => self.forward(who, 6, m),
             (EXECUTE, PRESENT) if who == self.focus && !self.asleep => {
                 let mut req = Message::new(EXECUTE, PRESENT, who);
                 req.arg = m.value;

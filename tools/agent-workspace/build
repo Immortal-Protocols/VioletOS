@@ -1,0 +1,4 @@
+#!/bin/sh
+# ./build NAME — build apps/NAME for the phone (see AGENTS.md).
+here=$(cd "$(dirname "$0")" && pwd)
+exec /usr/bin/python3 "@ROOT@/tools/agent_build.py" build "$1" "$here"

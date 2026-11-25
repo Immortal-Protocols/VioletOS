@@ -67,6 +67,8 @@ pub struct Bench {
     pub left: u32,
     pub next_ns: u64,
     pub pressed: bool,
+    /// `bench press`: lift the finger (a real tap) instead of handing focus back.
+    pub release: bool,
 }
 
 #[derive(Default)]

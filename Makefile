@@ -93,6 +93,12 @@ test-camera: qemu-image
 test-wifi-app: qemu-image
 	$(PYTHON) targets/qemu/test_wifi_app.py
 
+# The voice agent: QR pairing, an encrypted install that survives a restart, reconnect
+# and unpair, with the real Mac app (companion/mac) and a local relay.
+test-agent:
+	VIOLET_AGENT_RELAY=http://violet-relay.test $(MAKE) qemu-image
+	$(PYTHON) targets/qemu/test_agent.py
+
 test-open-apps: qemu-image
 	$(PYTHON) targets/qemu/test_open_apps.py
 	@mkdir -p build/tests

@@ -131,6 +131,7 @@ def fastboot(*args):
 STORAGE_MARKER = b"VioletOS XT2163DL boot_b storage v1\n"
 MARKER_OFFSET = 16 * 1024 * 1024  # platform/sel4/loader/build.py
 STORAGE_BYTES = 1024 * 1024
+BOOT_B_BYTES = 32 * 1024 * 1024  # targets/moto-g-pure/storage_volume.rs
 
 
 def keep_storage(image):
@@ -152,6 +153,11 @@ def keep_storage(image):
     raw(0, start)
     chunks.append(struct.pack("<HHII", 0xCAC3, 0, count, 12))  # don't care: left as it is
     raw(start + count, total - start - count)
+    # The rest of boot_b holds installed apps (runtime/open/appstore.rs): leave it too.
+    tail = BOOT_B_BYTES // block - total
+    if tail > 0:
+        chunks.append(struct.pack("<HHII", 0xCAC3, 0, tail, 12))
+        total += tail
     header = struct.pack("<IHHHHIIII", 0xED26FF3A, 1, 0, 28, 12, block, total, len(chunks), 0)
     out = BUILD / "moto-flash-keep-storage.simg"
     out.write_bytes(header + b"".join(chunks))

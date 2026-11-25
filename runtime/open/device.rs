@@ -25,6 +25,8 @@ pub enum Kind {
     Audio { channels: u32, pending: Vec<u8> },
     /// Frames from the Camera service; `seen` is the last frame returned.
     Camera { seen: u32 },
+    /// The microphone stream (16 kHz s16 mono); `seen` counts samples read.
+    Mic { seen: u32 },
     Events,
     Sys { pending: Vec<u8> },
     Log,
@@ -60,6 +62,9 @@ impl Drop for OpenFile {
         }
         if let Kind::Camera { .. } = self.kind {
             camera::want(false);
+        }
+        if let Kind::Mic { .. } = self.kind {
+            mic::close();
         }
         if let Kind::Tcp { slot: Some(slot), .. } = self.kind {
             super::net::close(slot);
@@ -186,6 +191,57 @@ pub mod camera {
     }
 }
 
+/// The microphone stream from Audio, in the pages after the PCM ring
+/// (services/audio/process.rs, mod stream). Audio copies samples while
+/// CAPTURE_WANTED is 1, which it is while any app has /dev/violet/mic open.
+pub mod mic {
+    use super::super::request;
+    use crate::protocol::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const HEADER: *mut u32 = 0x0910_0000 as *mut u32;
+    const RING: *const i16 = 0x0911_1000 as *const i16;
+    pub const SAMPLES: u32 = 8 * 4096 / 2;
+    static READERS: AtomicU32 = AtomicU32::new(0);
+    pub fn written() -> u32 {
+        unsafe { HEADER.add(17).read_volatile() }
+    }
+    /// Start (or keep) the microphone for one more reader.
+    pub fn open() -> u32 {
+        READERS.fetch_add(1, Ordering::Relaxed);
+        unsafe { HEADER.add(16).write_volatile(1) };
+        request(EXECUTE, MICROPHONE, MIC_LISTEN);
+        written()
+    }
+    /// The microphone again after the app in front changed (it turns off then).
+    pub fn resume() {
+        if READERS.load(Ordering::Relaxed) > 0 {
+            request(EXECUTE, MICROPHONE, MIC_LISTEN);
+        }
+    }
+    pub fn close() {
+        if READERS.fetch_sub(1, Ordering::Relaxed) == 1 {
+            unsafe { HEADER.add(16).write_volatile(0) };
+            request(EXECUTE, MICROPHONE, MIC_OFF);
+        }
+    }
+    /// Samples after `seen`, up to `max`; an overrun skips to the newest second.
+    pub fn take(seen: &mut u32, max: usize) -> alloc::vec::Vec<u8> {
+        let w = written();
+        core::sync::atomic::fence(Ordering::Acquire);
+        if w.wrapping_sub(*seen) > SAMPLES {
+            *seen = w.wrapping_sub(SAMPLES);
+        }
+        let n = (w.wrapping_sub(*seen) as usize).min(max);
+        let mut v = alloc::vec::Vec::with_capacity(n * 2);
+        for k in 0..n as u32 {
+            let s = unsafe { RING.add((seen.wrapping_add(k) % SAMPLES) as usize).read_volatile() };
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        *seen = seen.wrapping_add(n as u32);
+        v
+    }
+}
+
 /// The PCM ring shared with Audio (see services/audio/process.rs).
 const PCM_HEADER: *mut u32 = 0x0910_0000 as *mut u32;
 const PCM_RING: *mut [i16; 2] = 0x0910_1000 as *mut [i16; 2];
@@ -228,6 +284,12 @@ pub const ROW_H: usize = 80;
 const ROWS: usize = (HOME_Y - 40 - ROW_Y) / ROW_H;
 const BG_ROW: u32 = 0xff231d2e;
 pub const HOME_Y: usize = 1380;
+
+/// Row height for a list of `n` programs: 80 px while they fit, then smaller
+/// (down to 40) so installed apps never fall off the end. QEMU tests use the same rule.
+pub fn row_height(n: usize) -> usize {
+    if n <= ROWS { ROW_H } else { ((HOME_Y - 40 - ROW_Y) / n).max(40) }
+}
 
 /// Shared settings (see "get" and "set" in /dev/violet/sys).
 const SETTINGS: &str = "/data/settings";
@@ -302,19 +364,24 @@ impl Runtime {
             text(42, ROW_Y, "NO APPS IN /APPS", 4, INK);
         }
         let titles = self.titles();
-        for (i, path) in entries.iter().take(ROWS).enumerate() {
-            let y = ROW_Y + i * ROW_H;
+        let h = row_height(entries.len());
+        let fits = (HOME_Y - 40 - ROW_Y) / h;
+        for (i, path) in entries.iter().take(fits).enumerate() {
+            let y = ROW_Y + i * h;
             let name = path.trim_start_matches("/apps/");
             let title = titles.iter().find(|(n, _)| n == name).map(|(_, t)| t.to_ascii_uppercase());
-            fill(42, y, WIDTH - 84, ROW_H - 12, if title.is_some() { PANEL } else { BG_ROW });
+            fill(42, y, WIDTH - 84, h - 12, if title.is_some() { PANEL } else { BG_ROW });
             let shown: String = title.as_deref().unwrap_or(name).chars().take(16).collect();
-            text(72, y + 16, &shown, if title.is_some() { 5 } else { 4 }, INK);
+            let scale = if h == ROW_H { if title.is_some() { 5 } else { 4 } } else if h >= 52 { 4 } else { 3 };
+            text(72, y + (h - 12 - 7 * scale) / 2, &shown, scale, INK);
             match self.apps.iter().flatten().find(|a| a.path == *path) {
                 Some(a) if a.frozen.is_some() => {
-                    fill(42, y, 10, ROW_H - 12, ALERT);
-                    text(72, y + 52, "FROZEN BY VIOLET SHIELD", 2, ALERT);
+                    fill(42, y, 10, h - 12, ALERT);
+                    if h == ROW_H {
+                        text(72, y + 52, "FROZEN BY VIOLET SHIELD", 2, ALERT);
+                    }
                 }
-                Some(_) => text(WIDTH - 72 - 7 * 2 * 8, y + 28, "RUNNING", 2, ACCENT),
+                Some(_) => text(WIDTH - 72 - 7 * 2 * 8, y + (h - 12 - 14) / 2, "RUNNING", 2, ACCENT),
                 None => {}
             }
         }
@@ -356,8 +423,9 @@ impl Runtime {
         if y < ROW_Y || x < 42 || x > (WIDTH - 42) as i32 {
             return;
         }
-        let row = (y - ROW_Y) / ROW_H;
-        let Some(path) = self.app_entries().into_iter().nth(row) else { return };
+        let entries = self.app_entries();
+        let row = (y - ROW_Y) / row_height(entries.len());
+        let Some(path) = entries.into_iter().nth(row) else { return };
         crate::log!("app list: tap at {},{} -> {}", x, y, path);
         if let Some(i) = (0..MAX_APPS).find(|&i| self.apps[i].as_ref().map_or(false, |a| a.path == path)) {
             self.set_foreground(Some(i));
@@ -458,6 +526,15 @@ impl Runtime {
         if value == LIFECYCLE_FOCUS_LOST && self.audio {
             // An app that leaves the front stops recording, as with any app.
             request(EXECUTE, MICROPHONE, MIC_OFF);
+        }
+        if value == LIFECYCLE_FOCUS_GAINED && self.audio {
+            // An app back in front that still holds the microphone hears again.
+            let holds = self.apps[i].as_ref().is_some_and(|a| {
+                a.fds.iter().flatten().any(|f| matches!(f.borrow().kind, Kind::Mic { .. }))
+            });
+            if holds {
+                mic::resume();
+            }
         }
         if value == LIFECYCLE_FOCUS_LOST && self.camera {
             // And its camera: an app may only watch while it is on screen.
@@ -682,6 +759,7 @@ impl Runtime {
             Kind::Pipe { write: true, .. } => 4,
             Kind::Audio { .. } => if pcm_space() > 0 { 4 } else { 0 },
             Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i)) as u32,
+            Kind::Mic { seen } => (mic::written() != *seen) as u32,
             Kind::Udp { replies, .. } => 4 | (!replies.is_empty()) as u32,
             Kind::Tcp { slot: None, .. } => 4,
             Kind::Tcp { slot: Some(slot), .. } => {
@@ -858,6 +936,13 @@ impl Runtime {
                 let n = b.len().min(len as usize);
                 b.drain(..n).collect()
             }
+            Kind::Mic { seen } => {
+                let v = mic::take(seen, len as usize / 2);
+                if v.is_empty() {
+                    return if len < 2 { EINVAL } else { EAGAIN };
+                }
+                v
+            }
             Kind::Camera { seen } => {
                 // Only the app on screen sees frames (not while the phone
                 // sleeps or another screen is up); reading keeps the camera on.
@@ -987,7 +1072,8 @@ impl Runtime {
             // `bench tap X Y N`: N synthetic presses on the app in front;
             // `bench drag X Y DY N`: N drags of DY pixels over 250 ms each.
             Some("bench") => {
-                let drag = words.next() == Some("drag");
+                let verb = words.next();
+                let (drag, release) = (verb == Some("drag"), verb == Some("press"));
                 let mut n = words.map(|w| w.parse::<i32>().unwrap_or(-1));
                 let (x, y) = (n.next().unwrap_or(-1), n.next().unwrap_or(-1));
                 let dy = if drag { n.next().unwrap_or(0) } else { 0 };
@@ -995,13 +1081,49 @@ impl Runtime {
                     Some(count) if x >= 0 && y >= 0 && count > 0 && drag == (dy != 0) => {
                         let now = sys::now_ns();
                         self.frames.report(now);
-                        self.frames.bench = Some(super::frames::Bench { x, y, dy, step: 0, left: count as u32, next_ns: now + 300_000_000, pressed: false });
+                        self.frames.bench = Some(super::frames::Bench { x, y, dy, step: 0, left: count as u32, next_ns: now + 300_000_000, pressed: false, release });
                         String::from("ok\n")
                     }
-                    _ => String::from("error usage: bench tap X Y N | bench drag X Y DY N\n"),
+                    _ => String::from("error usage: bench tap X Y N | bench press X Y N | bench drag X Y DY N\n"),
                 }
             }
             // The programs running now, as paths.
+            // Installed apps (runtime/open/appstore.rs): "install NAME TITLE" keeps
+            // /apps/NAME, which the app wrote, across restarts and lists it under
+            // TITLE; "uninstall NAME" removes it; "installed" lists them. Only the
+            // agent (/apps/agent), which takes installs from the paired Mac, may
+            // change them.
+            Some(verb @ ("install" | "uninstall")) => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                if path != super::appstore::INSTALLER {
+                    return String::from("error only the agent installs apps\n");
+                }
+                let Some(name) = words.next().filter(|n| super::appstore::valid_name(n)) else {
+                    return alloc::format!("error usage: {} NAME{}\n", verb, if verb == "install" { " TITLE" } else { "" });
+                };
+                let image = self.fs.stat(&alloc::format!("/apps/{}", name)).is_some()
+                    && !self.fs.from_layer(&alloc::format!("/apps/{}", name));
+                if image || alloc::format!("/apps/{}", name) == super::appstore::INSTALLER {
+                    return String::from("error a built-in app has that name\n");
+                }
+                let title: Vec<&str> = words.collect();
+                let now = (self.clock(0) / 1_000_000_000) as u32;
+                let _lowered = sys::Lowered::new();
+                let r = if verb == "install" {
+                    self.store.install(&mut self.fs, name, &title.join(" "), now).map(|n| alloc::format!("ok {}\n", n))
+                } else {
+                    self.store.remove(&mut self.fs, name).map(|_| String::from("ok\n"))
+                };
+                self.shell.dirty = true;
+                match r {
+                    Ok(s) => {
+                        crate::log!("{} {}", verb, name);
+                        s
+                    }
+                    Err(e) => alloc::format!("error {}\n", e),
+                }
+            }
+            Some("installed") => self.store.list(),
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
                 alloc::format!("{}\n", paths.join(" "))

@@ -170,4 +170,28 @@ impl Disk {
         self.request(1, index, bytes)?;
         self.request(4, 0, bytes)
     }
+    /// The installed apps' extent: sectors 4096 onward of a disk large enough
+    /// (tools/run.py makes it 16 MiB), up to 12 MiB.
+    #[allow(dead_code)]
+    pub fn app_sectors(&self) -> usize {
+        self.sectors.saturating_sub(APPS).min(APP_SECTORS)
+    }
+    #[allow(dead_code)]
+    pub fn app_read(&mut self, index: usize) -> Result<Sector, ()> {
+        if index >= self.app_sectors() {
+            return Err(());
+        }
+        self.read(APPS + index)
+    }
+    #[allow(dead_code)]
+    pub fn app_write(&mut self, index: usize, bytes: &mut Sector) -> Result<(), ()> {
+        if index >= self.app_sectors() {
+            return Err(());
+        }
+        self.write(APPS + index, bytes)
+    }
 }
+#[allow(dead_code)]
+const APPS: usize = 4096;
+#[allow(dead_code)]
+const APP_SECTORS: usize = 24576;

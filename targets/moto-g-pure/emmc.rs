@@ -183,6 +183,27 @@ impl Disk {
         self.write(i, s)?;
         self.flush()
     }
+    /// The installed apps' extent, beyond the boot image.
+    #[allow(dead_code)]
+    pub fn app_sectors(&self) -> usize {
+        volume::APP_SECTORS
+    }
+    #[allow(dead_code)]
+    pub fn app_read(&mut self, i: usize) -> Result<Sector, ()> {
+        if self.retired {
+            return Err(());
+        }
+        let lba = volume::app_sector(i)?;
+        self.finish(read_card(17, lba))
+    }
+    #[allow(dead_code)]
+    pub fn app_write(&mut self, i: usize, s: &mut Sector) -> Result<(), ()> {
+        if self.retired {
+            return Err(());
+        }
+        let lba = volume::app_sector(i)?;
+        self.finish(transfer(24, lba, s))
+    }
 }
 
 // These two records sit beyond the filesystem and require their own provisioned

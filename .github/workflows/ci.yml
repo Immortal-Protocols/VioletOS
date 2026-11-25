@@ -1,8 +1,9 @@
 name: Build and test
 
-# Kept to a few minutes: the seL4 build and host unit tests on Linux, and on
+# Keep CI under 5 minutes: the seL4 build and host unit tests on Linux, and on
 # macOS two QEMU tests (`make test-ci`). The other QEMU suites (make
-# test-emulator, test-open, test-ladybird, test-shield, ...) run locally.
+# test-emulator, test-open, test-agent, test-ladybird, test-shield, ...) run
+# locally. Don't add QEMU suites or jobs here (README, Continuous integration).
 
 on:
   pull_request:
@@ -44,7 +45,7 @@ jobs:
     env:
       # The two QEMU tests need Home, Stopwatch, Sounds and Weather; leave out
       # the apps that are slow to build, and skip whole-program optimisation.
-      VIOLET_OPEN_SKIP: ladybird,music,canvas,hello
+      VIOLET_OPEN_SKIP: ladybird,music,canvas,hello,agent
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:

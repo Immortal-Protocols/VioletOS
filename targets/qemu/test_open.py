@@ -58,6 +58,9 @@ def until(what, check, timeout=10.0):
             return
         time.sleep(0.05)
     fail(what)
+def row_y(index, count):
+    h = 80 if count <= 13 else max(40, 1080 // count)
+    return 260 + index * h + (h - 12) // 2
 def tap(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
     time.sleep(.15); os.write(1, bytes(6)); time.sleep(.35)
@@ -79,7 +82,7 @@ def open_apps():
     tap(360, 1141)  # Home's Programs tile
     until("app list", on_list)
 def start(name):
-    tap(360, 260 + APPS.index(name) * 80 + 34)
+    tap(360, row_y(APPS.index(name), len(APPS)))
 def console(name, timeout=60):
     start(name)
     until(f"{name} finishes", lambda: f"{name} (pid" in everything() and "exited" in everything(), timeout)
@@ -133,7 +136,7 @@ until("square drawn", lambda: pixel(360, 800) == 0xffffffff and pixel(360, 700) 
 tap(360, 60)  # canvas asks /dev/violet/sys to go Home
 until("back on Home", on_home, 6)
 open_apps()
-tap(360, 260 + APPS.index("canvas") * 80 + 34)
+tap(360, row_y(APPS.index("canvas"), len(APPS)))
 until("canvas comes back with its frame", lambda: pixel(360, 800) == 0xffffffff)
 print("canvas: passed", file=sys.stderr)
 '''

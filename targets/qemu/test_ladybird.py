@@ -95,6 +95,9 @@ def touch(x, y):
     os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
 def release():
     os.write(1, bytes(6))
+def row_y(index, count):
+    h = 80 if count <= 13 else max(40, 1080 // count)
+    return 260 + index * h + (h - 12) // 2
 def tap(x, y, pause=.35):
     touch(x, y); time.sleep(.15); release(); time.sleep(pause)
 def pixel(x, y):
@@ -134,7 +137,7 @@ if not on_home():
     until("Home app", on_home, 90)
 tap(360, 1141)  # Home's Programs tile
 until("app list", on_list)
-tap(360, 260 + APPS.index("ladybird") * 80 + 34)
+tap(360, row_y(APPS.index("ladybird"), len(APPS)))
 
 # 1. The start page.
 until("start page parsed", lambda: re.search(r"ladybird: loaded about:home status=200 elements=\d+ rules=7 links=\d+", everything()), 60)

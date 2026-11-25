@@ -21,6 +21,14 @@ mod stream {
     pub fn set(i: usize, v: u32) {
         unsafe { HEADER.add(i).write_volatile(v) }
     }
+    /// The microphone stream for open apps (/dev/violet/mic): the Open Runtime
+    /// sets header word CAPTURE_WANTED to 1 while a reader has it open; Audio then
+    /// appends every settled 16 kHz mono sample to the capture ring after the
+    /// PCM ring and counts them in CAPTURE_WRITTEN.
+    pub const CAPTURE_WANTED: usize = 16;
+    pub const CAPTURE_WRITTEN: usize = 17;
+    pub const CAPTURE: *mut i16 = 0x0931_1000 as *mut i16;
+    pub const CAPTURE_SAMPLES: u32 = 8 * 4096 / 2;
 }
 
 extern "C" {
@@ -342,6 +350,12 @@ impl Audio {
                     self.settle -= 1;
                     continue;
                 }
+                if stream::reg(stream::CAPTURE_WANTED) == 1 {
+                    let at = stream::reg(stream::CAPTURE_WRITTEN);
+                    unsafe { stream::CAPTURE.add((at % stream::CAPTURE_SAMPLES) as usize).write_volatile(s) };
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                    stream::set(stream::CAPTURE_WRITTEN, at.wrapping_add(1));
+                }
                 if self.mic_mode == MIC_RECORD {
                     clip()[self.clip_len as usize] = s;
                     self.clip_peak = self.clip_peak.max(s.unsigned_abs() as u32);
@@ -472,6 +486,7 @@ pub fn run() -> ! {
     audio.stream = true;
     stream::set(1, stream::FRAMES);
     stream::set(3, stream::reg(2));
+    stream::set(stream::CAPTURE_WRITTEN, 0);
     stream::set(0, stream::MAGIC);
     board::set_volume(audio.level, audio.headphones);
     board::publish(audio.level, audio.flags(), 0, 0);

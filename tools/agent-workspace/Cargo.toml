@@ -1,0 +1,21 @@
+# The Violet Agent's app workspace (tools/agent_build.py setup makes it).
+# Every folder in apps/ is an app for the phone.
+[workspace]
+resolver = "2"
+members = ["apps/*"]
+
+[workspace.dependencies]
+violet = { path = "@VIOLET@" }
+
+[profile.release]
+panic = "abort"
+
+# Quick builds for the phone: no LTO, parallel codegen, cached between builds.
+[profile.agent]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true
+strip = true
+panic = "abort"
