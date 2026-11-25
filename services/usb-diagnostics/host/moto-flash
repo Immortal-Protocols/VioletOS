@@ -6,11 +6,8 @@ so the bootloader starts fastboot. From Android on slot A, adb requests the
 bootloader. If the running image cannot request fastboot, repeated VioletOS
 reboots use up slot B's retries until the bootloader falls back to Android A.
 
-The boot image carries VioletOS's 1 MiB storage volume (app files, saved Wi-Fi
-networks) as zeros. Unless --wipe-storage is given, the image is sent as an
-Android sparse image whose storage window is a "don't care" chunk, so the
-bootloader leaves the handset's saved data where it is. A bootloader that
-refuses the sparse image gets the plain one (which wipes the data).
+Unless --wipe-storage is given, send a sparse image that skips saved data
+and the installed app store. Stop if that image cannot be prepared or flashed.
 """
 import argparse
 import json
@@ -131,6 +128,7 @@ def fastboot(*args):
 STORAGE_MARKER = b"VioletOS XT2163DL boot_b storage v1\n"
 MARKER_OFFSET = 16 * 1024 * 1024  # platform/sel4/loader/build.py
 STORAGE_BYTES = 1024 * 1024
+APPS_OFFSET = 20 * 1024 * 1024  # targets/moto-g-pure/storage_volume.rs
 BOOT_B_BYTES = 32 * 1024 * 1024  # targets/moto-g-pure/storage_volume.rs
 
 
@@ -143,7 +141,7 @@ def keep_storage(image):
     block = 512  # the window starts one sector after the marker
     start = (MARKER_OFFSET + 512) // block
     count = STORAGE_BYTES // block
-    if len(data) % block or (start + count) * block > len(data):
+    if len(data) % block or not (start + count) * block < len(data) <= APPS_OFFSET:
         return None
     total = len(data) // block
     chunks = []
@@ -176,20 +174,19 @@ def main():
     args = parser.parse_args()
     if not args.fastboot_only and not args.image.is_file():
         raise SystemExit(f"{args.image} not found")
+    sparse = None
+    if not args.fastboot_only and not args.wipe_storage:
+        sparse = keep_storage(args.image)
+        if sparse is None:
+            raise SystemExit("Could not prepare a storage-preserving image. Flash stopped.")
     to_fastboot(args.fallback_reboots)
     if args.fastboot_only:
         return
-    sparse = None if args.wipe_storage else keep_storage(args.image)
-    flashed = False
-    if sparse:
+    if sparse is not None:
         log(f"Flashing {args.image} to boot_b, keeping the saved data")
-        try:
-            fastboot("flash", "boot_b", str(sparse))
-            flashed = True
-        except SystemExit as refused:
-            log(f"The sparse image was refused ({refused}); flashing the plain image, which wipes saved data")
-    if not flashed:
-        log(f"Flashing {args.image} to boot_b")
+        fastboot("flash", "boot_b", str(sparse))
+    else:
+        log(f"Flashing {args.image} to boot_b with --wipe-storage")
         fastboot("flash", "boot_b", str(args.image))
     fastboot("set_active", "b")
     log("Slot B selected; rebooting")

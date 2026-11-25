@@ -36,11 +36,18 @@ final class RelayServer {
     let port: UInt16
     private var tryPort: UInt16
     private var listener: NWListener?
+    private var stopped = false
     private var sessions: [ObjectIdentifier: Socks5Session] = [:]
     private var credentials: (user: String, pass: String)
-    let anyUpstream = UserDefaults.standard.string(forKey: "upstream") == "any"
+    let loopbackOnly: Bool
+    let localInvitation: ((@escaping (String?) -> Void) -> Void)?
+    var onReady: ((UInt16) -> Void)?
+    var anyUpstream: Bool { loopbackOnly || UserDefaults.standard.string(forKey: "upstream") == "any" }
 
-    init(port: UInt16, username: String, password: String) {
+    init(port: UInt16, username: String, password: String, loopbackOnly: Bool = false,
+         localInvitation: ((@escaping (String?) -> Void) -> Void)? = nil) {
+        self.loopbackOnly = loopbackOnly
+        self.localInvitation = localInvitation
         self.port = port
         self.tryPort = port
         self.credentials = (username, password)
@@ -50,7 +57,17 @@ final class RelayServer {
         queue.async { self.startListener() }
     }
 
+    func stop() {
+        queue.async {
+            self.stopped = true
+            self.listener?.cancel()
+            self.listener = nil
+            for session in Array(self.sessions.values) { session.abort("relay stopped") }
+        }
+    }
+
     private func startListener() {
+        guard !stopped else { return }
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         if let tcp = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
@@ -59,17 +76,24 @@ final class RelayServer {
             tcp.keepaliveIdle = 60
         }
         // Never accept over cellular: the client is on the local Wi-Fi.
-        params.prohibitedInterfaceTypes = [.cellular]
+        if loopbackOnly {
+            params.requiredInterfaceType = .loopback
+            params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: tryPort) ?? .any)
+        } else {
+            params.prohibitedInterfaceTypes = [.cellular]
+        }
         let listenPort = tryPort
         do {
-            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: listenPort)!)
+            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: listenPort) ?? .any)
             l.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
+                guard let self, !self.stopped else { return }
                 switch state {
                 case .ready:
                     self.counters.listenerState = "listening"
                     self.counters.boundPort = l.port?.rawValue ?? listenPort
-                    relayLog.info("listener ready on port \(listenPort)")
+                    let bound = self.counters.boundPort ?? listenPort
+                    relayLog.info("listener ready on port \(bound)")
+                    self.onReady?(bound)
                 case .waiting(let err):
                     self.counters.listenerState = "waiting"
                     self.counters.noteError("listener waiting on \(listenPort): \(err)")
@@ -93,7 +117,9 @@ final class RelayServer {
                 }
             }
             // Advertising over Bonjour lets VioletOS discover the relay and triggers the Local Network prompt early.
-            l.service = NWListener.Service(name: "Violet Relay", type: "_violetrelay._tcp")
+            if !loopbackOnly {
+                l.service = NWListener.Service(name: "Violet Relay", type: "_violetrelay._tcp")
+            }
             l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
             l.start(queue: queue)
             listener = l
@@ -116,13 +142,6 @@ final class RelayServer {
             }
         }
         session.start()
-    }
-
-    /// Violet Shield blocked these hosts: end their live sessions now (on `queue`).
-    func abortSessions(toHosts hosts: Set<String>) {
-        for s in sessions.values where hosts.contains(s.targetHost.lowercased()) {
-            s.abort("blocked by Violet Shield")
-        }
     }
 
     func checkCredentials(user: String, pass: String) -> Bool {
@@ -264,6 +283,9 @@ final class Socks5Session {
                     guard cmd == 0x01 else { return self.fail(.commandNotSupported, "command \(cmd) not supported") }
                     if case .name("time.violet", _) = host { return self.sendTime() }
                     if case .name("sentinel.violet", _) = host { return self.handOffToSentinel() }
+                    if case .name("agent-pair.violet", _) = host, let invitation = self.server.localInvitation {
+                        return self.sendInvitation(invitation)
+                    }
                     self.connect(host: host, port: port)
                 }
             }
@@ -288,9 +310,6 @@ final class Socks5Session {
     private func connect(host: NWEndpoint.Host, port: UInt16) {
         target = "\(host):\(port)"
         targetHost = Self.name(of: host)
-        if Shield.shared.isBlocked(host: targetHost, port: port) {
-            return fail(.notAllowed, "\(target) blocked by Violet Shield")
-        }
         flowId = Shield.shared.flowStarted(host: targetHost, port: port)
         phase = "connecting"
         lastActivity = Date()
@@ -298,6 +317,7 @@ final class Socks5Session {
         // (the Mac, from the Simulator) or standin:sink / standin:web on this phone's loopback.
         var host = host, port = port
         var local = false
+        #if os(iOS)
         if let mapped = RelayConfig.hostMap[targetHost.lowercased()] {
             if let (h, p) = StandIns.shared.resolve(mapped) {
                 host = .name(h, nil)
@@ -309,6 +329,7 @@ final class Socks5Session {
                 port = parts.count > 1 ? UInt16(parts[1]) ?? port : port
             }
         }
+        #endif
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.connectionTimeout = Int(Self.connectTimeout)
@@ -361,6 +382,17 @@ final class Socks5Session {
         case .ipv4(let a): return a.rawValue.map(String.init).joined(separator: ".")
         case .ipv6(let a): return "\(a)"
         @unknown default: return "\(host)"
+        }
+    }
+
+    private func sendInvitation(_ invitation: (@escaping (String?) -> Void) -> Void) {
+        invitation { [weak self] code in
+            guard let self else { return }
+            self.queue.async {
+                let success: [UInt8] = [0x05, Reply.succeeded.rawValue, 0, 0x01, 0, 0, 0, 0, 0, 0]
+                let message = code ?? "This Mac already has a phone or is showing a pairing code"
+                self.write(success + Array((message + "\n").utf8)) { self.finish(nil) }
+            }
         }
     }
 

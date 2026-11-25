@@ -113,7 +113,7 @@ with TemporaryDirectory() as tmp:
         (image / name).symlink_to(original / name)
     run.IMAGE = image
     apps = home_grid.apps((original / "initfs.cpio").read_bytes())
-    icons = {name: home_grid.icon(i, len(apps)) for i, name in enumerate(apps)}
+    icons = {name: home_grid.icon(i, apps) for i, name in enumerate(apps)}
     os.environ["OPEN_ICONS"] = json.dumps(icons)
     for stage in ("first", "second"):
         os.environ["OPEN_STAGE"] = stage

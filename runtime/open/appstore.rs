@@ -32,6 +32,7 @@ const DIR_SECTORS: u32 = 4;
 const FIRST_DATA: u32 = 2 * DIR_SECTORS;
 const ENTRIES: usize = 31;
 const MAGIC: &[u8; 8] = b"VAPPS1\0\0";
+const STAGED: &str = "/apps/.agent-install";
 /// Programs larger than this are refused (the extent is 12 MiB).
 pub const MAX_PROGRAM: usize = 8 << 20;
 pub const TITLES: &str = "/apps/.home";
@@ -290,7 +291,7 @@ impl Store {
         (at + sectors <= self.sectors).then_some(at)
     }
 
-    /// Keep /apps/NAME (already in the file system) across restarts, listed as `title`.
+    /// Commit the agent's staged program, then publish it at /apps/NAME.
     pub fn install(&mut self, fs: &mut Fs, name: &str, title: &str, time: u32) -> Result<usize, &'static str> {
         if self.sectors == 0 {
             return Err("no app storage");
@@ -299,39 +300,52 @@ impl Store {
             return Err("bad name");
         }
         let path = alloc::format!("/apps/{}", name);
-        let data = fs.contents(&path).ok_or("no such program")?.to_vec();
+        if fs.stat(&path).is_some_and(|stat| stat.mode & super::fs::S_IFMT != super::fs::S_IFREG) {
+            return Err("app path is not a file");
+        }
+        let data = fs.contents(STAGED).ok_or("no staged program")?.to_vec();
         if data.is_empty() || data.len() > MAX_PROGRAM {
             return Err("program too large or empty");
         }
-        let keep: Vec<Entry> = self.entries.iter().filter(|e| e.name != name).cloned().collect();
-        if keep.len() >= ENTRIES {
+        let existing = self.entries.iter().position(|e| e.name == name);
+        if existing.is_none() && self.entries.len() >= ENTRIES {
             return Err("too many installed apps");
         }
         let sectors = ((data.len() + 511) / 512) as u32;
-        let first = self.place(&keep, sectors).ok_or("no room for the program")?;
+        // The previous directory still references the old program until commit.
+        let first = self.place(&self.entries, sectors).ok_or("no room to stage the program")?;
         let package = is_package(&data);
-        if package {
+        let program = if package {
             // Unpacked first: a package that does not unpack is never stored.
             unpack(fs, &data)?;
-            let _ = fs.unlink(&path, false);
+            None
         } else if is_compressed(&data) {
-            // Runs from /apps as the program itself; the store keeps the compressed form.
-            let program = expand(data.clone())?;
-            if let Some(f) = fs.writable(&path, true, true, 0) {
-                *f = program;
-            }
-        }
+            Some(expand(data.clone())?)
+        } else {
+            None
+        };
         if !write(first, &data) || !flush() {
             return Err("write failed");
         }
-        let mut entries = keep;
+        let mut entries = self.entries.clone();
         let title: String = title.chars().filter(|c| *c != '\t' && *c != '\n').take(23).collect();
-        entries.push(Entry { name: String::from(name), title, first, len: data.len() as u32, crc: crc32(&data), time, package });
+        let bytes = data.len();
+        let entry = Entry { name: String::from(name), title, first, len: bytes as u32, crc: crc32(&data), time, package };
+        if let Some(index) = existing {
+            entries[index] = entry;
+        } else {
+            entries.push(entry);
+        }
         if !self.commit(entries) {
             return Err("directory write failed");
         }
+        if package {
+            let _ = fs.unlink(&path, false);
+        } else if let Some(file) = fs.writable(&path, true, true, time) {
+            *file = program.unwrap_or(data);
+        }
         self.titles(fs, None);
-        Ok(data.len())
+        Ok(bytes)
     }
 
     /// Forget an installed program and remove it from /apps.

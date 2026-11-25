@@ -9,7 +9,12 @@ struct VioletAgentApp: App {
 
     var body: some Scene {
         WindowGroup("Violet Agent") {
-            ContentView()
+            TabView {
+                ContentView()
+                    .tabItem { Label("Agent", systemImage: "waveform") }
+                List { ShieldSection() }
+                    .tabItem { Label("Violet Shield", systemImage: "shield") }
+            }
                 .environmentObject(model)
                 .frame(minWidth: 560, minHeight: 640)
                 .onAppear { model.start() }
@@ -65,11 +70,19 @@ struct ContentView: View {
                 if let p = model.phone {
                     Pill(ok: model.online, text: model.online ? "\(p.name) is connected" : "Waiting for \(p.name)…")
                 } else {
-                    Pill(ok: false, text: "No phone paired. Choose Pair a phone…, then open Agent on the phone.")
+                    Pill(ok: false, text: "No phone paired")
+                    if model.localReady {
+                        Text("In the emulator, open Violet Agent and click Connect to this Mac.")
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Pill(ok: model.relayUp, text: model.relayUp ? "Relay connected" : "Relay not connected")
                 if model.online {
-                    Pill(ok: model.directPath != nil, text: model.directPath.map { "Direct path to the phone (\($0))" } ?? "Through the relay (no direct path)")
+                    if model.phone?.relay == LocalCompanion.relay {
+                        Pill(ok: true, text: "Local emulator connection")
+                    } else {
+                        Pill(ok: model.directPath != nil, text: model.directPath.map { "Direct path to the phone (\($0))" } ?? "Through the relay (no direct path)")
+                    }
                 }
                 Pill(ok: model.codexState.hasPrefix("Codex ready"), text: model.codexState)
                 Pill(ok: model.speechState.hasPrefix("Speech recognition on"), text: model.speechState)

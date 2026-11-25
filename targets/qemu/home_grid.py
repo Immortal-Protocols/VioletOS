@@ -26,10 +26,12 @@ def apps(cpio):
     return ([n for n in BUILT_IN if n in listed] + others)[:MAX_APPS]
 
 
-def icon(index, count):
-    """The centre of icon `index` of `count`, in screen pixels."""
-    pitch = 286 if count <= 12 else 232
-    return [132, 360, 588][index % 3], 410 + (index // 3) * pitch
+def icon(index, names):
+    """The centre of an app's icon, including the gap in the factory layout."""
+    slot = index + (names[:len(BUILT_IN)] == BUILT_IN and index >= 4)
+    row, col = divmod(slot, 3)
+    y = 350 + row * 219 if len(names) > 12 else [407, 676, 901, 1126, 1351][row]
+    return [144, 360, 572][col], y
 
 
 # Helpers for the scripted viewers (tools/run.py runs them): put after the
@@ -58,7 +60,7 @@ def viewer(script, cpio):
     import json
     import os
     names = apps(cpio)
-    os.environ["HOME_ICONS"] = json.dumps({n: icon(i, len(names)) for i, n in enumerate(names)})
+    os.environ["HOME_ICONS"] = json.dumps({n: icon(i, names) for i, n in enumerate(names)})
     lines = script.splitlines(keepends=True)
     at = max(i for i, l in enumerate(lines) if l.startswith("import ")) + 1
     return "".join(lines[:at]) + VIEWER + "".join(lines[at:])

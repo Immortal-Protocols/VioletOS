@@ -19,6 +19,8 @@ Python app (the workspace's Tally), sending the Python package first. With the
 agent sent to the background, its microphone stream keeps reaching the Mac. On
 the second boot nobody opens the agent: it starts behind Home by itself and
 reconnects, and the Python app runs from the installed package.
+Before rebooting, the test also replaces Tally while its old process is running
+and verifies that reopening starts the new version on the same boot.
 
 Needs the image built with the test relay:
     VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu-image
@@ -43,7 +45,11 @@ import run
 APP = ROOT / "build/mac-agent/Build/Products/Debug/Violet Agent.app/Contents/MacOS/Violet Agent"
 EXAMPLE = ROOT / "build/agent-workspace/target/armv7-unknown-linux-musleabihf/agent/example"
 TALLY = ROOT / "build/agent-workspace/target/python/tally"
-SUPPORT = Path.home() / "Library/Application Support/Violet Agent test"
+TALLY_UPDATED = ROOT / "build/agent-workspace/target/python/tally-updated"
+PROFILE = os.environ.get("VIOLET_TEST_AGENT_PROFILE", "test")
+if not PROFILE.replace("-", "").isalnum():
+    raise SystemExit("The test profile must contain only letters, digits, and hyphens")
+SUPPORT = Path.home() / f"Library/Application Support/Violet Agent {PROFILE}"
 
 SCRIPT = r'''#!/usr/bin/env python3
 import json, mmap, os, re, struct, subprocess, sys, time
@@ -56,6 +62,7 @@ def mic_on(): return struct.unpack_from("<I", card, 48)[0] & 1
 STAGE = os.environ["AGENT_STAGE"]
 APP, EXAMPLE, SUPPORT = os.environ["AGENT_APP"], os.environ["AGENT_EXAMPLE"], os.environ["AGENT_SUPPORT"]
 TALLY = os.environ["AGENT_TALLY"]
+TALLY_UPDATED = os.environ["AGENT_TALLY_UPDATED"]
 
 def text():
     n = struct.unpack_from("<I", log, 4)[0]
@@ -98,7 +105,8 @@ def pixel(x, y):
     return struct.unpack_from("<I", screen, (y * 720 + x) * 4)[0]
 def launch_mac(*args):
     global mac
-    env = dict(os.environ, VIOLET_AGENT_PROFILE="test", VIOLET_AGENT_RELAY_MAP="http://violet-relay.test=http://127.0.0.1:8787",
+    env = dict(os.environ, VIOLET_AGENT_PROFILE=os.environ["AGENT_PROFILE"],
+               VIOLET_AGENT_RELAY_MAP="http://violet-relay.test=http://127.0.0.1:8787",
                VIOLET_AGENT_STUN="127.0.0.1:3478")
     mac = subprocess.Popen([APP, "--no-speech", *args], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -134,6 +142,20 @@ if STAGE == "first":
     if not mic_on():
         fail("the microphone stopped when the agent went to the background")
     print("agent: the microphone stayed on with the agent behind Home", file=sys.stderr)
+    open_icon("tally")
+    until("initial Tally UI", lambda: pixel(120, 1000) & 0xffffff == 0xe68cc8, 30)
+    tap(120, 1000)
+    n = home_shown()
+    installed = mac_log().count("test install tally: ok")
+    mac.terminate(); mac.wait()
+    launch_mac("--install", "tally=" + TALLY_UPDATED, "--wait-direct")
+    until("Tally update committed", lambda: mac_log().count("test install tally: ok") > installed, 90)
+    until("old Tally stopped", lambda: re.search(r"tally \(pid \d+\) exited", everything()), 10)
+    until("returned to Home after replacing Tally", lambda: home_shown() > n, 10)
+    open_icon("tally")
+    until("updated Tally on the same boot with its saved count",
+          lambda: "tally: replacement started with count 1" in everything(), 30)
+    print("agent: Tally replaced its running version on the same boot", file=sys.stderr)
     mac.terminate(); mac.wait()
     time.sleep(1)
     sys.exit(0)
@@ -143,24 +165,23 @@ if "installed apps: package python" not in everything():
     fail("the Python package was not unpacked")
 # Nothing is opened; the agent must start behind Home by itself.
 until("agent started in the background", lambda: "started the agent in the background" in everything(), 30)
+online_before = mac_log().count("phone online")
 launch_mac()
-until("reconnected", lambda: mac_log().count("phone online") >= 2, 90)
+until("reconnected", lambda: mac_log().count("phone online") > online_before, 90)
 print("agent: reconnected after the restart without a new scan", file=sys.stderr)
 until("relay fallback", lambda: "agent: direct path not found" in everything(), 30)
 print(re.findall(r"agent: direct path not found: .*", everything())[-1], file=sys.stderr)
-leave_to_home()
-time.sleep(1)
 # An installed app gets an icon after the built-in ones.
 open_icon("example")
 until("the installed app runs", lambda: "stopwatch: starting at" in everything(), 60)
 print("agent: the installed example runs from its Home icon after the restart", file=sys.stderr)
 leave_to_home()
 open_icon("tally")
-time.sleep(8)
+until("updated Tally and its saved count after reboot",
+      lambda: "tally: replacement started with count 1" in everything(), 30)
+until("Tally rendered", lambda: pixel(120, 1000) & 0xffffff == 0xe68cc8, 10)
 if "Traceback" in everything():
     fail("the Python app failed")
-if pixel(120, 1000) & 0xffffff != 0xe68cc8:
-    fail(f"the Python app's +1 button is not on screen ({pixel(120, 1000):#x})")
 print("agent: the Python app runs from the installed Python after the restart", file=sys.stderr)
 leave_to_home()
 # Settings › Agent Apps deletes the example (Delete, then Confirm on its row).
@@ -170,9 +191,9 @@ time.sleep(1)
 tap(360, 250 + 4 * 124 + 54)
 until("Agent Apps", lambda: "settings: AgentApps" in everything())
 time.sleep(1)
-row = [l.split("\t")[0] for l in INSTALLED.split(",")].index("example")
-tap(582, 250 + row * 124 + 62)
-tap(582, 250 + row * 124 + 62)
+# Example was the first installed app. The Python runtime is hidden.
+tap(582, 250 + 62)
+tap(582, 250 + 62)
 until("deleted", lambda: "settings: uninstall example -> ok" in everything(), 15)
 print("agent: Settings deleted the installed example", file=sys.stderr)
 tap(100, 60)
@@ -203,6 +224,10 @@ def main():
     if not EXAMPLE.exists():
         subprocess.run([sys.executable, str(ROOT / "tools/agent_build.py"), "setup"], check=True)
     subprocess.run([str(ROOT / "build/agent-workspace/build"), "tally"], check=True, stdout=subprocess.DEVNULL)
+    initial = TALLY.read_bytes()
+    marker = b'count = violet.load("tally", 0)\n'
+    updated = marker + b'print(f"tally: replacement started with count {count}", flush=True)\n'
+    TALLY_UPDATED.write_bytes(initial.replace(marker, updated, 1))
     subprocess.run([sys.executable, str(ROOT / "tools/build_python_package.py")], check=True)
     if b"bin/python3\0" in (ROOT / "build/sel4/qemu/initfs.cpio").read_bytes():
         raise SystemExit("Build the image without Python: VIOLET_OPEN_NO_PYTHON=1 (make test-agent does)")
@@ -225,7 +250,7 @@ def main():
             # The agent's installs, in the order they arrive (Python itself is a package, with no icon).
             names = home_grid.apps(cpio) + ["example", "tally"]
             for name in ("example", "tally"):
-                icons[name] = home_grid.icon(names.index(name), len(names))
+                icons[name] = home_grid.icon(names.index(name), names)
             os.environ["HOME_ICONS"] = json.dumps(icons)
             image = Path(tmp) / "image"
             image.mkdir()
@@ -233,7 +258,8 @@ def main():
                 (image / name).symlink_to(original / name)
             run.IMAGE = image
             os.environ.update(VIOLET_NET_HOSTS=json.dumps({"violet-relay.test": "127.0.0.1:8787", "violet-relay.test:3478": "127.0.0.1:3478"}),
-                              AGENT_APP=str(APP), AGENT_EXAMPLE=str(EXAMPLE), AGENT_SUPPORT=str(SUPPORT), AGENT_TALLY=str(TALLY))
+                              AGENT_APP=str(APP), AGENT_EXAMPLE=str(EXAMPLE), AGENT_SUPPORT=str(SUPPORT), AGENT_PROFILE=PROFILE,
+                              AGENT_TALLY=str(TALLY), AGENT_TALLY_UPDATED=str(TALLY_UPDATED))
             for stage in ("first", "second"):
                 # The second boot's network blocks UDP: the pair falls back to the relay.
                 os.environ.update(AGENT_STAGE=stage, VIOLET_NET_UDP="0" if stage == "second" else "1")

@@ -9,9 +9,9 @@ struct ShieldSection: View {
         let s = ui.snap
         Section {
             HStack(spacing: 10) {
-                Image(systemName: s.frozen.isEmpty ? (s.linkUp ? "checkmark.shield.fill" : "shield") : "exclamationmark.shield.fill")
+                Image(systemName: s.linkUp ? "checkmark.shield.fill" : "shield")
                     .font(.title2)
-                    .foregroundStyle(s.frozen.isEmpty ? (s.linkUp ? Color.green : Color.secondary) : Color.red)
+                    .foregroundStyle(s.linkUp ? Color.green : Color.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(s.linkUp ? "Watching VioletOS" : "VioletOS not linked").font(.headline)
                     Text(s.linkUp ? "boot \(s.bootId) · chain \(s.chain)" : s.link)
@@ -26,19 +26,16 @@ struct ShieldSection: View {
             row("Runs on", s.computeUnits.isEmpty ? "—" : "\(s.computeUnits) · \(s.lastLatencyMs > 0 ? "\(Int(s.lastLatencyMs)) ms/window" : "idle")", id: "shield-compute")
             row("Signing key", s.signer, id: "shield-signer")
             row("Events · windows", "\(s.events) · \(s.windowsScored)", id: "shield-counts")
-            row("Shields sent · verified", "\(s.shieldsSent) · \(s.shieldsAccepted)\(s.shieldsRejected > 0 ? " (\(s.shieldsRejected) rejected)" : "")", id: "shield-shields")
-            Toggle("Auto-contain (p ≥ 0.90)", isOn: Binding(get: { s.autoContain }, set: { Shield.shared.setAutoContain($0) }))
-                .accessibilityIdentifier("shield-auto")
-            if !s.frozen.isEmpty {
-                row("Frozen on VioletOS", s.frozen.joined(separator: ", "), id: "shield-frozen", tint: .red)
-            }
-            if !s.blocked.isEmpty {
-                row("Blocked by relay", s.blocked.joined(separator: ", "), id: "shield-blocked", tint: .red)
-            }
+            row("Home warnings verified", "\(s.shieldsAccepted)", id: "shield-shields")
+            row("Mode", "Monitoring only", id: "shield-mode")
         } header: {
             Text("Violet Shield")
         } footer: {
-            Text("Checks run on this iPhone. Containment is signed with this phone's key and expires on its own.")
+            #if os(macOS)
+            Text("Checks run on this Mac. VioletOS shows warnings on Home.")
+            #else
+            Text("Checks run on this iPhone. VioletOS shows warnings on Home.")
+            #endif
         }
         if !s.decisions.isEmpty {
             Section("Verdicts") {
@@ -78,16 +75,16 @@ private struct DecisionRow: View {
                 Spacer()
                 Text(String(format: "p %.2f", d.pMalicious)).font(.caption.monospacedDigit())
             }
-            Text("\(d.tier == "model" ? "model" : d.tier) → \(d.action)\(d.latencyMs > 0 ? " · \(Int(d.latencyMs)) ms" : "")\(d.tags.isEmpty ? "" : " · " + d.tags.map(\.0).joined(separator: ", "))")
+            Text("\(d.tier == "model" ? "model" : d.tier)\(d.latencyMs > 0 ? " · \(Int(d.latencyMs)) ms" : "")\(d.tags.isEmpty ? "" : " · " + d.tags.map(\.0).joined(separator: ", "))")
                 .font(.caption).foregroundStyle(.secondary)
             if !d.note.isEmpty {
-                Text(d.note).font(.caption).foregroundStyle(d.contained ? .red : .secondary)
+                Text(d.note).font(.caption).foregroundStyle(.secondary)
             }
-            if d.contained {
+            if d.warned {
+                Text("Home warning sent").font(.caption).foregroundStyle(.orange)
                 HStack {
-                    Button("Release") { Shield.shared.release(d) }
-                    Button("Allow & Learn") { Shield.shared.label(d, benign: true) }
-                    Button("Threat") { Shield.shared.label(d, benign: false) }.tint(.red)
+                    Button("Mark Benign") { Shield.shared.label(d, benign: true) }
+                    Button("Mark Threat") { Shield.shared.label(d, benign: false) }
                 }
                 .buttonStyle(.bordered).controlSize(.small)
             }

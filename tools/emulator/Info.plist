@@ -5,6 +5,7 @@
     <key>CFBundleExecutable</key><string>viewer</string>
     <key>CFBundleIdentifier</key><string>org.immortal-protocols.violetos.emulator</string>
     <key>CFBundleName</key><string>VioletOS Emulator</string>
+    <key>CFBundleIconFile</key><string>VioletOS.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>NSHighResolutionCapable</key><true/>

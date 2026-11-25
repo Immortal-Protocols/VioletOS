@@ -5,7 +5,11 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#import <AppKit/AppKit.h>
+#endif
 
+// Match the Moto G Pure framebuffer and keep square pixels on the host.
 enum { WIDTH = 720, HEIGHT = 1600, PITCH = WIDTH * 4 };
 // Emulated sound card shared with the guest Audio service (targets/qemu/audio.rs).
 // Control page, eight-page PCM ring, then a two-page 16 kHz mono microphone ring.
@@ -14,7 +18,7 @@ enum { SOUND_PAGE = 0x49204000 - 0x40000000, SOUND_BYTES = 11 * 4096, SOUND_MAGI
 static volatile uint32_t *sound;
 static uint32_t heard;
 // Captured samples go into the guest's ring; word 13 counts them.
-static void listen(void *unused, Uint8 *stream, int bytes) {
+static void capture_microphone(void *unused, Uint8 *stream, int bytes) {
     (void)unused;
     volatile int16_t *ring = (volatile int16_t *)((volatile uint8_t *)sound + MIC_OFFSET);
     const int16_t *in = (const int16_t *)stream;
@@ -95,16 +99,27 @@ int main(int argc, char **argv) {
     int mic_tried = 0;
     Uint32 mic_clock = 0;
     SDL_Window *window = SDL_CreateWindow("VioletOS · seL4 on QEMU",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH/2, HEIGHT/2,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH / 2, HEIGHT / 2,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!window) goto fail;
+#ifdef __APPLE__
+    // The launcher starts this executable directly to receive touch events.
+    // Set the Dock icon after SDL has initialized the macOS application.
+    @autoreleasepool {
+        NSString *name = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleIconFile"];
+        NSURL *url = name ? [NSBundle.mainBundle URLForResource:name withExtension:nil] : nil;
+        NSImage *icon = url ? [[NSImage alloc] initWithContentsOfURL:url] : nil;
+        if (icon) NSApp.applicationIconImage = icon;
+        [icon release];
+    }
+#endif
     // Presents follow the Mac's display refresh rather than a fixed delay.
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) renderer = SDL_CreateRenderer(window, -1, 0);
     if (!renderer || SDL_RenderSetLogicalSize(renderer, WIDTH, HEIGHT)) goto fail;
     SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
-    if (!texture) goto fail;
+    if (!texture || SDL_SetTextureScaleMode(texture, SDL_ScaleModeLinear)) goto fail;
     title(window);
     // Dirty rows from the guest (runtime/open/scanout.rs): magic, first row,
     // end row, a sequence number, and the sequence this viewer has copied.
@@ -126,6 +141,7 @@ int main(int argc, char **argv) {
             }
             if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT &&
                 e.button.x >= 0 && e.button.x < WIDTH && e.button.y >= 0 && e.button.y < HEIGHT) {
+                // SDL maps the mouse into guest coordinates, including letterboxing.
                 if (!send_report(e.button.x, e.button.y, 1)) goto fail;
                 held = 1;
             }
@@ -138,7 +154,7 @@ int main(int argc, char **argv) {
         int wanted = sound[2] == SOUND_MAGIC && (sound[12] & 1);
         if (wanted && !mic && !mic_tried) {
             SDL_AudioSpec want = {.freq = 16000, .format = AUDIO_S16SYS, .channels = 1,
-                                  .samples = 256, .callback = listen};
+                                  .samples = 256, .callback = capture_microphone};
             mic = SDL_OpenAudioDevice(NULL, 1, &want, NULL, 0);
             mic_tried = 1;
             if (mic) SDL_PauseAudioDevice(mic, 0);

@@ -5,7 +5,7 @@
 //! /data/networks, so a known network joins with one tap.
 use std::time::{Duration, Instant};
 
-use crate::keyboard::{self, Key, Keyboard};
+use violet::keyboard::{self, Key, Keyboard};
 use crate::wifi_ui::{self as ui, Hit, Page};
 use violet::device::{TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP};
 use violet::wifi::{self, Network, Security};

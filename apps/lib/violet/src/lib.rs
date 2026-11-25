@@ -6,6 +6,7 @@ pub mod canvas;
 pub mod compositor;
 pub mod device;
 pub mod http;
+pub mod keyboard;
 pub mod paper;
 pub mod text;
 pub mod wifi;

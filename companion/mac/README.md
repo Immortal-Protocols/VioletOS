@@ -16,6 +16,12 @@ It needs Codex signed in with ChatGPT (`codex login`), the build tools of this c
 
 **Name.** The agent is called Violet until you rename it: **Rename…** in the window, `--name "My Dude"`, or just ask ("I'd like to call you My Dude"; Codex calls `rename_assistant`). The name is kept with the pairing keys and shown on the phone.
 
+## Connect the emulator on this Mac
+
+Build the companion and run `make emulator` from the same checkout. In the emulator, open **Violet Agent** and click **Connect to this Mac**. The companion and emulator use the existing encrypted Agent pairing over a relay bound to Mac loopback. Each companion profile keeps one pairing. Use `VIOLET_AGENT_PROFILE=emulator` to keep your handset pairing in a separate profile.
+
+The **Violet Shield** tab shows the emulator link and model verdicts. Signed warnings appear in the Shield badge on VioletOS Home. The Mac companion serves the emulator's Sentinel and its TCP relay. Build with the Shield model assets in `build/shield` to enable AI scoring. Built-in checks can still warn when the model is unavailable. Use the same checkout and `VIOLET_SHIELD_KEY` (if set) for the emulator image and Mac companion so they share the pinned public key. A Moto paired with this Mac sends Shield telemetry over its encrypted Agent connection. The iPhone companion can still provide handset Shield through Phone Internet.
+
 ## How it fits together
 
 | Piece | Where |
@@ -39,6 +45,8 @@ The builder works in `build/agent-workspace` ([tools/agent_build.py](../../tools
 **Interrupting.** Tap the circle on the phone to stop a reply. Talking over it works as in RoseOS: the voice ducks at once, pauses after 0.2 s of speech, and stops for real words or "wait"/"stop"; "mm-hmm", a cough or the agent's own voice coming back through the speakerphone let it carry on.
 
 **Logs and timings** are in `~/Library/Application Support/Violet Agent`: `agent.log`, `status.json` and `timings.jsonl` (request, install and first open, in seconds).
+
+**Shield training data.** The Mac companion appends each new verdict to `shield-verdicts.jsonl` in its Application Support profile directory. The file includes the canonical telemetry window and, for AI verdicts, the model input, side features, and class probabilities. Verdicts are predictions. Human labels remain in `shield-feedback.jsonl` and reference the verdict ID. Both files are local to the Mac.
 
 ## Testing without a person
 

@@ -1,6 +1,5 @@
 //! Settings: Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone
 //! Internet), the clock's city, the apps Violet Agent built, and About.
-mod keyboard;
 mod pages;
 mod wifi;
 mod wifi_ui;

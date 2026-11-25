@@ -76,7 +76,7 @@ try:
         import home_grid
         grid=home_grid.apps((IMAGE/"initfs.cpio").read_bytes())
         settle(lambda:"home: ready" in log(), "Home did not start", 60)
-        x,y=home_grid.icon(grid.index("settings"),len(grid))
+        x,y=home_grid.icon(grid.index("settings"), grid)
         time.sleep(1)
         tap(y,x)
         settle(lambda:"settings: ready" in log(), "a tap on Home did not open Settings", 30)
