@@ -81,7 +81,11 @@ An install arrives (raw DEFLATE when `encoding` says so), is inflated and checke
 
 A Python app is a `#!/bin/python3` script installed the same way. The handset image has no Python, so before the first one the Mac installs the package `python` ([tools/build_python_package.py](../tools/build_python_package.py)): data starting with `VGZ1` that the Open Runtime unpacks into `/bin` and `/lib` at every start rather than keeping as `/apps/python`. The phone's next `hello` says `python: true`.
 
-**Locomo Music.** The Mac advertises the enabled plugin as `locomo: true` in `hello` and sends `locomo_available` with an `enabled` boolean when availability changes during the session. The device sends `locomo_make` with a request UUID in `id` and includes `resume: true` when reconnecting for that request. The Mac responds with `locomo_status` (`id`, `message`, `done`), or `locomo_track` (`id`, `title`, `durationMs`, `size`, `sha256`), MP3 records, then `locomo_end` with the request ID. The device publishes the file to Music after checking its SHA-256.
+**Locomo Music.** The Mac advertises the enabled plugin as `locomo: true` in `hello` and sends `locomo_available` with an `enabled` boolean when availability changes. The device sends `locomo_make` with a request UUID in `id` and generation options `station`, `length` (seconds, 0 for Auto, null for the Mac setting), `count`, and `overnight`. A request with a library track UUID in `track` fetches that song for playback. On reconnect, `resume: true` asks for the status or completed audio of the same request. The Mac responds with `locomo_status` (`id`, `message`, `done`), or `locomo_track` (`id`, `title`, `station`, `durationMs`, `size`, `sha256`), MP3 records, then `locomo_end` with the request ID. The device publishes the file to Music after checking its SHA-256.
+
+The device sends `locomo_browse` with `request` (u32 correlation ID), `query`, `page` (zero-based), and `favorites`. The Mac answers with `locomo_library` containing the same `request`, up to eight `tracks` (`id`, `title`, `station`, `duration_ms`, `favorite`), and `more` for pagination. An optional `error` describes a failed browse request.
+
+The device can send `locomo_control` with `control` set to `stop` for continuous generation or `disarm` for the overnight batch. The Mac reports the outcome in `locomo_control_status` with a `message`.
 
 ## Direct path
 

@@ -3,15 +3,17 @@
 //! (symphonia), PCM to /dev/violet/audio, and a full 720x1600 interface
 //! drawn into /dev/violet/screen.
 mod locomo;
+mod pages;
 mod player;
 mod ui;
+mod style;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use violet::{device::TOUCH_DOWN, rgb, Canvas, Fonts, Screen, H, W};
+use violet::{device::TOUCH_DOWN, Canvas, Fonts, Screen, H, W};
 
 fn main() {
     println!("music: starting");
@@ -22,11 +24,11 @@ fn main() {
     let mut layer = Canvas::new(W, H);
     let splash = |screen: &mut Screen, frame: &mut Canvas, line: &str| {
         let b = frame.bounds();
-        frame.fill(b, rgb(20, 14, 30));
-        frame.round_rect_alpha(ui::HOME, 29.0, rgb(255, 255, 255), 0.13);
-        fonts.medium(23.0).draw(frame, "‹  Home", ui::HOME.x0 + 28, ui::HOME.y0 + 38, rgb(245, 240, 250));
-        fonts.bold(38.0).centered(frame, "Rose Music", 0, W as i32, 760, rgb(0xe6, 0x8c, 0xc8));
-        fonts.regular(28.0).centered(frame, line, 0, W as i32, 820, rgb(0xee, 0xea, 0xf8));
+        frame.fill(b, style::SURFACE);
+        style::outline(frame, ui::HOME, 26.0);
+        fonts.medium(23.0).draw(frame, "‹  Home", ui::HOME.x0 + 28, ui::HOME.y0 + 38, style::INK);
+        fonts.bold(38.0).centered(frame, "Locomo Music", 0, W as i32, 760, style::INK);
+        fonts.regular(28.0).centered(frame, line, 0, W as i32, 820, style::MUTED);
         screen.show_all(frame);
     };
     // Until something can play, the splash answers Home and focus changes.
@@ -62,6 +64,7 @@ fn main() {
         base: String::new(),
         tracks: Vec::new(),
     };
+    let mut pages = pages::Pages::default();
     let mut local_track = None;
     let mut local_id = None;
     let mut plugin_status = String::new();
@@ -136,6 +139,7 @@ fn main() {
         }
         if last_locomo_check.elapsed() >= Duration::from_millis(500) {
             last_locomo_check = Instant::now();
+            if pages.sync_library() { shown = None; }
             let status = locomo::status();
             if status != plugin_status {
                 plugin_status = status;
@@ -150,6 +154,7 @@ fn main() {
                         catalog.tracks[i] = song.track();
                     }
                     local_id = Some(song.id);
+                    pages.refresh();
                     shown = None;
                     play(&mut player, &catalog, i as isize);
                 }
@@ -162,20 +167,16 @@ fn main() {
                 last_look = None;
             }
             Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
-            Ok(e) if e.kind == TOUCH_DOWN && ui::LATEST.contains(e.x, e.y) => {
-                if let Some(i) = local_track {
-                    play(&mut player, &catalog, i as isize);
-                }
-            }
-            Ok(e) if e.kind == TOUCH_DOWN && ui::LOCOMO.contains(e.x, e.y) => {
-                if locomo::request().is_ok() {
-                    plugin_status = "Requesting a Cool Jazz song…".into();
-                    shown = None;
-                }
-            }
             Ok(e) if e.kind == TOUCH_DOWN => {
+                match pages.tap(e.x, e.y, &catalog) {
+                    pages::Action::Redraw => { shown = None; continue; }
+                    pages::Action::Play(i) => { play(&mut player, &catalog, i as isize); shown = None; continue; }
+                    pages::Action::Submit => { plugin_status = "Contacting the Mac…".into(); shown = None; continue; }
+                    pages::Action::None if pages.page != pages::Page::Player => continue,
+                    pages::Action::None => {}
+                }
                 let current = player.track.load(Relaxed);
-                match ui::hit(e.x, e.y, catalog.tracks.len()) {
+                match ui::hit(e.x, e.y) {
                     Some(ui::Hit::Home) => violet::home(),
                     Some(ui::Hit::Play) => {
                         if current < 0 {
@@ -192,7 +193,6 @@ fn main() {
                         }
                     }
                     Some(ui::Hit::Next) => play(&mut player, &catalog, current as isize + 1),
-                    Some(ui::Hit::Song(i)) => play(&mut player, &catalog, i as isize),
                     None => {}
                 }
             }
@@ -235,13 +235,20 @@ fn main() {
             continue;
         }
         let full = shown != Some(current);
+        if pages.page != pages::Page::Player {
+            if full {
+                pages.draw(&mut frame, &fonts, &catalog, &plugin_status);
+                screen.show_all(&frame);
+                shown = Some(current);
+            }
+            continue;
+        }
         if full {
             ui::draw_static(&mut layer, &fonts, &catalog, covers.get(&art), current);
-            ui::draw_locomo(&mut layer, &fonts, &plugin_status, local_track.is_some());
+            pages::navigation(&mut layer, &fonts, pages::Page::Player);
             frame.px.copy_from_slice(&layer.px);
             shown = Some(current);
         }
-        let pal = covers.get(&art).map_or(ui::Palette::default(), |c| c.palette);
         let status = player.failure.lock().unwrap().clone();
         // Redraw the lower band only when what it shows changes: the second,
         // the waveform's progress, the spectrum (in 1/32 steps), play or pause.
@@ -261,7 +268,7 @@ fn main() {
         last_look = Some(look);
         last_frame = Instant::now();
         let t0 = Instant::now();
-        ui::draw_dynamic(&mut frame, &layer, &fonts, &catalog, &player, pal, &status);
+        ui::draw_dynamic(&mut frame, &layer, &fonts, &catalog, &player, &status);
         let t1 = Instant::now();
         if full {
             screen.show_all(&frame);

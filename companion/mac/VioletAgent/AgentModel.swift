@@ -601,35 +601,80 @@ final class AgentModel: ObservableObject {
         guard o["resume"] as? Bool != true else { return reply("The Mac no longer has that song request.") }
         guard !locomoRunning else { return reply("Locomo is already making a song.") }
         guard let app = locomoApp else { return reply("Enable Locomo in Violet Agent on the Mac.") }
+        let track = (o["track"] as? String).flatMap(UUID.init(uuidString:))
+        let options = LocomoPlugin.Options(o)
+        guard track != nil || (options != nil && o["track"] == nil) else { return reply("Locomo request options are invalid.") }
         locomoRunning = true
-        locomoJob = (id, phone.key, "Opening Locomo Music…", nil)
-        reply("Opening Locomo Music…", failed: false)
-        log("locomo: requested Cool Jazz song")
+        locomoJob = (id, phone.key, "Contacting Locomo Music…", nil)
+        reply("Contacting Locomo Music…", failed: false)
+        if track == nil, let options { log("locomo: requested \(options.station) song") }
         Task { @MainActor in
+            var status = "Locomo request finished."
+            func progress(_ message: String) {
+                status = message
+                self.locomoJob?.status = message
+                self.locomoStatus = message
+                self.log("locomo: \(message)")
+                if self.phone?.key == phone.key { reply(message, failed: false) }
+            }
+            defer { locomoRunning = false }
             do {
-                let song = try await LocomoPlugin.generate(app: app) { message in
-                    self.locomoJob?.status = message
-                    self.locomoStatus = message
-                    self.log("locomo: \(message)")
-                    if self.phone?.key == phone.key { reply(message, failed: false) }
+                let song: LocomoPlugin.Song?
+                if let track {
+                    song = try await Task.detached(priority: .utility) { try LocomoPlugin.read(track) }.value
+                } else if let options {
+                    song = try await LocomoPlugin.run(app: app, options: options, status: progress)
+                } else {
+                    return
                 }
                 locomoJob?.song = song
-                locomoStatus = "Finished \(song.title)"
-                log("locomo: generated \(song.title) (\(song.audio.count) MP3 bytes)")
-                if self.phone?.key == phone.key { sendLocomo(song, id: raw) }
+                if let song {
+                    locomoStatus = "Ready to play \(song.title)"
+                    log("locomo: delivering \(song.title) (\(song.audio.count) MP3 bytes)")
+                    if self.phone?.key == phone.key { sendLocomo(song, id: raw) }
+                } else if self.phone?.key == phone.key {
+                    reply(status)
+                }
             } catch {
                 locomoJob?.status = error.localizedDescription
                 locomoStatus = error.localizedDescription
                 log("locomo: \(error.localizedDescription)")
                 if self.phone?.key == phone.key { reply(error.localizedDescription) }
             }
-            locomoRunning = false
+        }
+    }
+
+    private func receiveLocomoBrowse(_ message: [String: Any]) {
+        guard let request = message["request"] as? UInt32, let phone else { return }
+        guard let app = locomoApp else {
+            link.send(["t": "locomo_library", "request": request, "tracks": [], "more": false,
+                       "error": "Enable Locomo Music on the Mac."])
+            return
+        }
+        let query = message["query"] as? String ?? ""
+        let page = message["page"] as? Int ?? 0
+        let favorites = message["favorites"] as? Bool == true
+        Task { @MainActor in
+            do {
+                let (entries, more) = try await Task.detached(priority: .utility) {
+                    try LocomoPlugin.verify(app)
+                    return try LocomoPlugin.browse(query: query, page: page, favorites: favorites)
+                }.value
+                let bytes = try JSONEncoder().encode(entries)
+                let tracks = try JSONSerialization.jsonObject(with: bytes)
+                guard self.phone?.key == phone.key, self.locomoApp == app else { return }
+                link.send(["t": "locomo_library", "request": request, "tracks": tracks, "more": more])
+            } catch {
+                guard self.phone?.key == phone.key else { return }
+                link.send(["t": "locomo_library", "request": request, "tracks": [], "more": false,
+                           "error": error.localizedDescription])
+            }
         }
     }
 
     private func sendLocomo(_ song: LocomoPlugin.Song, id: String) {
         link.send(["t": "locomo_track", "id": id, "title": song.title, "durationMs": song.durationMs,
-                   "size": song.audio.count, "sha256": sha256(song.audio).hex])
+                   "station": song.station, "size": song.audio.count, "sha256": sha256(song.audio).hex])
         for offset in stride(from: 0, to: song.audio.count, by: 48 * 1024) {
             var body = Data()
             withUnsafeBytes(of: UInt32(offset).littleEndian) { body.append(contentsOf: $0) }
@@ -650,6 +695,22 @@ final class AgentModel: ObservableObject {
                 saved.phones = [p]
                 Store.save(saved)
             }
+        case "locomo_control":
+            guard let app = locomoApp, let peer = phone?.key,
+                  let action = o["control"] as? String, ["stop", "disarm"].contains(action) else { return }
+            Task { @MainActor in
+                let message: String
+                do {
+                    message = try await LocomoPlugin.control(app: app, action: action)
+                } catch {
+                    message = error.localizedDescription
+                }
+                if self.phone?.key == peer {
+                    self.link.send(["t": "locomo_control_status", "message": message])
+                }
+            }
+        case "locomo_browse":
+            receiveLocomoBrowse(o)
         case "locomo_make":
             receiveLocomo(o)
         case "stop":
