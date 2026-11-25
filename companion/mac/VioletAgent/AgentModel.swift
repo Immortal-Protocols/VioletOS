@@ -22,12 +22,20 @@ final class AgentModel: ObservableObject {
     @Published var activity = "idle"
     @Published var scanning = false
     @Published var lastTiming: String?
+    @Published var agentName = "Violet"
 
     private var saved: Saved
     private let identity: Curve25519.Signing.PrivateKey
     private var link: PhoneLink!
     private let listener = Listener()
     private let speaker = Speaker()
+    /// RoseOS's listener and speaker (voice/violet_voice.py); Apple's speech when unavailable.
+    private let rose = RoseVoice()
+    private var useRose = false
+    private var replyIDs: [String: Int] = [:]
+    private var replySent: [String: Int] = [:]
+    private var nextReply = 1
+    private var renamed = false
     private var codex: Codex!
     let support: URL
     let repo: URL
@@ -48,6 +56,11 @@ final class AgentModel: ObservableObject {
     private var pendingSay: String?
     /// --install NAME=PATH: install a built program once the phone is online (tests).
     private var pendingInstall: (String, String)?
+    /// --record-mic: the phone's microphone stream, kept as mic.wav (measurements).
+    private var recording: Data?
+    private var micBytes = 0
+    private var micSince = Date()
+    private var speechBytes = 0
 
     init() {
         saved = Store.load()
@@ -63,6 +76,7 @@ final class AgentModel: ObservableObject {
         try? fm.createDirectory(at: workspace, withIntermediateDirectories: true)
         link = PhoneLink(identity: identity) { [weak self] e in self?.on(e) }
         phone = saved.phones.first
+        agentName = saved.name ?? "Violet"
         log("Violet Agent started; Mac key \(identity.publicKey.rawRepresentation.hex.prefix(16)); repo \(repo.path)")
     }
 
@@ -72,6 +86,8 @@ final class AgentModel: ObservableObject {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--unpair"), i >= 0 { saved.phones = []; Store.save(saved); phone = nil }
         if let i = args.firstIndex(of: "--say"), i + 1 < args.count { pendingSay = args[i + 1] }
+        if args.contains("--record-mic") { recording = Data() }
+        if let i = args.firstIndex(of: "--name"), i + 1 < args.count { rename(args[i + 1]) }
         if let i = args.firstIndex(of: "--install"), i + 1 < args.count, let eq = args[i + 1].firstIndex(of: "=") {
             pendingInstall = (String(args[i + 1][..<eq]), String(args[i + 1][args[i + 1].index(after: eq)...]))
         }
@@ -80,6 +96,8 @@ final class AgentModel: ObservableObject {
         speaker.onPCM = { [weak self] id, pcm in self?.sendSpeech(id, pcm) }
         speaker.onEnd = { [weak self] id in
             guard let self else { return }
+            self.log("spoke utterance \(id): \(self.speechBytes) bytes of speech sent")
+            self.speechBytes = 0
             self.link.send(["t": "say_end", "id": id])
             // Back to listening once the last sentence is out and Codex is done.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
@@ -90,6 +108,8 @@ final class AgentModel: ObservableObject {
         listener.onFinal = { [weak self] t in self?.final(t) }
         if args.contains("--no-speech") {
             speechState = "Speech recognition off (--no-speech)"
+        } else if !args.contains("--apple-speech") && RoseVoice.available() {
+            startRose()
         } else {
             listener.start { [weak self] ok in
                 self?.speechState = ok ? "Speech recognition on this Mac (\(self?.speaker.voiceName ?? "") voice)" : "Allow Speech Recognition in System Settings › Privacy"
@@ -123,12 +143,62 @@ final class AgentModel: ObservableObject {
         }
     }
 
+    private func startRose() {
+        useRose = true
+        speechState = "Loading the RoseOS voice (Silero, smart-turn, Nemotron, Parakeet, Phonon)…"
+        rose.onReady = { [weak self] voice in
+            self?.speechState = "RoseOS voice ready (Phonon \(voice))"
+            self?.log("RoseOS voice ready: \(voice)")
+        }
+        rose.onFailed = { [weak self] why in
+            guard let self else { return }
+            self.log("RoseOS voice failed: \(why); using the Mac's speech")
+            self.useRose = false
+            self.listener.start { ok in
+                self.speechState = ok ? "Speech recognition on this Mac (RoseOS voice unavailable)" : "Allow Speech Recognition in System Settings › Privacy"
+            }
+        }
+        rose.onTurn = { [weak self] text, hold in
+            guard let self else { return }
+            self.heard = ""
+            if hold { self.log("user: \(text) (holding)"); return }
+            self.userTurn(text)
+        }
+        rose.onPartial = { [weak self] t in self?.heard = t }
+        rose.onControl = { [weak self] m in self?.link.send(["t": "audio", "ctl": m]) }
+        rose.onPCM = { [weak self] seg, pcm in self?.sendSpeech(seg, pcm) }
+        rose.onAudible = { [weak self] on in
+            guard let self else { return }
+            if on { self.setActivity("speaking") } else if self.codex.activeTurn == nil { self.setActivity("idle") }
+        }
+        rose.onLog = { [weak self] s in self?.log(s) }
+        let script = repo.appendingPathComponent("companion/mac/voice/violet_voice.py")
+        rose.start(script: script, voice: saved.voice ?? "zoey")
+    }
+
+    /// Give the agent a new name (the Mac's setting, shown on the phone).
+    func rename(_ name: String) {
+        let n = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(24))
+        guard !n.isEmpty else { return }
+        agentName = n
+        saved.name = n
+        Store.save(saved)
+        renamed = true
+        link?.send(["t": "hello", "name": Host.current().localizedName ?? "Mac", "agent_name": n])
+        log("the agent is now called \(n)")
+    }
+
+    private var instructions: String {
+        Self.instructions.replacingOccurrences(of: "You are Violet,", with: "You are \(agentName),")
+    }
+
     private static let instructions = """
     You are Violet, the voice agent of the user's VioletOS phone (a Moto G Pure). You run on their Mac. \
     Everything you write is spoken aloud on the phone, so answer like a person talking: one or two short sentences, \
     no markdown, lists, code, paths or URLs. When the user asks for an app, follow AGENTS.md in this workspace: \
     say one short line first, build it, call install_app, then say it is ready. Choose sensible defaults instead of asking. \
-    If the user asks to open an app you installed, call open_app.
+    If the user asks to open an app you installed, call open_app. If they want to call you something else, call \
+    rename_assistant with the new name and use it from then on.
     """
 
     private static let tools: [[String: Any]] = [
@@ -139,13 +209,16 @@ final class AgentModel: ObservableObject {
             "title": ["type": "string", "description": "The title shown on the phone"],
             "path": ["type": "string", "description": "The path ./build printed"]],
                          "required": ["name", "title", "path"]]],
+        ["type": "function", "name": "rename_assistant",
+         "description": "Change the name the user calls you. It is saved and shown on the phone.",
+         "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
         ["type": "function", "name": "open_app",
          "description": "Open an installed app on the phone's screen.",
          "inputSchema": ["type": "object", "properties": ["name": ["type": "string"]], "required": ["name"]]],
     ]
 
     private func startCodex() {
-        codex = Codex(workspace: workspace, instructions: Self.instructions, tools: Self.tools)
+        codex = Codex(workspace: workspace, instructions: instructions, tools: Self.tools)
         codex.onLog = { [weak self] s in self?.log(s) }
         codex.onDelta = { [weak self] id, d in self?.delta(id, d) }
         codex.onMessage = { [weak self] id, t in self?.message(id, t) }
@@ -200,8 +273,12 @@ final class AgentModel: ObservableObject {
             if up != online { log(up ? "phone online" : "phone offline") }
             online = up
             if up {
-                link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac"])
+                link.send(["t": "hello", "name": Host.current().localizedName ?? "Mac", "agent_name": agentName])
                 sayPending()
+                if let i = CommandLine.arguments.firstIndex(of: "--speak"), i + 1 < CommandLine.arguments.count {
+                    let line = CommandLine.arguments[i + 1]
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.say(line) }
+                }
                 if CommandLine.arguments.contains("--unpair-remote") {
                     log("unpairing (--unpair-remote)")
                     unpair()
@@ -213,8 +290,20 @@ final class AgentModel: ObservableObject {
                     }
                 }
             }
+        case .note(let s):
+            log(s)
         case .mic(let pcm):
-            listener.feed(pcm)
+            if useRose { rose.feed(pcm) } else { listener.feed(pcm) }
+            micBytes += pcm.count
+            if Date().timeIntervalSince(micSince) >= 10 {
+                log(String(format: "microphone: %.1f KB/s from the phone, peak %.2f", Double(micBytes) / Date().timeIntervalSince(micSince) / 1000, listener.level))
+                micBytes = 0
+                micSince = Date()
+            }
+            if recording != nil {
+                recording!.append(pcm)
+                if recording!.count % (32000 * 5) < pcm.count { saveRecording() }
+            }
         case .json(let o):
             phoneMessage(o)
         }
@@ -224,7 +313,9 @@ final class AgentModel: ObservableObject {
         switch o["t"] as? String {
         case "stop":
             log("tapped to interrupt")
-            bargeIn()
+            if useRose { rose.stop("tapped") } else { bargeIn() }
+        case "audio_report":
+            if useRose, let m = o["msg"] as? [String: Any] { rose.client(m) }
         case "installed":
             let name = o["name"] as? String ?? ""
             if let (_, done) = installs.removeValue(forKey: name) {
@@ -293,6 +384,12 @@ final class AgentModel: ObservableObject {
             say("Codex isn't ready on the Mac yet.")
             return
         }
+        if renamed {
+            // A name changed in the app or by --name: tell Codex with the next turn.
+            renamed = false
+            codex.say("(Your name is now \(agentName).) " + t)
+            return
+        }
         codex.say(t)
     }
 
@@ -315,6 +412,13 @@ final class AgentModel: ObservableObject {
     private func say(_ s: String) {
         let t = clean(s)
         guard !t.isEmpty else { return }
+        if useRose {
+            let rid = nextReply
+            nextReply += 1
+            rose.reply(rid, t)
+            rose.replyEnd(rid)
+            return
+        }
         spoken.append((Date(), Set(words(t))))
         spoken.removeAll { Date().timeIntervalSince($0.0) > 30 }
         speaker.say(t)
@@ -326,14 +430,31 @@ final class AgentModel: ObservableObject {
         withUnsafeBytes(of: id.littleEndian) { body.append(contentsOf: $0) }
         body.append(pcm)
         link.send(kind: 0x21, body)
+        speechBytes += pcm.count
         let seconds = Double(pcm.count / 2) / 24000
         playingUntil = max(playingUntil, Date()) + seconds
         // The phone's ring and the relay add about half a second.
         playingUntil = max(playingUntil, Date() + 0.6)
     }
 
+    private func rid(_ item: String) -> Int {
+        if let r = replyIDs[item] { return r }
+        let r = nextReply
+        nextReply += 1
+        replyIDs[item] = r
+        return r
+    }
+
     /// Speak whole sentences of a reply as they stream in.
     private func delta(_ id: String, _ d: String) {
+        if useRose {
+            // Rose's speaker cuts clauses and sentences itself.
+            rose.reply(rid(id), d.replacingOccurrences(of: "`", with: "").replacingOccurrences(of: "**", with: ""))
+            replySent[id, default: 0] += d.count
+            texts[id] = (texts[id] ?? "") + d
+            link.send(["t": "transcript", "who": "agent", "text": clean(texts[id] ?? ""), "final": false])
+            return
+        }
         let text = (texts[id] ?? "") + d
         texts[id] = text
         var from = said[id] ?? 0
@@ -352,6 +473,14 @@ final class AgentModel: ObservableObject {
     }
 
     private func message(_ id: String, _ full: String) {
+        if useRose {
+            if replySent[id] == nil { rose.reply(rid(id), clean(full)) }
+            rose.replyEnd(rid(id))
+            lines.append(Line(user: false, text: clean(full)))
+            link.send(["t": "transcript", "who": "agent", "text": clean(full), "final": true])
+            log("agent: \(full)")
+            return
+        }
         let from = said[id] ?? 0
         let chars = Array(full)
         if from < chars.count { say(String(chars[from...])) }
@@ -379,6 +508,11 @@ final class AgentModel: ObservableObject {
         switch name {
         case "install_app":
             install(args) { ok, text in reply(ok, text) }
+        case "rename_assistant":
+            let n = args["name"] as? String ?? ""
+            rename(n)
+            renamed = false
+            reply(!n.isEmpty, n.isEmpty ? "No name given." : "Saved. Your name is now \(agentName), and the phone shows it.")
         case "open_app":
             let app = args["name"] as? String ?? ""
             link.send(["t": "open", "name": app])
@@ -402,18 +536,23 @@ final class AgentModel: ObservableObject {
         timing["name"] = name
         timing["bytes"] = data.count
         setActivity("building")
-        link.send(["t": "install", "name": name, "title": title, "size": data.count, "sha256": sha256(data).hex])
+        // Raw DEFLATE halves a Rust program; the phone's link is the slow part.
+        let packed = (try? (data as NSData).compressed(using: .zlib) as Data) ?? data
+        let deflated = packed.count < data.count
+        let wire = deflated ? packed : data
+        link.send(["t": "install", "name": name, "title": title, "size": wire.count, "bytes": data.count,
+                   "encoding": deflated ? "deflate" : "none", "sha256": sha256(data).hex])
         let chunk = 48 * 1024
         var offset = 0
-        while offset < data.count {
+        while offset < wire.count {
             var body = Data()
             withUnsafeBytes(of: UInt32(offset).littleEndian) { body.append(contentsOf: $0) }
-            body.append(data[offset..<min(offset + chunk, data.count)])
+            body.append(wire[offset..<min(offset + chunk, wire.count)])
             link.send(kind: 0x30, body)
             offset += chunk
         }
         link.send(["t": "install_end"])
-        log("sent \(name) (\(data.count) bytes)")
+        log("sent \(name) (\(data.count) bytes, \(wire.count) on the wire)")
         installs[name] = (started, { [weak self] o in
             guard let self else { return }
             let ok = o["ok"] as? Bool ?? false
@@ -427,6 +566,16 @@ final class AgentModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
             if let (_, d) = self?.installs.removeValue(forKey: name) { d(["ok": false, "error": "the phone did not answer"]) }
         }
+    }
+
+    private func saveRecording() {
+        guard let pcm = recording else { return }
+        var wav = Data("RIFF".utf8)
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { wav.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { wav.append(contentsOf: $0) } }
+        u32(UInt32(36 + pcm.count)); wav.append(Data("WAVEfmt ".utf8)); u32(16); u16(1); u16(1); u32(16000); u32(32000); u16(2); u16(16)
+        wav.append(Data("data".utf8)); u32(UInt32(pcm.count)); wav.append(pcm)
+        try? wav.write(to: support.appendingPathComponent("mic.wav"))
     }
 
     /// Tests may install a program from anywhere under the checkout's build/.

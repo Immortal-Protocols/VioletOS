@@ -49,12 +49,13 @@ extension Data {
     }
 }
 
-private func signed(role: UInt8, mode: UInt8, room: Data, ed: Data, x: Data) -> Data {
+private func signed(role: UInt8, mode: UInt8, room: Data, ed: Data, x: Data, answer: Data) -> Data {
     var m = Data("violet-agent hello v1".utf8)
     m.append(contentsOf: [role, mode])
     m.append(room)
     m.append(ed)
     m.append(x)
+    m.append(answer)
     return m
 }
 
@@ -70,19 +71,21 @@ struct Hello {
     let mode: UInt8
     let ed: Data
     let x: Data
+    let answer: Data
     let proof: Data?
 
     init?(_ m: Data, room: Data) {
         let b = [UInt8](m)
-        guard b.count >= 131, b[0] == Wire.hello else { return nil }
+        guard b.count >= 163, b[0] == Wire.hello else { return nil }
         role = b[1]
         mode = b[2]
         ed = Data(b[3..<35])
         x = Data(b[35..<67])
         let sig = Data(b[67..<131])
+        answer = Data(b[131..<163])
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: ed),
-              key.isValidSignature(sig, for: signed(role: role, mode: mode, room: room, ed: ed, x: x)) else { return nil }
-        proof = b.count >= 163 ? Data(b[131..<163]) : nil
+              key.isValidSignature(sig, for: signed(role: role, mode: mode, room: room, ed: ed, x: x, answer: answer)) else { return nil }
+        proof = b.count >= 195 ? Data(b[163..<195]) : nil
     }
 }
 
@@ -91,14 +94,16 @@ struct Offer {
     let message: Data
     var x: Data { key.publicKey.rawRepresentation }
 
-    init(identity: Curve25519.Signing.PrivateKey, role: UInt8, mode: UInt8, room: Data, secret: Data? = nil) {
+    /// The Mac's HELLO: an answer to the phone's offer `to` (its X25519 key).
+    init(identity: Curve25519.Signing.PrivateKey, role: UInt8, mode: UInt8, room: Data, secret: Data? = nil, answering to: Data) {
         key = Curve25519.KeyAgreement.PrivateKey()
         let ed = identity.publicKey.rawRepresentation
         let x = key.publicKey.rawRepresentation
         var m = Data([Wire.hello, role, mode])
         m.append(ed)
         m.append(x)
-        m.append((try? identity.signature(for: signed(role: role, mode: mode, room: room, ed: ed, x: x))) ?? Data(count: 64))
+        m.append((try? identity.signature(for: signed(role: role, mode: mode, room: room, ed: ed, x: x, answer: to))) ?? Data(count: 64))
+        m.append(to)
         if let s = secret { m.append(pairProof(secret: s, ed: ed, x: x)) }
         message = m
     }

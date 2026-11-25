@@ -30,6 +30,21 @@ struct Pill: View {
     }
 }
 
+/// The agent's name ("Violet" until changed), saved on the Mac and shown on the phone.
+struct NameField: View {
+    @EnvironmentObject var model: AgentModel
+    @State private var editing = false
+    @State private var name = ""
+    var body: some View {
+        if editing {
+            TextField("Name", text: $name).frame(width: 140).textFieldStyle(.roundedBorder)
+                .onSubmit { model.rename(name); editing = false }
+        } else {
+            Button("Rename…") { name = model.agentName; editing = true }
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var model: AgentModel
     @State private var typed = ""
@@ -37,8 +52,9 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("Violet Agent").font(.largeTitle.bold())
+                Text(model.agentName).font(.largeTitle.bold())
                 Spacer()
+                NameField()
                 if model.phone != nil {
                     Button("Unpair") { model.unpair() }
                 } else {

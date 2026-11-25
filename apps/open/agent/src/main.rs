@@ -7,8 +7,7 @@ mod link;
 mod secure;
 mod voice;
 
-use std::io::{Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +20,7 @@ const SAVED: &str = "/data/agent";
 /// The relay unless the shared setting "relay" names another.
 const RELAY: &str = match option_env!("VIOLET_AGENT_RELAY") {
     Some(r) => r,
-    None => "https://violet-chariot.apps.chariots.sh",
+    None => "https://agent-2af29451c05342fcbb9db79b4df48ce1.apps.chariots.sh",
 };
 const ORB: (f32, f32) = (360.0, 600.0);
 const ORB_BOX: Rect = Rect::new(150, 390, 570, 810);
@@ -42,6 +41,8 @@ struct Saved {
     seed: [u8; 32],
     peer: Option<[u8; 32]>,
     peer_name: String,
+    /// What the user calls the agent (the Mac's setting; "Violet" until it says).
+    name: String,
 }
 
 impl Saved {
@@ -49,7 +50,12 @@ impl Saved {
         let text = std::fs::read_to_string(SAVED).unwrap_or_default();
         let get = |k: &str| text.lines().find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()));
         let key = |k: &str| get(k).and_then(|h| secure::unhex(&h)).and_then(|v| <[u8; 32]>::try_from(v).ok());
-        let mut s = Saved { seed: key("seed ").unwrap_or([0; 32]), peer: key("peer "), peer_name: get("peer_name ").unwrap_or_default() };
+        let mut s = Saved {
+            seed: key("seed ").unwrap_or([0; 32]),
+            peer: key("peer "),
+            peer_name: get("peer_name ").unwrap_or_default(),
+            name: get("name ").filter(|n| !n.is_empty()).unwrap_or_else(|| "Violet".into()),
+        };
         if s.seed == [0; 32] {
             s.seed = secure::random();
             s.save();
@@ -57,7 +63,7 @@ impl Saved {
         s
     }
     fn save(&self) {
-        let mut t = format!("seed {}\n", secure::hex(&self.seed));
+        let mut t = format!("seed {}\nname {}\n", secure::hex(&self.seed), self.name.replace('\n', " "));
         if let Some(p) = self.peer {
             t += &format!("peer {}\npeer_name {}\n", secure::hex(&p), self.peer_name.replace('\n', " "));
         }
@@ -78,9 +84,13 @@ enum Activity {
 struct Install {
     name: String,
     title: String,
+    /// Bytes on the wire (compressed with raw DEFLATE when `deflate`).
     size: usize,
+    /// The program's length and SHA-256 once inflated.
+    bytes: usize,
     sha256: String,
-    file: std::fs::File,
+    deflate: bool,
+    data: Vec<u8>,
     started: Instant,
 }
 
@@ -110,11 +120,13 @@ struct Agent {
     muted: bool,
     focused: bool,
     speech: Sender<voice::Speech>,
-    cancelled: Arc<AtomicU32>,
-    speaking: Option<u32>,
+    speaking: bool,
     tx: Sender<Msg>,
     dirty: bool,
     mic_bytes: u64,
+    gate: voice::Gate,
+    offered: Instant,
+    silence: u32,
     since: Instant,
 }
 
@@ -196,6 +208,7 @@ impl Agent {
         let o = secure::offer(&self.me, secure::PHONE, mode, &self.room, None);
         self.send_raw(o.message.clone());
         self.offer = Some(o);
+        self.offered = Instant::now();
     }
 
     fn on_net(&mut self, e: link::Net) {
@@ -252,14 +265,13 @@ impl Agent {
             println!("agent: refused a Mac that is not ours");
             return;
         }
+        // The phone leads: only a Mac's answer to the offer it has out completes
+        // a handshake; answers to older offers (crossed reconnects) are ignored.
         let ours = match self.offer.take() {
-            Some(o) => o,
-            None => {
-                // The Mac reconnected: answer with a fresh key.
-                let mode = if pairing { secure::PAIRING } else { secure::SESSION };
-                let o = secure::offer(&self.me, secure::PHONE, mode, &self.room, None);
-                self.send_raw(o.message.clone());
-                o
+            Some(o) if o.x == h.answer => o,
+            other => {
+                self.offer = other;
+                return;
             }
         };
         let phone = self.me.public();
@@ -291,15 +303,15 @@ impl Agent {
                 }
             }
             0x21 if body.len() >= 4 => {
-                let id = u32::from_le_bytes(body[..4].try_into().unwrap());
-                let _ = self.speech.send(voice::Speech::Pcm(id, body[4..].to_vec()));
+                let seg = u32::from_le_bytes(body[..4].try_into().unwrap());
+                let _ = self.speech.send(voice::Speech::Pcm(seg, body[4..].to_vec()));
             }
             0x30 if body.len() >= 4 => {
                 let offset = u32::from_le_bytes(body[..4].try_into().unwrap()) as u64;
                 if let Some(i) = self.install.as_mut() {
-                    let ok = i.file.seek(SeekFrom::Start(offset)).and_then(|_| i.file.write_all(&body[4..]));
-                    if let Err(e) = ok {
-                        println!("agent: install write: {e}");
+                    let (at, part) = (offset as usize, &body[4..]);
+                    if at + part.len() <= i.size {
+                        i.data[at..at + part.len()].copy_from_slice(part);
                     }
                 }
             }
@@ -315,6 +327,11 @@ impl Agent {
                 let name = text("name");
                 if !name.is_empty() && name != self.saved.peer_name {
                     self.saved.peer_name = name;
+                    self.saved.save();
+                }
+                let agent = text("agent_name");
+                if !agent.is_empty() && agent != self.saved.name {
+                    self.saved.name = agent.chars().take(24).collect();
                     self.saved.save();
                 }
                 self.status = format!("Connected to {}", self.mac_name());
@@ -349,9 +366,14 @@ impl Agent {
                 }
             }
             "say_stop" => self.stop_speaking(false),
-            "say_end" => {
-                let id = v["id"].as_u64().unwrap_or(0) as u32;
-                let _ = self.speech.send(voice::Speech::End(id));
+            // The Mac's speaker (RoseOS's): duck, unduck, pause, resume, stop.
+            "audio" => {
+                let kind = v["ctl"]["type"].as_str().unwrap_or("").to_string();
+                let gain = v["ctl"]["gain"].as_f64().unwrap_or(0.25) as f32;
+                if kind == "stop" {
+                    self.activity = Activity::Listening;
+                }
+                let _ = self.speech.send(voice::Speech::Control(kind, gain));
             }
             "install" => self.begin_install(&v),
             "install_end" => self.finish_install(),
@@ -374,26 +396,28 @@ impl Agent {
             self.send_json(json!({"t": "installed", "name": name, "ok": false, "error": "bad name or size"}));
             return;
         }
-        match std::fs::File::create(format!("/apps/{name}")) {
-            Ok(file) => {
-                let title = v["title"].as_str().unwrap_or(&name).to_string();
-                self.status = format!("Installing {title}…");
-                self.activity = Activity::Building;
-                self.install = Some(Install { name, title, size, sha256: v["sha256"].as_str().unwrap_or("").to_string(), file, started: Instant::now() });
-            }
-            Err(e) => self.send_json(json!({"t": "installed", "name": name, "ok": false, "error": e.to_string()})),
-        }
+        let title = v["title"].as_str().unwrap_or(&name).to_string();
+        self.status = format!("Installing {title}…");
+        self.activity = Activity::Building;
+        let deflate = v["encoding"] == "deflate";
+        let bytes = v["bytes"].as_u64().map_or(size, |b| b as usize);
+        let sha256 = v["sha256"].as_str().unwrap_or("").to_string();
+        self.install = Some(Install { name, title, size, bytes, sha256, deflate, data: vec![0; size], started: Instant::now() });
     }
 
     fn finish_install(&mut self) {
         let Some(i) = self.install.take() else { return };
-        drop(i.file);
         let path = format!("/apps/{}", i.name);
-        let data = std::fs::read(&path).unwrap_or_default();
+        let data = if i.deflate {
+            miniz_oxide::inflate::decompress_to_vec_with_limit(&i.data, 8 << 20).unwrap_or_default()
+        } else {
+            i.data
+        };
         let digest = secure::hex(&secure::sha256(&[&data]));
-        let r = if data.len() != i.size || digest != i.sha256 {
-            let _ = std::fs::remove_file(&path);
-            format!("error the program arrived damaged ({} of {} bytes)", data.len(), i.size)
+        let r = if data.len() != i.bytes || digest != i.sha256 {
+            format!("error the program arrived damaged ({} of {} bytes)", data.len(), i.bytes)
+        } else if let Err(e) = std::fs::write(&path, &data) {
+            format!("error {e}")
         } else {
             violet::sys(&format!("install {} {}", i.name, i.title))
         };
@@ -412,10 +436,7 @@ impl Agent {
     }
 
     fn stop_speaking(&mut self, tell: bool) {
-        if let Some(id) = self.speaking {
-            self.cancelled.fetch_max(id, Ordering::Relaxed);
-        }
-        let _ = self.speech.send(voice::Speech::Stop);
+        let _ = self.speech.send(voice::Speech::Control("stop".into(), 1.0));
         if tell {
             self.send_json(json!({"t": "stop", "at": now_ms()}));
         }
@@ -447,7 +468,7 @@ impl Agent {
         } else if self.paired() && UNPAIR_BOX.contains(x, y) {
             self.unpair(true);
         } else if self.paired() && ORB_BOX.contains(x, y) {
-            if self.speaking.is_some() || self.activity == Activity::Speaking {
+            if self.speaking || self.activity == Activity::Speaking {
                 self.stop_speaking(true);
             } else {
                 self.muted = !self.muted;
@@ -502,7 +523,7 @@ fn wrap(face: &violet::Face, s: &str, width: i32) -> Vec<String> {
 
 fn draw(c: &mut Canvas, fonts: &Fonts, a: &Agent) {
     c.fill(c.bounds(), BACKGROUND);
-    violet::header(c, fonts, "Agent");
+    violet::header(c, fonts, &a.saved.name);
     let small = fonts.regular(26.0);
     let body = fonts.regular(30.0);
     small.draw(c, &small.fit(&a.status, W as i32 - 80), 40, 250, MUTED);
@@ -588,8 +609,7 @@ fn main() {
     }
     let (speech_tx, speech_rx) = mpsc::channel();
     let (played_tx, played_rx) = mpsc::channel();
-    let cancelled = Arc::new(AtomicU32::new(0));
-    voice::speaker(speech_rx, cancelled.clone(), played_tx);
+    voice::speaker(speech_rx, played_tx);
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -633,11 +653,13 @@ fn main() {
         muted: false,
         focused: true,
         speech: speech_tx,
-        cancelled,
-        speaking: None,
+        speaking: false,
         tx,
         dirty: true,
         mic_bytes: 0,
+        gate: voice::Gate::default(),
+        offered: Instant::now(),
+        silence: 0,
         since: Instant::now(),
     };
     a.connect();
@@ -660,8 +682,28 @@ fn main() {
             Ok(Msg::Net(..)) => {}
             Ok(Msg::Mic(voice::Mic::Samples(pcm, peak))) => {
                 if a.session.is_some() && a.listening.load(Ordering::Relaxed) {
-                    a.mic_bytes += pcm.len() as u64;
-                    a.send(0x20, &pcm);
+                    match a.gate.feed(pcm, peak) {
+                        voice::Gated::Audio(chunks) => {
+                            if a.silence > 0 {
+                                let n = std::mem::take(&mut a.silence);
+                                a.send(0x23, &n.to_le_bytes());
+                            }
+                            for c in chunks {
+                                let enc = voice::mulaw(&c);
+                                a.mic_bytes += enc.len() as u64;
+                                a.send(0x22, &enc);
+                            }
+                        }
+                        voice::Gated::Silence(0) => {}
+                        // Silence goes as one count every 200 ms.
+                        voice::Gated::Silence(n) => {
+                            a.silence += n;
+                            if a.silence >= 3200 {
+                                let n = std::mem::take(&mut a.silence);
+                                a.send(0x23, &n.to_le_bytes());
+                            }
+                        }
+                    }
                 }
                 let level = (peak as f32 / 8000.0).min(1.0);
                 if (level - a.level).abs() > 0.05 {
@@ -674,20 +716,30 @@ fn main() {
                 a.status = why;
                 a.dirty = true;
             }
-            Ok(Msg::Played(voice::Played::Started(id))) => {
-                a.speaking = Some(id);
-            }
-            Ok(Msg::Played(voice::Played::Finished(id))) => {
-                if a.speaking == Some(id) {
-                    a.speaking = None;
+            Ok(Msg::Played(voice::Played::Report(r))) => {
+                if let Ok(msg) = serde_json::from_str::<Value>(&r) {
+                    a.send_json(json!({"t": "audio_report", "msg": msg}));
                 }
-                a.send_json(json!({"t": "played", "id": id}));
+            }
+            Ok(Msg::Played(voice::Played::Audible(on))) => {
+                a.speaking = on;
+                if on {
+                    a.activity = Activity::Speaking;
+                } else if a.activity == Activity::Speaking {
+                    a.activity = Activity::Listening;
+                }
+                a.dirty = true;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return,
         }
-        if a.since.elapsed() > Duration::from_secs(60) && a.mic_bytes > 0 {
-            println!("agent: microphone {} B/s to the Mac", a.mic_bytes / a.since.elapsed().as_secs().max(1));
+        // No session while the relay is up: offer again every 4 s (a message lost on the way).
+        if a.session.is_none() && a.relay_up && a.offered.elapsed() > Duration::from_secs(4) {
+            a.offer_hello();
+        }
+        if a.since.elapsed() > Duration::from_secs(20) {
+            println!("agent: microphone {} B/s to the Mac; loudest {}, floor {:.0}", a.mic_bytes / a.since.elapsed().as_secs().max(1), a.gate.loudest, a.gate.floor);
+            a.gate.loudest = 0;
             a.mic_bytes = 0;
             a.since = Instant::now();
         }

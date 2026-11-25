@@ -17,9 +17,27 @@ pub enum Net {
     Lost(String),
 }
 
+/// The socket under TLS, written with plain write(): rustls writes records
+/// with writev, which Open Runtimes before November 2026 answered with EAGAIN
+/// on a blocking socket whose send ring was full.
+struct Sock(TcpStream);
+impl Read for Sock {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        self.0.read(b)
+    }
+}
+impl Write for Sock {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.0.write(b)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 enum Stream {
     Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Sock>>),
 }
 impl Read for Stream {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
@@ -74,19 +92,31 @@ fn split(url: &str) -> Option<(bool, String, u16, String)> {
     Some((secure, host, port, if base.is_empty() { String::new() } else { format!("/{base}") }))
 }
 
-fn connect(url: &str, path: &str) -> io::Result<Stream> {
-    let bad = || io::Error::new(io::ErrorKind::InvalidInput, "bad relay address");
-    let (secure, host, port, base) = split(url).ok_or_else(bad)?;
+fn bad() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "bad relay address")
+}
+
+/// A TCP (and, for https, TLS) connection to the relay.
+fn open_stream(url: &str, timeout: Duration) -> io::Result<Stream> {
+    let (secure, host, port, _) = split(url).ok_or_else(bad)?;
     let sock = TcpStream::connect((host.as_str(), port))?;
     let _ = sock.set_nodelay(true);
-    sock.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let mut s = if secure {
+    sock.set_read_timeout(Some(timeout))?;
+    Ok(if secure {
         let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| bad())?;
         let conn = rustls::ClientConnection::new(tls(), name).map_err(io::Error::other)?;
-        Stream::Tls(Box::new(rustls::StreamOwned::new(conn, sock)))
+        Stream::Tls(Box::new(rustls::StreamOwned::new(conn, Sock(sock))))
     } else {
         Stream::Plain(sock)
-    };
+    })
+}
+
+/// A relay that refused the WebSocket upgrade (a proxy in front of it).
+const REFUSED: &str = "relay refused";
+
+fn connect(url: &str, path: &str) -> io::Result<Stream> {
+    let (_, host, _, base) = split(url).ok_or_else(bad)?;
+    let mut s = open_stream(url, Duration::from_secs(15))?;
     let key = crate::secure::b64url(&crate::secure::random::<16>()).replace('-', "+").replace('_', "/");
     let req = format!(
         "GET {base}{path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}==\r\nSec-WebSocket-Version: 13\r\nUser-Agent: VioletOS-Agent/1\r\n\r\n"
@@ -103,7 +133,7 @@ fn connect(url: &str, path: &str) -> io::Result<Stream> {
     }
     let status = String::from_utf8_lossy(&head);
     if !status.starts_with("HTTP/1.1 101") {
-        return Err(io::Error::other(format!("relay refused: {}", status.lines().next().unwrap_or(""))));
+        return Err(io::Error::other(format!("{REFUSED}: {}", status.lines().next().unwrap_or(""))));
     }
     Ok(s)
 }
@@ -246,9 +276,199 @@ fn session(url: &str, path: &str, events: &Sender<Net>, outgoing: &Receiver<Vec<
 fn set_timeout(s: &Stream, d: Duration) {
     let t = match s {
         Stream::Plain(t) => t,
-        Stream::Tls(t) => t.get_ref(),
+        Stream::Tls(t) => &t.get_ref().0,
     };
     let _ = t.set_read_timeout(Some(d));
+}
+
+/// One HTTP request on a kept-alive connection (reopened when the server closes it).
+fn http(conn: &mut Option<Stream>, url: &str, timeout: Duration, method: &str, path: &str, body: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+    let started = Instant::now();
+    let fresh = conn.is_none();
+    http_once(conn, url, timeout, method, path, body)
+        .map_err(|e| io::Error::new(e.kind(), format!("{method} after {} ms ({}): {e}", started.elapsed().as_millis(), if fresh { "new" } else { "kept" })))
+}
+
+fn http_once(conn: &mut Option<Stream>, url: &str, timeout: Duration, method: &str, path: &str, body: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+    let (_, host, _, base) = split(url).ok_or_else(bad)?;
+    let fresh = conn.is_none();
+    let t0 = Instant::now();
+    if fresh {
+        let mut st = open_stream(url, timeout).map_err(|e| io::Error::new(e.kind(), format!("connect: {e}")))?;
+        let t1 = t0.elapsed().as_millis();
+        if let Stream::Tls(t) = &mut st {
+            while t.conn.is_handshaking() {
+                t.conn.complete_io(&mut t.sock).map_err(|e| io::Error::new(e.kind(), format!("TLS after connect {t1} ms, {} ms: {e}", t0.elapsed().as_millis())))?;
+            }
+        }
+        *conn = Some(st);
+    }
+    let s = conn.as_mut().unwrap();
+    let head = format!(
+        "{method} {base}{path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nUser-Agent: VioletOS-Agent/1\r\n\r\n",
+        body.len()
+    );
+    let sent = s.write_all(head.as_bytes()).and_then(|_| s.write_all(body)).and_then(|_| s.flush());
+    if let Err(e) = sent {
+        *conn = None;
+        // A kept-alive connection the server dropped: try once more on a new one.
+        return if fresh { Err(e) } else { http_once(conn, url, timeout, method, path, body) };
+    }
+    let mut head = Vec::new();
+    let mut b = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match s.read(&mut b) {
+            Ok(1) => head.push(b[0]),
+            Ok(_) if head.is_empty() && !fresh => {
+                *conn = None;
+                return http_once(conn, url, timeout, method, path, body);
+            }
+            Ok(_) => {
+                *conn = None;
+                return Err(io::Error::other("relay closed the connection"));
+            }
+            Err(e) => {
+                *conn = None;
+                let e = io::Error::new(e.kind(), format!("reply, {} ms in: {e}", t0.elapsed().as_millis()));
+                // A kept-alive connection a proxy dropped without a word: once more on a new one.
+                return if fresh { Err(e) } else { http_once(conn, url, timeout, method, path, body) };
+            }
+        }
+        if head.len() > 16384 {
+            *conn = None;
+            return Err(io::Error::other("bad reply from the relay"));
+        }
+    }
+    let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let len = text.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0usize);
+    let mut data = vec![0u8; len];
+    if let Err(e) = s.read_exact(&mut data) {
+        *conn = None;
+        return Err(e);
+    }
+    if text.contains("connection: close") {
+        *conn = None;
+    }
+    Ok((status, data))
+}
+
+fn poll_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 5 <= data.len() {
+        let n = u32::from_be_bytes(data[at + 1..at + 5].try_into().unwrap()) as usize;
+        if at + 5 + n > data.len() {
+            break;
+        }
+        out.push((data[at], data[at + 5..at + 5 + n].to_vec()));
+        at += 5 + n;
+    }
+    out
+}
+
+/// The relay over plain HTTP, for proxies that refuse WebSockets (a Chariot's):
+/// messages go up in POSTs, batched for 200 ms, and come down in GETs the relay
+/// holds for up to 8 seconds, on a thread of their own.
+fn poll_session(url: &str, room: &str, role: &str, events: &Sender<Net>, outgoing: &Receiver<Vec<u8>>) -> io::Result<()> {
+    let id = crate::secure::hex(&crate::secure::random::<8>());
+    let send_path = format!("/v1/send/{room}?role={role}&id={id}");
+    let recv_path = format!("/v1/recv/{room}?role={role}&id={id}");
+    let mut up: Option<Stream> = None;
+    http(&mut up, url, Duration::from_secs(15), "POST", &send_path, &[])?;
+    if events.send(Net::Connected).is_err() {
+        return Ok(());
+    }
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let failure = Arc::new(std::sync::Mutex::new(None::<String>));
+    {
+        let (url, events, alive, failure) = (url.to_string(), events.clone(), alive.clone(), failure.clone());
+        std::thread::spawn(move || {
+            let mut down: Option<Stream> = None;
+            let mut misses = 0;
+            while alive.load(std::sync::atomic::Ordering::Relaxed) {
+                match http(&mut down, &url, Duration::from_secs(20), "GET", &recv_path, &[]) {
+                    Ok((200, data)) => {
+                        misses = 0;
+                        for (op, m) in poll_frames(&data) {
+                            let e = match op {
+                                1 if m.windows(4).any(|w| w == b"\"up\"") => Net::PeerUp,
+                                1 if m.windows(6).any(|w| w == b"\"down\"") => Net::PeerDown,
+                                2 if !m.is_empty() => Net::Message(m),
+                                _ => continue,
+                            };
+                            if events.send(e).is_err() {
+                                alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                    // A proxy's own timeout or hiccup: ask again.
+                    Ok((code, _)) if (500..600).contains(&code) && code != 501 => {
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                    Ok((code, _)) => {
+                        *failure.lock().unwrap() = Some(format!("relay answered {code}"));
+                        break;
+                    }
+                    // A blip: try again a few times before giving up on the relay.
+                    Err(e) => {
+                        println!("agent: relay: {e}");
+                        misses += 1;
+                        if misses >= 4 {
+                            *failure.lock().unwrap() = Some(e.to_string());
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+            alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    let result = loop {
+        if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+            let why = failure.lock().unwrap().take().unwrap_or_else(|| "relay lost".into());
+            break Err(io::Error::other(why));
+        }
+        let first = match outgoing.recv_timeout(Duration::from_millis(200)) {
+            Ok(m) => m,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break Ok(()),
+        };
+        let mut batch = Vec::new();
+        let add = |b: &mut Vec<u8>, m: &[u8]| {
+            b.push(2);
+            b.extend_from_slice(&(m.len() as u32).to_be_bytes());
+            b.extend_from_slice(m);
+        };
+        add(&mut batch, &first);
+        // Five requests a second at most: each costs headers and a proxy's attention.
+        let until = Instant::now() + Duration::from_millis(200);
+        while batch.len() < 256 << 10 {
+            match outgoing.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(m) => add(&mut batch, &m),
+                Err(_) => break,
+            }
+        }
+        let mut tries = 0;
+        let sent = loop {
+            match http(&mut up, url, Duration::from_secs(6), "POST", &send_path, &batch) {
+                Ok(_) => break Ok(()),
+                Err(e) if tries < 3 => {
+                    tries += 1;
+                    up = None;
+                    println!("agent: relay: {e}; again");
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        if let Err(e) = sent {
+            break Err(e);
+        }
+    };
+    alive.store(false, std::sync::atomic::Ordering::Relaxed);
+    result
 }
 
 /// Keep a connection to `url` for `room` as `role` until the returned sender is dropped.
@@ -257,10 +477,21 @@ pub fn spawn(url: String, room: [u8; 16], role: &'static str, events: Sender<Net
     std::thread::spawn(move || {
         let path = format!("/v1/pipe/{}?role={role}", crate::secure::hex(&room));
         let mut wait = Duration::from_secs(1);
+        let mut polling = false;
         loop {
             let started = Instant::now();
-            match session(&url, &path, &events, &rx) {
+            let r = if polling {
+                poll_session(&url, &crate::secure::hex(&room), role, &events, &rx)
+            } else {
+                session(&url, &path, &events, &rx)
+            };
+            match r {
                 Ok(()) => return,
+                Err(e) if !polling && e.to_string().starts_with(REFUSED) => {
+                    println!("agent: the relay refuses WebSockets; polling over HTTP");
+                    polling = true;
+                    continue;
+                }
                 Err(e) => {
                     if events.send(Net::Lost(e.to_string())).is_err() {
                         return;
@@ -302,5 +533,34 @@ mod tests {
         assert!(f.next().is_none());
         f.buf.extend_from_slice(b"hi");
         assert_eq!(f.next().unwrap(), (1, b"hi".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// VIOLET_RELAY_TEST=https://… cargo test -p agent live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn poll_holds_up() {
+        let Ok(url) = std::env::var("VIOLET_RELAY_TEST") else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let out = super::spawn(url, [7u8; 16], "phone", tx);
+        let start = std::time::Instant::now();
+        let mut lost = 0;
+        while start.elapsed() < std::time::Duration::from_secs(150) {
+            let _ = out.send(vec![0x55; 700]);
+            while let Ok(e) = rx.try_recv() {
+                match e {
+                    super::Net::Lost(why) => {
+                        lost += 1;
+                        println!("{:?} lost: {why}", start.elapsed());
+                    }
+                    super::Net::Connected => println!("{:?} connected", start.elapsed()),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        assert_eq!(lost, 0);
     }
 }

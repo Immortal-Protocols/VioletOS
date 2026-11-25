@@ -13,6 +13,8 @@ struct PairedPhone: Codable, Equatable {
 struct Saved: Codable {
     var seed: String     // the Mac's Ed25519 seed, hex
     var phones: [PairedPhone]
+    var name: String?    // what the user calls the agent; "Violet" when unset
+    var voice: String?   // the RoseOS (Phonon) voice
 }
 
 enum Store {

@@ -73,7 +73,11 @@ static void drop(int i) {
     tcp_arg(s[i].pcb, NULL);
     tcp_recv(s[i].pcb, NULL);
     tcp_err(s[i].pcb, NULL);
-    if (tcp_close(s[i].pcb) != ERR_OK) tcp_abort(s[i].pcb);
+    // A connection closed with data still unsent or unacknowledged (its peer
+    // went quiet) would keep that data in lwIP's 24 KiB heap until its
+    // retransmissions give up, minutes later; a few of them starve every new
+    // connection's tcp_write. Reset those at once; close the rest gracefully.
+    if (s[i].pcb->unsent || s[i].pcb->unacked || tcp_close(s[i].pcb) != ERR_OK) tcp_abort(s[i].pcb);
   }
   if (s[i].rx) pbuf_free(s[i].rx);
   memset(&s[i], 0, sizeof s[i]);

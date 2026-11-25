@@ -20,8 +20,10 @@ final class Listener {
     private var timer: Timer?
     private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
     private(set) var authorized = false
-    /// The latest chunk's peak, 0...1.
+    /// The latest chunk's peak, 0...1, before gain.
     private(set) var level: Float = 0
+    private var recentPeak: Float = 0.01
+    private var gain: Float = 10
 
     func start(_ ready: @escaping (Bool) -> Void) {
         SFSpeechRecognizer.requestAuthorization { status in
@@ -95,16 +97,21 @@ final class Listener {
         guard n > 0, let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(n)) else { return }
         buf.frameLength = AVAudioFrameCount(n)
         var peak: Float = 0
+        // The phone's microphone is quiet (speech a metre away peaks near -35 dBFS):
+        // follow the recent peak and raise speech to about -12 dBFS, at most 30x.
+        let g = gain
         pcm.withUnsafeBytes { raw in
             let s = raw.bindMemory(to: Int16.self)
             let out = buf.floatChannelData![0]
             for i in 0..<n {
                 let v = Float(Int16(littleEndian: s[i])) / 32768
-                out[i] = v
+                out[i] = max(-1, min(1, v * g))
                 peak = max(peak, abs(v))
             }
         }
         level = peak
+        recentPeak = max(peak, recentPeak * 0.97)
+        gain = min(30, 0.25 / max(recentPeak, 0.006))
         request?.append(buf)
     }
 }

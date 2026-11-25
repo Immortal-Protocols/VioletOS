@@ -75,8 +75,8 @@ impl Identity {
     }
 }
 
-fn signed(role: u8, mode: u8, room: &[u8; 16], ed: &[u8; 32], x: &[u8; 32]) -> Vec<u8> {
-    [b"violet-agent hello v1" as &[u8], &[role, mode], room, ed, x].concat()
+fn signed(role: u8, mode: u8, room: &[u8; 16], ed: &[u8; 32], x: &[u8; 32], answer: &[u8; 32]) -> Vec<u8> {
+    [b"violet-agent hello v1" as &[u8], &[role, mode], room, ed, x, answer].concat()
 }
 
 fn pair_proof(secret: &[u8; 32], ed: &[u8; 32], x: &[u8; 32]) -> [u8; 32] {
@@ -90,20 +90,23 @@ pub struct Hello {
     pub mode: u8,
     pub ed: [u8; 32],
     pub x: [u8; 32],
+    /// The phone's X25519 key a Mac's HELLO answers (zero in the phone's own).
+    pub answer: [u8; 32],
     pub proof: Option<[u8; 32]>,
 }
 
 pub fn parse_hello(m: &[u8], room: &[u8; 16]) -> Option<Hello> {
-    if m.len() < 131 || m[0] != HELLO {
+    if m.len() < 163 || m[0] != HELLO {
         return None;
     }
     let (role, mode) = (m[1], m[2]);
     let ed: [u8; 32] = m[3..35].try_into().ok()?;
     let x: [u8; 32] = m[35..67].try_into().ok()?;
     let sig = &m[67..131];
-    signature::UnparsedPublicKey::new(&signature::ED25519, &ed).verify(&signed(role, mode, room, &ed, &x), sig).ok()?;
-    let proof = (m.len() >= 163).then(|| m[131..163].try_into().unwrap());
-    Some(Hello { role, mode, ed, x, proof })
+    let answer: [u8; 32] = m[131..163].try_into().ok()?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, &ed).verify(&signed(role, mode, room, &ed, &x, &answer), sig).ok()?;
+    let proof = (m.len() >= 195).then(|| m[163..195].try_into().unwrap());
+    Some(Hello { role, mode, ed, x, answer, proof })
 }
 
 /// Our half of a handshake: the ephemeral key and the HELLO that carries it.
@@ -114,6 +117,11 @@ pub struct Offer {
 }
 
 pub fn offer(me: &Identity, role: u8, mode: u8, room: &[u8; 16], secret: Option<&[u8; 32]>) -> Offer {
+    answer(me, role, mode, room, secret, &[0; 32])
+}
+
+/// A HELLO that answers the peer's (the Mac's half of a handshake).
+pub fn answer(me: &Identity, role: u8, mode: u8, room: &[u8; 16], secret: Option<&[u8; 32]>, to: &[u8; 32]) -> Offer {
     let rng = rand::SystemRandom::new();
     let key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).expect("x25519");
     let x: [u8; 32] = key.compute_public_key().expect("x25519").as_ref().try_into().unwrap();
@@ -121,7 +129,8 @@ pub fn offer(me: &Identity, role: u8, mode: u8, room: &[u8; 16], secret: Option<
     let mut message = vec![HELLO, role, mode];
     message.extend_from_slice(&ed);
     message.extend_from_slice(&x);
-    message.extend_from_slice(&me.sign(&signed(role, mode, room, &ed, &x)));
+    message.extend_from_slice(&me.sign(&signed(role, mode, room, &ed, &x, to)));
+    message.extend_from_slice(to);
     if let Some(s) = secret {
         message.extend_from_slice(&pair_proof(s, &ed, &x));
     }
@@ -211,9 +220,10 @@ mod tests {
         let secret = [7u8; 32];
         let room = pairing_room(&secret);
         let p = offer(&phone, PHONE, PAIRING, &room, None);
-        let m = offer(&mac, MAC, PAIRING, &room, Some(&secret));
         let hp = parse_hello(&p.message, &room).unwrap();
+        let m = answer(&mac, MAC, PAIRING, &room, Some(&secret), &hp.x);
         let hm = parse_hello(&m.message, &room).unwrap();
+        assert_eq!(hm.answer, p.x);
         assert!(proof_ok(&secret, &hm));
         assert!(!proof_ok(&[8; 32], &hm));
         assert!(!proof_ok(&secret, &hp));

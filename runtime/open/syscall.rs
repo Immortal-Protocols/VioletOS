@@ -463,6 +463,25 @@ impl Runtime {
                     } else {
                         self.read_now(i, a[0] as i32, base, len)
                     };
+                    if r == EAGAIN && total == 0 {
+                        // Nothing moved on a blocking socket or pipe: wait, as write and
+                        // read do, with this buffer (a short count is fine for writev).
+                        // rustls writes TLS records with writev, and a full send ring
+                        // used to come back as EAGAIN on a blocking socket.
+                        let blocking = self.file(i, a[0] as i32).map_or(false, |f| {
+                            let f = f.borrow();
+                            let tcp = matches!(f.kind, Kind::Tcp { .. });
+                            (tcp || (n == 145 && matches!(f.kind, Kind::Pipe { .. }))) && f.flags & O_NONBLOCK == 0
+                        });
+                        if blocking {
+                            let fd = a[0] as i32;
+                            return if n == 146 {
+                                Block(Wait::Send { fd, buf: base, len }, None)
+                            } else {
+                                Block(Wait::Read { fd, buf: base, len }, self.recv_deadline(i, fd))
+                            };
+                        }
+                    }
                     if r < 0 {
                         return Done(if total > 0 { total } else { r });
                     }
