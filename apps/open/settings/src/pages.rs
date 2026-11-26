@@ -32,6 +32,8 @@ pub enum Hit {
     Back,
     Row(usize),
     Details,
+    /// The app holding Bluetooth, on Details: opens it.
+    HolderApp,
     Relay,
     NewCode,
     City(usize),
@@ -70,6 +72,8 @@ pub struct Bluetooth {
     pub open: bool,
     /// The title of the app holding the controller, empty when none does.
     pub app: String,
+    /// Its program name in /apps, to open it.
+    pub name: String,
     pub advertising: bool,
     pub scanning: bool,
     /// The scan asks devices nearby for more, which transmits.
@@ -106,6 +110,7 @@ impl Bluetooth {
             on: flag("on"),
             open: flag("open"),
             app,
+            name,
             advertising: flag("advertising"),
             scanning: flag("scanning"),
             active: flag("active"),
@@ -218,6 +223,7 @@ pub fn delete_rect(i: usize) -> Rect {
 }
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
 pub const BT_DETAILS: Rect = Rect::new(40, 700, W as i32 - 40, 800);
+pub const BT_HOLDER: Rect = Rect::new(40, 230, W as i32 - 40, 370);
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -226,6 +232,7 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     match v.section {
         Section::Menu => (0..MENU.len()).find(|&i| menu_rect(i).contains(x, y)).map(Hit::Row),
         Section::Bluetooth if BT_DETAILS.contains(x, y) => Some(Hit::Details),
+        Section::BluetoothDetails if v.status.bt.open && !v.status.bt.name.is_empty() && BT_HOLDER.contains(x, y) => Some(Hit::HolderApp),
         Section::PhoneLink if relay_usable(v.status) => {
             if RELAY_BUTTON.contains(x, y) {
                 Some(Hit::Relay)
@@ -461,12 +468,17 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
 /// the runtime saw the holding app tell it.
 fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
     header(c, f, v, "‹ Bluetooth", "Details");
-    let held = Rect::new(40, 230, W as i32 - 40, 370);
-    slab(c, held, 30.0, PAPER_RAISED);
+    // Tapping the app opens it.
+    let held = BT_HOLDER;
+    let opens = bt.open && !bt.name.is_empty();
+    slab(c, held, 30.0, if v.pressed == Some(Hit::HolderApp) { PAPER_PRESSED } else { PAPER_RAISED });
+    if opens {
+        chevron(c, (held.x1 - 34) as f32, (held.y0 + held.height() / 2) as f32);
+    }
     f.medium(23.0).draw(c, "IN USE BY", 80, 282, MUTED);
     let app = if !bt.open { "No app" } else if bt.app.is_empty() { "An app" } else { &bt.app };
     let big = f.medium(34.0);
-    big.draw(c, &big.fit(app, held.width() - 80), 80, 336, if bt.open { VIOLET } else { CREAM });
+    big.draw(c, &big.fit(app, held.width() - 120), 80, 336, if bt.open { VIOLET } else { CREAM });
     let (label, value) = (f.regular(26.0), f.medium(28.0));
     let card = |c: &mut Canvas, top: i32, title: &str, rows: &[(&str, String, violet::Color)]| {
         let r = Rect::new(40, top, W as i32 - 40, top + 86 + rows.len() as i32 * 60);

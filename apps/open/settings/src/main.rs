@@ -109,6 +109,10 @@ impl App {
             Hit::Back if self.section == Section::BluetoothDetails => self.go(Section::Bluetooth),
             Hit::Back => self.go(Section::Menu),
             Hit::Details => self.go(Section::BluetoothDetails),
+            Hit::HolderApp => {
+                let answer = violet::sys(&format!("open /apps/{}", self.status.bt.name));
+                println!("settings: open {} -> {}", self.status.bt.name, answer);
+            }
             Hit::Row(i) => self.go(MENU[i].0),
             Hit::Relay => {
                 let answer = if self.relay_on { violet::sys("relay off") } else { violet::sys(&format!("relay on {}", self.code)) };
@@ -287,7 +291,7 @@ mod preview {
     #[test]
     fn bluetooth_fields() {
         let b = bitchat();
-        assert_eq!(b.app, "Bitchat");
+        assert_eq!((b.app.as_str(), b.name.as_str()), ("Bitchat", "bitchat"));
         assert!(b.advertising && b.scanning && !b.active && b.random_adv);
         assert_eq!((b.rx, b.hci, b.maker), (1204, 11, 70));
         let idle = pages::Bluetooth::parse("on=1 open=0 app=- state=failed error=0x140", "");
