@@ -100,6 +100,8 @@ pub const LIFECYCLE: u16 = 7;
 /// Lifecycle values.
 pub const FOCUS_GAINED: i32 = 1;
 pub const FOCUS_LOST: i32 = 2;
+/// FOCUS_GAINED's code when Home, the app list or `open` brought the app to the front.
+pub const FOCUS_OPENED: u16 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Event {
@@ -113,6 +115,11 @@ pub struct Event {
 impl Event {
     pub fn focus_gained(&self) -> bool {
         self.kind == LIFECYCLE && self.value == FOCUS_GAINED
+    }
+    /// Brought to the front from Home, the app list or another app's `open`:
+    /// it may start over, rather than show what it showed when it left.
+    pub fn opened(&self) -> bool {
+        self.focus_gained() && self.code == FOCUS_OPENED
     }
 }
 

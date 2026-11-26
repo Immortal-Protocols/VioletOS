@@ -3,11 +3,19 @@
 use violet::paper::{slab, ALERT, CREAM, GOOD, MUTED, PAPER, PAPER_PRESSED, PAPER_RAISED, VIOLET};
 use violet::{Canvas, Fonts, Rect, CITIES, HOME_BOX, W};
 
+use crate::nearby::{Device, Scan};
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Section {
     Menu,
     Wifi,
     Bluetooth,
+    /// What the radio is doing and who made it so; reached from Bluetooth.
+    BluetoothDetails,
+    /// A passive scan of the devices nearby; reached from Details.
+    BluetoothNearby,
+    /// One device the scan heard; reached by tapping it.
+    BluetoothDevice,
     PhoneLink,
     Time,
     AgentApps,
@@ -29,6 +37,16 @@ pub const MENU: [(Section, &str); 6] = [
 pub enum Hit {
     Back,
     Row(usize),
+    Details,
+    /// The app holding Bluetooth, on Details: opens it.
+    HolderApp,
+    /// Scan nearby, on Details; then Cancel, Proceed and Stop on its page.
+    ScanNearby,
+    Cancel,
+    Proceed,
+    Stop,
+    /// A device in the scan's list, strongest first.
+    Device(usize),
     Relay,
     NewCode,
     City(usize),
@@ -59,11 +77,110 @@ pub fn parse_installed(text: &str) -> Vec<Installed> {
         .collect()
 }
 
+/// Bluetooth as the Open Runtime saw it ("bluetooth" in /dev/violet/sys): the
+/// commands the holding app sent, not what the app says about itself.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Bluetooth {
+    pub on: bool,
+    pub open: bool,
+    /// The title of the app holding the controller, empty when none does.
+    pub app: String,
+    /// Its program name in /apps, to open it.
+    pub name: String,
+    pub advertising: bool,
+    pub scanning: bool,
+    /// The scan asks devices nearby for more, which transmits.
+    pub active: bool,
+    pub random_adv: bool,
+    pub random_scan: bool,
+    /// "off", "starting", "on" or "failed".
+    pub state: String,
+    pub error: u32,
+    pub rx: u32,
+    pub tx: u32,
+    pub bad: u32,
+    pub dropped: u32,
+    /// The controller's HCI version code and Bluetooth SIG company id; 0 before it answered.
+    pub hci: u32,
+    pub maker: u32,
+}
+
+impl Bluetooth {
+    /// From the runtime's answer, with titles from /apps/.home ("name<TAB>title" lines).
+    pub fn parse(answer: &str, titles: &str) -> Self {
+        let f = violet::fields(answer);
+        let flag = |k: &str| f.get(k).is_some_and(|v| v == "1");
+        let num = |k: &str| {
+            let v = f.get(k).map_or("", |v| v.as_str());
+            match v.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16).unwrap_or(0),
+                None => v.parse().unwrap_or(0),
+            }
+        };
+        let name = f.get("app").filter(|a| *a != "-").cloned().unwrap_or_default();
+        let app = titles.lines().filter_map(|l| l.split_once('\t')).find(|(n, _)| *n == name).map_or(name.clone(), |(_, t)| t.to_string());
+        Bluetooth {
+            on: flag("on"),
+            open: flag("open"),
+            app,
+            name,
+            advertising: flag("advertising"),
+            scanning: flag("scanning"),
+            active: flag("active"),
+            random_adv: flag("random_adv"),
+            random_scan: flag("random_scan"),
+            state: f.get("state").cloned().unwrap_or_else(|| "off".into()),
+            error: num("error"),
+            rx: num("rx"),
+            tx: num("tx"),
+            bad: num("bad"),
+            dropped: num("dropped"),
+            hci: num("hci"),
+            maker: num("maker"),
+        }
+    }
+
+    /// Who is using it, for the line under the title.
+    fn holder(&self) -> String {
+        match (self.open, self.app.is_empty()) {
+            (false, _) => "No app is using it".into(),
+            (true, true) => "In use by an app".into(),
+            (true, false) => format!("In use by {}", self.app),
+        }
+    }
+
+    /// The Bluetooth version the controller's HCI speaks, as people know it.
+    fn version(&self) -> &'static str {
+        match self.hci {
+            6 => "4.0",
+            7 => "4.1",
+            8 => "4.2",
+            9 => "5.0",
+            10 => "5.1",
+            11 => "5.2",
+            12 => "5.3",
+            13 => "5.4",
+            _ => "",
+        }
+    }
+
+    /// The Bluetooth SIG company name for the controller's maker.
+    fn manufacturer(&self) -> String {
+        match self.maker {
+            2 => "Intel".into(),
+            15 => "Broadcom".into(),
+            29 => "Qualcomm".into(),
+            70 => "MediaTek".into(),
+            93 => "Realtek".into(),
+            n => format!("Company {n}"),
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub struct Status {
     pub wifi: String,
-    pub bt_on: bool,
-    pub bt_open: bool,
+    pub bt: Bluetooth,
     pub shield_known: bool,
     pub shield_linked: bool,
     pub shield_rules: u32,
@@ -77,8 +194,18 @@ pub struct Status {
     pub installed: Vec<Installed>,
 }
 
+/// Scan nearby: asking first, then the scan (running or stopped), or why it couldn't start.
+#[derive(Clone, Copy)]
+pub enum Nearby<'a> {
+    Ask,
+    /// `scroll`: how far the device list is scrolled, in pixels; `device`: the one tapped.
+    Scan { scan: &'a Scan, running: bool, seconds: u64, scroll: i32, device: Option<&'a Device> },
+    Failed(&'a str),
+}
+
 pub struct View<'a> {
     pub section: Section,
+    pub nearby: Nearby<'a>,
     pub status: &'a Status,
     /// The saved Phone Internet pairing code and whether it should be on.
     pub code: &'a str,
@@ -118,6 +245,20 @@ pub fn delete_rect(i: usize) -> Rect {
     Rect::new(r.x1 - 196, r.y0 + 20, r.x1 - 20, r.y1 - 20)
 }
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
+pub const BT_DETAILS: Rect = Rect::new(40, 700, W as i32 - 40, 800);
+pub const BT_HOLDER: Rect = Rect::new(40, 230, W as i32 - 40, 370);
+pub const SCAN_NEARBY: Rect = Rect::new(40, 1440, W as i32 - 40, 1540);
+pub const CANCEL: Rect = Rect::new(40, 1440, W as i32 / 2 - 12, 1540);
+pub const PROCEED: Rect = Rect::new(W as i32 / 2 + 12, 1440, W as i32 - 40, 1540);
+/// Stop, or Done once the scan stopped.
+pub const STOP: Rect = Rect::new(40, 1440, W as i32 - 40, 1540);
+/// The devices heard: rows scroll inside this, between the scan card and Stop.
+pub const DEVICE_LIST: Rect = Rect::new(0, 396, W as i32, 1424);
+const DEVICE_ROW: i32 = 64;
+/// How far a list of `n` devices can scroll.
+pub fn devices_max_scroll(n: usize) -> i32 {
+    (n as i32 * DEVICE_ROW + 24 - DEVICE_LIST.height()).max(0)
+}
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -125,6 +266,19 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     }
     match v.section {
         Section::Menu => (0..MENU.len()).find(|&i| menu_rect(i).contains(x, y)).map(Hit::Row),
+        Section::Bluetooth if BT_DETAILS.contains(x, y) => Some(Hit::Details),
+        Section::BluetoothDetails if v.status.bt.open && !v.status.bt.name.is_empty() && BT_HOLDER.contains(x, y) => Some(Hit::HolderApp),
+        Section::BluetoothDetails if SCAN_NEARBY.contains(x, y) => Some(Hit::ScanNearby),
+        Section::BluetoothNearby => match v.nearby {
+            Nearby::Ask if CANCEL.contains(x, y) => Some(Hit::Cancel),
+            Nearby::Ask if PROCEED.contains(x, y) && can_scan(&v.status.bt).is_ok() => Some(Hit::Proceed),
+            Nearby::Scan { .. } | Nearby::Failed(_) if STOP.contains(x, y) => Some(Hit::Stop),
+            Nearby::Scan { scan, scroll, .. } if DEVICE_LIST.contains(x, y) => {
+                let k = ((y - DEVICE_LIST.y0 + scroll) / DEVICE_ROW) as usize;
+                (k < scan.devices.len()).then_some(Hit::Device(k))
+            }
+            _ => None,
+        },
         Section::PhoneLink if relay_usable(v.status) => {
             if RELAY_BUTTON.contains(x, y) {
                 Some(Hit::Relay)
@@ -184,7 +338,7 @@ fn paragraph(c: &mut Canvas, f: &violet::Face, text: &str, x: i32, mut y: i32, w
 pub fn menu_value(s: &Status, section: Section) -> (String, bool) {
     match section {
         Section::Wifi => (s.wifi.clone(), s.wifi != "Not connected"),
-        Section::Bluetooth => ((if s.bt_on { "On" } else { "Off" }).into(), s.bt_on),
+        Section::Bluetooth => ((if s.bt.on { "On" } else { "Off" }).into(), s.bt.on),
         Section::PhoneLink => {
             let shield = if !s.shield_known { "" } else if s.shield_linked { "Shield linked" } else { "Shield waiting" };
             let relay = match s.relay.as_str() {
@@ -227,11 +381,16 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             header(c, f, v, "‹ Settings", "Bluetooth");
             let card = Rect::new(40, 230, W as i32 - 40, 390);
             slab(c, card, 30.0, PAPER_RAISED);
-            f.medium(36.0).draw(c, if s.bt_on { "On" } else { "Off" }, 80, 300, if s.bt_on { VIOLET } else { CREAM });
-            let line = if s.bt_open { "In use by Bitchat" } else if s.bt_on { "Ready for nearby chat" } else { "The radio is not running" };
-            f.regular(27.0).draw(c, line, 80, 346, MUTED);
+            f.medium(36.0).draw(c, if s.bt.on { "On" } else { "Off" }, 80, 300, if s.bt.on { VIOLET } else { CREAM });
+            let line = if s.bt.open { s.bt.holder() } else if s.bt.on { "Ready for nearby chat".into() } else { "The radio is not running".into() };
+            f.regular(27.0).draw(c, &line, 80, 346, MUTED);
             paragraph(c, &f.regular(28.0), "Bluetooth shares the phone's connectivity chip with Wi-Fi, so it runs while Wi-Fi is on. Bitchat uses it to chat with phones nearby, with no internet needed.", 44, 460, W as i32 - 88, MUTED);
+            let bg = if v.pressed == Some(Hit::Details) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), BT_DETAILS, "Details", bg, CREAM);
         }
+        Section::BluetoothDetails => bluetooth_details(c, f, v, &s.bt),
+        Section::BluetoothNearby => bluetooth_nearby(c, f, v, &s.bt),
+        Section::BluetoothDevice => bluetooth_device(c, f, v),
         Section::PhoneLink => {
             header(c, f, v, "‹ Settings", "Phone Link");
             // Violet Shield.
@@ -351,4 +510,183 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             }
         }
     }
+}
+
+/// A card of label-value rows under a small-caps title; returns its bottom.
+fn card(c: &mut Canvas, f: &Fonts, top: i32, title: &str, rows: &[(&str, String, violet::Color)]) -> i32 {
+    let (label, value) = (f.regular(26.0), f.medium(28.0));
+    let r = Rect::new(40, top, W as i32 - 40, top + 86 + rows.len() as i32 * 60);
+    slab(c, r, 30.0, PAPER_RAISED);
+    f.medium(23.0).draw(c, title, 80, top + 52, MUTED);
+    for (k, (name, text, ink)) in rows.iter().enumerate() {
+        let y = top + 112 + k as i32 * 60;
+        label.draw(c, name, 80, y, MUTED);
+        value.draw(c, &value.fit(text, r.x1 - 40 - 300), 300, y, *ink);
+    }
+    r.y1
+}
+
+/// Who can hear this phone, who it can hear, and the controller, from what
+/// the runtime saw the holding app tell it.
+fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
+    header(c, f, v, "‹ Bluetooth", "Details");
+    // Tapping the app opens it.
+    let held = BT_HOLDER;
+    let opens = bt.open && !bt.name.is_empty();
+    slab(c, held, 30.0, if v.pressed == Some(Hit::HolderApp) { PAPER_PRESSED } else { PAPER_RAISED });
+    if opens {
+        chevron(c, (held.x1 - 34) as f32, (held.y0 + held.height() / 2) as f32);
+    }
+    f.medium(23.0).draw(c, "IN USE BY", 80, 282, MUTED);
+    let app = if !bt.open { "No app" } else if bt.app.is_empty() { "An app" } else { &bt.app };
+    let big = f.medium(34.0);
+    big.draw(c, &big.fit(app, held.width() - 120), 80, 336, if bt.open { VIOLET } else { CREAM });
+    let lit = |on: bool| if on { VIOLET } else { CREAM };
+    // The Core Specification's names: a public or random device address.
+    let address = |random: bool| if random { "Random" } else { "Public" };
+    let y = card(c, f, held.y1 + 24, "WHO CAN HEAR ME?", &[
+        ("Advertising", if bt.advertising { "On".into() } else { "Off".into() }, lit(bt.advertising)),
+        ("Address type", if bt.advertising { address(bt.random_adv).into() } else { "—".into() }, CREAM),
+    ]);
+    // A passive scan only listens; an active one sends scan requests from an address.
+    let y = card(c, f, y + 24, "WHO CAN I HEAR?", &[
+        ("Scanning", match (bt.scanning, bt.active) {
+            (false, _) => "Off".into(),
+            (true, false) => "Passive".into(),
+            (true, true) => "Active · sends scan requests".into(),
+        }, lit(bt.scanning)),
+        ("Address type", if bt.scanning && bt.active { address(bt.random_scan).into() } else if bt.scanning { "None sent".into() } else { "—".into() }, CREAM),
+    ]);
+    let state = match bt.state.as_str() {
+        "on" => "On".to_string(),
+        "starting" => "Starting…".into(),
+        "failed" => format!("Failed ({:#x})", bt.error),
+        _ => "Off · runs while Wi-Fi is on".into(),
+    };
+    let dash = |t: String| if bt.hci == 0 { "—".to_string() } else { t };
+    let y = card(c, f, y + 24, "CONTROLLER", &[
+        ("State", state, if bt.state == "failed" { ALERT } else { lit(bt.state == "on") }),
+        ("Manufacturer", dash(bt.manufacturer()), CREAM),
+        ("HCI version", dash(match bt.version() { "" => format!("{:#x}", bt.hci), v => format!("Bluetooth {v}") }), CREAM),
+        ("Frames", format!("{} received · {} sent", bt.rx, bt.tx), CREAM),
+        ("Errors", format!("{} rejected · {} dropped", bt.bad, bt.dropped), if bt.bad != 0 || bt.dropped != 0 { ALERT } else { CREAM }),
+    ]);
+    paragraph(c, &f.regular(26.0), "VioletOS never makes this phone visible by itself. Only an app that opens Bluetooth can, and it shows here. When the app closes, the radio stops.", 44, y + 60, W as i32 - 88, MUTED);
+    let bg = if v.pressed == Some(Hit::ScanNearby) { PAPER_PRESSED } else { PAPER_RAISED };
+    violet::button(c, &f.medium(32.0), SCAN_NEARBY, "Scan nearby", bg, CREAM);
+}
+
+/// Whether Settings can take the controller for a scan, or why not.
+pub fn can_scan(bt: &Bluetooth) -> Result<(), String> {
+    if !bt.on {
+        return Err("Bluetooth is off. It runs while Wi-Fi is on.".into());
+    }
+    if bt.open {
+        let app = if bt.app.is_empty() { "An app" } else { &bt.app };
+        return Err(format!("{app} is using Bluetooth. Close it to scan."));
+    }
+    Ok(())
+}
+
+/// Scan nearby: what the scan does to whom, asked before it starts; then
+/// the devices heard, strongest first.
+fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
+    header(c, f, v, "‹ Details", "Scan nearby");
+    let (name, text) = (f.medium(30.0), f.regular(26.0));
+    match v.nearby {
+        Nearby::Ask => {
+            f.regular(26.0).draw(c, "For as long as the scan runs:", 44, 228, MUTED);
+            let card = Rect::new(40, 260, W as i32 - 40, 690);
+            slab(c, card, 30.0, PAPER_RAISED);
+            let mut y = 320;
+            for (who, what) in [
+                ("This phone", "Listens with a passive scan. It receives advertisements and transmits nothing."),
+                ("Devices nearby", "Can't see this phone or tell that it is listening."),
+                ("Bitchat and other apps", "Can't use Bluetooth until you stop the scan."),
+            ] {
+                name.draw(c, who, 80, y, CREAM);
+                y = paragraph(c, &text, what, 80, y + 44, card.width() - 80, MUTED) + 36;
+            }
+            if let Err(why) = can_scan(bt) {
+                paragraph(c, &f.regular(26.0), &why, 44, 750, W as i32 - 88, ALERT);
+            }
+            let bg = if v.pressed == Some(Hit::Cancel) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), CANCEL, "Cancel", bg, CREAM);
+            let ok = can_scan(bt).is_ok();
+            let bg = if v.pressed == Some(Hit::Proceed) { PAPER_PRESSED } else if ok { VIOLET } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), PROCEED, "Proceed", bg, if ok { PAPER } else { MUTED });
+        }
+        Nearby::Failed(why) => {
+            paragraph(c, &f.regular(30.0), why, 44, 260, W as i32 - 88, ALERT);
+            let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), STOP, "Done", bg, CREAM);
+        }
+        Nearby::Scan { scan, running, seconds, scroll, .. } => {
+            let card = Rect::new(40, 230, W as i32 - 40, 380);
+            slab(c, card, 30.0, PAPER_RAISED);
+            let (head, tint) = if !running { ("Stopped", CREAM) } else if scan.listening { ("Passive scan", VIOLET) } else { ("Starting…", CREAM) };
+            f.medium(34.0).draw(c, head, 80, 296, tint);
+            let n = scan.devices.len();
+            let line = format!("{n} device{} heard · {}:{:02}", if n == 1 { "" } else { "s" }, seconds / 60, seconds % 60);
+            f.regular(26.0).draw(c, &line, 80, 344, MUTED);
+            let (label, value) = (f.medium(28.0), f.regular(24.0));
+            c.set_clip(DEVICE_LIST);
+            for (k, d) in scan.strongest().iter().enumerate() {
+                let y = DEVICE_LIST.y0 + 44 + k as i32 * DEVICE_ROW - scroll;
+                if y < DEVICE_LIST.y0 || y - DEVICE_ROW > DEVICE_LIST.y1 {
+                    continue;
+                }
+                if v.pressed == Some(Hit::Device(k)) {
+                    c.fill(Rect::new(0, y - 44, W as i32, y + 20), PAPER_PRESSED);
+                }
+                let signal = if d.rssi == i8::MIN { "—".to_string() } else { format!("{} dBm", d.rssi) };
+                let detail = format!("{signal} · {}", if d.random { "Random" } else { "Public" });
+                let w = value.width(&detail);
+                value.draw(c, &detail, W as i32 - 44 - w, y, MUTED);
+                label.draw(c, &label.fit(&d.label(), W as i32 - 140 - w), 44, y, CREAM);
+            }
+            // A thin bar on the right while there is more than fits.
+            let most = devices_max_scroll(n);
+            if most > 0 {
+                let h = DEVICE_LIST.height();
+                let bar = (h * h / (h + most)).max(60);
+                let top = DEVICE_LIST.y0 + (h - bar) * scroll / most;
+                c.fill(Rect::new(W as i32 - 14, top, W as i32 - 8, top + bar), MUTED);
+            }
+            c.reset_clip();
+            let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), STOP, if running { "Stop" } else { "Done" }, bg, if running { ALERT } else { CREAM });
+        }
+    }
+}
+
+/// One device from Scan nearby: everything its advertisements said.
+fn bluetooth_device(c: &mut Canvas, f: &Fonts, v: &View) {
+    header(c, f, v, "‹ Scan", "");
+    let Nearby::Scan { scan, device: Some(d), .. } = v.nearby else { return };
+    let title = f.regular(44.0);
+    title.draw(c, &title.fit(&d.label(), W as i32 - 80), 40, 180, CREAM);
+    let address = d.address.iter().rev().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+    let dbm = |r: i8| if r == i8::MIN { "—".to_string() } else { format!("{r} dBm") };
+    let ago = scan.elapsed().saturating_sub(d.last).as_secs();
+    let first = d.first.as_secs();
+    let y = card(c, f, 230, "DEVICE", &[
+        ("Name", if d.name.is_empty() { "Not advertised".into() } else { d.name.clone() }, CREAM),
+        ("Address", address, CREAM),
+        ("Address type", d.address_type().into(), CREAM),
+    ]);
+    let y = card(c, f, y + 24, "SIGNAL", &[
+        ("Strongest", dbm(d.rssi), VIOLET),
+        ("Latest", dbm(d.last_rssi), CREAM),
+        ("TX power", d.tx_power.map_or("Not advertised".into(), |p| format!("{p} dBm")), CREAM),
+        ("Reports", d.reports.to_string(), CREAM),
+    ]);
+    let y = card(c, f, y + 24, "ADVERTISING", &[
+        ("Type", d.advertising().into(), CREAM),
+        ("Manufacturer", d.manufacturer(), CREAM),
+        ("Services", d.service_list(), CREAM),
+        ("First heard", format!("{}:{:02} into the scan", first / 60, first % 60), CREAM),
+        ("Last heard", if ago == 0 { "Just now".into() } else { format!("{ago} s ago") }, CREAM),
+    ]);
+    paragraph(c, &f.regular(26.0), "Phones and many accessories change their random address every few minutes, so one device can appear more than once.", 44, y + 60, W as i32 - 88, MUTED);
 }
