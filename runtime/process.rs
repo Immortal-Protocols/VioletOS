@@ -21,7 +21,7 @@ fn service(key: u32) -> u32 {
     match key {
         SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         PRESENT => 5,
-        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | RELAY => 7,
+        SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | RELAY | LINK => 7,
         POWER => 8,
         CATALOG | INBOX | INSTALL | REMOVE => 9,
         _ => 0,
@@ -35,7 +35,7 @@ const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK, MI
 /// The component whose inventory bit gates a key.
 fn component(key: u32) -> u32 {
     match key {
-        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | RELAY => 7,
+        RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | RELAY | LINK => 7,
         POWER => 8,
         SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         VOLUME | PLAYBACK | MICROPHONE => AUDIO_COMPONENT,
@@ -195,8 +195,9 @@ impl Runtime {
                 self.forward(who, 5, req)
             }
             // The Open Runtime's Wi-Fi settings (the "wifi" commands in
-            // /dev/violet/sys, which only /apps/wifi may use to join or leave).
-            (GET, SCAN | PROFILE) | (EXECUTE, PROFILE) if who == OPEN_APPS => self.forward(who, 7, m),
+            // /dev/violet/sys, which only /apps/wifi may use to join or leave,
+            // or to read the joined link's addresses).
+            (GET, SCAN | PROFILE | LINK) | (EXECUTE, PROFILE) if who == OPEN_APPS => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == OPEN_APPS && m.value == 1 => self.forward(who, 7, m),
             (GET, RADIO) => self.forward(who, 7, m),
             (EXECUTE, RADIO) if who == LAUNCHER => self.forward(who, 7, m),

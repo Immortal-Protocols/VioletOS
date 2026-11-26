@@ -9,6 +9,12 @@
 //!                           id=ID channel=N security=wpa2|open|other ssid=HEX
 //!   wifi join ID [PMK]      join a network; PMK is 64 hex digits for WPA2
 //!   wifi leave              leave the joined network
+//!   wifi info               the joined network's link, for Settings only, as
+//!                           fields (one Radio does not know is left out):
+//!                           mac=HEX from=chip|random|fixed bssid=HEX channel=N
+//!                           ip=A.B.C.D mask=A.B.C.D router=A.B.C.D dns=A.B.C.D
+//!                           dns2=A.B.C.D dhcp=A.B.C.D lease=SECONDS left=SECONDS
+//!                           hostname=HEX radio=HEX firmware=N.N.N built=HEX
 //!
 //! Saved networks rejoin on their own: the Wi-Fi app keeps them in
 //! /data/networks (most recently joined first), and the auto-connector here
@@ -19,8 +25,10 @@
 //!
 //! Radio's requests can take seconds on the handset (it boots the Wi-Fi chip,
 //! scans and runs the WPA2 handshake), so they run as Runtime tickets polled
-//! from here, and other apps keep running meanwhile. Only /apps/wifi may join
-//! or leave a network: the others can look but not change it.
+//! from here, and other apps keep running meanwhile. Only Settings may join
+//! or leave a network: the others can look but not change it. Only Settings
+//! may read "wifi info" too: the phone's Wi-Fi address and the access point's
+//! identify the phone and the place it is in.
 use super::{fs::Fs, request, sys};
 use crate::log;
 use crate::protocol::*;
@@ -133,6 +141,66 @@ fn submit(m: Message) -> Result<u32, u32> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// "wifi info": what Radio reports about the joined link (LINK_* in
+/// runtime/protocol.rs). Radio answers these between its other work, like
+/// GET PROFILE, so they are plain requests and not tickets.
+fn link_info() -> String {
+    let station = request(GET, LINK, LINK_STATION);
+    if station.op != OK {
+        return String::from("error offline\n");
+    }
+    let d = station.data;
+    let mut out = format!("mac={}", hex(&d[..6]));
+    match station.arg {
+        LINK_ADDRESS_CHIP => out += " from=chip",
+        LINK_ADDRESS_RANDOM => out += " from=random",
+        LINK_ADDRESS_FIXED => out += " from=fixed",
+        _ => {}
+    }
+    if d[6..12] != [0; 6] {
+        out += &format!(" bssid={}", hex(&d[6..12]));
+    }
+    if d[12] != 0 {
+        out += &format!(" channel={}", d[12]);
+    }
+    let ip = request(GET, LINK, LINK_IP);
+    if ip.op == OK {
+        for (i, key) in ["ip", "mask", "router", "dns", "dns2", "dhcp"].iter().enumerate() {
+            let a = &ip.data[4 * i..4 * i + 4];
+            if a != [0; 4] {
+                out += &format!(" {}={}.{}.{}.{}", key, a[0], a[1], a[2], a[3]);
+            }
+        }
+        let word = |at: usize| u32::from_le_bytes([ip.data[at], ip.data[at + 1], ip.data[at + 2], ip.data[at + 3]]);
+        if word(24) != 0 {
+            out += &format!(" lease={} left={}", word(24), word(28));
+        }
+    }
+    // A text record, up to its first zero byte.
+    let text = |m: &Message| {
+        let t = m.text();
+        let n = t.iter().position(|&b| b == 0).unwrap_or(t.len());
+        hex(&t[..n])
+    };
+    let name = request(GET, LINK, LINK_NAME);
+    if name.op == OK && name.value != 0 {
+        out += &format!(" hostname={}", text(&name));
+    }
+    let radio = request(GET, LINK, LINK_RADIO);
+    if radio.op == OK && radio.data[0] != 0 {
+        out += &format!(" radio={}", text(&radio));
+    }
+    let firmware = request(GET, LINK, LINK_FIRMWARE);
+    if firmware.op == OK {
+        out += &format!(" firmware={}.{}.{}", (firmware.value >> 8) & 0xff, firmware.value & 0xff, firmware.arg);
+        if firmware.data[0] != 0 {
+            out += &format!(" built={}", text(&firmware));
+        }
+    }
+    out.push('\n');
+    out
 }
 
 fn unhex(s: &str) -> Option<[u8; 32]> {
@@ -327,6 +395,9 @@ impl Wifi {
         if matches!(sub, Some("join" | "leave")) && path != SETTINGS_APP {
             return String::from("error denied: only Settings changes the network\n");
         }
+        if sub == Some("info") && path != SETTINGS_APP {
+            return String::from("error denied: only Settings reads the link's addresses\n");
+        }
         match sub {
             None | Some("state") => {
                 self.poll();
@@ -434,7 +505,14 @@ impl Wifi {
                 }
                 answer
             }
-            Some(_) => String::from("error usage: wifi [state|scan|list|join ID [PMK]|leave]\n"),
+            Some("info") => {
+                self.poll();
+                if self.job.is_some() {
+                    return String::from("error busy\n");
+                }
+                link_info()
+            }
+            Some(_) => String::from("error usage: wifi [state|scan|list|join ID [PMK]|leave|info]\n"),
         }
     }
 

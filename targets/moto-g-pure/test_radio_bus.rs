@@ -23,6 +23,8 @@ pub struct Model {
     pub no_ack: bool,
     pub invalid_mac: bool,
     pub fixed_mac: Option<[u8; 6]>,
+    /// The firmware leaves its version and build date out of its capability answer.
+    pub unnamed_firmware: bool,
     pub deny_association: bool,
     pub wrong_channel: bool,
     pub drop_key_done: bool,
@@ -150,6 +152,12 @@ impl Model {
             reply[16..22].copy_from_slice(&[128, 0, 0, 224, 1, bytes[39]]);
             if !self.invalid_mac {
                 reply[36..42].copy_from_slice(&[2, 17, 34, 51, 68, 85]);
+            }
+            if !self.unnamed_firmware {
+                // Version 2.1 build 48, at their places in the 116-byte capability body.
+                reply[30..32].copy_from_slice(&0x0201u16.to_le_bytes());
+                reply[48..62].copy_from_slice(b"20210608152745");
+                reply[84] = 48;
             }
             self.inject(1, &reply);
         } else if bytes[36] == 0x11 {

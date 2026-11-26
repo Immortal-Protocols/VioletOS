@@ -97,6 +97,8 @@ pub struct App {
     page: Page,
     nets: Vec<Network>,
     state: wifi::State,
+    /// The joined link's addresses and hardware, while its details are shown.
+    link: Option<wifi::Link>,
     saved: Saved,
     joining: Option<Joining>,
     /// A leave this app asked for.
@@ -119,6 +121,7 @@ impl App {
             page: Page::List,
             nets: wifi::networks(),
             state: wifi::state(),
+            link: None,
             saved: Saved::load(),
             joining: None,
             leaving: false,
@@ -198,6 +201,7 @@ impl App {
             joining: self.joining.as_ref().map(|j| j.net.id),
             saved: self.saved.0.iter().map(|(s, _)| s.as_slice()).collect(),
             message: self.message.as_deref(),
+            link: self.link.as_ref(),
             scroll: self.scroll,
             pressed: self.pressed,
             keyboard: &self.keyboard,
@@ -247,6 +251,9 @@ impl App {
             return;
         }
         if self.state.is_joined(&net) {
+            self.link = wifi::link();
+            let rows: usize = ui::detail_sections(&self.view(), &net).iter().map(|s| s.1.len()).sum();
+            println!("wifi: showing {} ({rows} details)", net.name());
             self.page = Page::Details { net };
             return;
         }
@@ -273,6 +280,12 @@ impl App {
         let was = std::mem::replace(&mut self.state, s);
         let finished = self.state.busy.is_none();
         let mut changed = was != self.state;
+        // The lease runs down and a rejoin can change the addresses.
+        if matches!(self.page, Page::Details { .. }) {
+            let link = if finished { wifi::link() } else { None };
+            changed |= link != self.link;
+            self.link = link;
+        }
         // Something else (the runtime rejoining a saved network) finished: show its scan.
         if finished && was.busy.is_some() && !self.scanning && self.joining.is_none() && !self.leaving {
             self.nets = wifi::networks();
@@ -507,7 +520,91 @@ mod preview {
     use crate::wifi_ui as ui;
 
     fn net(id: u32, name: &str, channel: u32, security: Security) -> Network {
-        Network { id, channel, security, ssid: name.as_bytes().to_vec() }
+        Network { id, channel, security, ssid: name.as_bytes().to_vec(), channels: vec![channel] }
+    }
+
+    /// A link as the handset reports one, and as the emulator does.
+    fn links() -> (wifi::Link, wifi::Link) {
+        let hex = |s: &str| wifi::hex(s.as_bytes());
+        let handset = wifi::Link::parse(&format!(
+            "mac=04decac0ffee from=fixed bssid=48a98a0a0b0c channel=161 ip=192.168.88.23 mask=255.255.255.0 \
+             router=192.168.88.1 dns=192.168.88.1 dns2=1.1.1.1 dhcp=192.168.88.1 lease=86400 left=85000 \
+             hostname={} radio={} firmware=2.1.48 built={}",
+            hex("Violet"), hex("MediaTek MT6765"), hex("20210608152745")
+        ));
+        let emulator = wifi::Link::parse(&format!("mac=525400560001 from=chip ip=10.0.2.15 router=10.0.2.2 radio={}", hex("QEMU virtio-net")));
+        (handset.unwrap(), emulator.unwrap())
+    }
+
+    #[test]
+    fn details_show_the_joined_link_and_nothing_for_another_network() {
+        let (handset, emulator) = links();
+        let mut mesh = net(7, "LouieDog", 6, Security::Wpa2);
+        mesh.channels = vec![6, 161, 8, 161];
+        let other = net(9, "NETGEAR-5G", 149, Security::Wpa2);
+        let kb = Keyboard::default();
+        let joined = wifi::State { connected: 7, ssid: b"LouieDog".to_vec(), ..Default::default() };
+        let page = Page::List;
+        let view = |link: Option<&'static wifi::Link>| ui::View {
+            page: &page, nets: &[], state: &joined, connected_name: String::new(), hosting: false, busy: None, joining: None,
+            saved: vec![b"LouieDog".as_slice()], message: None, link, scroll: 0, pressed: None, keyboard: &kb, phase: 0.0,
+        };
+        let text = |link, net: &Network| -> Vec<String> {
+            ui::detail_sections(&view(link), net)
+                .iter()
+                .flat_map(|(heading, rows)| std::iter::once(heading.to_string()).chain(rows.iter().map(|(k, v)| format!("{k}: {v}"))))
+                .collect()
+        };
+        let handset: &'static wifi::Link = Box::leak(Box::new(handset));
+        let emulator: &'static wifi::Link = Box::leak(Box::new(emulator));
+        assert_eq!(text(Some(handset), &mesh), [
+            "NETWORK",
+            "Status: Connected",
+            "Security: WPA2-Personal · AES",
+            // The joined access point's channel, not the first one the scan saw.
+            "Channel: 161 · 5 GHz · 5805 MHz",
+            "Connected to: 48:a9:8a:0a:0b:0c",
+            "Access points: 4 on channels 6, 8, 161",
+            "Password: Saved on this phone",
+            "INTERNET",
+            "IP address: 192.168.88.23",
+            "Subnet mask: 255.255.255.0 · /24",
+            "Router: 192.168.88.1",
+            "DNS: 192.168.88.1",
+            "DNS 2: 1.1.1.1",
+            "DHCP server: 192.168.88.1",
+            "Lease: 1 day · 23 h 36 min left",
+            "Host name: Violet",
+            "THIS PHONE",
+            "Wi-Fi address: 04:de:ca:c0:ff:ee",
+            "Address type: Fixed, set over USB",
+            "Radio: MediaTek MT6765",
+            "Firmware: 2.1.48 · 2021-06-08 15:27",
+        ]);
+        // Only what Radio reported: the emulator has no access point, lease or firmware.
+        assert_eq!(text(Some(emulator), &net(7, "LouieDog", 0, Security::Open)), [
+            "NETWORK",
+            "Status: Connected",
+            "Security: None",
+            "Password: Saved on this phone",
+            "INTERNET",
+            "IP address: 10.0.2.15",
+            "Router: 10.0.2.2",
+            "Host name: Not sent",
+            "THIS PHONE",
+            "Wi-Fi address: 52:54:00:56:00:01",
+            "Address type: Built into the chip",
+            "Radio: QEMU virtio-net",
+        ]);
+        // The link belongs to the joined network: another one's page shows none of it.
+        assert_eq!(text(Some(handset), &other), [
+            "NETWORK",
+            "Status: Not connected",
+            "Security: WPA2-Personal · AES",
+            "Channel: 149 · 5 GHz · 5745 MHz",
+            "Password: Not saved",
+        ]);
+        assert_eq!(text(None, &mesh).len(), 6);
     }
 
     #[test]
@@ -523,20 +620,26 @@ mod preview {
         let kb = Keyboard::default();
         let joined = wifi::State { connected: 7, ssid: b"LouieDog".to_vec(), ..Default::default() };
         let idle = wifi::State::default();
+        let (handset, emulator) = links();
         let base = |page: &'static Page| ui::View {
             page, nets: &nets, state: &joined, connected_name: "LouieDog".into(), hosting: false, busy: None,
-            joining: None, saved: vec![b"LouieDog".as_slice()], message: None, scroll: 0, pressed: None, keyboard: &kb, phase: 0.3,
+            joining: None, saved: vec![b"LouieDog".as_slice()], message: None, link: None, scroll: 0, pressed: None, keyboard: &kb, phase: 0.3,
         };
         let list: &'static Page = Box::leak(Box::new(Page::List));
         let pw: &'static Page = Box::leak(Box::new(Page::Password {
             net: nets[2].clone(), text: "hunter2!".into(), show: false, error: Some(wifi::reason(52).into()),
         }));
-        let details: &'static Page = Box::leak(Box::new(Page::Details { net: nets[0].clone() }));
+        let mut mesh = nets[0].clone();
+        mesh.channels = vec![6, 161, 8, 161];
+        let details: &'static Page = Box::leak(Box::new(Page::Details { net: mesh }));
         let mut joining = base(list);
         joining.state = &idle;
         joining.joining = Some(9);
+        let (mut rich, mut plain) = (base(details), base(details));
+        rich.link = Some(&handset);
+        plain.link = Some(&emulator);
         let mut c = violet::Canvas::new(violet::W, violet::H);
-        for (name, v) in [("list", base(list)), ("joining", joining), ("password", base(pw)), ("details", base(details))] {
+        for (name, v) in [("list", base(list)), ("joining", joining), ("password", base(pw)), ("details", rich), ("details-emulator", plain), ("details-no-link", base(details))] {
             ui::draw(&mut c, &fonts, &v);
             let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
             std::fs::write(format!("{dir}/{name}.rgba"), bytes).unwrap();

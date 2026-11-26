@@ -21,6 +21,14 @@ Settings › Wi-Fi scans when it starts and lists the networks it found, one row
 
 The password never leaves the app: it becomes the network's key (PBKDF2-SHA1 with the SSID, as WPA2 defines) and only the key goes to Radio. Networks that joined are kept in `/data/networks`, most recently joined first, so a known network joins with one tap; tap the connected network to **Disconnect** or **Forget** it.
 
+The connected network's page also shows its link, as far as Radio reports it:
+
+- **Network**: the security, the channel and address of the access point the phone is connected to, and how many access points share the name and on which channels.
+- **Internet**: the phone's IP address, the subnet mask, the router, the DNS servers, the DHCP server, the lease and what is left of it, and the host name the phone sends with DHCP requests (**Not sent** for a private client).
+- **This phone**: the Wi-Fi address in use and where it came from (the chip, a random one for each time Wi-Fi starts, or the fixed one set over USB), the radio, and its firmware's version and build date when the firmware reports them.
+
+Only Settings is told these (`wifi info`): the addresses identify the phone and the place it is in.
+
 Saved networks rejoin by themselves: a few seconds after boot, and again while none is joined, the Open Runtime scans and joins the most recently joined saved network in range (see [wifi.rs](../../../runtime/open/wifi.rs)). **Disconnect** pauses that until you join a network again. A saved key is never thrown away because a join failed. Only when the access point keeps rejecting the handshake (reason 52) does the app ask for the password again, and the new one replaces the old only once it works. A timeout or weak signal (reason 57) keeps the key.
 
-`make test-wifi-app` drives Wi-Fi by touch in QEMU, across four boots: joining, rejoining by itself after a restart, and keeping the key through a handshake timeout. The app talks to the system through the `wifi` commands of [`/dev/violet/sys`](../../../runtime/open/README.md).
+`make test-wifi-app` drives Wi-Fi by touch in QEMU, across four boots: joining, the joined network's page, rejoining by itself after a restart, and keeping the key through a handshake timeout. The app talks to the system through the `wifi` commands of [`/dev/violet/sys`](../../../runtime/open/README.md).

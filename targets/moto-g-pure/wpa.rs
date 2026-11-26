@@ -318,6 +318,14 @@ pub unsafe fn join_ip(dev: *mut Axi) -> bool {
     station_net_hostname(name[6..].as_ptr(), n);
     station_net_join(mac.as_ptr()) != 0 && !LINK_ERROR
 }
+extern "C" {
+    fn station_net_info(out: *mut u8) -> i32;
+}
+/// The joined network's IPv4 settings (LINK_IP in runtime/protocol.rs); false
+/// without an address from DHCP.
+pub fn link_addresses(out: &mut [u8; 32]) -> bool {
+    unsafe { station_net_info(out.as_mut_ptr()) != 0 }
+}
 pub unsafe fn close() {
     station_net_close();
     station_wpa_close();

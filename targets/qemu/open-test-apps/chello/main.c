@@ -5,6 +5,8 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static void *work(void *arg) { long n = (long)arg; long s = 0; for (long i = 1; i <= n; i++) s += i; return (void *)s; }
 
@@ -26,6 +28,10 @@ int main(void) {
     char buf[64] = {0}; f = fopen("/tmp/c.txt", "r"); fgets(buf, sizeof buf, f); fclose(f);
     printf("file round trip: %s\n", buf);
     char *big = malloc(16 << 20); memset(big, 3, 16 << 20); printf("16 MiB malloc ok: %d\n", big[12345] == 3); free(big);
+    /* The joined Wi-Fi link's addresses identify the phone and the place: only Settings is told. */
+    char answer[128] = {0}; int sys = open("/dev/violet/sys", O_RDWR);
+    if (sys >= 0 && write(sys, "wifi info\n", 10) == 10 && read(sys, answer, sizeof answer - 1) > 0) answer[strcspn(answer, "\n")] = 0;
+    printf("wifi info: %s\n", answer);
     printf("c done\n");
     return 0;
 }

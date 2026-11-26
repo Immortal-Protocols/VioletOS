@@ -224,11 +224,12 @@ fn register_level_scan_and_dma_timeout_paths() {
 
 #[test]
 fn provisioned_address_replaces_the_chip_and_random_ones() {
-    for (invalid_mac, fixed_mac, expected) in [
-        (false, None, [2, 17, 34, 51, 68, 85]),
-        (true, None, [0xfe, 1, 2, 3, 4, 5]),
-        (false, Some([2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]), [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
-        (true, Some([2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]), [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+    use wlan_axi::AddressFrom::{Chip, Fixed, Random};
+    for (invalid_mac, fixed_mac, expected, from) in [
+        (false, None, [2, 17, 34, 51, 68, 85], Chip),
+        (true, None, [0xfe, 1, 2, 3, 4, 5], Random),
+        (false, Some([2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]), [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee], Fixed),
+        (true, Some([2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]), [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee], Fixed),
     ] {
         radio_io::reset();
         radio_io::wr(0x09011208, 0x10001870);
@@ -237,10 +238,32 @@ fn provisioned_address_replaces_the_chip_and_random_ones() {
             m.fixed_mac = fixed_mac;
         });
         let mut axi = wlan_axi::Axi::new();
+        assert_eq!(axi.station_from, None);
         let mut results = passive_scan::Results::default();
         let (p, n) = entry(3);
         axi.scan(&FACTORY[p..p + n], &mut results, |_| {}).unwrap();
         assert_eq!(axi.station, expected);
+        // Settings shows where the address came from.
+        assert_eq!(axi.station_from, Some(from));
+        assert!(axi.shutdown());
+    }
+}
+
+#[test]
+fn firmware_version_and_build_date_come_from_its_capability_answer() {
+    for unnamed in [false, true] {
+        radio_io::reset();
+        radio_io::wr(0x09011208, 0x10001870);
+        radio_io::with(|m| m.unnamed_firmware = unnamed);
+        let mut axi = wlan_axi::Axi::new();
+        let mut results = passive_scan::Results::default();
+        let (p, n) = entry(3);
+        axi.scan(&FACTORY[p..p + n], &mut results, |_| {}).unwrap();
+        let mut date = [0; 16];
+        date[..14].copy_from_slice(b"20210608152745");
+        let named = wlan_axi::Firmware { version: 0x0201, build: 48, date };
+        // A firmware that fills in neither reports nothing, and Settings shows no row.
+        assert_eq!(axi.firmware, (!unnamed).then_some(named));
         assert!(axi.shutdown());
     }
 }

@@ -98,6 +98,24 @@ pub fn run() -> ! {
                     target
                 })
             }
+            // The joined link, for Settings' network page. A virtual network has
+            // no access point address, channel or DHCP lease to report.
+            (GET, LINK) if online && associated != 0 => {
+                let mut r = Message::result(associated);
+                match m.value {
+                    LINK_STATION => {
+                        r.data[..6].copy_from_slice(&gateway::MAC);
+                        r.arg = LINK_ADDRESS_CHIP;
+                    }
+                    LINK_IP => {
+                        r.data[..4].copy_from_slice(&gateway::GUEST);
+                        r.data[8..12].copy_from_slice(&gateway::GATEWAY);
+                    }
+                    LINK_RADIO => r.put_text(b"QEMU virtio-net"),
+                    _ => return Message::error(OFFLINE),
+                }
+                r
+            }
             (EXECUTE, RADIO_TEST) if online && associated != 0 => {
                 if !gateway::probe() {
                     Message::result(0)

@@ -1,8 +1,9 @@
 //! Drawing Settings › Wi-Fi. Everything comes from `View`, so a preview can be
 //! drawn without the devices.
 use std::f32::consts::PI;
+use std::net::Ipv4Addr;
 
-use violet::wifi::{Network, Security};
+use violet::wifi::{self, AddressFrom, Link, Network, Security};
 use violet::{colors::*, mix, Canvas, Color, Fonts, Rect, H, W};
 
 use violet::keyboard::{self, Keyboard};
@@ -20,9 +21,10 @@ pub const SCAN: Rect = Rect::new(60, 1440, W as i32 - 60, 1550);
 pub const FIELD: Rect = Rect::new(40, 280, W as i32 - 40, 390);
 pub const SHOW: Rect = Rect::new(W as i32 - 170, 296, W as i32 - 56, 374);
 pub const CONNECT: Rect = Rect::new(40, 480, W as i32 - 40, 590);
-// The details page.
-pub const DISCONNECT: Rect = Rect::new(40, 620, W as i32 - 40, 730);
-pub const FORGET: Rect = Rect::new(40, 760, W as i32 - 40, 870);
+// The details page: the sections fill it from the top, the buttons stay below.
+pub const DISCONNECT: Rect = Rect::new(40, 1426, 352, 1536);
+pub const FORGET: Rect = Rect::new(368, 1426, W as i32 - 40, 1536);
+const DETAIL_ROW: i32 = 50;
 
 pub enum Page {
     List,
@@ -56,6 +58,8 @@ pub struct View<'a> {
     pub saved: Vec<&'a [u8]>,
     /// A line for the status card: the last result or problem.
     pub message: Option<&'a str>,
+    /// The joined link's addresses and hardware, for the details page.
+    pub link: Option<&'a Link>,
     pub scroll: i32,
     pub pressed: Option<Hit>,
     pub keyboard: &'a Keyboard,
@@ -275,27 +279,146 @@ fn password(c: &mut Canvas, f: &Fonts, v: &View, net: &Network, text: &str, show
     }
 }
 
+/// "1 day 2 h", "23 h 36 min", "45 s": the two largest units.
+fn duration(secs: u32) -> String {
+    let (d, h, m) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60);
+    let days = format!("{d} day{}", if d == 1 { "" } else { "s" });
+    match (d, h, m) {
+        (0, 0, 0) => format!("{secs} s"),
+        (0, 0, _) => format!("{m} min"),
+        (0, _, 0) => format!("{h} h"),
+        (0, _, _) => format!("{h} h {m} min"),
+        (_, 0, _) => days,
+        _ => format!("{days} {h} h"),
+    }
+}
+
+/// A subnet mask's prefix length ("/24"), for a mask of ones then zeros.
+fn prefix(mask: Ipv4Addr) -> Option<u32> {
+    let bits = u32::from(mask);
+    (bits.leading_ones() + bits.trailing_zeros() == 32).then_some(bits.leading_ones())
+}
+
+/// The firmware's build date: "20210608152745" as "2021-06-08 15:27", anything else as it is.
+fn built(date: &str) -> String {
+    if date.len() == 14 && date.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{}-{}-{} {}:{}", &date[..4], &date[4..6], &date[6..8], &date[8..10], &date[10..12])
+    } else {
+        date.to_string()
+    }
+}
+
+/// The details page: each section's heading and its rows (label, value). The
+/// link's rows are there only for the joined network, and only those Radio reported.
+pub fn detail_sections(v: &View, net: &Network) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+    let here = v.state.is_joined(net);
+    let link = v.link.filter(|_| here);
+    let mut network = vec![
+        ("Status", if here { "Connected" } else { "Not connected" }.to_string()),
+        ("Security", match net.security {
+            Security::Wpa2 => "WPA2-Personal · AES",
+            Security::Open => "None",
+            Security::Other => "Not supported",
+        }.to_string()),
+    ];
+    // Radio tries every access point with this name, so the joined one's
+    // channel can differ from the first one the scan saw.
+    let channel = link.map(|l| l.channel).filter(|&c| c != 0).unwrap_or(net.channel);
+    if channel != 0 {
+        let mhz = wifi::frequency(channel).map_or(String::new(), |f| format!(" · {f} MHz"));
+        network.push(("Channel", format!("{channel} · {}{mhz}", wifi::band(channel))));
+    }
+    if let Some(bssid) = link.and_then(|l| l.bssid) {
+        network.push(("Connected to", wifi::mac_text(&bssid)));
+    }
+    if net.channels.len() > 1 {
+        let mut channels: Vec<u32> = net.channels.iter().copied().filter(|&c| c != 0).collect();
+        channels.sort();
+        channels.dedup();
+        let list: Vec<String> = channels.iter().map(u32::to_string).collect();
+        let on = match list.len() {
+            0 => String::new(),
+            1 => format!(" on channel {}", list[0]),
+            _ => format!(" on channels {}", list.join(", ")),
+        };
+        network.push(("Access points", format!("{}{on}", net.channels.len())));
+    }
+    network.push(("Password", if v.is_saved(&net.ssid) { "Saved on this phone" } else { "Not saved" }.to_string()));
+    let mut sections = vec![("NETWORK", network)];
+    let Some(link) = link else { return sections };
+
+    let mut internet = Vec::new();
+    if let Some(ip) = link.ip {
+        internet.push(("IP address", ip.to_string()));
+    }
+    if let Some(mask) = link.mask {
+        internet.push(("Subnet mask", match prefix(mask) {
+            Some(n) => format!("{mask} · /{n}"),
+            None => mask.to_string(),
+        }));
+    }
+    if let Some(router) = link.router {
+        internet.push(("Router", router.to_string()));
+    }
+    for (label, dns) in ["DNS", "DNS 2"].into_iter().zip(&link.dns) {
+        internet.push((label, dns.to_string()));
+    }
+    if let Some(dhcp) = link.dhcp {
+        internet.push(("DHCP server", dhcp.to_string()));
+    }
+    match link.lease {
+        Some((u32::MAX, _)) => internet.push(("Lease", "Does not end".to_string())),
+        Some((total, left)) if left < total => internet.push(("Lease", format!("{} · {} left", duration(total), duration(left)))),
+        Some((total, _)) => internet.push(("Lease", duration(total))),
+        None => {}
+    }
+    internet.push(("Host name", link.hostname.clone().unwrap_or_else(|| "Not sent".to_string())));
+    sections.push(("INTERNET", internet));
+
+    let mut phone = Vec::new();
+    if let Some(mac) = link.mac {
+        phone.push(("Wi-Fi address", wifi::mac_text(&mac)));
+    }
+    if let Some(from) = link.from {
+        phone.push(("Address type", match from {
+            AddressFrom::Chip => "Built into the chip",
+            AddressFrom::Random => "Random each time Wi-Fi starts",
+            AddressFrom::Fixed => "Fixed, set over USB",
+        }.to_string()));
+    }
+    if let Some(radio) = &link.radio {
+        phone.push(("Radio", radio.clone()));
+    }
+    match (&link.firmware, &link.built) {
+        (Some(version), Some(date)) => phone.push(("Firmware", format!("{version} · {}", built(date)))),
+        (Some(version), None) => phone.push(("Firmware", version.clone())),
+        (None, Some(date)) => phone.push(("Firmware", built(date))),
+        (None, None) => {}
+    }
+    if !phone.is_empty() {
+        sections.push(("THIS PHONE", phone));
+    }
+    sections
+}
+
 fn details(c: &mut Canvas, f: &Fonts, v: &View, net: &Network) {
     back(c, f, v, "‹ Back");
     let title = f.bold(44.0);
     title.draw(c, &title.fit(&net.name(), W as i32 - 80), 40, 180, INK);
     let here = v.state.is_joined(net);
-    let line = f.medium(30.0);
-    let mut y = 270;
-    let mut row = |c: &mut Canvas, label: &str, value: &str| {
-        f.medium(24.0).draw(c, label, 44, y, MUTED);
-        line.draw(c, &line.fit(value, W as i32 - 300), 260, y, INK);
-        y += 64;
-    };
-    row(c, "Status", if here { "Connected" } else { "Not connected" });
-    row(c, "Security", match net.security {
-        Security::Wpa2 => "WPA2-Personal",
-        Security::Open => "None",
-        Security::Other => "Not supported",
-    });
-    let channel = if net.channel == 0 { "—".to_string() } else { format!("{} · {}", net.channel, net.band()) };
-    row(c, "Channel", &channel);
-    row(c, "Password", if v.is_saved(&net.ssid) { "Saved on this phone" } else { "Not saved" });
+    let (heading, label, value) = (f.medium(23.0), f.regular(24.0), f.medium(27.0));
+    let mut y = 212;
+    for (name, rows) in detail_sections(v, net) {
+        heading.draw(c, name, 48, y + 30, MUTED);
+        let card = Rect::new(40, y + 44, W as i32 - 40, y + 72 + rows.len() as i32 * DETAIL_ROW);
+        violet::paper::slab(c, card, 26.0, PANEL);
+        for (k, (name, text)) in rows.iter().enumerate() {
+            let base = card.y0 + 46 + k as i32 * DETAIL_ROW;
+            label.draw(c, name, 68, base, MUTED);
+            value.draw(c, &value.fit(text, card.x1 - 24 - 258), 258, base, INK);
+        }
+        y = card.y1 + 14;
+    }
     let busy = v.busy.is_some();
     if here {
         let bg = if v.pressed == Some(Hit::Disconnect) { ROW_PRESSED } else { PANEL };
@@ -304,5 +427,23 @@ fn details(c: &mut Canvas, f: &Fonts, v: &View, net: &Network) {
     if v.is_saved(&net.ssid) {
         let bg = if v.pressed == Some(Hit::Forget) { ROW_PRESSED } else { PANEL };
         violet::button(c, &f.bold(34.0), FORGET, "Forget network", bg, if busy { MUTED } else { ALERT });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn details_wording() {
+        assert_eq!(
+            [86400, 90000, 85000, 3600, 5400, 600, 45, 2 * 86400 + 59].map(duration),
+            ["1 day", "1 day 1 h", "23 h 36 min", "1 h", "1 h 30 min", "10 min", "45 s", "2 days"]
+        );
+        assert_eq!(prefix(Ipv4Addr::new(255, 255, 255, 0)), Some(24));
+        assert_eq!(prefix(Ipv4Addr::new(255, 255, 252, 0)), Some(22));
+        assert_eq!(prefix(Ipv4Addr::new(255, 0, 255, 0)), None);
+        assert_eq!(built("20210608152745"), "2021-06-08 15:27");
+        assert_eq!(built("Jun  8 2021"), "Jun  8 2021");
     }
 }

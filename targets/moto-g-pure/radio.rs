@@ -278,6 +278,11 @@ pub fn run() -> ! {
                     r
                 }
                 (GET, SCAN) => scan_entry(scan, m.value),
+                // Nothing to report while hosting Phone Internet: no network is joined.
+                (GET, LINK) => match joined.get() {
+                    Some(ap) => link_entry(unsafe { &*dev }, &ap, m.value),
+                    None => Message::error(OFFLINE),
+                },
                 _ => Message::error(BUSY),
             };
         }
@@ -900,6 +905,42 @@ fn scan_entry(scan: &passive_scan::Results, index: u32) -> Message {
             | if ap.wpa2_psk_ccmp { SCAN_WPA2 } else { 0 }
             | if ap.open { SCAN_OPEN } else { 0 };
         reply.put_text(&ap.ssid[..ap.ssid_len]);
+    }
+    reply
+}
+
+/// GET LINK: one record about the joined network (LINK_* in runtime/protocol.rs).
+fn link_entry(axi: &wlan_axi::Axi, ap: &passive_scan::AccessPoint, index: u32) -> Message {
+    let mut reply = Message::result(0);
+    match index {
+        LINK_STATION => {
+            reply.data[..6].copy_from_slice(&axi.station);
+            reply.data[6..12].copy_from_slice(&ap.bssid);
+            reply.data[12] = ap.channel;
+            reply.arg = match axi.station_from {
+                Some(wlan_axi::AddressFrom::Chip) => LINK_ADDRESS_CHIP,
+                Some(wlan_axi::AddressFrom::Random) => LINK_ADDRESS_RANDOM,
+                Some(wlan_axi::AddressFrom::Fixed) => LINK_ADDRESS_FIXED,
+                None => 0,
+            };
+        }
+        // No lease while the link is being rejoined.
+        LINK_IP if wpa::link_addresses(&mut reply.data) => {}
+        LINK_NAME => {
+            // The name wpa::join_ip gives DHCP: the one provisioned over USB, if any.
+            let options = Message::new(GET, 0x4061, 0).call(7);
+            let n = if options.op == OK { options.value.min(32) as usize } else { 0 };
+            reply.value = n as u32;
+            reply.put_text(&options.text()[6..6 + n]);
+        }
+        LINK_RADIO => reply.put_text(b"MediaTek MT6765"),
+        LINK_FIRMWARE if axi.firmware.is_some() => {
+            let firmware = axi.firmware.unwrap();
+            reply.value = firmware.version as u32;
+            reply.arg = firmware.build as u32;
+            reply.put_text(&firmware.date);
+        }
+        _ => return Message::error(OFFLINE),
     }
     reply
 }

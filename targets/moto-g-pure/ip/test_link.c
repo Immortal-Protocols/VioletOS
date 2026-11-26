@@ -110,7 +110,17 @@ int radio_l2_recv(unsigned char *out, size_t capacity) {
   return queue[i].len;
 }
 int station_net_join(const unsigned char *), station_net_uuid(unsigned char *);
+int station_net_info(unsigned char *);
 void station_net_close(void), station_net_hostname(const unsigned char *, unsigned);
+// What Settings is told about the lease (station_net_info) must be what the
+// test network above hands out; libslirp's leases last a day.
+static int lease_reported(void) {
+  static const unsigned char expected[32] = {
+      10, 0, 2, 15, 255, 255, 255, 0, 10, 0, 2, 2, 10, 0, 2, 3, 0, 0, 0, 0,
+      10, 0, 2, 2,  0x80, 0x51, 1, 0, 0x80, 0x51, 1, 0};
+  unsigned char info[32];
+  return station_net_info(info) && !memcmp(info, expected, sizeof info);
+}
 int main(void) {
   SlirpConfig conf = {
       .version = 6, .in_enabled = true, .disable_host_loopback = true};
@@ -129,10 +139,18 @@ int main(void) {
   if (!net)
     return 1;
   const unsigned char mac[] = {2, 0, 0, 0, 0, 1};
-  unsigned char id[37] = {0};
+  unsigned char id[37] = {0}, none[32];
+  if (station_net_info(none)) {
+    fputs("A lease was reported before joining\n", stderr);
+    return 6;
+  }
   if (!station_net_join(mac)) {
     fputs("DHCP failed\n", stderr);
     return 2;
+  }
+  if (!lease_reported()) {
+    fputs("The lease reported for Settings is not the one DHCP gave\n", stderr);
+    return 6;
   }
   if (!dhcp_messages || sent_name_len != -1) {
     fputs("DHCP sent a host name without one being set\n", stderr);
@@ -148,10 +166,14 @@ int main(void) {
     fputs("DHCP did not carry the host name\n", stderr);
     return 5;
   }
-  puts("Moto IP client acquired DHCP lease on test Ethernet, naming itself only when a host name is set");
+  puts("Moto IP client acquired DHCP lease on test Ethernet, naming itself only when a host name is set, and reported the lease");
   fflush(stdout);
   int ok = station_net_uuid(id);
   station_net_close();
+  if (station_net_info(none)) {
+    fputs("A lease was still reported after leaving\n", stderr);
+    return 6;
+  }
   slirp_cleanup(net);
   if (!ok) {
     fputs("UUID request failed\n", stderr);
