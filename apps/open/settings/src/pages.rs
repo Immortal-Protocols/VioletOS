@@ -194,7 +194,8 @@ pub struct Status {
 #[derive(Clone, Copy)]
 pub enum Nearby<'a> {
     Ask,
-    Scan { scan: &'a Scan, running: bool, seconds: u64 },
+    /// `scroll`: how far the device list is scrolled, in pixels.
+    Scan { scan: &'a Scan, running: bool, seconds: u64, scroll: i32 },
     Failed(&'a str),
 }
 
@@ -247,6 +248,13 @@ pub const CANCEL: Rect = Rect::new(40, 1440, W as i32 / 2 - 12, 1540);
 pub const PROCEED: Rect = Rect::new(W as i32 / 2 + 12, 1440, W as i32 - 40, 1540);
 /// Stop, or Done once the scan stopped.
 pub const STOP: Rect = Rect::new(40, 1440, W as i32 - 40, 1540);
+/// The devices heard: rows scroll inside this, between the scan card and Stop.
+pub const DEVICE_LIST: Rect = Rect::new(0, 396, W as i32, 1424);
+const DEVICE_ROW: i32 = 64;
+/// How far a list of `n` devices can scroll.
+pub fn devices_max_scroll(n: usize) -> i32 {
+    (n as i32 * DEVICE_ROW + 24 - DEVICE_LIST.height()).max(0)
+}
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -602,7 +610,7 @@ fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
             let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
             violet::button(c, &f.medium(32.0), STOP, "Done", bg, CREAM);
         }
-        Nearby::Scan { scan, running, seconds } => {
+        Nearby::Scan { scan, running, seconds, scroll } => {
             let card = Rect::new(40, 230, W as i32 - 40, 380);
             slab(c, card, 30.0, PAPER_RAISED);
             let (head, tint) = if !running { ("Stopped", CREAM) } else if scan.listening { ("Passive scan", VIOLET) } else { ("Starting…", CREAM) };
@@ -611,18 +619,27 @@ fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
             let line = format!("{n} device{} heard · {}:{:02}", if n == 1 { "" } else { "s" }, seconds / 60, seconds % 60);
             f.regular(26.0).draw(c, &line, 80, 344, MUTED);
             let (label, value) = (f.medium(28.0), f.regular(24.0));
-            const ROWS: usize = 15;
-            for (k, d) in scan.strongest().iter().take(ROWS).enumerate() {
-                let y = 440 + k as i32 * 64;
+            c.set_clip(DEVICE_LIST);
+            for (k, d) in scan.strongest().iter().enumerate() {
+                let y = DEVICE_LIST.y0 + 44 + k as i32 * DEVICE_ROW - scroll;
+                if y < DEVICE_LIST.y0 || y - DEVICE_ROW > DEVICE_LIST.y1 {
+                    continue;
+                }
                 let signal = if d.rssi == i8::MIN { "—".to_string() } else { format!("{} dBm", d.rssi) };
                 let detail = format!("{signal} · {}", if d.random { "Random" } else { "Public" });
                 let w = value.width(&detail);
                 value.draw(c, &detail, W as i32 - 44 - w, y, MUTED);
                 label.draw(c, &label.fit(&d.label(), W as i32 - 140 - w), 44, y, CREAM);
             }
-            if n > ROWS {
-                value.draw(c, &format!("and {} more", n - ROWS), 44, 440 + ROWS as i32 * 64, MUTED);
+            // A thin bar on the right while there is more than fits.
+            let most = devices_max_scroll(n);
+            if most > 0 {
+                let h = DEVICE_LIST.height();
+                let bar = (h * h / (h + most)).max(60);
+                let top = DEVICE_LIST.y0 + (h - bar) * scroll / most;
+                c.fill(Rect::new(W as i32 - 14, top, W as i32 - 8, top + bar), MUTED);
             }
+            c.reset_clip();
             let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
             violet::button(c, &f.medium(32.0), STOP, if running { "Stop" } else { "Done" }, bg, if running { ALERT } else { CREAM });
         }
