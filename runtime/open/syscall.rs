@@ -920,7 +920,7 @@ impl Runtime {
                 Kind::Mic { seen: super::device::mic::open() }
             }
             "/dev/violet/hci" => {
-                if !super::hci::open() {
+                if !super::hci::open(i) {
                     return Done(EBUSY);
                 }
                 Kind::Hci

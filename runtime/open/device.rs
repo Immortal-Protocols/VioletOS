@@ -437,7 +437,7 @@ impl Runtime {
         if let Some(i) = (0..MAX_APPS).find(|&i| self.apps[i].as_ref().map_or(false, |a| a.path == path)) {
             self.set_foreground(Some(i));
             self.refresh(i);
-            self.lifecycle(i, LIFECYCLE_FOCUS_GAINED);
+            self.focus_opened(i);
             return;
         }
         match self.launch(&path, &[], None) {
@@ -551,6 +551,16 @@ impl Runtime {
     /// voice agent), while it holds it.
     pub fn background_listener(&self) -> Option<usize> {
         (0..MAX_APPS).find(|&n| self.apps[n].as_ref().is_some_and(|a| a.path == super::appstore::INSTALLER) && self.holds_mic(n))
+    }
+    /// FOCUS_GAINED with code FOCUS_OPENED: Home, the app list or `open`
+    /// brought the app to the front, so it may start over.
+    fn focus_opened(&mut self, i: usize) {
+        self.lifecycle(i, LIFECYCLE_FOCUS_GAINED);
+        if let Some(e) = self.apps[i].as_mut().and_then(|a| a.events.back_mut()) {
+            if e.kind == EVENT_LIFECYCLE && e.value == LIFECYCLE_FOCUS_GAINED {
+                e.code = FOCUS_OPENED;
+            }
+        }
     }
     pub fn lifecycle(&mut self, i: usize, value: i32) {
         let now = sys::now_ns() / 1000;
@@ -1094,8 +1104,28 @@ impl Runtime {
                 self.shell.dirty = true;
                 String::from("ok\n")
             }
-            // Bluetooth: whether the controller is on, and whether an app has its HCI open.
-            Some("bluetooth") => alloc::format!("on={} open={}\n", super::hci::up() as u32, super::hci::is_open() as u32),
+            // Bluetooth: whether the controller is on; the app holding its HCI
+            // and what that app told it to do; Radio's state, last error and
+            // counters; and the controller's HCI version and maker.
+            Some("bluetooth") => {
+                use super::hci;
+                let app = hci::holder().and_then(|n| self.apps.get(n)?.as_ref()).map_or("-", |a| a.name.as_str());
+                let seen = hci::seen();
+                let bit = |b: u32| (seen & b != 0) as u32;
+                let [state, error, rx, tx, bad, dropped, v0, v1] = hci::telemetry();
+                let state = match state {
+                    1 => "starting",
+                    2 => "on",
+                    3 => "failed",
+                    _ => "off",
+                };
+                alloc::format!(
+                    "on={} open={} app={} advertising={} scanning={} active={} random_adv={} random_scan={} state={} error={:#x} rx={} tx={} bad={} dropped={} hci={} maker={}\n",
+                    hci::up() as u32, hci::is_open() as u32, app,
+                    bit(hci::ADVERTISING), bit(hci::SCANNING), bit(hci::ACTIVE_SCAN), bit(hci::RANDOM_ADV), bit(hci::RANDOM_SCAN),
+                    state, error, rx, tx, bad, dropped, v0 & 0xff, v1 & 0xffff,
+                )
+            }
             // Phone Internet (runtime/open/wifi.rs).
             Some("relay") => {
                 let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
@@ -1108,7 +1138,7 @@ impl Runtime {
                         if self.foreground != Some(n) {
                             self.set_foreground(Some(n));
                             self.refresh(n);
-                            self.lifecycle(n, LIFECYCLE_FOCUS_GAINED);
+                            self.focus_opened(n);
                         }
                         return String::from("ok\n");
                     }
