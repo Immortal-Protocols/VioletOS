@@ -3,7 +3,7 @@
 use violet::paper::{slab, ALERT, CREAM, GOOD, MUTED, PAPER, PAPER_PRESSED, PAPER_RAISED, VIOLET};
 use violet::{Canvas, Fonts, Rect, CITIES, HOME_BOX, W};
 
-use crate::nearby::Scan;
+use crate::nearby::{Device, Scan};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Section {
@@ -14,6 +14,8 @@ pub enum Section {
     BluetoothDetails,
     /// A passive scan of the devices nearby; reached from Details.
     BluetoothNearby,
+    /// One device the scan heard; reached by tapping it.
+    BluetoothDevice,
     PhoneLink,
     Time,
     AgentApps,
@@ -43,6 +45,8 @@ pub enum Hit {
     Cancel,
     Proceed,
     Stop,
+    /// A device in the scan's list, strongest first.
+    Device(usize),
     Relay,
     NewCode,
     City(usize),
@@ -194,8 +198,8 @@ pub struct Status {
 #[derive(Clone, Copy)]
 pub enum Nearby<'a> {
     Ask,
-    /// `scroll`: how far the device list is scrolled, in pixels.
-    Scan { scan: &'a Scan, running: bool, seconds: u64, scroll: i32 },
+    /// `scroll`: how far the device list is scrolled, in pixels; `device`: the one tapped.
+    Scan { scan: &'a Scan, running: bool, seconds: u64, scroll: i32, device: Option<&'a Device> },
     Failed(&'a str),
 }
 
@@ -269,6 +273,10 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
             Nearby::Ask if CANCEL.contains(x, y) => Some(Hit::Cancel),
             Nearby::Ask if PROCEED.contains(x, y) && can_scan(&v.status.bt).is_ok() => Some(Hit::Proceed),
             Nearby::Scan { .. } | Nearby::Failed(_) if STOP.contains(x, y) => Some(Hit::Stop),
+            Nearby::Scan { scan, scroll, .. } if DEVICE_LIST.contains(x, y) => {
+                let k = ((y - DEVICE_LIST.y0 + scroll) / DEVICE_ROW) as usize;
+                (k < scan.devices.len()).then_some(Hit::Device(k))
+            }
             _ => None,
         },
         Section::PhoneLink if relay_usable(v.status) => {
@@ -382,6 +390,7 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
         }
         Section::BluetoothDetails => bluetooth_details(c, f, v, &s.bt),
         Section::BluetoothNearby => bluetooth_nearby(c, f, v, &s.bt),
+        Section::BluetoothDevice => bluetooth_device(c, f, v),
         Section::PhoneLink => {
             header(c, f, v, "‹ Settings", "Phone Link");
             // Violet Shield.
@@ -503,6 +512,20 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
     }
 }
 
+/// A card of label-value rows under a small-caps title; returns its bottom.
+fn card(c: &mut Canvas, f: &Fonts, top: i32, title: &str, rows: &[(&str, String, violet::Color)]) -> i32 {
+    let (label, value) = (f.regular(26.0), f.medium(28.0));
+    let r = Rect::new(40, top, W as i32 - 40, top + 86 + rows.len() as i32 * 60);
+    slab(c, r, 30.0, PAPER_RAISED);
+    f.medium(23.0).draw(c, title, 80, top + 52, MUTED);
+    for (k, (name, text, ink)) in rows.iter().enumerate() {
+        let y = top + 112 + k as i32 * 60;
+        label.draw(c, name, 80, y, MUTED);
+        value.draw(c, &value.fit(text, r.x1 - 40 - 300), 300, y, *ink);
+    }
+    r.y1
+}
+
 /// Who can hear this phone, who it can hear, and the controller, from what
 /// the runtime saw the holding app tell it.
 fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
@@ -518,27 +541,15 @@ fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
     let app = if !bt.open { "No app" } else if bt.app.is_empty() { "An app" } else { &bt.app };
     let big = f.medium(34.0);
     big.draw(c, &big.fit(app, held.width() - 120), 80, 336, if bt.open { VIOLET } else { CREAM });
-    let (label, value) = (f.regular(26.0), f.medium(28.0));
-    let card = |c: &mut Canvas, top: i32, title: &str, rows: &[(&str, String, violet::Color)]| {
-        let r = Rect::new(40, top, W as i32 - 40, top + 86 + rows.len() as i32 * 60);
-        slab(c, r, 30.0, PAPER_RAISED);
-        f.medium(23.0).draw(c, title, 80, top + 52, MUTED);
-        for (k, (name, text, ink)) in rows.iter().enumerate() {
-            let y = top + 112 + k as i32 * 60;
-            label.draw(c, name, 80, y, MUTED);
-            value.draw(c, &value.fit(text, r.x1 - 40 - 300), 300, y, *ink);
-        }
-        r.y1
-    };
     let lit = |on: bool| if on { VIOLET } else { CREAM };
     // The Core Specification's names: a public or random device address.
     let address = |random: bool| if random { "Random" } else { "Public" };
-    let y = card(c, held.y1 + 24, "WHO CAN HEAR ME?", &[
+    let y = card(c, f, held.y1 + 24, "WHO CAN HEAR ME?", &[
         ("Advertising", if bt.advertising { "On".into() } else { "Off".into() }, lit(bt.advertising)),
         ("Address type", if bt.advertising { address(bt.random_adv).into() } else { "—".into() }, CREAM),
     ]);
     // A passive scan only listens; an active one sends scan requests from an address.
-    let y = card(c, y + 24, "WHO CAN I HEAR?", &[
+    let y = card(c, f, y + 24, "WHO CAN I HEAR?", &[
         ("Scanning", match (bt.scanning, bt.active) {
             (false, _) => "Off".into(),
             (true, false) => "Passive".into(),
@@ -553,7 +564,7 @@ fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
         _ => "Off · runs while Wi-Fi is on".into(),
     };
     let dash = |t: String| if bt.hci == 0 { "—".to_string() } else { t };
-    let y = card(c, y + 24, "CONTROLLER", &[
+    let y = card(c, f, y + 24, "CONTROLLER", &[
         ("State", state, if bt.state == "failed" { ALERT } else { lit(bt.state == "on") }),
         ("Manufacturer", dash(bt.manufacturer()), CREAM),
         ("HCI version", dash(match bt.version() { "" => format!("{:#x}", bt.hci), v => format!("Bluetooth {v}") }), CREAM),
@@ -610,7 +621,7 @@ fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
             let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
             violet::button(c, &f.medium(32.0), STOP, "Done", bg, CREAM);
         }
-        Nearby::Scan { scan, running, seconds, scroll } => {
+        Nearby::Scan { scan, running, seconds, scroll, .. } => {
             let card = Rect::new(40, 230, W as i32 - 40, 380);
             slab(c, card, 30.0, PAPER_RAISED);
             let (head, tint) = if !running { ("Stopped", CREAM) } else if scan.listening { ("Passive scan", VIOLET) } else { ("Starting…", CREAM) };
@@ -624,6 +635,9 @@ fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
                 let y = DEVICE_LIST.y0 + 44 + k as i32 * DEVICE_ROW - scroll;
                 if y < DEVICE_LIST.y0 || y - DEVICE_ROW > DEVICE_LIST.y1 {
                     continue;
+                }
+                if v.pressed == Some(Hit::Device(k)) {
+                    c.fill(Rect::new(0, y - 44, W as i32, y + 20), PAPER_PRESSED);
                 }
                 let signal = if d.rssi == i8::MIN { "—".to_string() } else { format!("{} dBm", d.rssi) };
                 let detail = format!("{signal} · {}", if d.random { "Random" } else { "Public" });
@@ -644,4 +658,35 @@ fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
             violet::button(c, &f.medium(32.0), STOP, if running { "Stop" } else { "Done" }, bg, if running { ALERT } else { CREAM });
         }
     }
+}
+
+/// One device from Scan nearby: everything its advertisements said.
+fn bluetooth_device(c: &mut Canvas, f: &Fonts, v: &View) {
+    header(c, f, v, "‹ Scan", "");
+    let Nearby::Scan { scan, device: Some(d), .. } = v.nearby else { return };
+    let title = f.regular(44.0);
+    title.draw(c, &title.fit(&d.label(), W as i32 - 80), 40, 180, CREAM);
+    let address = d.address.iter().rev().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+    let dbm = |r: i8| if r == i8::MIN { "—".to_string() } else { format!("{r} dBm") };
+    let ago = scan.elapsed().saturating_sub(d.last).as_secs();
+    let first = d.first.as_secs();
+    let y = card(c, f, 230, "DEVICE", &[
+        ("Name", if d.name.is_empty() { "Not advertised".into() } else { d.name.clone() }, CREAM),
+        ("Address", address, CREAM),
+        ("Address type", d.address_type().into(), CREAM),
+    ]);
+    let y = card(c, f, y + 24, "SIGNAL", &[
+        ("Strongest", dbm(d.rssi), VIOLET),
+        ("Latest", dbm(d.last_rssi), CREAM),
+        ("TX power", d.tx_power.map_or("Not advertised".into(), |p| format!("{p} dBm")), CREAM),
+        ("Reports", d.reports.to_string(), CREAM),
+    ]);
+    let y = card(c, f, y + 24, "ADVERTISING", &[
+        ("Type", d.advertising().into(), CREAM),
+        ("Manufacturer", d.manufacturer(), CREAM),
+        ("Services", d.service_list(), CREAM),
+        ("First heard", format!("{}:{:02} into the scan", first / 60, first % 60), CREAM),
+        ("Last heard", if ago == 0 { "Just now".into() } else { format!("{ago} s ago") }, CREAM),
+    ]);
+    paragraph(c, &f.regular(26.0), "Phones and many accessories change their random address every few minutes, so one device can appear more than once.", 44, y + 60, W as i32 - 88, MUTED);
 }

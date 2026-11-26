@@ -71,16 +71,22 @@ struct App {
     /// The device list's scroll, and while a finger drags it, where it started.
     scan_scroll: i32,
     drag: Option<(i32, i32)>,
+    /// The device shown on its own page: address and whether it is random.
+    device: Option<([u8; 6], bool)>,
 }
 
 impl App {
+    /// The scan running or last run, if any.
+    fn scan(&self) -> Option<&nearby::Scan> {
+        self.listener.as_ref().map(|l| &l.scan).or(self.scanned.as_ref())
+    }
+
     fn view(&self) -> pages::View<'_> {
         let nearby = if !self.scan_error.is_empty() {
             pages::Nearby::Failed(&self.scan_error)
-        } else if let Some(l) = &self.listener {
-            pages::Nearby::Scan { scan: &l.scan, running: true, seconds: self.scan_seconds, scroll: self.scan_scroll }
-        } else if let Some(scan) = &self.scanned {
-            pages::Nearby::Scan { scan, running: false, seconds: self.scan_seconds, scroll: self.scan_scroll }
+        } else if let Some(scan) = self.scan() {
+            let device = self.device.and_then(|(a, r)| scan.devices.iter().find(|d| d.address == a && d.random == r));
+            pages::Nearby::Scan { scan, running: self.listener.is_some(), seconds: self.scan_seconds, scroll: self.scan_scroll, device }
         } else {
             pages::Nearby::Ask
         };
@@ -113,7 +119,7 @@ impl App {
 
     fn go(&mut self, section: Section) {
         println!("settings: {:?}", section);
-        if section != Section::BluetoothNearby {
+        if !matches!(section, Section::BluetoothNearby | Section::BluetoothDevice) {
             self.stop_scan();
             self.scanned = None;
             self.scan_error.clear();
@@ -141,6 +147,13 @@ impl App {
             Hit::Back if self.section == Section::Menu => std::process::exit(0),
             Hit::Back if self.section == Section::BluetoothDetails => self.go(Section::Bluetooth),
             Hit::Back if self.section == Section::BluetoothNearby => self.go(Section::BluetoothDetails),
+            Hit::Back if self.section == Section::BluetoothDevice => self.go(Section::BluetoothNearby),
+            Hit::Device(k) => {
+                self.device = self.scan().and_then(|s| s.strongest().get(k).map(|d| (d.address, d.random)));
+                if self.device.is_some() {
+                    self.go(Section::BluetoothDevice);
+                }
+            }
             Hit::ScanNearby => self.go(Section::BluetoothNearby),
             Hit::Cancel => self.go(Section::BluetoothDetails),
             Hit::Proceed => match nearby::Listener::start() {
@@ -232,7 +245,7 @@ impl App {
             TOUCH_MOVE => {
                 // Scan nearby's device list scrolls under a drag.
                 if let (Section::BluetoothNearby, Some((x0, y0))) = (self.section, self.down) {
-                    let n = self.listener.as_ref().map(|l| &l.scan).or(self.scanned.as_ref()).map_or(0, |s| s.devices.len());
+                    let n = self.scan().map_or(0, |s| s.devices.len());
                     if pages::DEVICE_LIST.contains(x0, y0) && (self.drag.is_some() || (y - y0).abs() > 18) {
                         let (start, from) = *self.drag.get_or_insert((y0, self.scan_scroll));
                         self.scan_scroll = (from - (y - start)).clamp(0, pages::devices_max_scroll(n));
@@ -283,6 +296,7 @@ fn main() {
         scan_seconds: 0,
         scan_scroll: 0,
         drag: None,
+        device: None,
     };
     if saved.is_empty() {
         app.save_relay();
@@ -414,7 +428,8 @@ mod preview {
             scan.receive(&[4, 0x0e, 4, 1, p[1], p[2], 0]);
         }
         let mut ev = vec![0x02, 3];
-        ev.extend_from_slice(&[0, 1, 1, 2, 3, 4, 5, 0xc6, 13, 12, 0x09, b'G', b'r', b'e', b'g', b'g', b'\'', b's', b' ', b'M', b'a', b'c', (-48i8) as u8]);
+        ev.extend_from_slice(&[0, 1, 1, 2, 3, 4, 5, 0x46, 25, 12, 0x09, b'G', b'r', b'e', b'g', b'g', b'\'', b's', b' ', b'M', b'a', b'c',
+            3, 0x03, 0x0f, 0x18, 2, 0x0a, 8, 4, 0xff, 0x4c, 0x00, 0x10, (-48i8) as u8]);
         ev.extend_from_slice(&[0, 0, 9, 8, 7, 6, 5, 4, 0, (-71i8) as u8]);
         ev.extend_from_slice(&[3, 1, 6, 6, 6, 6, 6, 0x46, 0, (-88i8) as u8]);
         let mut p = vec![4, 0x3e, ev.len() as u8];
@@ -431,10 +446,12 @@ mod preview {
         for (name, status, nearby) in [
             ("nearby-ask", &idle, pages::Nearby::Ask),
             ("nearby-busy", &s, pages::Nearby::Ask),
-            ("nearby-scan", &idle, pages::Nearby::Scan { scan: &scan, running: true, seconds: 42, scroll: 0 }),
-            ("nearby-long", &idle, pages::Nearby::Scan { scan: &crowd, running: true, seconds: 95, scroll: 400 }),
+            ("nearby-scan", &idle, pages::Nearby::Scan { scan: &scan, running: true, seconds: 42, scroll: 0, device: None }),
+            ("nearby-long", &idle, pages::Nearby::Scan { scan: &crowd, running: true, seconds: 95, scroll: 400, device: None }),
+            ("nearby-device", &idle, pages::Nearby::Scan { scan: &scan, running: true, seconds: 42, scroll: 0, device: scan.strongest().first().copied() }),
         ] {
-            let v = pages::View { section: Section::BluetoothNearby, nearby, status, code: "", relay_on: false, pressed: None, confirm: None, note: "" };
+            let section = if name == "nearby-device" { Section::BluetoothDevice } else { Section::BluetoothNearby };
+            let v = pages::View { section, nearby, status, code: "", relay_on: false, pressed: None, confirm: None, note: "" };
             pages::draw(&mut c, &fonts, &v);
             write(&c, &dir, name);
         }

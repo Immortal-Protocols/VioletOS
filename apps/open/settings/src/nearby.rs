@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::{Duration, Instant};
 
 const O_NONBLOCK: i32 = 0o4000;
 
@@ -25,12 +26,98 @@ pub struct Device {
     pub random: bool,
     /// The Complete or Shortened Local Name it advertised, if any.
     pub name: String,
-    /// The strongest signal heard, in dBm.
+    /// The strongest signal heard, in dBm, and the latest.
     pub rssi: i8,
+    pub last_rssi: i8,
     pub reports: u32,
+    /// Since the scan started.
+    pub first: Duration,
+    pub last: Duration,
+    /// The last advertising event type: 0 ADV_IND, 1 ADV_DIRECT_IND,
+    /// 2 ADV_SCAN_IND, 3 ADV_NONCONN_IND, 4 SCAN_RSP.
+    pub kind: u8,
+    /// What its advertising data said, kept from the latest report that had it.
+    pub company: Option<u16>,
+    pub services: Vec<u16>,
+    /// 32- and 128-bit service UUIDs, counted only.
+    pub long_services: usize,
+    pub tx_power: Option<i8>,
+}
+
+/// Bluetooth SIG company identifiers this page names; others show as hex.
+fn company_name(id: u16) -> Option<&'static str> {
+    Some(match id {
+        0x0002 => "Intel",
+        0x0006 => "Microsoft",
+        0x000f => "Broadcom",
+        0x001d => "Qualcomm",
+        0x0046 => "MediaTek",
+        0x004c => "Apple",
+        0x0059 => "Nordic Semiconductor",
+        0x0075 => "Samsung",
+        0x0087 => "Garmin",
+        0x00e0 => "Google",
+        _ => return None,
+    })
+}
+
+/// Assigned 16-bit service UUIDs this page names.
+fn service_name(uuid: u16) -> Option<&'static str> {
+    Some(match uuid {
+        0x180a => "Device Information",
+        0x180d => "Heart Rate",
+        0x180f => "Battery",
+        0x1812 => "HID",
+        0x181a => "Environmental Sensing",
+        0xfd6f => "Exposure Notification",
+        0xfeaa => "Eddystone",
+        _ => return None,
+    })
 }
 
 impl Device {
+    /// The Core Specification's address types; a random address's top two bits say which kind.
+    pub fn address_type(&self) -> &'static str {
+        if !self.random {
+            return "Public";
+        }
+        match self.address[5] >> 6 {
+            3 => "Random static",
+            1 => "Resolvable private",
+            0 => "Non-resolvable private",
+            _ => "Random",
+        }
+    }
+
+    /// How it advertises, from the advertising event type.
+    pub fn advertising(&self) -> &'static str {
+        match self.kind {
+            0 => "Connectable",
+            1 => "Connectable, directed",
+            2 => "Scannable, not connectable",
+            3 => "Not connectable",
+            _ => "Scan response",
+        }
+    }
+
+    pub fn manufacturer(&self) -> String {
+        match self.company {
+            None => "Not advertised".into(),
+            Some(id) => match company_name(id) {
+                Some(name) => format!("{name} ({id:#06x})"),
+                None => format!("{id:#06x}"),
+            },
+        }
+    }
+
+    pub fn service_list(&self) -> String {
+        let mut names: Vec<String> = self.services.iter().map(|&u| service_name(u).map_or(format!("{u:#06x}"), String::from)).collect();
+        if self.long_services > 0 {
+            names.push(format!("{} custom", self.long_services));
+        }
+        if names.is_empty() { "None advertised".into() } else { names.join(", ") }
+    }
+
     /// The name, or the address as Bluetooth writes it (most significant byte first).
     pub fn label(&self) -> String {
         if !self.name.is_empty() {
@@ -41,8 +128,8 @@ impl Device {
 }
 
 /// The scan's HCI host: the commands to send and what the events said.
-#[derive(Default)]
 pub struct Scan {
+    started: Instant,
     out: VecDeque<Vec<u8>>,
     commands: VecDeque<(u16, Vec<u8>)>,
     pending: Option<u16>,
@@ -60,25 +147,56 @@ fn command(op: u16, params: &[u8]) -> Vec<u8> {
     p
 }
 
-/// The Local Name in advertising data (AD types 0x09, then 0x08).
-fn local_name(mut data: &[u8]) -> String {
+/// What one advertisement's data says (Core Specification Supplement, Part A).
+#[derive(Default)]
+struct Advert {
+    name: String,
+    company: Option<u16>,
+    services: Vec<u16>,
+    long_services: usize,
+    tx_power: Option<i8>,
+}
+
+fn advert(mut data: &[u8]) -> Advert {
+    let mut a = Advert::default();
     let mut short = String::new();
     while data.len() >= 2 {
         let n = data[0] as usize;
         let Some(field) = data.get(1..1 + n) else { break };
-        match field.first() {
-            Some(0x09) => return String::from_utf8_lossy(&field[1..]).into_owned(),
-            Some(0x08) => short = String::from_utf8_lossy(&field[1..]).into_owned(),
-            _ => {}
+        if let Some((&kind, v)) = field.split_first() {
+            match kind {
+                // Incomplete and complete lists of 16-bit service UUIDs, and service data.
+                0x02 | 0x03 => a.services.extend(v.chunks_exact(2).map(|u| u16::from_le_bytes([u[0], u[1]]))),
+                0x16 if v.len() >= 2 => a.services.push(u16::from_le_bytes([v[0], v[1]])),
+                0x04 | 0x05 => a.long_services += v.len() / 4,
+                0x06 | 0x07 => a.long_services += v.len() / 16,
+                0x08 => short = String::from_utf8_lossy(v).into_owned(),
+                0x09 => a.name = String::from_utf8_lossy(v).into_owned(),
+                0x0a if v.len() == 1 => a.tx_power = Some(v[0] as i8),
+                0xff if v.len() >= 2 => a.company = Some(u16::from_le_bytes([v[0], v[1]])),
+                _ => {}
+            }
         }
         data = &data[1 + n..];
     }
-    short
+    if a.name.is_empty() {
+        a.name = short;
+    }
+    a.services.dedup();
+    a
 }
 
 impl Scan {
     pub fn new() -> Scan {
-        let mut s = Scan::default();
+        let mut s = Scan {
+            started: Instant::now(),
+            out: VecDeque::new(),
+            commands: VecDeque::new(),
+            pending: None,
+            listening: false,
+            failure: None,
+            devices: Vec::new(),
+        };
         s.queue(RESET, &[]);
         // The default events (bits 0-44) and LE Meta (bit 61).
         s.queue(SET_EVENT_MASK, &[0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0, 0x20]);
@@ -143,7 +261,7 @@ impl Scan {
                     let n = r[8] as usize;
                     let Some(data) = p.get(at + 9..at + 9 + n) else { break };
                     let Some(&rssi) = p.get(at + 9 + n) else { break };
-                    self.heard(r[2..8].try_into().unwrap(), r[1] & 1 == 1, data, rssi as i8);
+                    self.heard(r[0], r[2..8].try_into().unwrap(), r[1] & 1 == 1, data, rssi as i8);
                     at += 10 + n;
                 }
             }
@@ -151,20 +269,47 @@ impl Scan {
         }
     }
 
-    fn heard(&mut self, address: [u8; 6], random: bool, data: &[u8], rssi: i8) {
+    fn heard(&mut self, kind: u8, address: [u8; 6], random: bool, data: &[u8], rssi: i8) {
         // 127 means the controller couldn't measure it.
         let rssi = if rssi == 127 { i8::MIN } else { rssi };
-        let name = local_name(data);
-        match self.devices.iter_mut().find(|d| d.address == address && d.random == random) {
-            Some(d) => {
-                d.reports += 1;
-                d.rssi = d.rssi.max(rssi);
-                if d.name.is_empty() {
-                    d.name = name;
-                }
+        let now = self.started.elapsed();
+        let a = advert(data);
+        let d = match self.devices.iter().position(|d| d.address == address && d.random == random) {
+            Some(i) => &mut self.devices[i],
+            None => {
+                self.devices.push(Device {
+                    address, random, name: String::new(), rssi, last_rssi: rssi, reports: 0, first: now, last: now,
+                    kind, company: None, services: Vec::new(), long_services: 0, tx_power: None,
+                });
+                self.devices.last_mut().unwrap()
             }
-            None => self.devices.push(Device { address, random, name, rssi, reports: 1 }),
+        };
+        d.reports += 1;
+        d.rssi = d.rssi.max(rssi);
+        d.last_rssi = rssi;
+        d.last = now;
+        // A scan response says nothing about how the device advertises.
+        if kind != 4 {
+            d.kind = kind;
         }
+        if !a.name.is_empty() {
+            d.name = a.name;
+        }
+        if a.company.is_some() {
+            d.company = a.company;
+        }
+        if !a.services.is_empty() || a.long_services > 0 {
+            d.services = a.services;
+            d.long_services = a.long_services;
+        }
+        if a.tx_power.is_some() {
+            d.tx_power = a.tx_power;
+        }
+    }
+
+    /// How long the scan has run.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// The devices, strongest signal first.
@@ -265,6 +410,16 @@ mod tests {
         let d = s.strongest();
         assert_eq!((d[0].label().as_str(), d[0].random, d[0].reports), ("Phone", true, 2));
         assert_eq!((d[1].label().as_str(), d[1].random), ("09:09:09:09:09:09", false));
+    }
+
+    #[test]
+    fn advertising_data() {
+        // Flags, a 16-bit service list (Battery, Heart Rate), TX power 4 dBm, Apple manufacturer data.
+        let data = [2, 0x01, 0x06, 5, 0x03, 0x0f, 0x18, 0x0d, 0x18, 2, 0x0a, 4, 5, 0xff, 0x4c, 0x00, 0x10, 0x05];
+        let a = advert(&data);
+        assert_eq!((a.services, a.tx_power, a.company), (vec![0x180f, 0x180d], Some(4), Some(0x004c)));
+        // A truncated field stops the parse without panicking.
+        assert!(advert(&[9, 0x09, b'x']).name.is_empty());
     }
 
     #[test]
