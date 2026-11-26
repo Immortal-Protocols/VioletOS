@@ -26,12 +26,11 @@ fn new_code() -> String {
 
 fn status() -> Status {
     let sh = violet::fields(&violet::sys("shield"));
-    let bt = violet::fields(&violet::sys("bluetooth"));
+    let bt = violet::sys("bluetooth");
     let st = violet::fields(&violet::sys("status"));
     Status {
         wifi: wifi::App::summary(),
-        bt_on: bt.get("on").is_some_and(|v| v == "1"),
-        bt_open: bt.get("open").is_some_and(|v| v == "1"),
+        bt: pages::Bluetooth::parse(&bt, &std::fs::read_to_string("/apps/.home").unwrap_or_default()),
         shield_known: sh.contains_key("linked"),
         shield_linked: sh.get("linked").is_some_and(|v| v == "1"),
         shield_rules: sh.get("rules").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -107,7 +106,9 @@ impl App {
             // Saved settings and Phone Internet are managed by the runtime.
             // Release this screen's memory when the user returns to Home.
             Hit::Back if self.section == Section::Menu => std::process::exit(0),
+            Hit::Back if self.section == Section::BluetoothDetails => self.go(Section::Bluetooth),
             Hit::Back => self.go(Section::Menu),
+            Hit::Details => self.go(Section::BluetoothDetails),
             Hit::Row(i) => self.go(MENU[i].0),
             Hit::Relay => {
                 let answer = if self.relay_on { violet::sys("relay off") } else { violet::sys(&format!("relay on {}", self.code)) };
@@ -254,7 +255,7 @@ fn main() {
         }
         if app.section == Section::Wifi {
             dirty |= app.wifi.tick(&mut wifi_poll);
-        } else if last_poll.elapsed() >= Duration::from_secs(if app.section == Section::PhoneLink { 1 } else { 3 }) {
+        } else if last_poll.elapsed() >= Duration::from_secs(if matches!(app.section, Section::PhoneLink | Section::BluetoothDetails) { 1 } else { 3 }) {
             last_poll = Instant::now();
             let before = app.status.clone();
             app.refresh();
@@ -269,10 +270,30 @@ mod preview {
 
     fn status() -> Status {
         Status {
-            wifi: "LouieDog".into(), bt_on: true, bt_open: false, shield_known: true, shield_linked: true, shield_rules: 3,
+            wifi: "LouieDog".into(), bt: bitchat(), shield_known: true, shield_linked: true, shield_rules: 3,
             frozen: vec![], relay: "off".into(), relay_failure: 0, battery: 82, volume: 8, city: 1,
             installed: pages::parse_installed("scorekeeper\t412345\tScorekeeper\ntips\t300000\tTip Calculator\n"),
         }
+    }
+
+    /// Bluetooth while Bitchat holds it, as the runtime reports it.
+    fn bitchat() -> pages::Bluetooth {
+        pages::Bluetooth::parse(
+            "on=1 open=1 app=bitchat advertising=1 scanning=1 active=0 random_adv=1 random_scan=1 state=on error=0x0 rx=1204 tx=980 bad=0 dropped=0 hci=11 maker=70",
+            "ladybird\tLadybird Browser\nbitchat\tBitchat\n",
+        )
+    }
+
+    #[test]
+    fn bluetooth_fields() {
+        let b = bitchat();
+        assert_eq!(b.app, "Bitchat");
+        assert!(b.advertising && b.scanning && !b.active && b.random_adv);
+        assert_eq!((b.rx, b.hci, b.maker), (1204, 11, 70));
+        let idle = pages::Bluetooth::parse("on=1 open=0 app=- state=failed error=0x140", "");
+        assert_eq!((idle.app.as_str(), idle.error, idle.state.as_str()), ("", 0x140, "failed"));
+        // The old answer still parses.
+        assert!(pages::Bluetooth::parse("on=1 open=0", "").on);
     }
 
     #[test]
@@ -290,7 +311,8 @@ mod preview {
         let fonts = Fonts::load();
         let s = status();
         let mut c = Canvas::new(violet::W, violet::H);
-        for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth), ("phone", Section::PhoneLink),
+        for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth),
+                                ("bluetooth-details", Section::BluetoothDetails), ("phone", Section::PhoneLink),
                                 ("time", Section::Time), ("apps", Section::AgentApps), ("about", Section::About)] {
             let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
             pages::draw(&mut c, &fonts, &v);

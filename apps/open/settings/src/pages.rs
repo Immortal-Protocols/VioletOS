@@ -8,6 +8,8 @@ pub enum Section {
     Menu,
     Wifi,
     Bluetooth,
+    /// What the radio is doing and who made it so; reached from Bluetooth.
+    BluetoothDetails,
     PhoneLink,
     Time,
     AgentApps,
@@ -29,6 +31,7 @@ pub const MENU: [(Section, &str); 6] = [
 pub enum Hit {
     Back,
     Row(usize),
+    Details,
     Relay,
     NewCode,
     City(usize),
@@ -59,11 +62,107 @@ pub fn parse_installed(text: &str) -> Vec<Installed> {
         .collect()
 }
 
+/// Bluetooth as the Open Runtime saw it ("bluetooth" in /dev/violet/sys): the
+/// commands the holding app sent, not what the app says about itself.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Bluetooth {
+    pub on: bool,
+    pub open: bool,
+    /// The title of the app holding the controller, empty when none does.
+    pub app: String,
+    pub advertising: bool,
+    pub scanning: bool,
+    /// The scan asks devices nearby for more, which transmits.
+    pub active: bool,
+    pub random_adv: bool,
+    pub random_scan: bool,
+    /// "off", "starting", "on" or "failed".
+    pub state: String,
+    pub error: u32,
+    pub rx: u32,
+    pub tx: u32,
+    pub bad: u32,
+    pub dropped: u32,
+    /// The controller's HCI version code and Bluetooth SIG company id; 0 before it answered.
+    pub hci: u32,
+    pub maker: u32,
+}
+
+impl Bluetooth {
+    /// From the runtime's answer, with titles from /apps/.home ("name<TAB>title" lines).
+    pub fn parse(answer: &str, titles: &str) -> Self {
+        let f = violet::fields(answer);
+        let flag = |k: &str| f.get(k).is_some_and(|v| v == "1");
+        let num = |k: &str| {
+            let v = f.get(k).map_or("", |v| v.as_str());
+            match v.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16).unwrap_or(0),
+                None => v.parse().unwrap_or(0),
+            }
+        };
+        let name = f.get("app").filter(|a| *a != "-").cloned().unwrap_or_default();
+        let app = titles.lines().filter_map(|l| l.split_once('\t')).find(|(n, _)| *n == name).map_or(name.clone(), |(_, t)| t.to_string());
+        Bluetooth {
+            on: flag("on"),
+            open: flag("open"),
+            app,
+            advertising: flag("advertising"),
+            scanning: flag("scanning"),
+            active: flag("active"),
+            random_adv: flag("random_adv"),
+            random_scan: flag("random_scan"),
+            state: f.get("state").cloned().unwrap_or_else(|| "off".into()),
+            error: num("error"),
+            rx: num("rx"),
+            tx: num("tx"),
+            bad: num("bad"),
+            dropped: num("dropped"),
+            hci: num("hci"),
+            maker: num("maker"),
+        }
+    }
+
+    /// Who is using it, for the line under the title.
+    fn holder(&self) -> String {
+        match (self.open, self.app.is_empty()) {
+            (false, _) => "No app is using it".into(),
+            (true, true) => "In use by an app".into(),
+            (true, false) => format!("In use by {}", self.app),
+        }
+    }
+
+    /// The Bluetooth version the controller's HCI speaks, as people know it.
+    fn version(&self) -> &'static str {
+        match self.hci {
+            6 => "4.0",
+            7 => "4.1",
+            8 => "4.2",
+            9 => "5.0",
+            10 => "5.1",
+            11 => "5.2",
+            12 => "5.3",
+            13 => "5.4",
+            _ => "",
+        }
+    }
+
+    /// The Bluetooth SIG company name for the controller's maker.
+    fn manufacturer(&self) -> String {
+        match self.maker {
+            2 => "Intel".into(),
+            15 => "Broadcom".into(),
+            29 => "Qualcomm".into(),
+            70 => "MediaTek".into(),
+            93 => "Realtek".into(),
+            n => format!("Company {n}"),
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq)]
 pub struct Status {
     pub wifi: String,
-    pub bt_on: bool,
-    pub bt_open: bool,
+    pub bt: Bluetooth,
     pub shield_known: bool,
     pub shield_linked: bool,
     pub shield_rules: u32,
@@ -118,6 +217,7 @@ pub fn delete_rect(i: usize) -> Rect {
     Rect::new(r.x1 - 196, r.y0 + 20, r.x1 - 20, r.y1 - 20)
 }
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
+pub const BT_DETAILS: Rect = Rect::new(40, 700, W as i32 - 40, 800);
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -125,6 +225,7 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     }
     match v.section {
         Section::Menu => (0..MENU.len()).find(|&i| menu_rect(i).contains(x, y)).map(Hit::Row),
+        Section::Bluetooth if BT_DETAILS.contains(x, y) => Some(Hit::Details),
         Section::PhoneLink if relay_usable(v.status) => {
             if RELAY_BUTTON.contains(x, y) {
                 Some(Hit::Relay)
@@ -184,7 +285,7 @@ fn paragraph(c: &mut Canvas, f: &violet::Face, text: &str, x: i32, mut y: i32, w
 pub fn menu_value(s: &Status, section: Section) -> (String, bool) {
     match section {
         Section::Wifi => (s.wifi.clone(), s.wifi != "Not connected"),
-        Section::Bluetooth => ((if s.bt_on { "On" } else { "Off" }).into(), s.bt_on),
+        Section::Bluetooth => ((if s.bt.on { "On" } else { "Off" }).into(), s.bt.on),
         Section::PhoneLink => {
             let shield = if !s.shield_known { "" } else if s.shield_linked { "Shield linked" } else { "Shield waiting" };
             let relay = match s.relay.as_str() {
@@ -227,11 +328,14 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             header(c, f, v, "‹ Settings", "Bluetooth");
             let card = Rect::new(40, 230, W as i32 - 40, 390);
             slab(c, card, 30.0, PAPER_RAISED);
-            f.medium(36.0).draw(c, if s.bt_on { "On" } else { "Off" }, 80, 300, if s.bt_on { VIOLET } else { CREAM });
-            let line = if s.bt_open { "In use by Bitchat" } else if s.bt_on { "Ready for nearby chat" } else { "The radio is not running" };
-            f.regular(27.0).draw(c, line, 80, 346, MUTED);
+            f.medium(36.0).draw(c, if s.bt.on { "On" } else { "Off" }, 80, 300, if s.bt.on { VIOLET } else { CREAM });
+            let line = if s.bt.open { s.bt.holder() } else if s.bt.on { "Ready for nearby chat".into() } else { "The radio is not running".into() };
+            f.regular(27.0).draw(c, &line, 80, 346, MUTED);
             paragraph(c, &f.regular(28.0), "Bluetooth shares the phone's connectivity chip with Wi-Fi, so it runs while Wi-Fi is on. Bitchat uses it to chat with phones nearby, with no internet needed.", 44, 460, W as i32 - 88, MUTED);
+            let bg = if v.pressed == Some(Hit::Details) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), BT_DETAILS, "Details", bg, CREAM);
         }
+        Section::BluetoothDetails => bluetooth_details(c, f, v, &s.bt),
         Section::PhoneLink => {
             header(c, f, v, "‹ Settings", "Phone Link");
             // Violet Shield.
@@ -351,4 +455,54 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             }
         }
     }
+}
+
+/// Who can hear this phone, who it can hear, and the controller, from what
+/// the runtime saw the holding app tell it.
+fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
+    header(c, f, v, "‹ Bluetooth", "Details");
+    f.regular(26.0).draw(c, &bt.holder(), 44, 228, MUTED);
+    let (label, value) = (f.regular(26.0), f.medium(28.0));
+    let card = |c: &mut Canvas, top: i32, title: &str, rows: &[(&str, String, violet::Color)]| {
+        let r = Rect::new(40, top, W as i32 - 40, top + 86 + rows.len() as i32 * 60);
+        slab(c, r, 30.0, PAPER_RAISED);
+        f.medium(23.0).draw(c, title, 80, top + 52, MUTED);
+        for (k, (name, text, ink)) in rows.iter().enumerate() {
+            let y = top + 112 + k as i32 * 60;
+            label.draw(c, name, 80, y, MUTED);
+            value.draw(c, &value.fit(text, r.x1 - 40 - 300), 300, y, *ink);
+        }
+        r.y1
+    };
+    let lit = |on: bool| if on { VIOLET } else { CREAM };
+    // The Core Specification's names: a public or random device address.
+    let address = |random: bool| if random { "Random" } else { "Public" };
+    let y = card(c, 260, "WHO CAN HEAR ME?", &[
+        ("Advertising", if bt.advertising { "On".into() } else { "Off".into() }, lit(bt.advertising)),
+        ("Address type", if bt.advertising { address(bt.random_adv).into() } else { "—".into() }, CREAM),
+    ]);
+    // A passive scan only listens; an active one sends scan requests from an address.
+    let y = card(c, y + 24, "WHO CAN I HEAR?", &[
+        ("Scanning", match (bt.scanning, bt.active) {
+            (false, _) => "Off".into(),
+            (true, false) => "Passive".into(),
+            (true, true) => "Active · sends scan requests".into(),
+        }, lit(bt.scanning)),
+        ("Address type", if bt.scanning && bt.active { address(bt.random_scan).into() } else if bt.scanning { "None sent".into() } else { "—".into() }, CREAM),
+    ]);
+    let state = match bt.state.as_str() {
+        "on" => "On".to_string(),
+        "starting" => "Starting…".into(),
+        "failed" => format!("Failed ({:#x})", bt.error),
+        _ => "Off · runs while Wi-Fi is on".into(),
+    };
+    let dash = |t: String| if bt.hci == 0 { "—".to_string() } else { t };
+    let y = card(c, y + 24, "CONTROLLER", &[
+        ("State", state, if bt.state == "failed" { ALERT } else { lit(bt.state == "on") }),
+        ("Manufacturer", dash(bt.manufacturer()), CREAM),
+        ("HCI version", dash(match bt.version() { "" => format!("{:#x}", bt.hci), v => format!("Bluetooth {v}") }), CREAM),
+        ("Frames", format!("{} received · {} sent", bt.rx, bt.tx), CREAM),
+        ("Errors", format!("{} rejected · {} dropped", bt.bad, bt.dropped), if bt.bad != 0 || bt.dropped != 0 { ALERT } else { CREAM }),
+    ]);
+    paragraph(c, &f.regular(26.0), "VioletOS never makes this phone visible by itself. Only an app that opens Bluetooth can, and it shows here. When the app closes, the radio stops.", 44, y + 60, W as i32 - 88, MUTED);
 }

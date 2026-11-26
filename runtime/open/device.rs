@@ -1094,8 +1094,28 @@ impl Runtime {
                 self.shell.dirty = true;
                 String::from("ok\n")
             }
-            // Bluetooth: whether the controller is on, and whether an app has its HCI open.
-            Some("bluetooth") => alloc::format!("on={} open={}\n", super::hci::up() as u32, super::hci::is_open() as u32),
+            // Bluetooth: whether the controller is on; the app holding its HCI
+            // and what that app told it to do; Radio's state, last error and
+            // counters; and the controller's HCI version and maker.
+            Some("bluetooth") => {
+                use super::hci;
+                let app = hci::holder().and_then(|n| self.apps.get(n)?.as_ref()).map_or("-", |a| a.name.as_str());
+                let seen = hci::seen();
+                let bit = |b: u32| (seen & b != 0) as u32;
+                let [state, error, rx, tx, bad, dropped, v0, v1] = hci::telemetry();
+                let state = match state {
+                    1 => "starting",
+                    2 => "on",
+                    3 => "failed",
+                    _ => "off",
+                };
+                alloc::format!(
+                    "on={} open={} app={} advertising={} scanning={} active={} random_adv={} random_scan={} state={} error={:#x} rx={} tx={} bad={} dropped={} hci={} maker={}\n",
+                    hci::up() as u32, hci::is_open() as u32, app,
+                    bit(hci::ADVERTISING), bit(hci::SCANNING), bit(hci::ACTIVE_SCAN), bit(hci::RANDOM_ADV), bit(hci::RANDOM_SCAN),
+                    state, error, rx, tx, bad, dropped, v0 & 0xff, v1 & 0xffff,
+                )
+            }
             // Phone Internet (runtime/open/wifi.rs).
             Some("relay") => {
                 let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());

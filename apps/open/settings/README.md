@@ -3,7 +3,7 @@
 One app for the phone's settings, opened from its icon on Home:
 
 - **Wi-Fi** (below).
-- **Bluetooth**: whether the controller is on, and whether Bitchat is using it.
+- **Bluetooth**: whether the controller is on and which app is using it. **Details** answers *Who can hear me?* (advertising, and whether it uses a public or random address) and *Who can I hear?* (scanning: off, passive or active), then the controller: state, manufacturer, HCI version, frames and errors. These come from the commands the Open Runtime saw the app send, not from the app.
 - **Phone Link**: Violet Shield's link to your iPhone, and Phone Internet: a pairing code to type into Violet Relay, **Turn on**/**Turn off** and **New code**. The choice and code are kept in `/data/relay`, and the Open Runtime turns Phone Internet back on after a restart.
 - **Date & Time**: the city whose date Home shows (the shared setting `time.city`).
 - **Agent Apps**: every app Violet Agent installed, with its size; **Delete** (tap twice to confirm) removes one, **Delete all** removes them all.
