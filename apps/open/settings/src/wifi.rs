@@ -75,6 +75,19 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
+/// Put the joined network first in the list, leaving the others as the scan
+/// found them. True when that moved it.
+fn joined_first(nets: &mut Vec<Network>, state: &wifi::State) -> bool {
+    match nets.iter().position(|n| state.is_joined(n)) {
+        Some(at) if at > 0 => {
+            let joined = nets.remove(at);
+            nets.insert(0, joined);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A join this app asked for.
 struct Joining {
     net: Network,
@@ -116,7 +129,7 @@ pub struct App {
 
 impl App {
     pub fn new() -> App {
-        let app = App {
+        let mut app = App {
             exit: false,
             page: Page::List,
             nets: wifi::networks(),
@@ -134,6 +147,7 @@ impl App {
             held_back: None,
             started: Instant::now(),
         };
+        joined_first(&mut app.nets, &app.state);
         println!("wifi: ready, {} saved networks", app.saved.0.len());
         app
     }
@@ -346,6 +360,12 @@ impl App {
             }
             changed = true;
         }
+        // The connected network leads the list, in view, whatever was scrolled to.
+        if joined_first(&mut self.nets, &self.state) {
+            self.scroll = 0;
+            self.pressed = None;
+            changed = true;
+        }
         changed
     }
 
@@ -534,6 +554,31 @@ mod preview {
         ));
         let emulator = wifi::Link::parse(&format!("mac=525400560001 from=chip ip=10.0.2.15 router=10.0.2.2 radio={}", hex("QEMU virtio-net")));
         (handset.unwrap(), emulator.unwrap())
+    }
+
+    #[test]
+    fn the_joined_network_leads_the_list() {
+        let scan = || vec![net(7, "LouieDog", 6, Security::Wpa2), net(8, "Cafe", 1, Security::Open), net(9, "NETGEAR-5G", 149, Security::Wpa2), net(10, "Office", 36, Security::Other)];
+        let names = |nets: &[Network]| nets.iter().map(Network::name).collect::<Vec<_>>();
+        // Joined by its ID: it moves up and the others keep the scan's order.
+        let mut nets = scan();
+        assert!(joined_first(&mut nets, &wifi::State { connected: 9, ..Default::default() }));
+        assert_eq!(names(&nets), ["NETGEAR-5G", "LouieDog", "Cafe", "Office"]);
+        // Joined through another access point with the same name (its ID is not in the list).
+        let mut nets = scan();
+        assert!(joined_first(&mut nets, &wifi::State { connected: 77, ssid: b"Office".to_vec(), ..Default::default() }));
+        assert_eq!(names(&nets), ["Office", "LouieDog", "Cafe", "NETGEAR-5G"]);
+        // Already first, nothing joined, or hosting Phone Internet: the scan's order stays.
+        for state in [
+            wifi::State { connected: 7, ..Default::default() },
+            wifi::State::default(),
+            wifi::State { connected: 0x5245_4c59, hosting: true, ..Default::default() },
+            wifi::State { connected: 5, ssid: b"Elsewhere".to_vec(), ..Default::default() },
+        ] {
+            let mut nets = scan();
+            assert!(!joined_first(&mut nets, &state));
+            assert_eq!(names(&nets), ["LouieDog", "Cafe", "NETGEAR-5G", "Office"]);
+        }
     }
 
     #[test]

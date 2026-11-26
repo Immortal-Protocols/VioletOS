@@ -13,7 +13,7 @@ One app for the phone's settings, opened from its icon on Home:
 
 ## Wi-Fi
 
-Settings › Wi-Fi scans when it starts and lists the networks it found, one row per name, with a lock on WPA2 networks. Tap a network to join it:
+Settings › Wi-Fi scans when it starts and lists the networks it found, one row per name, the connected one first, with a lock on WPA2 networks. Tap a network to join it:
 
 - **WPA2-Personal**: type the password on the on-screen keyboard (letters, **123** and **#+=** cover every printable character; **Show** reveals it) and tap **Connect**. A wrong password is reported under the field.
 - **Open** networks join with one tap. (On the handset this is new and not yet checked against a real router.)
