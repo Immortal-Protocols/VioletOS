@@ -461,7 +461,12 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
 /// the runtime saw the holding app tell it.
 fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
     header(c, f, v, "‹ Bluetooth", "Details");
-    f.regular(26.0).draw(c, &bt.holder(), 44, 228, MUTED);
+    let held = Rect::new(40, 230, W as i32 - 40, 370);
+    slab(c, held, 30.0, PAPER_RAISED);
+    f.medium(23.0).draw(c, "IN USE BY", 80, 282, MUTED);
+    let app = if !bt.open { "No app" } else if bt.app.is_empty() { "An app" } else { &bt.app };
+    let big = f.medium(34.0);
+    big.draw(c, &big.fit(app, held.width() - 80), 80, 336, if bt.open { VIOLET } else { CREAM });
     let (label, value) = (f.regular(26.0), f.medium(28.0));
     let card = |c: &mut Canvas, top: i32, title: &str, rows: &[(&str, String, violet::Color)]| {
         let r = Rect::new(40, top, W as i32 - 40, top + 86 + rows.len() as i32 * 60);
@@ -477,7 +482,7 @@ fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
     let lit = |on: bool| if on { VIOLET } else { CREAM };
     // The Core Specification's names: a public or random device address.
     let address = |random: bool| if random { "Random" } else { "Public" };
-    let y = card(c, 260, "WHO CAN HEAR ME?", &[
+    let y = card(c, held.y1 + 24, "WHO CAN HEAR ME?", &[
         ("Advertising", if bt.advertising { "On".into() } else { "Off".into() }, lit(bt.advertising)),
         ("Address type", if bt.advertising { address(bt.random_adv).into() } else { "—".into() }, CREAM),
     ]);
