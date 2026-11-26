@@ -249,7 +249,9 @@ fn main() {
         while let Some(e) = next {
             if e.focus_gained() {
                 app.pressed = None;
-                let section = app.section;
+                // Opened again from Home it starts at the menu; when the screen
+                // comes back to it, it shows the page it left.
+                let section = if e.opened() { Section::Menu } else { app.section };
                 app.go(section);
                 dirty = true;
             } else if matches!(e.kind, TOUCH_DOWN | TOUCH_MOVE | TOUCH_UP) {

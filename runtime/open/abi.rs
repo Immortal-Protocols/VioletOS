@@ -142,6 +142,9 @@ pub const KEY_HOME: u16 = 3;
 pub const LIFECYCLE_FOCUS_GAINED: i32 = 1;
 pub const LIFECYCLE_FOCUS_LOST: i32 = 2;
 pub const LIFECYCLE_QUIT: i32 = 3;
+/// FOCUS_GAINED's code when Home, the app list or `open` brought the app to
+/// the front (0 otherwise, as when the screen comes back to the open apps).
+pub const FOCUS_OPENED: u16 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

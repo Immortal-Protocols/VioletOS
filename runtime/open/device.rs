@@ -437,7 +437,7 @@ impl Runtime {
         if let Some(i) = (0..MAX_APPS).find(|&i| self.apps[i].as_ref().map_or(false, |a| a.path == path)) {
             self.set_foreground(Some(i));
             self.refresh(i);
-            self.lifecycle(i, LIFECYCLE_FOCUS_GAINED);
+            self.focus_opened(i);
             return;
         }
         match self.launch(&path, &[], None) {
@@ -551,6 +551,16 @@ impl Runtime {
     /// voice agent), while it holds it.
     pub fn background_listener(&self) -> Option<usize> {
         (0..MAX_APPS).find(|&n| self.apps[n].as_ref().is_some_and(|a| a.path == super::appstore::INSTALLER) && self.holds_mic(n))
+    }
+    /// FOCUS_GAINED with code FOCUS_OPENED: Home, the app list or `open`
+    /// brought the app to the front, so it may start over.
+    fn focus_opened(&mut self, i: usize) {
+        self.lifecycle(i, LIFECYCLE_FOCUS_GAINED);
+        if let Some(e) = self.apps[i].as_mut().and_then(|a| a.events.back_mut()) {
+            if e.kind == EVENT_LIFECYCLE && e.value == LIFECYCLE_FOCUS_GAINED {
+                e.code = FOCUS_OPENED;
+            }
+        }
     }
     pub fn lifecycle(&mut self, i: usize, value: i32) {
         let now = sys::now_ns() / 1000;
@@ -1128,7 +1138,7 @@ impl Runtime {
                         if self.foreground != Some(n) {
                             self.set_foreground(Some(n));
                             self.refresh(n);
-                            self.lifecycle(n, LIFECYCLE_FOCUS_GAINED);
+                            self.focus_opened(n);
                         }
                         return String::from("ok\n");
                     }
