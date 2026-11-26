@@ -145,6 +145,13 @@ showphone: build/moto-debug
 	echo "Android (adb):         $${android:-not found}"; \
 	echo "VioletOS (USB):        $${violet:-not found}"
 
+# Build the handset image, install it on the connected handset and join the
+# saved Wi-Fi network (moto-wifi-profile --save).
+.PHONY: flashphone
+flashphone: moto build/moto-package
+	@export PATH="$$PATH:$(PLATFORM_TOOLS)"; \
+	services/usb-diagnostics/host/moto-flash && build/moto-package join-wifi
+
 .PHONY: test-moto-radio
 MOTO_WIFI_STOCK ?= build/xt2163dl/S3RHS32.20-42-13-2-3-2/stock/wifi
 HOST_RUSTC ?= $(or $(shell command -v rustc),build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc)
