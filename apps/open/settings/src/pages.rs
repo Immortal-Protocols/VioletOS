@@ -3,6 +3,8 @@
 use violet::paper::{slab, ALERT, CREAM, GOOD, MUTED, PAPER, PAPER_PRESSED, PAPER_RAISED, VIOLET};
 use violet::{Canvas, Fonts, Rect, CITIES, HOME_BOX, W};
 
+use crate::nearby::Scan;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Section {
     Menu,
@@ -10,6 +12,8 @@ pub enum Section {
     Bluetooth,
     /// What the radio is doing and who made it so; reached from Bluetooth.
     BluetoothDetails,
+    /// A passive scan of the devices nearby; reached from Details.
+    BluetoothNearby,
     PhoneLink,
     Time,
     AgentApps,
@@ -34,6 +38,11 @@ pub enum Hit {
     Details,
     /// The app holding Bluetooth, on Details: opens it.
     HolderApp,
+    /// Scan nearby, on Details; then Cancel, Proceed and Stop on its page.
+    ScanNearby,
+    Cancel,
+    Proceed,
+    Stop,
     Relay,
     NewCode,
     City(usize),
@@ -181,8 +190,17 @@ pub struct Status {
     pub installed: Vec<Installed>,
 }
 
+/// Scan nearby: asking first, then the scan (running or stopped), or why it couldn't start.
+#[derive(Clone, Copy)]
+pub enum Nearby<'a> {
+    Ask,
+    Scan { scan: &'a Scan, running: bool, seconds: u64 },
+    Failed(&'a str),
+}
+
 pub struct View<'a> {
     pub section: Section,
+    pub nearby: Nearby<'a>,
     pub status: &'a Status,
     /// The saved Phone Internet pairing code and whether it should be on.
     pub code: &'a str,
@@ -224,6 +242,11 @@ pub fn delete_rect(i: usize) -> Rect {
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
 pub const BT_DETAILS: Rect = Rect::new(40, 700, W as i32 - 40, 800);
 pub const BT_HOLDER: Rect = Rect::new(40, 230, W as i32 - 40, 370);
+pub const SCAN_NEARBY: Rect = Rect::new(40, 1440, W as i32 - 40, 1540);
+pub const CANCEL: Rect = Rect::new(40, 1440, W as i32 / 2 - 12, 1540);
+pub const PROCEED: Rect = Rect::new(W as i32 / 2 + 12, 1440, W as i32 - 40, 1540);
+/// Stop, or Done once the scan stopped.
+pub const STOP: Rect = Rect::new(40, 1440, W as i32 - 40, 1540);
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -233,6 +256,13 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
         Section::Menu => (0..MENU.len()).find(|&i| menu_rect(i).contains(x, y)).map(Hit::Row),
         Section::Bluetooth if BT_DETAILS.contains(x, y) => Some(Hit::Details),
         Section::BluetoothDetails if v.status.bt.open && !v.status.bt.name.is_empty() && BT_HOLDER.contains(x, y) => Some(Hit::HolderApp),
+        Section::BluetoothDetails if SCAN_NEARBY.contains(x, y) => Some(Hit::ScanNearby),
+        Section::BluetoothNearby => match v.nearby {
+            Nearby::Ask if CANCEL.contains(x, y) => Some(Hit::Cancel),
+            Nearby::Ask if PROCEED.contains(x, y) && can_scan(&v.status.bt).is_ok() => Some(Hit::Proceed),
+            Nearby::Scan { .. } | Nearby::Failed(_) if STOP.contains(x, y) => Some(Hit::Stop),
+            _ => None,
+        },
         Section::PhoneLink if relay_usable(v.status) => {
             if RELAY_BUTTON.contains(x, y) {
                 Some(Hit::Relay)
@@ -343,6 +373,7 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             violet::button(c, &f.medium(32.0), BT_DETAILS, "Details", bg, CREAM);
         }
         Section::BluetoothDetails => bluetooth_details(c, f, v, &s.bt),
+        Section::BluetoothNearby => bluetooth_nearby(c, f, v, &s.bt),
         Section::PhoneLink => {
             header(c, f, v, "‹ Settings", "Phone Link");
             // Violet Shield.
@@ -522,4 +553,78 @@ fn bluetooth_details(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
         ("Errors", format!("{} rejected · {} dropped", bt.bad, bt.dropped), if bt.bad != 0 || bt.dropped != 0 { ALERT } else { CREAM }),
     ]);
     paragraph(c, &f.regular(26.0), "VioletOS never makes this phone visible by itself. Only an app that opens Bluetooth can, and it shows here. When the app closes, the radio stops.", 44, y + 60, W as i32 - 88, MUTED);
+    let bg = if v.pressed == Some(Hit::ScanNearby) { PAPER_PRESSED } else { PAPER_RAISED };
+    violet::button(c, &f.medium(32.0), SCAN_NEARBY, "Scan nearby", bg, CREAM);
+}
+
+/// Whether Settings can take the controller for a scan, or why not.
+pub fn can_scan(bt: &Bluetooth) -> Result<(), String> {
+    if !bt.on {
+        return Err("Bluetooth is off. It runs while Wi-Fi is on.".into());
+    }
+    if bt.open {
+        let app = if bt.app.is_empty() { "An app" } else { &bt.app };
+        return Err(format!("{app} is using Bluetooth. Close it to scan."));
+    }
+    Ok(())
+}
+
+/// Scan nearby: what the scan does to whom, asked before it starts; then
+/// the devices heard, strongest first.
+fn bluetooth_nearby(c: &mut Canvas, f: &Fonts, v: &View, bt: &Bluetooth) {
+    header(c, f, v, "‹ Details", "Scan nearby");
+    let (name, text) = (f.medium(30.0), f.regular(26.0));
+    match v.nearby {
+        Nearby::Ask => {
+            f.regular(26.0).draw(c, "For as long as the scan runs:", 44, 228, MUTED);
+            let card = Rect::new(40, 260, W as i32 - 40, 690);
+            slab(c, card, 30.0, PAPER_RAISED);
+            let mut y = 320;
+            for (who, what) in [
+                ("This phone", "Listens with a passive scan. It receives advertisements and transmits nothing."),
+                ("Devices nearby", "Can't see this phone or tell that it is listening."),
+                ("Bitchat and other apps", "Can't use Bluetooth until you stop the scan."),
+            ] {
+                name.draw(c, who, 80, y, CREAM);
+                y = paragraph(c, &text, what, 80, y + 44, card.width() - 80, MUTED) + 36;
+            }
+            if let Err(why) = can_scan(bt) {
+                paragraph(c, &f.regular(26.0), &why, 44, 750, W as i32 - 88, ALERT);
+            }
+            let bg = if v.pressed == Some(Hit::Cancel) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), CANCEL, "Cancel", bg, CREAM);
+            let ok = can_scan(bt).is_ok();
+            let bg = if v.pressed == Some(Hit::Proceed) { PAPER_PRESSED } else if ok { VIOLET } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), PROCEED, "Proceed", bg, if ok { PAPER } else { MUTED });
+        }
+        Nearby::Failed(why) => {
+            paragraph(c, &f.regular(30.0), why, 44, 260, W as i32 - 88, ALERT);
+            let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), STOP, "Done", bg, CREAM);
+        }
+        Nearby::Scan { scan, running, seconds } => {
+            let card = Rect::new(40, 230, W as i32 - 40, 380);
+            slab(c, card, 30.0, PAPER_RAISED);
+            let (head, tint) = if !running { ("Stopped", CREAM) } else if scan.listening { ("Passive scan", VIOLET) } else { ("Starting…", CREAM) };
+            f.medium(34.0).draw(c, head, 80, 296, tint);
+            let n = scan.devices.len();
+            let line = format!("{n} device{} heard · {}:{:02}", if n == 1 { "" } else { "s" }, seconds / 60, seconds % 60);
+            f.regular(26.0).draw(c, &line, 80, 344, MUTED);
+            let (label, value) = (f.medium(28.0), f.regular(24.0));
+            const ROWS: usize = 15;
+            for (k, d) in scan.strongest().iter().take(ROWS).enumerate() {
+                let y = 440 + k as i32 * 64;
+                let signal = if d.rssi == i8::MIN { "—".to_string() } else { format!("{} dBm", d.rssi) };
+                let detail = format!("{signal} · {}", if d.random { "Random" } else { "Public" });
+                let w = value.width(&detail);
+                value.draw(c, &detail, W as i32 - 44 - w, y, MUTED);
+                label.draw(c, &label.fit(&d.label(), W as i32 - 140 - w), 44, y, CREAM);
+            }
+            if n > ROWS {
+                value.draw(c, &format!("and {} more", n - ROWS), 44, 440 + ROWS as i32 * 64, MUTED);
+            }
+            let bg = if v.pressed == Some(Hit::Stop) { PAPER_PRESSED } else { PAPER_RAISED };
+            violet::button(c, &f.medium(32.0), STOP, if running { "Stop" } else { "Done" }, bg, if running { ALERT } else { CREAM });
+        }
+    }
 }

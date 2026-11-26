@@ -1,5 +1,6 @@
 //! Settings: Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone
 //! Internet), the clock's city, the apps Violet Agent built, and About.
+mod nearby;
 mod pages;
 mod wifi;
 mod wifi_ui;
@@ -8,7 +9,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use pages::{Hit, Section, Status, MENU};
-use violet::device::{TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP};
+use violet::device::{FOCUS_LOST, LIFECYCLE, TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP};
 use violet::{Canvas, Fonts, Screen, CITIES};
 
 /// Settings' saved Phone Internet choice, which the runtime restores after a
@@ -61,12 +62,28 @@ struct App {
     down: Option<(i32, i32)>,
     confirm: Option<usize>,
     note: String,
+    /// Scan nearby: the running scan, or the last one's results, and when it started.
+    listener: Option<nearby::Listener>,
+    scanned: Option<nearby::Scan>,
+    scan_error: String,
+    scan_started: Instant,
+    scan_seconds: u64,
 }
 
 impl App {
     fn view(&self) -> pages::View<'_> {
+        let nearby = if !self.scan_error.is_empty() {
+            pages::Nearby::Failed(&self.scan_error)
+        } else if let Some(l) = &self.listener {
+            pages::Nearby::Scan { scan: &l.scan, running: true, seconds: self.scan_seconds }
+        } else if let Some(scan) = &self.scanned {
+            pages::Nearby::Scan { scan, running: false, seconds: self.scan_seconds }
+        } else {
+            pages::Nearby::Ask
+        };
         pages::View {
             section: self.section,
+            nearby,
             status: &self.status,
             code: &self.code,
             relay_on: self.relay_on,
@@ -83,8 +100,21 @@ impl App {
         }
     }
 
+    /// Ends the scan, closing the HCI (the runtime resets the controller); keeps what it heard.
+    fn stop_scan(&mut self) {
+        if let Some(l) = self.listener.take() {
+            println!("settings: scan stopped, {} devices", l.scan.devices.len());
+            self.scanned = Some(l.scan);
+        }
+    }
+
     fn go(&mut self, section: Section) {
         println!("settings: {:?}", section);
+        if section != Section::BluetoothNearby {
+            self.stop_scan();
+            self.scanned = None;
+            self.scan_error.clear();
+        }
         self.section = section;
         self.confirm = None;
         self.note.clear();
@@ -107,6 +137,20 @@ impl App {
             // Release this screen's memory when the user returns to Home.
             Hit::Back if self.section == Section::Menu => std::process::exit(0),
             Hit::Back if self.section == Section::BluetoothDetails => self.go(Section::Bluetooth),
+            Hit::Back if self.section == Section::BluetoothNearby => self.go(Section::BluetoothDetails),
+            Hit::ScanNearby => self.go(Section::BluetoothNearby),
+            Hit::Cancel => self.go(Section::BluetoothDetails),
+            Hit::Proceed => match nearby::Listener::start() {
+                Ok(l) => {
+                    println!("settings: passive scan");
+                    self.listener = Some(l);
+                    self.scan_started = Instant::now();
+                    self.scan_seconds = 0;
+                }
+                Err(e) => self.scan_error = e,
+            },
+            Hit::Stop if self.listener.is_some() => self.stop_scan(),
+            Hit::Stop => self.go(Section::BluetoothDetails),
             Hit::Back => self.go(Section::Menu),
             Hit::Details => self.go(Section::BluetoothDetails),
             Hit::HolderApp => {
@@ -216,6 +260,11 @@ fn main() {
         down: None,
         confirm: None,
         note: String::new(),
+        listener: None,
+        scanned: None,
+        scan_error: String::new(),
+        scan_started: Instant::now(),
+        scan_seconds: 0,
     };
     if saved.is_empty() {
         app.save_relay();
@@ -239,7 +288,7 @@ fn main() {
             dirty = false;
         }
         let animating = app.section == Section::Wifi && app.wifi.animating();
-        let timeout = if animating { Duration::from_millis(120) } else { Duration::from_secs(1) };
+        let timeout = if animating || app.listener.is_some() { Duration::from_millis(120) } else { Duration::from_secs(1) };
         let mut next = match events.recv_timeout(timeout) {
             Ok(e) => Some(e),
             Err(RecvTimeoutError::Timeout) => None,
@@ -247,7 +296,11 @@ fn main() {
         };
         // Handle everything that queued up, then draw once.
         while let Some(e) = next {
-            if e.focus_gained() {
+            if e.kind == LIFECYCLE && e.value == FOCUS_LOST {
+                // The scan runs only while you can see it.
+                app.stop_scan();
+                dirty = true;
+            } else if e.focus_gained() {
                 app.pressed = None;
                 // Opened again from Home it starts at the menu; when the screen
                 // comes back to it, it shows the page it left.
@@ -258,6 +311,17 @@ fn main() {
                 dirty |= app.touch(e.kind, e.x, e.y);
             }
             next = events.try_recv().ok();
+        }
+        if let Some(l) = &mut app.listener {
+            dirty |= l.pump();
+            let seconds = app.scan_started.elapsed().as_secs();
+            dirty |= seconds != app.scan_seconds;
+            app.scan_seconds = seconds;
+            if let Some(e) = l.scan.failure.clone() {
+                app.stop_scan();
+                app.scan_error = e;
+                dirty = true;
+            }
         }
         if app.section == Section::Wifi {
             dirty |= app.wifi.tick(&mut wifi_poll);
@@ -320,10 +384,37 @@ mod preview {
         for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth),
                                 ("bluetooth-details", Section::BluetoothDetails), ("phone", Section::PhoneLink),
                                 ("time", Section::Time), ("apps", Section::AgentApps), ("about", Section::About)] {
-            let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
+            let v = pages::View { section, nearby: pages::Nearby::Ask, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
             pages::draw(&mut c, &fonts, &v);
-            let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
-            std::fs::write(format!("{dir}/{name}.rgba"), bytes).unwrap();
+            write(&c, &dir, name);
         }
+        // Scan nearby: asking (Bitchat closed), then a scan that heard three devices.
+        let mut idle = s.clone();
+        idle.bt.open = false;
+        let mut scan = nearby::Scan::new();
+        while let Some(p) = scan.take_out() {
+            scan.receive(&[4, 0x0e, 4, 1, p[1], p[2], 0]);
+        }
+        let mut ev = vec![0x02, 3];
+        ev.extend_from_slice(&[0, 1, 1, 2, 3, 4, 5, 0xc6, 13, 12, 0x09, b'G', b'r', b'e', b'g', b'g', b'\'', b's', b' ', b'M', b'a', b'c', (-48i8) as u8]);
+        ev.extend_from_slice(&[0, 0, 9, 8, 7, 6, 5, 4, 0, (-71i8) as u8]);
+        ev.extend_from_slice(&[3, 1, 6, 6, 6, 6, 6, 0x46, 0, (-88i8) as u8]);
+        let mut p = vec![4, 0x3e, ev.len() as u8];
+        p.extend_from_slice(&ev);
+        scan.receive(&p);
+        for (name, status, nearby) in [
+            ("nearby-ask", &idle, pages::Nearby::Ask),
+            ("nearby-busy", &s, pages::Nearby::Ask),
+            ("nearby-scan", &idle, pages::Nearby::Scan { scan: &scan, running: true, seconds: 42 }),
+        ] {
+            let v = pages::View { section: Section::BluetoothNearby, nearby, status, code: "", relay_on: false, pressed: None, confirm: None, note: "" };
+            pages::draw(&mut c, &fonts, &v);
+            write(&c, &dir, name);
+        }
+    }
+
+    fn write(c: &Canvas, dir: &str, name: &str) {
+        let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
+        std::fs::write(format!("{dir}/{name}.rgba"), bytes).unwrap();
     }
 }
