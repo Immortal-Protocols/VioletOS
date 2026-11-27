@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VioletOS MediaSource playback</title>
+<style>
+  body { margin: 0; color: white; background: #151515; font: 22px sans-serif }
+  video { display: block; width: 100vw; height: 65vh; object-fit: fill }
+  button { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 1; background: #16927c; color: white; font: 36px sans-serif; border: 0 }
+</style>
+<video playsinline></video>
+<button type="button">Play media fixture</button>
+<p id="status"></p>
+<script>
+  const video = document.querySelector("video");
+  const button = document.querySelector("button");
+  const status = document.getElementById("status");
+  const source = new MediaSource();
+  function report(message) {
+    status.textContent = message;
+    console.log("VioletMSE " + message);
+  }
+  video.addEventListener("error", () => report("error " + video.error.message));
+  video.addEventListener("playing", () => report("playing"), {once: true});
+  video.addEventListener("timeupdate", function advanced() {
+    if (video.currentTime > 2) {
+      report("later");
+      video.removeEventListener("timeupdate", advanced);
+    }
+  });
+  source.addEventListener("sourceopen", () => {
+    try {
+      report("opened");
+      const buffer = source.addSourceBuffer('video/webm; codecs="vp9,opus"');
+      buffer.addEventListener("updateend", () => { report("added"); source.endOfStream(); }, {once: true});
+      buffer.addEventListener("error", () => report("error appending supported WebM"));
+      const bytes = Uint8Array.from(atob("@CLIP@"), c => c.charCodeAt(0));
+      buffer.appendBuffer(bytes);
+    } catch (error) {
+      report("error " + error.message);
+    }
+  }, {once: true});
+  button.addEventListener("click", () => {
+    button.remove();
+    video.src = URL.createObjectURL(source);
+    video.play().catch(error => report("error " + error.message));
+  }, {once: true});
+</script>

@@ -9,7 +9,7 @@ use std::time::Duration;
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
 /// The largest response body read into memory.
-const MAX_BODY: usize = 32 << 20;
+pub const MAX_BODY: usize = 32 << 20;
 
 pub struct Response {
     pub status: u16,
@@ -145,7 +145,7 @@ fn exchange(conn: &mut BufReader<Tls>, host: &str, path: &str, headers: &[(&str,
                 }
                 break;
             }
-            if body.len() + size > MAX_BODY {
+            if size > MAX_BODY - body.len() {
                 return Err(io::Error::other("response is too large"));
             }
             let at = body.len();
@@ -157,10 +157,13 @@ fn exchange(conn: &mut BufReader<Tls>, host: &str, path: &str, headers: &[(&str,
         reusable = !close;
     } else {
         // Until the server closes the connection; TLS close_notify may be missing.
-        match conn.read_to_end(&mut body) {
+        match conn.take(MAX_BODY as u64 + 1).read_to_end(&mut body) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && !body.is_empty() => {}
             Err(e) => return Err(e),
+        }
+        if body.len() > MAX_BODY {
+            return Err(io::Error::other("response is too large"));
         }
         reusable = false;
     }

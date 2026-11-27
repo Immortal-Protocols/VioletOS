@@ -6,8 +6,9 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::url::Url;
+use violet::http::MAX_BODY;
 
-const USER_AGENT: &str = "Mozilla/5.0 (VioletOS; ARMv7) Ladybird/1.0 Mobile";
+const USER_AGENT: &str = "Mozilla/5.0 (VioletOS) Ladybird/1.0 Mobile";
 const ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5";
 const MAX_REDIRECTS: usize = 8;
 
@@ -99,6 +100,9 @@ fn http(url: &Url) -> io::Result<Reply> {
             if size == 0 {
                 break;
             }
+            if size > MAX_BODY - body.len() {
+                return Err(io::Error::other("response is too large"));
+            }
             let at = body.len();
             body.resize(at + size, 0);
             conn.read_exact(&mut body[at..])?;
@@ -106,10 +110,16 @@ fn http(url: &Url) -> io::Result<Reply> {
             conn.read_line(&mut line)?;
         }
     } else if let Some(n) = reply.header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if n > MAX_BODY {
+            return Err(io::Error::other("response is too large"));
+        }
         body.resize(n, 0);
         conn.read_exact(&mut body)?;
     } else {
-        conn.read_to_end(&mut body)?;
+        conn.take(MAX_BODY as u64 + 1).read_to_end(&mut body)?;
+        if body.len() > MAX_BODY {
+            return Err(io::Error::other("response is too large"));
+        }
     }
     Ok(Reply { body, ..reply })
 }

@@ -1,0 +1,126 @@
+--- a/Meta/CMake/audio.cmake
++++ b/Meta/CMake/audio.cmake
+@@ -1,4 +1,10 @@
+ include_guard()
++
++option(LADYBIRD_VIOLET_AUDIO "Use the native VioletOS speaker for interactive playback" OFF)
++if (LADYBIRD_VIOLET_AUDIO)
++    set(LADYBIRD_AUDIO_BACKEND "VIOLET")
++    return()
++endif()
+ 
+ # Audio backend -- how we output audio to the speakers.
+ if (APPLE AND NOT IOS)
+--- a/Services/AudioServer/CMakeLists.txt
++++ b/Services/AudioServer/CMakeLists.txt
+@@ -34,7 +34,11 @@
+ target_link_libraries(AudioServer PRIVATE LibThreading)
+ 
+ # The platform backends: the only code in the tree that opens an audio device.
+-if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
++if (LADYBIRD_AUDIO_BACKEND STREQUAL "VIOLET")
++    target_sources(audioserverservice PRIVATE PlaybackStreamViolet.cpp)
++    target_compile_definitions(audioserverservice PRIVATE AUDIOSERVER_PLAYBACK_BACKEND=1)
++    target_compile_definitions(AudioServer PRIVATE LADYBIRD_VIOLET_AUDIO=1)
++elseif (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+     target_sources(audioserverservice PRIVATE
+         AudioDevicesPulseAudio.cpp
+         PlaybackStreamPulseAudio.cpp
+--- a/Services/AudioServer/main.cpp
++++ b/Services/AudioServer/main.cpp
+@@ -21,6 +21,10 @@
+ #include <LibIPC/SingleServer.h>
+ #include <LibMain/Main.h>
+ #include <LibSandbox/ConnectBroker.h>
++
++#ifdef LADYBIRD_VIOLET_AUDIO
++namespace Audio { ErrorOr<void> prepare_violet_playback_device(); }
++#endif
+ 
+ ErrorOr<int> ladybird_main(Main::Arguments arguments)
+ {
+@@ -70,6 +74,13 @@
+     }
+ #endif
+ 
++#ifdef LADYBIRD_VIOLET_AUDIO
++    if (!is_headless) {
++        if (auto result = Audio::prepare_violet_playback_device(); result.is_error())
++            warnln("Could not open VioletOS speaker: {}", result.error());
++    }
++#endif
++
+     if (!disable_sandbox)
+         TRY(AudioServer::apply_sandbox(mach_server_name));
+ 
+--- a/Services/AudioServer/SandboxLinux.cpp
++++ b/Services/AudioServer/SandboxLinux.cpp
+@@ -29,11 +29,13 @@
+     TRY(Sandbox::add_loaded_library_directories(paths, build_root));
+     TRY(Sandbox::add_path_if_exists(paths, "/proc/self"sv, Sandbox::PathRule::Access::ReadOnly));
+ 
++#ifndef LADYBIRD_VIOLET_AUDIO
+     // libpulse still keeps its cookie and runtime files in these, so they stay readable.
+     auto pulse_runtime_path = LexicalPath::join(TRY(Core::StandardPaths::runtime_directory()), "pulse"sv).string();
+     TRY(Core::Directory::create(pulse_runtime_path, Core::Directory::CreateDirectories::Yes, 0700));
+     TRY(Sandbox::add_path_if_exists(paths, pulse_runtime_path, Sandbox::PathRule::Access::ReadOnly));
+     TRY(Sandbox::add_path_if_exists(paths, LexicalPath::join(Core::StandardPaths::config_directory(), "pulse"sv).string(), Sandbox::PathRule::Access::ReadOnly));
++#endif
+     TRY(Sandbox::restrict_filesystem(paths.span()));
+ 
+     Sandbox::SeccompPolicy policy;
+@@ -42,8 +44,10 @@
+     policy.allow_file_descriptor_operations();
+     policy.allow_ipc();
+     policy.allow_socket_pairs();
++#ifndef LADYBIRD_VIOLET_AUDIO
+     policy.broker_unix_socket_connections();
+     policy.allow_pulseaudio_client_file_operations();
++#endif
+     policy.allow_common_runtime();
+     TRY(policy.install());
+     return {};
+--- a/Libraries/LibWebView/CMakeLists.txt
++++ b/Libraries/LibWebView/CMakeLists.txt
+@@ -183,6 +183,9 @@
+ if (LINUX)
+     # The connect broker asks the audio library where the daemon is before connecting a helper to it.
+     include(audio)
++    if (LADYBIRD_AUDIO_BACKEND STREQUAL "VIOLET")
++        target_compile_definitions(LibWebView PRIVATE LADYBIRD_VIOLET_AUDIO=1)
++    endif()
+     if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+         target_compile_definitions(LibWebView PRIVATE HAVE_PULSEAUDIO=1)
+         target_link_libraries(LibWebView PRIVATE PkgConfig::PULSEAUDIO)
+--- a/Libraries/LibWebView/HelperProcess.cpp
++++ b/Libraries/LibWebView/HelperProcess.cpp
+@@ -237,7 +237,7 @@
+             }
+         }
+ #endif
+-#if defined(AK_OS_LINUX)
++#if defined(AK_OS_LINUX) && !defined(LADYBIRD_VIOLET_AUDIO)
+         OwnPtr<Sandbox::ConnectBroker> connect_broker;
+         OwnPtr<Core::File> connect_broker_child_file;
+ 
+@@ -271,7 +271,7 @@
+             process.set_is_private(is_private);
+             if (crash_report)
+                 process.set_crash_report(crash_report.release_nonnull());
+-#if defined(AK_OS_LINUX)
++#if defined(AK_OS_LINUX) && !defined(LADYBIRD_VIOLET_AUDIO)
+             if (connect_broker)
+                 process.set_connect_broker(connect_broker.release_nonnull());
+ #endif
+@@ -473,7 +473,11 @@
+     auto const& browser_options = WebView::Application::browser_options();
+ 
+     Vector<ByteString> arguments;
++#ifdef LADYBIRD_VIOLET_AUDIO
++    if (browser_options.headless_mode.has_value() && *browser_options.headless_mode != HeadlessMode::Terminal)
++#else
+     if (browser_options.headless_mode.has_value())
++#endif
+         arguments.append("--headless"sv);
+     if (browser_options.disable_sandbox == DisableSandbox::Yes)
+         arguments.append("--disable-sandbox"sv);

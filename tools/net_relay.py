@@ -18,6 +18,7 @@ Agent pairing without setting environment variables.
 A UDP slot (command 3) is a Mac UDP socket; datagrams cross the rings framed
 as in net.rs. VIOLET_NET_UDP=0 refuses UDP, like a network that blocks it.
 """
+from concurrent.futures import ThreadPoolExecutor
 import json
 import mmap
 import os
@@ -25,6 +26,7 @@ from pathlib import Path
 import socket
 import struct
 import stat
+import sys
 import threading
 import time
 
@@ -61,13 +63,17 @@ def local_companion():
 
 
 class Relay(threading.Thread):
-    def __init__(self, ram_path):
+    def __init__(self, ram_path, offset=PAGE, slots=SLOTS):
         super().__init__(daemon=True)
+        self.slots = slots
+        self.data_offset = (256 + slots * 128 + 4095) & ~4095
         self.ram = open(ram_path, "r+b")
-        self.mem = mmap.mmap(self.ram.fileno(), 4096 + SLOTS * STRIDE, offset=PAGE)
-        self.socks = [None] * SLOTS
-        self.udp = [False] * SLOTS
-        self.closing = [False] * SLOTS
+        self.mem = mmap.mmap(self.ram.fileno(), self.data_offset + slots * STRIDE, offset=offset)
+        self.socks = [None] * slots
+        self.udp = [False] * slots
+        self.connectors = ThreadPoolExecutor(max_workers=min(slots, 16), thread_name_prefix="violet-connect")
+        self.pending = [None] * slots
+        self.trace = os.environ.get("VIOLET_NET_TRACE") == "1"
         self.hosts = json.loads(os.environ.get("VIOLET_NET_HOSTS", "{}"))
         proxy = os.environ.get("VIOLET_NET_SOCKS")
         self.socks_proxy = None
@@ -83,7 +89,17 @@ class Relay(threading.Thread):
     def put(self, slot, i, v):
         struct.pack_into("<I", self.mem, 256 + slot * 128 + 4 * i, v & 0xFFFFFFFF)
 
+    @staticmethod
+    def discard_connection(future):
+        if not future.cancelled() and future.exception() is None:
+            future.result().close()
+
     def drop(self, slot):
+        future = self.pending[slot]
+        if future is not None:
+            self.pending[slot] = None
+            if not future.cancel():
+                future.add_done_callback(self.discard_connection)
         self.udp[slot] = False
         if self.socks[slot]:
             try:
@@ -92,38 +108,59 @@ class Relay(threading.Thread):
                 pass
         self.socks[slot] = None
 
-    def connect(self, slot):
-        name = bytes(self.mem[256 + slot * 128 + 64:256 + slot * 128 + 128]).split(b"\0")[0].decode()
-        ip, port = self.word(slot, 5), self.word(slot, 6)
+    def open_tcp(self, name, ip, port):
+        # Workers never touch guest memory. A slot can be closed and reused
+        # while DNS, a companion handshake or a TCP connection is pending.
         host = name or socket.inet_ntoa(struct.pack(">I", ip))
+        # Explicit test mappings and SOCKS settings override desktop discovery.
+        only_violet = os.environ.get("VIOLET_NET_SOCKS_SCOPE") == "violet"
+        target = self.hosts.get(name) or self.hosts.get(f"{host}:{port}")
+        local = local_companion() if not self.socks_proxy and not target else None
+        if local and host == "agent-relay.violet" and port == 80:
+            sock = socket.create_connection(("127.0.0.1", local["relayPort"]), timeout=2)
+        elif local and (not host.endswith(".violet") or host in LOCAL_NAMES):
+            sock = self.socks_connect(host, port, bool(name), ("127.0.0.1", local["socksPort"]), local["password"])
+        elif self.socks_proxy and (not only_violet or host.endswith(".violet")):
+            sock = self.socks_connect(host, port, bool(name), self.socks_proxy, self.socks_pass)
+        else:
+            if target:
+                host, _, mapped = target.partition(":")
+                port = int(mapped or port)
+            elif host.endswith(".violet"):
+                raise ConnectionRefusedError(111, "no companion relay")
+            sock = socket.create_connection((host, port), timeout=8)
+        return sock
+
+    def start_connect(self, slot):
+        name = bytes(self.mem[256 + slot * 128 + 64:256 + slot * 128 + 128]).split(b"\0")[0].decode(errors="replace")
+        self.pending[slot] = self.connectors.submit(self.open_tcp, name, self.word(slot, 5), self.word(slot, 6))
+
+    def finish_connect(self, slot):
+        future = self.pending[slot]
+        if future is None or not future.done():
+            return
+        self.pending[slot] = None
+        if self.trace:
+            name = bytes(self.mem[256 + slot * 128 + 64:256 + slot * 128 + 128]).split(b"\0")[0].decode(errors="replace")
+            host = name or socket.inet_ntoa(struct.pack(">I", self.word(slot, 5)))
+            peer = f"{host}:{self.word(slot, 6)} on slot {slot}"
         try:
-            # Explicit test mappings and SOCKS settings override desktop discovery.
-            only_violet = os.environ.get("VIOLET_NET_SOCKS_SCOPE") == "violet"
-            target = self.hosts.get(name) or self.hosts.get(f"{host}:{port}")
-            local = local_companion() if not self.socks_proxy and not target else None
-            if local and host == "agent-relay.violet" and port == 80:
-                sock = socket.create_connection(("127.0.0.1", local["relayPort"]), timeout=2)
-            elif local and (not host.endswith(".violet") or host in LOCAL_NAMES):
-                sock = self.socks_connect(host, port, bool(name), ("127.0.0.1", local["socksPort"]), local["password"])
-            elif self.socks_proxy and (not only_violet or host.endswith(".violet")):
-                sock = self.socks_connect(host, port, bool(name), self.socks_proxy, self.socks_pass)
-            else:
-                if target:
-                    host, _, mapped = target.partition(":")
-                    port = int(mapped or port)
-                elif host.endswith(".violet"):
-                    raise ConnectionRefusedError(111, "no companion relay")
-                sock = socket.create_connection((host, port), timeout=8)
-            sock.setblocking(False)
+            sock = future.result()
             self.socks[slot] = sock
+            sock.setblocking(False)
+            local_ip, local_port = sock.getsockname()[:2]
+            self.put(slot, 12, local_port)
+            if sock.family == socket.AF_INET:
+                self.put(slot, 13, int.from_bytes(socket.inet_aton(local_ip), "big"))
             self.put(slot, 4, 0)
             self.put(slot, 3, OPEN)
-        except socket.gaierror:
-            self.put(slot, 4, 2)
+            if self.trace:
+                print(f"socket relay connected {peer}", file=sys.stderr, flush=True)
+        except (OSError, ValueError) as error:
+            self.put(slot, 4, 2 if isinstance(error, socket.gaierror) else getattr(error, "errno", None) or 111)
             self.put(slot, 3, FAILED)
-        except OSError as e:
-            self.put(slot, 4, e.errno or 111)
-            self.put(slot, 3, FAILED)
+            if self.trace:
+                print(f"socket relay failed {peer}: {error}", file=sys.stderr, flush=True)
 
     # SOCKS5 reply codes as the errno the app sees.
     SOCKS_ERRNO = {1: 5, 2: 13, 3: 101, 4: 113, 5: 111, 6: 110, 7: 95, 8: 97}
@@ -198,7 +235,7 @@ class Relay(threading.Thread):
 
     def pump_udp(self, slot):
         sock = self.socks[slot]
-        base = 4096 + slot * STRIDE
+        base = self.data_offset + slot * STRIDE
         head, tail = self.word(slot, 7), self.word(slot, 8)
         while (head - tail) & 0xFFFFFFFF >= 2:
             body = struct.unpack("<H", self.ring(base, tail, 2, TX))[0]
@@ -240,7 +277,7 @@ class Relay(threading.Thread):
             return
         if self.udp[slot]:
             return self.pump_udp(slot)
-        base = 4096 + slot * STRIDE
+        base = self.data_offset + slot * STRIDE
         head, tail = self.word(slot, 7), self.word(slot, 8)
         while head != tail:
             at = tail % TX
@@ -288,19 +325,20 @@ class Relay(threading.Thread):
     def run(self):
         struct.pack_into("<II", self.mem, 0, MAGIC, 3)
         while not self.stopped.is_set():
-            for slot in range(SLOTS):
+            for slot in range(self.slots):
                 seq = self.word(slot, 0)
                 if seq != self.word(slot, 2):
                     command = self.word(slot, 1)
                     self.drop(slot)
                     if command == 1:
                         self.put(slot, 3, CONNECTING)
-                        self.connect(slot)
+                        self.start_connect(slot)
                     elif command == 3:
                         self.udp_open(slot)
                     else:
                         self.put(slot, 3, IDLE)
                     self.put(slot, 2, seq)
+                self.finish_connect(slot)
                 self.pump(slot)
             time.sleep(0.002)
 
@@ -308,7 +346,8 @@ class Relay(threading.Thread):
         self.stopped.set()
         if self.is_alive():
             self.join(timeout=1)
-        for slot in range(SLOTS):
+        for slot in range(self.slots):
             self.drop(slot)
+        self.connectors.shutdown(wait=False, cancel_futures=True)
         self.mem.close()
         self.ram.close()

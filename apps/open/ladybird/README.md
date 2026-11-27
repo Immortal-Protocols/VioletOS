@@ -1,6 +1,10 @@
 # Ladybird
 
-A web browser for VioletOS, pre-installed as an open app (`/apps/ladybird`, listed on Home as **Ladybird**). Pages are parsed by [Ladybird](https://ladybird.org/)'s own HTML tokenizer and tree builder: the Rust crate in Ladybird's `Libraries/LibWeb/HTML/Parser/Rust`, compiled for ARMv7 and linked into this Rust program. The rest of the browser is small and written here in Rust.
+On the AArch64 QEMU target, installing a full upstream browser package makes the Home icon launch Ladybird's multiprocess Hub. LibWeb handles scripts, input and page layout, the compositor sends pixels to the VioletOS screen, and RequestServer handles HTTPS inside the guest. Build instructions and the native touch regression are in the [AArch64 guide](../../../targets/qemu/aarch64/README.md).
+
+## Lightweight browser
+
+A web browser for VioletOS, pre-installed as an open app (`/apps/ladybird`, listed on Home as **Ladybird**). Pages are parsed by [Ladybird](https://ladybird.org/)'s own HTML tokenizer and tree builder: the Rust crate in Ladybird's `Libraries/LibWeb/HTML/Parser/Rust`, compiled for the guest and linked into this Rust program. The browser UI, layout and networking are written here in Rust. A small C adapter links FFmpeg for WebM playback.
 
 ```
   network (net.rs)                 HTTPS with rustls (violet::http) or HTTP, redirects
@@ -19,9 +23,10 @@ A web browser for VioletOS, pre-installed as an open app (`/apps/ladybird`, list
 - Loads `http://` and `https://` pages (certificates verified against the Mozilla roots), follows redirects and fetches up to six linked style sheets.
 - Applies CSS with type, class, id and attribute selectors, descendant and child combinators, `@media` width queries for its 360 CSS px viewport, and the common text, color, spacing and `display` properties.
 - Lays out headings, paragraphs, lists, block quotes, preformatted text and tables, and draws images as placeholder boxes of their declared size.
+- Opens direct `video/webm` responses and shows a **Play video** link for static HTML video sources. The app downloads up to 32 MiB, decodes VP8 or VP9 frames in the guest and sends Opus or Vorbis audio to the VioletOS audio device. Tap the video to pause, resume or replay. Back returns to the page with the video.
 - Taps follow links (relative links resolve against the page), dragging scrolls, **‹** goes back, and the address bar opens an on-screen keyboard. Text without a dot or scheme is searched on DuckDuckGo Lite.
 
-Scripts are not run: the tree builder pauses at each `<script>` and the browser resumes it, as a browser with scripting turned off would. Images are not decoded, and forms are not submitted.
+The standard ARMv7 image supports static HTML and WebM. The 64-bit QEMU image can run upstream WebContent, LibJS, RequestServer and the software compositor. With a complete matching browser package installed, Home starts the native UI and forwards taps to the live upstream view. With a document-helper package installed, the Rust UI displays the DOM returned by LibWeb after parsing and script execution. A YouTube watch-page playback result requires progressing video frames and audio in the real guest. See the [64-bit guest build and tests](../../../targets/qemu/aarch64/README.md).
 
 ## How the Ladybird parser is hosted
 
@@ -41,10 +46,12 @@ rustup toolchain install 1.98.0 --target armv7-unknown-linux-musleabihf
 make qemu-image
 ```
 
-[`tools/build_initfs.py`](../../../tools/build_initfs.py) fetches Ladybird and builds the browser into `/apps`. Without the toolchain it skips the browser, as it does for other optional toolchains.
+[`tools/build_initfs.py`](../../../tools/build_initfs.py) fetches Ladybird and builds the browser into `/apps`. The media build cross-compiles FFmpeg 9.0.2 with the Android NDK and the Open Runtime musl sysroot. [Media build](../../../tools/build_ladybird_media.py) Without the toolchain it skips the browser, as it does for other optional toolchains.
 
 On the Mac, `cargo +1.98.0 test --manifest-path apps/open/ladybird/Cargo.toml` runs the unit tests, and a Mac build can render an HTML file the way the phone would: `ladybird --render page.html out.ppm [scroll] [sheet.css…]`.
 
 ## Testing
 
 `make test-ladybird` boots QEMU, opens Ladybird from Home and drives it by touch against a local web server standing in for two sites: a link from the start page, a linked style sheet, a relative link, Back, a drag to scroll, and a URL typed on the keyboard, each checked in the Open Runtime's log and the guest's screen pixels. With the Mac online it also loads example.com over HTTPS and reports how a large Wikipedia article loads.
+
+`make test-ladybird-media` opens a static HTML video from Home in a fresh seL4 QEMU guest. The test checks changing VP9 frames, measures an Opus tone in the guest audio ring, then returns to the page and Home. The fixture is served over loopback.

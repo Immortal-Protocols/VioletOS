@@ -15,7 +15,7 @@ unsafe impl Sync for Heap {}
 pub static HEAP: Heap = Heap { head: core::cell::UnsafeCell::new(null_mut()) };
 
 const ALIGN: usize = 8;
-const HEADER: usize = 8;
+const HEADER: usize = 2 * core::mem::size_of::<usize>();
 fn round(n: usize) -> usize {
     (n + ALIGN - 1) & !(ALIGN - 1)
 }
@@ -79,7 +79,7 @@ unsafe impl GlobalAlloc for Heap {
         while !cur.is_null() {
             let start = cur as usize;
             let end = start + (*cur).size;
-            // The user pointer follows an 8-byte header that records the block.
+            // The user pointer follows a two-word header that records the block.
             let user = (start + HEADER + align - 1) & !(align - 1);
             let block_start = user - HEADER;
             let block_end = round(user + layout.size().max(1));

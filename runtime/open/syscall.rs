@@ -51,6 +51,8 @@ const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
+pub(super) const O_CLOEXEC: u32 = 0o2000000;
+pub(super) const FD_LIMIT: usize = 1024;
 const O_NONBLOCK: u32 = 0o4000;
 const O_DIRECTORY: u32 = 0o40000; // ARM's value.
 const CLONE_VM: u32 = 0x100;
@@ -117,12 +119,12 @@ impl Runtime {
     }
 
     // ---- app memory helpers ----
-    fn rd(&mut self, i: usize, va: u32, len: usize) -> Option<Vec<u8>> {
+    pub(super) fn rd(&mut self, i: usize, va: u32, len: usize) -> Option<Vec<u8>> {
         let mut v = alloc::vec![0u8; len];
         let app = self.apps[i].as_mut()?;
         app.space.read(&mut self.k, &mut self.pool, va, &mut v).then_some(v)
     }
-    fn wr(&mut self, i: usize, va: u32, data: &[u8]) -> bool {
+    pub(super) fn wr(&mut self, i: usize, va: u32, data: &[u8]) -> bool {
         let app = self.apps[i].as_mut().unwrap();
         app.space.write(&mut self.k, &mut self.pool, va, data)
     }
@@ -137,26 +139,13 @@ impl Runtime {
         let app = self.apps[i].as_mut()?;
         app.space.read_string(&mut self.k, &mut self.pool, va, 4096)
     }
-    fn file(&self, i: usize, fd: i32) -> Option<FileRef> {
-        self.apps[i].as_ref()?.fds.get(fd as usize)?.clone()
+    pub(super) fn file(&self, i: usize, fd: i32) -> Option<FileRef> {
+        Some(self.apps[i].as_ref()?.fds.get(fd as usize)?.as_ref()?.file.clone())
     }
-    fn install(&mut self, i: usize, f: OpenFile, from: usize) -> i32 {
-        let app = self.apps[i].as_mut().unwrap();
-        let file = Rc::new(RefCell::new(f));
-        for (n, slot) in app.fds.iter_mut().enumerate().skip(from) {
-            if slot.is_none() {
-                *slot = Some(file);
-                return n as i32;
-            }
-        }
-        if app.fds.len() >= 1024 {
-            return EMFILE;
-        }
-        while app.fds.len() < from {
-            app.fds.push(None);
-        }
-        app.fds.push(Some(file));
-        app.fds.len() as i32 - 1
+    pub(super) fn install(&mut self, i: usize, mut f: OpenFile, from: usize) -> i32 {
+        let cloexec = f.flags & O_CLOEXEC != 0;
+        f.flags &= !O_CLOEXEC;
+        self.install_ref(i, Rc::new(RefCell::new(f)), from, cloexec)
     }
     /// An absolute path for `path` relative to `dirfd` (or the working directory).
     fn at(&mut self, i: usize, dirfd: i32, path_ptr: u32) -> Result<String, i32> {
@@ -439,7 +428,7 @@ impl Runtime {
                 }
                 let blocking_socket = r == EAGAIN && self.file(i, a[0] as i32).map_or(false, |f| {
                     let f = f.borrow();
-                    matches!(f.kind, Kind::Tcp { .. } | Kind::Hci) && f.flags & O_NONBLOCK == 0
+                    matches!(f.kind, Kind::Tcp { .. } | Kind::Local(_) | Kind::Hci) && f.flags & O_NONBLOCK == 0
                 });
                 if blocking_socket {
                     return Block(Wait::Send { fd: a[0] as i32, buf: a[1], len: a[2] }, None);
@@ -472,8 +461,8 @@ impl Runtime {
                         // used to come back as EAGAIN on a blocking socket.
                         let blocking = self.file(i, a[0] as i32).map_or(false, |f| {
                             let f = f.borrow();
-                            let tcp = matches!(f.kind, Kind::Tcp { .. });
-                            (tcp || (n == 145 && matches!(f.kind, Kind::Pipe { .. }))) && f.flags & O_NONBLOCK == 0
+                            let stream = matches!(f.kind, Kind::Tcp { .. } | Kind::Local(_));
+                            (stream || (n == 145 && matches!(f.kind, Kind::Pipe { .. }))) && f.flags & O_NONBLOCK == 0
                         });
                         if blocking {
                             let fd = a[0] as i32;
@@ -543,23 +532,15 @@ impl Runtime {
             41 | 63 | 358 => {
                 let Some(f) = self.file(i, a[0] as i32) else { return Done(EBADF) };
                 if n == 41 {
-                    let app = self.apps[i].as_mut().unwrap();
-                    let pos = app.fds.iter().position(|s| s.is_none()).unwrap_or(app.fds.len());
-                    if pos == app.fds.len() {
-                        app.fds.push(None);
-                    }
-                    app.fds[pos] = Some(f);
-                    return Done(pos as i32);
+                    return Done(self.install_ref(i, f, 0, false));
                 }
                 let target = a[1] as usize;
-                if target >= 1024 {
-                    return Done(EBADF);
-                }
+                if target >= FD_LIMIT { return Done(EBADF); }
+                if n == 358 && (a[2] & !O_CLOEXEC != 0 || a[0] == a[1]) { return Done(EINVAL); }
+                if a[0] == a[1] { return Done(target as i32); }
                 let app = self.apps[i].as_mut().unwrap();
-                while app.fds.len() <= target {
-                    app.fds.push(None);
-                }
-                app.fds[target] = Some(f);
+                while app.fds.len() <= target { app.fds.push(None); }
+                app.fds[target] = Some(super::Descriptor { file: f, cloexec: n == 358 && a[2] & O_CLOEXEC != 0 });
                 Done(target as i32)
             }
             55 | 221 => self.fcntl(i, a[0] as i32, a[1], a[2]),
@@ -985,7 +966,7 @@ impl Runtime {
             let r = self.write_audio(i, fd, buf, len);
             return if r == 0 { EAGAIN } else { r };
         }
-        if matches!(f.borrow().kind, Kind::Tcp { .. } | Kind::Udp { .. }) {
+        if matches!(f.borrow().kind, Kind::Local(_) | Kind::Tcp { .. } | Kind::Udp { .. }) {
             return self.socket_send(i, fd, buf, len, None);
         }
         let Some(data) = self.rd(i, buf, len as usize) else { return EFAULT };
@@ -1064,8 +1045,12 @@ impl Runtime {
     fn fcntl(&mut self, i: usize, fd: i32, cmd: u32, arg: u32) -> Outcome {
         let Some(f) = self.file(i, fd) else { return Done(EBADF) };
         match cmd {
-            0 | 1030 => Done(self.install_ref(i, f, arg as usize)),
-            1 | 2 => Done(0),
+            0 | 1030 => Done(self.install_ref(i, f, arg as usize, cmd == 1030)),
+            1 => Done(self.apps[i].as_ref().unwrap().fds[fd as usize].as_ref().unwrap().cloexec as i32),
+            2 => {
+                self.apps[i].as_mut().unwrap().fds[fd as usize].as_mut().unwrap().cloexec = arg & 1 != 0;
+                Done(0)
+            }
             3 => Done((f.borrow().flags | 0o400000) as i32),
             4 => {
                 let mut f = f.borrow_mut();
@@ -1076,19 +1061,15 @@ impl Runtime {
             _ => Done(EINVAL),
         }
     }
-    fn install_ref(&mut self, i: usize, f: FileRef, from: usize) -> i32 {
+    pub(super) fn install_ref(&mut self, i: usize, f: FileRef, from: usize, cloexec: bool) -> i32 {
+        if from >= FD_LIMIT { return EINVAL; }
         let app = self.apps[i].as_mut().unwrap();
-        while app.fds.len() <= from {
-            app.fds.push(None);
-        }
-        let pos = (from..app.fds.len()).find(|&k| app.fds[k].is_none()).unwrap_or(app.fds.len());
-        if pos == app.fds.len() {
-            app.fds.push(None);
-        }
-        app.fds[pos] = Some(f);
+        let pos = (from..app.fds.len()).find(|&k| app.fds[k].is_none()).unwrap_or(app.fds.len().max(from));
+        if pos >= FD_LIMIT { return EMFILE; }
+        if pos >= app.fds.len() { app.fds.resize(pos + 1, None); }
+        app.fds[pos] = Some(super::Descriptor { file: f, cloexec });
         pos as i32
     }
-
     fn ioctl(&mut self, i: usize, fd: i32, cmd: u32, arg: u32) -> Outcome {
         let Some(f) = self.file(i, fd) else { return Done(EBADF) };
         let is_screen = matches!(f.borrow().kind, Kind::Screen);
@@ -1131,6 +1112,7 @@ impl Runtime {
             }
             0x541b => {
                 let n = match &f.borrow().kind {
+                    Kind::Local(stream) => stream.readable_bytes() as u32,
                     Kind::Pipe { buffer, .. } => buffer.borrow().len() as u32,
                     _ => 0,
                 };

@@ -92,6 +92,18 @@ pub fn layout(d: &Document, styles: &[Style], fonts: &Fonts, width: i32) -> Layo
 }
 
 impl Builder<'_> {
+    fn target(&self, node: usize) -> Option<&str> {
+        if self.d.name(node) != "video" {
+            return self.d.attribute(node, "href");
+        }
+        self.d.attribute(node, "src").or_else(|| {
+            self.d.node(node).children.iter().copied()
+                .filter(|&n| self.d.name(n) == "source")
+                .filter(|&n| self.d.attribute(n, "type").is_none_or(crate::media::is_webm))
+                .find_map(|n| self.d.attribute(n, "src"))
+        })
+    }
+
     fn link_of(&self, node: usize, inherited: Option<usize>) -> Option<usize> {
         if self.d.name(node) == "a" && self.d.attribute(node, "href").is_some() { Some(node) } else { inherited }
     }
@@ -127,6 +139,10 @@ impl Builder<'_> {
         if self.d.name(node) == "hr" {
             self.out.items.push(Item::Fill { r: Rect::new(inner_x, y, inner_x + inner_w, y + 2), color: s.border.unwrap_or(rgb(0x99, 0x99, 0x99)) });
             y += 2;
+        } else if self.d.name(node) == "video" && self.target(node).is_some() {
+            let mut run = Vec::new();
+            self.collect(node, link, &mut run);
+            y = self.lines(run, inner_x, inner_w, y, s.align);
         } else if self.d.name(node) == "img" {
             if let Some((w, h)) = self.image_size(node) {
                 let r = Rect::new(inner_x, y, inner_x + w.min(inner_w), y + h);
@@ -439,6 +455,9 @@ impl Builder<'_> {
                             run.push(Frag::Word { text: format!("[{alt}]"), node, link });
                         }
                     }
+                    "video" if self.target(node).is_some() => {
+                        run.push(Frag::Word { text: "Play video".into(), node, link: Some(node) });
+                    }
                     "input" => {
                         let kind = self.d.attribute(node, "type").unwrap_or("text").to_ascii_lowercase();
                         let label = match kind.as_str() {
@@ -522,7 +541,7 @@ impl Builder<'_> {
                     b.out.items.push(Item::Fill { r, color: rgb(0xe4, 0xe0, 0xea) });
                     let _ = node;
                     if let Some(a) = link
-                        && let Some(href) = b.d.attribute(*a, "href")
+                        && let Some(href) = b.target(*a)
                     {
                         b.out.links.push((r, href.to_string()));
                     }
@@ -547,14 +566,16 @@ impl Builder<'_> {
                 if let Some(bg) = s.background {
                     b.out.items.push(Item::Fill { r: Rect::new(wx, baseline - f.ascent(), wx + p.width, baseline - f.descent()), color: bg });
                 }
-                b.out.items.push(Item::Text { x: wx, baseline, text, size: f.size(), bold: s.bold, color: s.color });
-                if s.underline {
+                let video = b.d.name(*node) == "video";
+                let color = if video { rgb(0x1a, 0x55, 0xc4) } else { s.color };
+                b.out.items.push(Item::Text { x: wx, baseline, text, size: f.size(), bold: s.bold, color });
+                if s.underline || video {
                     let t = (s.font_size / 14.0).max(2.0) as i32;
                     let uy = baseline + (s.font_size * 0.12) as i32;
-                    b.out.items.push(Item::Fill { r: Rect::new(wx, uy, underline_end, uy + t), color: s.color });
+                    b.out.items.push(Item::Fill { r: Rect::new(wx, uy, underline_end, uy + t), color });
                 }
                 if let Some(a) = link
-                    && let Some(href) = b.d.attribute(*a, "href")
+                    && let Some(href) = b.target(*a)
                 {
                     let r = Rect::new(wx - 6, baseline - ascent, wx + p.width + 6, baseline + descent);
                     b.out.links.push((r, href.to_string()));

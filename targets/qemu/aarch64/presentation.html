@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VioletOS browser input test</title>
+<style>
+html, body { margin: 0; height: 100%; background: #c73452 }
+button { display: block; width: 100%; height: 100%; color: white; border: 0; background: transparent; font: 36px sans-serif }
+</style>
+<button>Tap to change the page</button>
+<script>
+document.querySelector('button').onclick = function () {
+    document.body.style.backgroundColor = '#246c99';
+    this.textContent = 'Ladybird received the tap';
+};
+</script>

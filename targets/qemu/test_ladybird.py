@@ -13,6 +13,10 @@ its output from the guest's screen and the Open Runtime's log:
   5. The address bar and on-screen keyboard load a typed URL.
   6. With the Mac online, example.com loads over HTTPS with a verified certificate.
   7. Home returns to the Home app.
+
+With VIOLET_TEST_WEBM=1, tap a video on the second page and check changing
+screen pixels and decoded PCM on the guest sound card, then go Back and Home.
+This mode uses only the local HTTP fixture.
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +33,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "targets/qemu"))
 import home_grid
 import run
+
+WEBM = os.environ.get("VIOLET_TEST_WEBM") == "1"
 
 FIRST = """<!doctype html>
 <html><head><title>VioletOS Ladybird test</title>
@@ -168,6 +174,58 @@ tap(360, green[len(green) // 2])
 until("second page", lambda: loaded("http://info.cern.ch/hypertext/WWW/second.html?from=first", "Second page"), 60)
 until("second page drawn", lambda: len(rows_with(0xee8800)) > 20, 20)
 
+if os.environ.get("VIOLET_TEST_WEBM") == "1":
+    # The secondary page has just one blue link, from <video controls src=...>.
+    until("the video's Play link drawn", lambda: bool(rows_with(LINK)))
+    link_rows = rows_with(LINK)
+    xs = [x for x in range(720) if any(pixel(x, y) == LINK for y in link_rows)]
+    card = mmap.mmap(ram.fileno(), 9 * 4096, offset=0x49204000 - 0x40000000, prot=mmap.PROT_READ)
+    def word(i):
+        return struct.unpack_from("<I", card, 4 * i)[0]
+    def frame_color():
+        colors = [pixel(x, y) for x in (330, 360, 390) for y in (330, 350, 370)]
+        rgb = [((c >> 16) & 255, (c >> 8) & 255, c & 255) for c in colors]
+        if all(r > 180 and g < 70 and b < 70 for r, g, b in rgb):
+            return "red"
+        if all(b > 180 and r < 70 and g < 70 for r, g, b in rgb):
+            return "blue"
+    def tone(new_frames):
+        # Read 2048 consecutive left-channel samples, including wraparound.
+        end, size = word(5), word(7)
+        n = 2048
+        if new_frames < n or size < n:
+            return 0
+        samples = [struct.unpack_from("<h", card, 4096 + 4 * ((end - n + k) % size))[0] for k in range(n)]
+        if max(samples) - min(samples) < 100:
+            return 0
+        crossings = [k - a / (b - a) for k, (a, b) in enumerate(zip(samples, samples[1:])) if a <= 0 < b]
+        if len(crossings) < 10:
+            return 0
+        return (len(crossings) - 1) * 48000 / (crossings[-1] - crossings[0])
+    start_frame = word(5)
+    tap((xs[0] + xs[-1]) // 2, (link_rows[0] + link_rows[-1]) // 2, 0)
+    colors, tone_hz = [], 0
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        color = frame_color()
+        if color and (not colors or colors[-1] != color):
+            colors.append(color)
+        new_frames = (word(5) - start_frame) & 0xffffffff
+        if not tone_hz:
+            frequency = tone(new_frames)
+            if 435 <= frequency <= 445:
+                tone_hz = frequency
+        if len(colors) >= 3 and tone_hz and new_frames >= 24000:
+            break
+        time.sleep(.025)
+    else:
+        fail(f"WebM playback: colors={colors}, PCM frames={new_frames}, tone={tone_hz:.0f} Hz")
+    print(f"native WebM: {colors}, {new_frames} PCM frames, {tone_hz:.0f} Hz", file=sys.stderr)
+    tap(242, 63)
+    until("Back from WebM to the video page", lambda: bool(rows_with(0xee8800)) and bool(rows_with(LINK)), 30)
+    leave_to_home()
+    sys.exit(0)
+
 # 4. Back, then scroll by dragging.
 before = count(r"ladybird: loaded http://info.cern.ch/hypertext/WWW/TheProject.html ")
 tap(242, 63)
@@ -216,10 +274,12 @@ leave_to_home()
 class Site(BaseHTTPRequestHandler):
     pages = {
         "/hypertext/WWW/TheProject.html": FIRST,
-        "/hypertext/WWW/second.html?from=first": SECOND,
+        "/hypertext/WWW/second.html?from=first": SECOND + ('<video controls src="colors.webm"></video>' if WEBM else ""),
         "/hypertext/WWW/style.css": LINKED_CSS,
         "/form": TYPED,
     }
+    if WEBM:
+        pages["/hypertext/WWW/colors.webm"] = (ROOT / "targets/qemu/fixtures/colors.webm").read_bytes()
     requests = []
 
     def do_GET(self):
@@ -230,8 +290,11 @@ class Site(BaseHTTPRequestHandler):
             body = "<title>Not found</title><h1>Not found</h1>"
         else:
             self.send_response(200)
-        data = body.encode()
-        kind = "text/css" if self.path.endswith(".css") else "text/html; charset=utf-8"
+        if isinstance(body, bytes):
+            data, kind = body, "video/webm"
+        else:
+            data = body.encode()
+            kind = "text/css" if self.path.endswith(".css") else "text/html; charset=utf-8"
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -266,17 +329,20 @@ with TemporaryDirectory() as tmp:
     run.IMAGE = image
     viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
     os.environ.update(
-        OPEN_ONLINE="1" if online() else "0",
+        OPEN_ONLINE="1" if not WEBM and online() else "0",
         VIOLET_NET_HOSTS=json.dumps({"info.cern.ch": f"127.0.0.1:{port}", "typed.test": f"127.0.0.1:{port}"}),
     )
     status = run.main(str(viewer))
     server.shutdown()
     if status != 0:
         raise SystemExit(f"ladybird test failed (viewer status {status})")
-    expected = {("info.cern.ch", "/hypertext/WWW/TheProject.html"), ("info.cern.ch", "/hypertext/WWW/style.css"), ("info.cern.ch", "/hypertext/WWW/second.html?from=first"),
-                ("typed.test", "/form")}
+    expected = {("info.cern.ch", "/hypertext/WWW/TheProject.html"), ("info.cern.ch", "/hypertext/WWW/style.css"), ("info.cern.ch", "/hypertext/WWW/second.html?from=first")}
+    expected.add(("info.cern.ch", "/hypertext/WWW/colors.webm") if WEBM else ("typed.test", "/form"))
     missing = expected - set(Site.requests)
     if missing:
         raise SystemExit(f"the browser never requested {sorted(missing)}; it asked for {Site.requests}")
-    print("Ladybird verified: start page, HTTP links, a linked style sheet, a relative link, back, scrolling, typed address"
-          + (", HTTPS" if os.environ["OPEN_ONLINE"] == "1" else ""))
+    if WEBM:
+        print("Ladybird verified: HTML video link, VP9 frame changes, Opus tone, Back and Home")
+    else:
+        print("Ladybird verified: start page, HTTP links, a linked style sheet, a relative link, back, scrolling, typed address"
+              + (", HTTPS" if os.environ["OPEN_ONLINE"] == "1" else ""))

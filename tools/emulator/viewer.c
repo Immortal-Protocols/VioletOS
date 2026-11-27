@@ -2,6 +2,8 @@
 #include <SDL.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -39,7 +41,7 @@ static void play(void *unused, Uint8 *stream, int bytes) {
     int16_t *out = (int16_t *)stream;
     int frames = bytes / 4;
     const int16_t *ring = (const int16_t *)(sound + 1024);
-    uint32_t size = sound[7], written = sound[5];
+    uint32_t size = sound[7], written = __atomic_load_n(&sound[5], __ATOMIC_ACQUIRE);
     if (sound[2] != SOUND_MAGIC || !size || size > 8192) size = 0;
     // Rejoin the guest after a stall rather than replaying stale samples.
     if (size && written - heard > size) heard = written - size / 4;
@@ -53,9 +55,11 @@ static void play(void *unused, Uint8 *stream, int bytes) {
         }
     }
 }
+static const char *guest_title;
 static void title(SDL_Window *window) {
-    SDL_SetWindowTitle(window, sound[1] & 1 ? "VioletOS · seL4 on QEMU · headphones in"
-                                            : "VioletOS · seL4 on QEMU");
+    char label[100];
+    snprintf(label, sizeof(label), "%s%s", guest_title, sound[1] & 1 ? " · headphones in" : "");
+    SDL_SetWindowTitle(window, label);
 }
 static int send_report(int x, int y, int down) {
     uint8_t report[6] = {0};
@@ -70,35 +74,62 @@ static int send_report(int x, int y, int down) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    if (argc < 2 || argc > 4) return 2;
+    guest_title = argc >= 3 ? "VioletOS · AArch64 seL4 on QEMU" : "VioletOS · seL4 on QEMU";
+    const char *label = getenv("VIOLET_QEMU_TITLE");
+    if (label && *label) guest_title = label;
     int fd = open(argv[1], O_RDWR);
     if (fd < 0) { perror("guest RAM"); return 1; }
-    // Align to host page size (16 KiB on Apple Silicon).
+    // The ARMv7 board has a fixed scanout. The AArch64 image supplies its
+    // framebuffer offset within QEMU RAM; it may start inside a host page.
     off_t offset = 0x79450000 - 0x40000000;
+    if (argc >= 3) {
+        char *end;
+        offset = strtoll(argv[2], &end, 0);
+        if (*end || offset < 0) return 2;
+    }
     // The frame, then the page after it, where the guest says which rows changed.
     const size_t length = PITCH * HEIGHT + 4096;
-    void *frame = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
-    sound = mmap(NULL, SOUND_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, SOUND_PAGE);
+    struct stat statbuf;
+    if (fstat(fd, &statbuf) || offset > statbuf.st_size - (off_t)length) return 2;
+    size_t prefix = (size_t)(offset % sysconf(_SC_PAGESIZE));
+    void *base = mmap(NULL, length + prefix, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset - prefix);
+    static uint32_t silent[SOUND_BYTES / sizeof(uint32_t)];
+    sound = silent;
+    if (argc != 3) {
+        off_t sound_offset = SOUND_PAGE;
+        if (argc == 4) {
+            char *end;
+            sound_offset = strtoll(argv[3], &end, 0);
+            if (*end || sound_offset < 0) return 2;
+        }
+        if (sound_offset > statbuf.st_size - SOUND_BYTES) return 2;
+        size_t skip = sound_offset % sysconf(_SC_PAGESIZE);
+        void *card = mmap(NULL, SOUND_BYTES + skip, PROT_READ | PROT_WRITE, MAP_SHARED, fd, sound_offset - skip);
+        if (card == MAP_FAILED) { perror("sound memory"); return 1; }
+        sound = (volatile uint32_t *)((uint8_t *)card + skip);
+    }
     close(fd);
-    if (frame == MAP_FAILED || sound == MAP_FAILED) { perror("guest memory"); return 1; }
+    if (base == MAP_FAILED || sound == MAP_FAILED) { perror("guest memory"); return 1; }
+    void *frame = (uint8_t *)base + prefix;
     sound[0] = 0;
     heard = sound[5];
     if (SDL_Init(SDL_INIT_VIDEO)) goto fail;
     // Sound is optional: the guest keeps running on a Mac without an output device.
     SDL_AudioDeviceID speaker = 0;
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+    if (argc != 3 && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         SDL_AudioSpec want = {.freq = 48000, .format = AUDIO_S16SYS, .channels = 2,
                               .samples = 512, .callback = play};
         speaker = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
         if (speaker) SDL_PauseAudioDevice(speaker, 0);
     }
-    if (!speaker) fprintf(stderr, "VioletOS display: no sound output (%s)\n", SDL_GetError());
+    if (!speaker && argc != 3) fprintf(stderr, "VioletOS display: no sound output (%s)\n", SDL_GetError());
     // The Mac's microphone opens only while the guest asks for it (word 12), so
     // macOS asks for permission the first time an app records.
     SDL_AudioDeviceID mic = 0;
     int mic_tried = 0;
     Uint32 mic_clock = 0;
-    SDL_Window *window = SDL_CreateWindow("VioletOS · seL4 on QEMU",
+    SDL_Window *window = SDL_CreateWindow(guest_title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH / 2, HEIGHT / 2,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!window) goto fail;
@@ -200,11 +231,11 @@ int main(int argc, char **argv) {
     if (speaker) SDL_CloseAudioDevice(speaker);
     if (mic) SDL_CloseAudioDevice(mic);
     SDL_Quit();
-    munmap(frame, length);
+    munmap(base, length + prefix);
     return 0;
 fail:
     fprintf(stderr, "VioletOS display: %s\n", SDL_GetError());
     SDL_Quit();
-    munmap(frame, length);
+    munmap(base, length + prefix);
     return 1;
 }

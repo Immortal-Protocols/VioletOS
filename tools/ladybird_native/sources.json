@@ -1,0 +1,68 @@
+[
+  {
+    "name": "ladybird",
+    "url": "https://codeload.github.com/LadybirdBrowser/ladybird/tar.gz/c87319cd8b89404aff26d791fb6a2c8007fe1b65",
+    "sha256": "a0e84d880a0420a2ed51c7e8bfc6c7999f1c96c810034b3447f87eec208f8f0d"
+  },
+  {
+    "name": "simdutf",
+    "url": "https://codeload.github.com/simdutf/simdutf/tar.gz/v9.3.3",
+    "sha256": "441e374e8629bd8469f6d5cde9f0fa17ef3ad158aeb077791606d8aa73b565ef"
+  },
+  {
+    "name": "fast_float",
+    "url": "https://codeload.github.com/fastfloat/fast_float/tar.gz/v8.3.3",
+    "sha256": "4dd695f051893c8218faf2ed9871fa4a4990aa6aee2d3190ed7bfa2e83092245"
+  },
+  {
+    "name": "mimalloc",
+    "url": "https://codeload.github.com/microsoft/mimalloc/tar.gz/v2.2.7",
+    "sha256": "8e0ed89907a681276bff2e49e9a048b47ba51254ab60daf6b3c220acac456a95"
+  },
+  {
+    "name": "zmij",
+    "url": "https://codeload.github.com/vitaut/zmij/tar.gz/refs/tags/v1.2",
+    "sha256": "13e11c9309fab358d5b6f656050e4f3efa1d20ecf15958ae9055382d07b0268f"
+  },
+  {
+    "name": "llvm-project",
+    "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/e54169423e7ee5d8b41c2f1b6f7a59000c901ee0",
+    "sha256": "db3ee51752d716118e3ff1109c7920a32dfc29bd414112e8d18ff6280e608c1c",
+    "subdir": "llvm-project-e54169423e7ee5d8b41c2f1b6f7a59000c901ee0/libc"
+  },
+  {
+    "name": "icu-data-full-78.3-r0.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/icu-data-full-78.3-r0.apk",
+    "sha256": "cf36df81593607100702e549ef35b4af5c4548cf7a6285648b4dde43af5aec99"
+  },
+  {
+    "name": "icu-dev-78.3-r0.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/icu-dev-78.3-r0.apk",
+    "sha256": "31d2f15bc8563d0908b1818182eaa347a82514d952d3cf506a813027fb9d54f8"
+  },
+  {
+    "name": "icu-static-78.3-r0.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/icu-static-78.3-r0.apk",
+    "sha256": "35e548fda1357997eab5e6df2faec6d4d7ac7c2c25909e94571b94e11fa4ecd8"
+  },
+  {
+    "name": "libgcc-static-15.2.0-r9.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/libgcc-static-15.2.0-r9.apk",
+    "sha256": "a83ebd954be67c48c5616b4468a3500e3b4a4c7f2ec7dd4dc40664cde2de5c7f"
+  },
+  {
+    "name": "libstdc++-dev-15.2.0-r9.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/libstdc++-dev-15.2.0-r9.apk",
+    "sha256": "7566e13cba5ae5d7c80d3962f91783556d1f50022e7157f287e8c0cd2c30b217"
+  },
+  {
+    "name": "linux-headers-7.2.1-r0.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/linux-headers-7.2.1-r0.apk",
+    "sha256": "d4db4bdb66a54ef86500bb8ea834e3769ff5502f22d1ab40b360edc1566a0e92"
+  },
+  {
+    "name": "musl-dev-1.2.6-r6.apk",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/edge/main/aarch64/musl-dev-1.2.6-r6.apk",
+    "sha256": "867ed4f6c22c905980a06d17a55d8396120b737085e83486496b18360302323d"
+  }
+]

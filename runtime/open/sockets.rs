@@ -8,6 +8,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use Outcome::*;
 
+const AF_UNIX: u32 = 1;
+const SOCK_CLOEXEC: u32 = 0o2000000;
 const AF_INET: u32 = 2;
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
@@ -24,6 +26,117 @@ const EALREADY: i32 = -114;
 const ENETUNREACH: i32 = -101;
 /// The resolver programs are told to ask (/etc/resolv.conf).
 pub const NAMESERVER: u32 = 0x0a00_0035; // 10.0.0.53
+
+/// One direction of a local stream. The peer can drain queued bytes after its
+/// writer closes. Duplicated descriptors share their OpenFile and endpoint.
+#[derive(Default)]
+struct StreamBuffer {
+    bytes: VecDeque<u8>,
+    received: u64,
+    rights: VecDeque<Rights>,
+    read_closed: bool,
+    write_closed: bool,
+}
+
+struct Rights {
+    first: u64,
+    end: u64,
+    files: Vec<super::FileRef>,
+}
+
+type BufferRef = alloc::rc::Rc<core::cell::RefCell<StreamBuffer>>;
+
+pub struct LocalStream {
+    input: BufferRef,
+    output: BufferRef,
+}
+
+const STREAM_CAPACITY: usize = 64 * 1024;
+
+impl LocalStream {
+    fn pair() -> (Self, Self) {
+        let a = BufferRef::default();
+        let b = BufferRef::default();
+        (Self { input: a.clone(), output: b.clone() }, Self { input: b, output: a })
+    }
+
+    pub fn readable_bytes(&self) -> usize {
+        self.input.borrow().bytes.len()
+    }
+
+    pub fn poll_mask(&self) -> u32 {
+        let rx = self.input.borrow();
+        let tx = self.output.borrow();
+        let eof = rx.read_closed || rx.write_closed;
+        let write_closed = tx.read_closed || tx.write_closed;
+        let mut mask = 0;
+        if !rx.bytes.is_empty() || eof { mask |= 1; }
+        if write_closed || tx.bytes.len() < STREAM_CAPACITY { mask |= 4; }
+        if eof { mask |= 0x2000; } // POLLRDHUP
+        if eof && write_closed { mask |= 0x10; }
+        mask
+    }
+
+    /// SCM_RIGHTS is delivered with the first byte of its send. Keep that
+    /// boundary across reads; draining by read(2) discards the attached files.
+    pub fn preview(&self, max: usize) -> Result<(Vec<u8>, Vec<super::FileRef>), i32> {
+        let rx = self.input.borrow();
+        if max == 0 || rx.read_closed { return Ok((Vec::new(), Vec::new())); }
+        if rx.bytes.is_empty() && !rx.write_closed { return Err(EAGAIN); }
+        let mut n = rx.bytes.len().min(max);
+        let mut files = Vec::new();
+        if let Some(mark) = rx.rights.front() {
+            let boundary = if mark.first == rx.received {
+                files = mark.files.clone();
+                mark.end
+            } else { mark.first };
+            n = n.min((boundary - rx.received) as usize);
+        }
+        Ok((rx.bytes.iter().take(n).copied().collect(), files))
+    }
+
+    pub fn consume(&self, n: usize) {
+        let mut rx = self.input.borrow_mut();
+        if n > 0 && rx.rights.front().is_some_and(|m| m.first == rx.received) { rx.rights.pop_front(); }
+        rx.bytes.drain(..n);
+        rx.received += n as u64;
+    }
+
+    pub fn send_files(&self, data: &[u8], files: &[super::FileRef]) -> i32 {
+        let mut tx = self.output.borrow_mut();
+        if tx.read_closed || tx.write_closed {
+            return -32; // EPIPE
+        }
+        let n = data.len().min(STREAM_CAPACITY - tx.bytes.len());
+        if n == 0 && !data.is_empty() { return EAGAIN; }
+        if n > 0 && !files.is_empty() {
+            let queued: usize = tx.rights.iter().map(|m| m.files.len()).sum();
+            if queued + files.len() > 253 { return -109; } // ETOOMANYREFS
+            let first = tx.received + tx.bytes.len() as u64;
+            tx.rights.push_back(Rights { first, end: first + n as u64, files: files.to_vec() });
+        }
+        tx.bytes.extend(&data[..n]);
+        n as i32
+    }
+
+    fn shutdown(&self, how: u32) {
+        if how == 0 || how == 2 {
+            let mut rx = self.input.borrow_mut();
+            rx.read_closed = true;
+            rx.bytes.clear();
+            rx.rights.clear();
+        }
+        if how == 1 || how == 2 {
+            self.output.borrow_mut().write_closed = true;
+        }
+    }
+}
+
+impl Drop for LocalStream {
+    fn drop(&mut self) {
+        self.shutdown(2);
+    }
+}
 
 fn sockaddr(ip: u32, port: u16) -> [u8; 16] {
     let mut b = [0u8; 16];
@@ -51,6 +164,11 @@ impl Runtime {
             }
             293 => {
                 let Some(f) = self.socket_file(i, a[0] as i32) else { return Done(EBADF) };
+                if let Kind::Local(ref stream) = f.borrow().kind {
+                    if a[1] > 2 { return Done(EINVAL); }
+                    stream.shutdown(a[1]);
+                    return Done(0);
+                }
                 if let Kind::Tcp { slot: Some(slot), .. } = f.borrow().kind {
                     if a[1] >= 1 {
                         self.net.shutdown_send(slot);
@@ -81,14 +199,14 @@ impl Runtime {
             }
             295 => self.getsockopt(i, a[0] as i32, a[1], a[2], a[3], a[4]),
             296 | 297 => self.message_call(i, a[0] as i32, a[1], a[2], n == 296),
-            288 => Done(EOPNOTSUPP),
+            288 => Done(self.socket_pair(i, a[0], a[1], a[2], a[3])),
             _ => Done(ENOSYS),
         }
     }
 
     fn socket_file(&self, i: usize, fd: i32) -> Option<super::FileRef> {
-        let f = self.apps[i].as_ref()?.fds.get(fd as usize)?.clone()?;
-        let socket = matches!(f.borrow().kind, Kind::Tcp { .. } | Kind::Udp { .. });
+        let f = self.file(i, fd)?;
+        let socket = matches!(f.borrow().kind, Kind::Local(_) | Kind::Tcp { .. } | Kind::Udp { .. });
         socket.then_some(f)
     }
     fn is_socket(&self, i: usize, fd: i32) -> bool {
@@ -127,23 +245,42 @@ impl Runtime {
         }
     }
 
+    fn socket_pair(&mut self, i: usize, domain: u32, kind: u32, protocol: u32, result: u32) -> i32 {
+        if domain != AF_UNIX { return EAFNOSUPPORT; }
+        if kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC | 0xf) != 0 { return EINVAL; }
+        if kind & 0xf != SOCK_STREAM || protocol != 0 { return EPROTONOSUPPORT; }
+        let flags = 2 | (kind & (O_NONBLOCK | SOCK_CLOEXEC));
+        let (a, b) = LocalStream::pair();
+        let left = self.install(i, OpenFile::new(Kind::Local(a), flags), 0);
+        if left < 0 { return left; }
+        let right = self.install(i, OpenFile::new(Kind::Local(b), flags), 0);
+        let app = self.apps[i].as_mut().unwrap();
+        if right < 0 {
+            app.fds[left as usize] = None;
+            return right;
+        }
+        let mut pair = [0; 8];
+        pair[..4].copy_from_slice(&left.to_le_bytes());
+        pair[4..].copy_from_slice(&right.to_le_bytes());
+        if !app.space.write(&mut self.k, &mut self.pool, result, &pair) {
+            app.fds[left as usize] = None;
+            app.fds[right as usize] = None;
+            return EFAULT;
+        }
+        0
+    }
+
     fn socket(&mut self, i: usize, domain: u32, kind: u32) -> i32 {
         if domain != AF_INET {
             return EAFNOSUPPORT;
         }
-        let flags = 2 | if kind & SOCK_NONBLOCK != 0 { O_NONBLOCK } else { 0 };
+        let flags = 2 | (kind & (SOCK_NONBLOCK | SOCK_CLOEXEC));
         let file = match kind & 0xf {
             SOCK_STREAM => OpenFile::new(Kind::Tcp { slot: None, peer: (0, 0) }, flags),
             SOCK_DGRAM => OpenFile::new(Kind::Udp { peer: None, replies: VecDeque::new(), slot: None, allowed: Vec::new() }, flags),
             _ => return EPROTONOSUPPORT,
         };
-        let app = self.apps[i].as_mut().unwrap();
-        let pos = app.fds.iter().position(|f| f.is_none()).unwrap_or(app.fds.len());
-        if pos == app.fds.len() {
-            app.fds.push(None);
-        }
-        app.fds[pos] = Some(alloc::rc::Rc::new(core::cell::RefCell::new(file)));
-        pos as i32
+        self.install(i, file, 0)
     }
 
     fn connect(&mut self, i: usize, fd: i32, addr: u32, len: u32) -> Outcome {
@@ -241,6 +378,7 @@ impl Runtime {
         };
         let mut file = f.borrow_mut();
         match &mut file.kind {
+            Kind::Local(stream) => stream.send_files(&data, &[]),
             Kind::Udp { peer, replies, slot, allowed } => {
                 let dest = to.or(*peer);
                 match dest {
@@ -357,6 +495,12 @@ impl Runtime {
         self.net.last_from = (0, 0);
         let r = self.read_now(i, fd, buf, len);
         if r >= 0 && name != 0 {
+            if self.socket_file(i, fd).is_some_and(|f| matches!(f.borrow().kind, Kind::Local(_))) {
+                // An unnamed peer supplies no sender address to recvfrom.
+                let app = self.apps[i].as_mut().unwrap();
+                if !app.space.write_u32(&mut self.k, &mut self.pool, name_len, 0) { return EFAULT; }
+                return r;
+            }
             let addr = match self.net.last_from {
                 (0, 0) => self.peer_of(i, fd).unwrap_or((NAMESERVER, 53)),
                 a => a,
@@ -369,6 +513,11 @@ impl Runtime {
     /// sendmsg and recvmsg: the address and the first buffer of the vector.
     fn message_call(&mut self, i: usize, fd: i32, msg: u32, flags: u32, send: bool) -> Outcome {
         let Some(h) = self.rd_words(i, msg, 7) else { return Done(EFAULT) };
+        if let Some(f) = self.file(i, fd) {
+            if matches!(f.borrow().kind, Kind::Local(_)) {
+                return self.unix_message(i, fd, f, msg, &h, flags, send);
+            }
+        }
         let (name, namelen, iov, iovlen) = (h[0], h[1], h[2], h[3]);
         if iovlen == 0 {
             return Done(0);
@@ -390,9 +539,9 @@ impl Runtime {
             r
         }
     }
-    fn rd_words(&mut self, i: usize, at: u32, n: usize) -> Option<Vec<u32>> {
+    pub(super) fn rd_words(&mut self, i: usize, at: u32, n: usize) -> Option<Vec<u32>> {
         let app = self.apps[i].as_mut()?;
-        (0..n).map(|k| app.space.read_u32(&mut self.k, &mut self.pool, at + 4 * k as u32)).collect()
+        (0..n).map(|k| app.space.read_u32(&mut self.k, &mut self.pool, at.checked_add(4 * k as u32)?)).collect()
     }
 
     fn getsockopt(&mut self, i: usize, fd: i32, level: u32, name: u32, val: u32, len_ptr: u32) -> Outcome {
@@ -407,7 +556,7 @@ impl Runtime {
                 _ => 0,
             },
             (1, 3) => match f.borrow().kind {
-                Kind::Tcp { .. } => SOCK_STREAM,
+                Kind::Local(_) | Kind::Tcp { .. } => SOCK_STREAM,
                 _ => SOCK_DGRAM,
             },
             (1, 7) | (1, 8) => 65536, // SO_SNDBUF, SO_RCVBUF
@@ -437,6 +586,14 @@ impl Runtime {
     fn socket_name(&mut self, i: usize, fd: i32, ptr: u32, len_ptr: u32, peer: bool) -> Outcome {
         if !self.is_socket(i, fd) {
             return Done(EBADF);
+        }
+        if self.socket_file(i, fd).is_some_and(|f| matches!(f.borrow().kind, Kind::Local(_))) {
+            let app = self.apps[i].as_mut().unwrap();
+            let Some(room) = app.space.read_u32(&mut self.k, &mut self.pool, len_ptr) else { return Done(EFAULT) };
+            let family = (AF_UNIX as u16).to_le_bytes();
+            let ok = app.space.write(&mut self.k, &mut self.pool, ptr, &family[..room.min(2) as usize])
+                && app.space.write_u32(&mut self.k, &mut self.pool, len_ptr, 2);
+            return Done(if ok { 0 } else { EFAULT });
         }
         let addr = if peer {
             match self.peer_of(i, fd) {

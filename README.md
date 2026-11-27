@@ -14,6 +14,8 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 | Command | What you get |
 | --- | --- |
 | `make emulator` | A clickable seL4 window that boots straight to Home. Sound plays through the Mac's speakers; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
+| `make emulator-aarch64` | Boots the 64-bit VioletOS development image to Home. Set `LADYBIRD_BROWSER_ROOT` to include the full upstream browser and its helpers. [AArch64 setup](targets/qemu/aarch64/README.md) |
+| `make emulator-ladybird-youtube` | Opens Ladybird in a VioletOS QEMU window once Google's public YouTube embed is playing with sound. Requires the [AArch64 browser and audio services](targets/qemu/aarch64/README.md#full-upstream-video-and-sound). |
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering touch transfer failures, controller recovery and watchdog handling; where touch works, a tap on Home must open Settings. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
