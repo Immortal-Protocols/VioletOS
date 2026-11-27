@@ -87,7 +87,8 @@ def qemu_traces():
     from windows import windows_from_records
 
     out = []
-    # Only the benign capture (make shield-capture): demo runs include the attacks.
+    # Only benign captures (companion_sim.py --record, saved as benign-*.jsonl; there is
+    # no make target for it yet): demo runs include the attacks.
     for path in sorted((OUT / "qemu-traces").glob("benign-*.jsonl")):
         records = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
         for app_key, win in windows_from_records(records):

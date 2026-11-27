@@ -94,6 +94,22 @@ pub const RADIO_RELEASE_POWER:u32=0x405f;
 pub const RADIO_RETAIN_POWER:u32=0x4053;
 pub const RADIO_DIAGNOSTIC: u32 = 1 << 31;
 pub const POWER_MILLIVOLTS: u32 = 1 << 31;
+// Power sub-requests in `value` under the POWER key (services/power/process.rs).
+// GET POWER_INFO: thermal level, flags and governor state. GET POWER_LOCKS|index:
+// a held wake lock, or with arg 1 an owner's accounting. EXECUTE
+// POWER_LOCK|action<<4|kind with the app's pid in arg (0 release, 1 take, 2 app gone).
+pub const POWER_INFO: u32 = 0x100;
+pub const POWER_LOCKS: u32 = 0x200;
+pub const POWER_LOCK: u32 = 0x300;
+pub const POWER_INFO_SENSOR: u32 = 1;
+pub const POWER_INFO_SENSOR_FAILED: u32 = 2;
+pub const POWER_INFO_DVFS: u32 = 4;
+pub const POWER_INFO_SLEEP_DEFERRED: u32 = 8;
+pub const POWER_INFO_SCREEN_OFF: u32 = 16;
+// Why a POWER_LOCK was DENIED, in the reply's arg: the lock table is full, or
+// an app asked with the screen off (a new lock, or past its allowance).
+pub const POWER_LOCK_FULL: u32 = 1;
+pub const POWER_LOCK_SCREEN_OFF: u32 = 2;
 pub const CATALOG: u32 = 9;
 pub const QUIT: u32 = 10;
 pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {
@@ -123,6 +139,10 @@ pub const FILE_READ: u32 = 22;
 pub const FILE_WRITE: u32 = 23;
 pub const FILE_TRUNCATE: u32 = 24;
 pub const FILE_DELETE: u32 = 25;
+/// In `arg` of FILE_WRITE and FILE_TRUNCATE: replace the file whole. Writes
+/// append from offset 0 without showing; the truncate, at the full length,
+/// publishes them all in one commit (services/storage/files.rs).
+pub const FILE_STAGED: u32 = 0x100;
 pub const STORAGE_FILE: u32 = 0x200;
 /// APPSTORE: the installed apps' disk extent, for the Open Runtime only
 /// (runtime/open/appstore.rs). GET reads `arg` sectors (at most 128) from sector

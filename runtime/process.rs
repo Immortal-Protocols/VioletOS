@@ -214,6 +214,8 @@ impl Runtime {
                 }
                 self.forward(who, 8, m)
             }
+            // Wake locks for open apps (the Open Runtime names the app in arg).
+            (EXECUTE, POWER) if who == OPEN_APPS && m.value & !0xff == POWER_LOCK => self.forward(who, 8, m),
             _ => Message::error(DENIED),
         }
     }

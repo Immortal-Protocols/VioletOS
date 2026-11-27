@@ -10,7 +10,7 @@ use super::abi::*;
 use super::device::{Kind, OpenFile, BUFFER_BYTES, HEIGHT, STRIDE, WIDTH};
 use super::fs::{self, S_IFCHR, S_IFDIR, S_IFMT};
 use super::policy::{AccessMode, Action, AppId, Decision, Policy};
-use super::procmgr::{PROT_READ, PROT_WRITE, USER_TOP};
+use super::procmgr::USER_TOP;
 use super::sys::{self, MR_CPSR, MR_FAULT_IP};
 use super::{FileRef, Log, Runtime, Wait};
 use alloc::rc::Rc;
@@ -87,11 +87,19 @@ impl Runtime {
         saved[8] = mrs[MR_FAULT_IP].wrapping_add(4);
         let number = mrs[7];
         self.stats.count(number);
+        // When calls arrive is a little unpredictable: it goes into the random generator.
+        self.entropy.stir(sys::counter() as u32);
         // A frozen app's thread that reached here before it was suspended waits too.
         let outcome = if self.apps[i].as_ref().map_or(false, |a| a.frozen.is_some()) {
             Block(Wait::Frozen, None)
+        } else if self.quarantine_blocks(i, number, mrs[0] as i32) {
+            // Violet Shield: a quarantined app cannot send, on old connections either.
+            Done(EACCES)
         } else {
-            self.dispatch(i, slot, number, mrs)
+            let o = self.dispatch(i, slot, number, mrs);
+            // Violet Shield: UDP bytes count toward the exfiltration limit too.
+            if let Done(r) = o { self.shield_after(i, number, mrs[0] as i32, r); }
+            o
         };
         match outcome {
             Done(r) => {
@@ -203,7 +211,8 @@ impl Runtime {
     pub fn clock(&self, id: u32) -> u64 {
         let mono = sys::now_ns();
         match id {
-            0 | 5 | 8 | 11 => epoch() * 1_000_000_000 + mono,
+            // The build time until a network sets the clock (timesync.rs).
+            0 | 5 | 8 | 11 => super::timesync::wall_ns(mono),
             _ => mono,
         }
     }
@@ -307,6 +316,10 @@ impl Runtime {
                 }
                 let end = a[0].saturating_add(align_up(a[1], 4096)).min(USER_TOP);
                 let app = self.apps[i].as_mut().unwrap();
+                // The trampoline page is the runtime's: it is never unmapped.
+                if app.space.pinned(a[0], end) {
+                    return Done(EINVAL);
+                }
                 app.space.remove(&mut self.k, &mut self.pool, a[0], end);
                 Done(0)
             }
@@ -319,15 +332,13 @@ impl Runtime {
                         super::Gate::Killed => return Gone,
                     }
                 }
+                // The W^X policy (vma.rs) answers EACCES: no writable and
+                // executable memory, and no data turned into code.
                 let end = a[0].saturating_add(align_up(a[1], 4096));
                 let app = self.apps[i].as_mut().unwrap();
-                if app.space.protect(a[0], end, a[2] & 7) {
-                    if a[2] & 4 != 0 {
-                        app.space.sync_code(a[0], end);
-                    }
-                    Done(0)
-                } else {
-                    Done(ENOMEM)
+                match app.space.protect(a[0], end, a[2] & 7) {
+                    Ok(()) => Done(0),
+                    Err(e) => Done(e),
                 }
             }
             163 => Done(ENOMEM), // mremap: callers copy instead
@@ -497,6 +508,8 @@ impl Runtime {
             180 | 181 => {
                 let offset = u64::from(a[4]) | u64::from(a[5]) << 32;
                 let Some(f) = self.file(i, a[0] as i32) else { return Done(EBADF) };
+                // A socket has no offset, as on Linux (and pwrite is not a way around send).
+                if matches!(f.borrow().kind, Kind::Tcp { .. } | Kind::Udp { .. }) { return Done(ESPIPE); }
                 let saved = f.borrow().offset;
                 f.borrow_mut().offset = offset;
                 let r = if n == 180 {
@@ -620,6 +633,8 @@ impl Runtime {
             39 | 323 => {
                 let (dirfd, ptr) = if n == 39 { (AT_FDCWD, a[0]) } else { (a[0] as i32, a[1]) };
                 let p = match self.at(i, dirfd, ptr) { Ok(p) => p, Err(e) => return Done(e) };
+                // Violet Shield. A folder that exists changes nothing and keeps its EEXIST.
+                if self.fs.stat(&p).is_none() { if let Some(o) = self.gate_change(i, &p) { return o; } }
                 Done(match self.fs.mkdir(&p) { Ok(()) => 0, Err(e) => e })
             }
             40 | 10 | 328 => {
@@ -629,12 +644,15 @@ impl Runtime {
                     _ => (a[0] as i32, a[1], a[2] & 0x200 != 0),
                 };
                 let p = match self.at(i, dirfd, ptr) { Ok(p) => p, Err(e) => return Done(e) };
+                if let Some(o) = self.gate_change(i, &p) { return o; } // Violet Shield
                 Done(match self.fs.unlink(&p, dir) { Ok(()) => 0, Err(e) => e })
             }
             38 | 329 | 382 => {
                 let (fa, fp, ta, tp) = if n == 38 { (AT_FDCWD, a[0], AT_FDCWD, a[1]) } else { (a[0] as i32, a[1], a[2] as i32, a[3]) };
                 let from = match self.at(i, fa, fp) { Ok(p) => p, Err(e) => return Done(e) };
                 let to = match self.at(i, ta, tp) { Ok(p) => p, Err(e) => return Done(e) };
+                // Violet Shield: a rename changes both names and takes the contents along.
+                if let Some(o) = self.gate_rename(i, &from, &to) { return o; }
                 Done(match self.fs.rename(&from, &to) { Ok(()) => 0, Err(e) => e })
             }
             85 | 332 => {
@@ -660,6 +678,13 @@ impl Runtime {
                 } else {
                     match self.at(i, AT_FDCWD, a[0]) { Ok(p) => p, Err(e) => return Done(e) }
                 };
+                // Violet Shield: truncate by path never went through open().
+                if matches!(n, 92 | 193) { if let Some(o) = self.gate_change(i, &path) { return o; } }
+                // ...and by descriptor only if it was opened for writing (the rules are asked again).
+                if matches!(n, 93 | 194) {
+                    let flags = self.file(i, a[0] as i32).map_or(0, |f| f.borrow().flags);
+                    if let Some(e) = self.fd_write_error(i, &path, flags) { return Done(e); }
+                }
                 let now = (self.clock(0) / 1_000_000_000) as u32;
                 match self.fs.writable(&path, false, false, now) {
                     Some(data) => {
@@ -669,7 +694,25 @@ impl Runtime {
                     None => Done(ENOENT),
                 }
             }
-            118 | 148 | 36 | 373 | 15 | 94 | 333 | 325 | 95 | 207 | 212 | 269 | 348 | 412 | 143 | 352 => Done(0),
+            // fsync, fdatasync, sync: /data is written back before they return
+            // 0, and they say so when it could not be (data::fsync). fsync
+            // waits for the file (or directory) of its descriptor only.
+            118 | 148 | 36 => {
+                let scope = if n == 36 {
+                    None
+                } else {
+                    let Some(f) = self.file(i, a[0] as i32) else { return Done(EBADF) };
+                    let f = f.borrow();
+                    match &f.kind { Kind::File { path } | Kind::Dir { path, .. } => Some(path.clone()), _ => return Done(0) }
+                };
+                let now = sys::now_ns();
+                match super::data::fsync(&mut self.fs, scope.as_deref(), i, now) {
+                    // Stored, but the app has used more than its share: answer late.
+                    (0, wait) if wait > 0 => Block(Wait::Sleep, Some(now + wait)),
+                    (r, _) => Done(r),
+                }
+            }
+            373 | 15 | 94 | 333 | 325 | 95 | 207 | 212 | 269 | 348 | 412 | 143 | 352 => Done(0),
             60 => Done(0o022),
             122 => {
                 let mut u = [0u8; 390];
@@ -702,12 +745,27 @@ impl Runtime {
             }
             75 => Done(0),
             384 => {
-                let mut v = Vec::with_capacity(a[1] as usize);
-                while v.len() < a[1] as usize {
-                    v.extend_from_slice(&self.next_random().to_le_bytes());
+                // getrandom: at most 256 KiB a call (a short count, as Linux
+                // gives for large requests), and EIO rather than predictable
+                // bytes if the generator was never seeded.
+                let len = a[1].min(256 << 10);
+                // All of it must be writable before any of it is written.
+                if !self.apps[i].as_ref().unwrap().space.writable(a[0], len as usize) {
+                    return Done(EFAULT);
                 }
-                v.truncate(a[1] as usize);
-                Done(if self.wr(i, a[0], &v) { a[1] as i32 } else { EFAULT })
+                let mut chunk = [0u8; 256];
+                let mut done = 0;
+                while done < len {
+                    let n = (len - done).min(256) as usize;
+                    if !self.entropy.fill(&mut chunk[..n]) {
+                        return Done(EIO);
+                    }
+                    if !self.wr(i, a[0].wrapping_add(done), &chunk[..n]) {
+                        return Done(EFAULT);
+                    }
+                    done += n as u32;
+                }
+                Done(len as i32)
             }
             // ---- waiting ----
             168 | 336 | 414 => {
@@ -876,13 +934,14 @@ impl Runtime {
             Ok(p) => p,
             Err(e) => return Done(e),
         };
-        let mode = if flags & O_ACCMODE == 0 { AccessMode::Read } else { AccessMode::Write };
+        let mode: AccessMode = super::shield::open_mode(flags, self.fs.stat(&path).is_some());
         let app_id = AppId(self.apps[i].as_ref().unwrap().pid);
         if self.policy.check(app_id, &Action::OpenPath { path: &path, mode }) != Decision::Allow {
             return Done(EACCES);
         }
-        // Violet Shield sees the same private copy of the path that is opened below.
-        match self.gate(i, &Action::OpenPath { path: &path, mode }) {
+        // Violet Shield sees the same private copy of the path that is opened below,
+        // and judges the open by what it does (O_TRUNC and O_CREAT write; O_RDWR also reads).
+        match self.gate_open(i, &path, flags) {
             super::Gate::Allow => {}
             super::Gate::Deny => return Done(EACCES),
             super::Gate::Frozen => return Block(Wait::Frozen, None),
@@ -986,8 +1045,12 @@ impl Runtime {
             return if r == 0 { EAGAIN } else { r };
         }
         if matches!(f.borrow().kind, Kind::Tcp { .. } | Kind::Udp { .. }) {
+            // Violet Shield: every write to a socket comes through here (write, writev,
+            // pwrite64, a send that was waiting), so this is where a quarantine cuts it.
+            if self.quarantined(i) { return EACCES; }
             return self.socket_send(i, fd, buf, len, None);
         }
+        if matches!(f.borrow().kind, Kind::Hci) && self.quarantined(i) { return EACCES; }
         let Some(data) = self.rd(i, buf, len as usize) else { return EFAULT };
         let mut f = f.borrow_mut();
         let flags = f.flags;
@@ -1010,6 +1073,9 @@ impl Runtime {
             }
             Kind::File { path } => {
                 let path = path.clone();
+                // Violet Shield: only a descriptor opened for writing writes, and the
+                // built-in rules are asked again (they saw only what open() asked for).
+                if let Some(e) = self.fd_write_error(i, &path, flags) { return e; }
                 let now = (self.clock(0) / 1_000_000_000) as u32;
                 let Some(content) = self.fs.writable(&path, false, false, now) else { return EIO };
                 let start = if flags & O_APPEND != 0 { content.len() } else { at.unwrap_or(f.offset) as usize };
@@ -1165,7 +1231,6 @@ impl Runtime {
             if flags & MAP_FIXED_NOREPLACE != 0 && app.space.overlaps(addr, addr + len) {
                 return Done(EEXIST);
             }
-            app.space.remove(&mut self.k, &mut self.pool, addr, addr + len);
             addr
         } else if addr != 0 && addr & 0xffff == 0 && addr >= 0x1000_0000
             && addr.checked_add(len).map_or(false, |e| e <= super::procmgr::MMAP_TOP)
@@ -1178,6 +1243,14 @@ impl Runtime {
                 None => return Done(ENOMEM),
             }
         };
+        // The W^X policy (vma.rs): mmap never gives executable memory, puts
+        // nothing in a 64 KiB page that holds code, and leaves the trampoline page alone.
+        if app.space.refuses(start, start + len, prot & 7) {
+            return Done(EACCES);
+        }
+        if fixed {
+            app.space.remove(&mut self.k, &mut self.pool, start, start + len);
+        }
         app.space.add(start, start + len, prot & 7);
         if screen {
             if start & 0xffff != 0 || offset as usize % sys::PAGE != 0 {
@@ -1194,6 +1267,8 @@ impl Runtime {
                 Kind::File { path } => path.clone(),
                 _ => return Done(ENODEV),
             };
+            // A mapping reads the file: not through a write-only descriptor (as on Linux).
+            if !super::shield::fd_reads(f.borrow().flags) { return Done(EACCES); }
             let _ = MAP_SHARED; // Shared file mappings are not written back.
             let data = self.fs.contents(&path).map(|c| {
                 let s = (offset as usize).min(c.len());
@@ -1202,18 +1277,11 @@ impl Runtime {
             });
             if let Some(data) = data {
                 let app = self.apps[i].as_mut().unwrap();
-                let saved = app.space.find(start).map(|v| v.prot);
-                // Write the file in even if the mapping is read-only.
-                app.space.add(start, start + len, PROT_READ | PROT_WRITE);
-                let mut ok = app.space.write(&mut self.k, &mut self.pool, start, &data);
+                // The runtime writes the file in, even if the mapping is read-only.
+                let mut ok = app.space.poke(&mut self.k, &mut self.pool, start, &data);
                 // Out of pages: close a background app and try again.
                 while !ok && self.foreground == Some(i) && self.pool.available() == 0 && self.reclaim(None) {
-                    ok = self.apps[i].as_mut().unwrap().space.write(&mut self.k, &mut self.pool, start, &data);
-                }
-                let app = self.apps[i].as_mut().unwrap();
-                app.space.add(start, start + len, saved.unwrap_or(prot & 7));
-                if prot & 4 != 0 {
-                    app.space.sync_code(start, start + len);
+                    ok = self.apps[i].as_mut().unwrap().space.poke(&mut self.k, &mut self.pool, start, &data);
                 }
                 if !ok {
                     return Done(ENOMEM);

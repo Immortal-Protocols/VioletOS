@@ -24,10 +24,15 @@ unsigned open_object_type(unsigned which) {
   default: return ~0u;
   }
 }
-int open_page_map(unsigned frame, unsigned pd, unsigned va, int writable, int cached) {
+/* Map a frame, or change the rights of one already mapped at `va` (the
+   kernel rewrites the entries in place and flushes the address space's TLB).
+   Read-only unless `writable`; Execute-Never unless `exec`. The callers never
+   ask for both (W^X); if one did, the mapping would still not be executable. */
+int open_page_map(unsigned frame, unsigned pd, unsigned va, int writable, int cached, int exec) {
   seL4_CapRights_t rights = writable ? seL4_AllRights : seL4_CanRead;
-  return seL4_ARM_Page_Map(frame, pd, va, rights,
-                           cached ? seL4_ARM_Default_VMAttributes : seL4_ARM_ExecuteNever);
+  unsigned attributes = cached ? seL4_ARM_Default_VMAttributes : 0;
+  if (!exec || writable) attributes |= seL4_ARM_ExecuteNever;
+  return seL4_ARM_Page_Map(frame, pd, va, rights, (seL4_ARM_VMAttributes)attributes);
 }
 int open_page_unmap(unsigned frame) { return seL4_ARM_Page_Unmap(frame); }
 int open_page_unify(unsigned frame, unsigned bytes) {

@@ -59,33 +59,34 @@ components(repo,out,cc,common,incs,rustc,shims,only,selected,storage_backend,var
 if only or (variant=="qemu" and os.environ.get("VIOLET_APP_DIR")): sys.exit(0)
 (out/"catalog.S").write_text('.section .rodata.catalog,"a"\n.balign 4\n.global builtin_catalog,builtin_catalog_end\nbuiltin_catalog: .incbin "catalog.bin"\nbuiltin_catalog_end:\n.balign 4\n.global recovery_manager\nrecovery_manager: .incbin "packages/package_manager.vpk"\n')
 run(common+["-c",out/"catalog.S","-o","catalog.o"])
-signing_objects = []
-if variant == "moto":
-    # Only the public key enters the image. Reuse the private key on this Mac.
-    from tempfile import TemporaryDirectory
-    key = out / "developer-signing.pem"
-    if not key.exists():
-        with TemporaryDirectory(dir=out) as directory:
-            temporary = Path(directory) / "key.pem"
-            run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", temporary])
-            temporary.chmod(0o600)
-            temporary.replace(key)
-    public = subprocess.check_output(["openssl", "ec", "-in", key, "-pubout", "-outform", "DER",
-                                      "-conv_form", "uncompressed"], stderr=subprocess.DEVNULL)
-    prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
-    if len(public) != len(prefix) + 65 or not public.startswith(prefix + b"\x04"):
-        sys.exit("Expected a P-256 developer key")
+# Package signatures. The supervisor verifies every VPK2 (system/package-manager/
+# verify.rs, with BearSSL's SHA-256 and P-256) against the keys pinned here:
+# the per-build developer key, or only the release root when VIOLET_RELEASE=1
+# (image/packages/sign.py). Only public keys enter the image.
+from sign import config as signing_config, write_keys, summary as sign_summary, DEVELOPER_KEY_ID
+package_signer = signing_config(repo, variant)
+os.environ["VIOLET_PACKAGE_KEYS_RS"] = str(write_keys(package_signer, out))
+sys.path.insert(0, str(repo / "services/radio"))
+from build_tls import build as build_crypto
+crypto_incs = ["-I", build / "bearssl-0.6/inc", "-I", repo / "services/radio/freestanding"]
+run(common + crypto_incs + ["-c", repo/"system/package-manager/verify_crypto.c", "-o", "verify-crypto.o"])
+# An object, not a second staticlib: core comes from the root's one Rust archive.
+run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=lib", "--emit=obj", "-Cpanic=abort",
+     "-Copt-level=s", "-Ccodegen-units=1", repo/"system/package-manager/verify.rs", "-o", "package-verify.o"])
+signing_objects = ["package-verify.o", "verify-crypto.o", build_crypto(repo, out, common)[1]]
+if variant == "moto" and DEVELOPER_KEY_ID in package_signer.keys:
+    # Developer images also accept a detached signature by the developer key to
+    # activate a Radio or USB Diagnostics package over USB without a tap. A
+    # release image has no developer key, so it has no such path.
     (out / "developer-key.h").write_text("static unsigned char developer_key[] = {" +
-        ",".join(map(str, public[len(prefix):])) + "};\n")
-    sys.path.insert(0, str(repo / "services/radio"))
-    from build_tls import build as build_crypto
-    signing_objects = [build_crypto(repo, out, common)[1]]
-    incs += ["-I", build / "bearssl-0.6/inc", "-I", repo / "services/radio/freestanding"]
+        ",".join(map(str, package_signer.keys[DEVELOPER_KEY_ID])) + "};\n")
+    defines.append("-DVIOLET_DEVELOPER_KEY")
 run(common+incs+defines+["-I",out,"-I",platform_include,"-std=gnu11","-c",repo/"system/supervisor/supervisor.c","-o","supervisor.o"])
 root_objects=["root.S.o","supervisor.o","strings.c.o","catalog.o"]
 if variant=="qemu":
     run([rustc,"--edition=2021","--target=armv7a-none-eabi","--crate-type=staticlib","--cfg","package_volume","-Cpanic=abort","-Copt-level=s",repo/"system/package-manager/volume.rs","-o","volume.a"])
     root_objects.insert(2,"volume.a")
+    root_objects.extend(signing_objects)
 else:
     run(common+incs+defines+["-I",platform_include,"-c",board_spi,"-o","board-map.o"])
     root_objects.append("board-map.o")
@@ -97,7 +98,14 @@ else:
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
-assert (out/"root.bin").stat().st_size < 0xfe000
+# The root task's stack is what is left of its 1 MiB window (root.S), and
+# package signatures are checked on it (SHA-256 and P-256: a few KiB).
+root_bytes = (out/"root.bin").stat().st_size
+print(f"root.bin: {root_bytes} bytes, {0x100000 - root_bytes} left for the root stack (at least {0x100000 - 0xfe000} required)")
+if root_bytes >= 0xfe000:
+    sys.exit(f"root.bin is {root_bytes} bytes: under {0x100000 - 0xfe000} bytes would be left for the root task's stack")
+# Say which keys this image trusts: a developer image must never pass for a release.
+print(sign_summary(package_signer))
 elf = (abi/"kernel.elf").read_bytes()
 assert elf[:6] == b"\x7fELF\x01\x01" and struct.unpack_from("<I",elf,24)[0] == 0xe0000000
 phoff, = struct.unpack_from("<I",elf,28)

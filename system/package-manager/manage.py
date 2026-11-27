@@ -1,4 +1,4 @@
-"""Stage compatible component packages. QEMU activates the catalog on its next boot."""
+"""Stage signed component packages. QEMU activates the catalog on its next boot."""
 
 import argparse
 import fcntl
@@ -12,7 +12,8 @@ from contextlib import contextmanager
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "image/packages"))
-from package_format import inspect, pack, unpack
+from package_format import floors, inspect, pack, unpack, version
+from sign import load_keys
 
 COMPONENTS = json.loads((ROOT / "image/catalog/components.json").read_text())
 NAMES = {c["name"]: c for c in COMPONENTS}
@@ -87,12 +88,29 @@ def stage(directory, factory, action, argument):
                 raise ValueError("already running factory catalog")
             state = {"current": state["previous"], "previous": None}
         else:
-            packages = unpack((current or factory).read_bytes())
+            installed = (current or factory).read_bytes()
+            packages = unpack(installed)
+            shipped = unpack(factory.read_bytes()) if current else dict(packages)
+            # The highest version seen of each component, kept in the catalog
+            # itself so that removing a component does not forget it.
+            kept = floors(installed)
             if action == "install":
                 data = Path(argument).read_bytes()
-                identity = inspect(data)
+                # The same checks the supervisor makes at boot: a signature by a
+                # key the image pins, and no version older than the one installed
+                # or the one the image shipped with.
+                pinned = factory.parent / "package-keys.json"
+                if not pinned.is_file():
+                    raise ValueError(f"cannot verify the package: {pinned} is missing (build the image first)")
+                target, keys = load_keys(pinned)
+                identity = inspect(data, keys, target)
                 if identity == 21:
                     raise ValueError("USB Diagnostics requires the Moto target")
+                for catalog in (packages, shipped):
+                    if identity in catalog and version(data) < version(catalog[identity]):
+                        raise ValueError("package is older than the installed version")
+                if version(data) < kept.get(identity, 0):
+                    raise ValueError("package is older than the installed version (a version that was removed)")
                 packages[identity] = data
             else:
                 item = NAMES[argument]
@@ -102,8 +120,12 @@ def stage(directory, factory, action, argument):
                     )
                 if item["id"] not in packages:
                     raise ValueError("component is already absent")
+                kept[item["id"]] = max(kept.get(item["id"], 0), version(packages[item["id"]]))
                 del packages[item["id"]]
-            data = pack(packages.values())
+            for identity, blob in packages.items():
+                kept[identity] = max(kept.get(identity, 0), version(blob))
+            above = {i: v for i, v in kept.items() if i not in shipped or v > version(shipped[i])}
+            data = pack(packages.values(), above)
             digest = hashlib.sha256(data).hexdigest()
             if digest == state["current"]:
                 return

@@ -5,7 +5,7 @@ One app for the phone's settings, opened from its icon on Home:
 - **Wi-Fi** (below).
 - **Bluetooth**: whether the controller is on, and whether Bitchat is using it.
 - **Phone Link**: Violet Shield's link to your iPhone, and Phone Internet: a pairing code to type into Violet Relay, **Turn on**/**Turn off** and **New code**. The choice and code are kept in `/data/relay`, and the Open Runtime turns Phone Internet back on after a restart.
-- **Date & Time**: the city whose date Home shows (the shared setting `time.city`).
+- **Date & Time**: the city whose date Home shows (the shared setting `time.city`), and the time there now. That time is the system clock, once the network has set it, shifted by the city's own rule ([violet::time](../../lib/violet/src/time.rs): a POSIX TZ string per city, daylight saving included, checked against tzdata 2026f for 2026 to 2031); nothing is fetched. Until the clock is set the page says so instead of showing the build time. Home still takes its own time from wttr.in.
 - **Agent Apps**: every app Violet Agent installed, with its size; **Delete** (tap twice to confirm) removes one, **Delete all** removes them all.
 - **About**: the system, battery, volume and network.
 

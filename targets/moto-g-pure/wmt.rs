@@ -82,8 +82,15 @@ pub fn set_sink(sink: Sink) {
 /// page of Radio's own beside the HCI pages: Radio's RAM has no 2 KiB to spare.
 const FRAME_SIZE: usize = 2048 + 6;
 impl Link {
+    #[cfg(not(test))]
     fn frame(&self) -> &'static mut [u8; FRAME_SIZE] {
         unsafe { &mut *(0x0b04_2000 as *mut [u8; FRAME_SIZE]) }
+    }
+    /// Host tests have no page at that address: one buffer for each test thread.
+    #[cfg(test)]
+    fn frame(&self) -> &'static mut [u8; FRAME_SIZE] {
+        std::thread_local!(static FRAME: *mut [u8; FRAME_SIZE] = Box::leak(Box::new([0; FRAME_SIZE])));
+        FRAME.with(|frame| unsafe { &mut **frame })
     }
     fn send(&mut self, channel: u8, payload: &[u8]) -> Result<(), u32> {
         let n = payload.len();

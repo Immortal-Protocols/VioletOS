@@ -1,0 +1,6 @@
+1000	100	notes	dd834110	EXEC	0	0	/apps/notes	
+1621	100	notes	dd834110	OPEN_W	0	0	/data/notes/keys.txt	
+1622	100	notes	dd834110	OPEN_W	0	0	/data/notes/todo.txt	
+1622	100	notes	dd834110	OPEN_R	0	0	/data/notes/todo.txt	
+1647	100	notes	dd834110	SOCK_CONN	0	0	sync.notes.test:80	sync.notes.test:80
+1729	100	notes	dd834110	SOCK_TX	0	0	85B	sync.notes.test:80

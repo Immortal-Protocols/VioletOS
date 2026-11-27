@@ -1,7 +1,7 @@
 //! Polled Connac AXI transport. Only the dedicated, uncached Moto DMA pool
 //! supplies descriptor and payload addresses. One command can be in flight.
 use super::radio_io::{barrier, byte, expired, now, put, rd, wr};
-use super::{passive_scan, softap, wlan_download};
+use super::{passive_scan, pmf, softap, wlan_download};
 use wlan_download::Transport;
 const DMA: usize = 0x09c00000;
 const PA: u32 = 0x42400000;
@@ -54,6 +54,8 @@ pub struct Axi {
     /// Hosting telemetry: every frame and every management frame seen on rings 2/3.
     pub rx_frames: u32,
     pub rx_mgmt: u32,
+    /// Management frame protection (802.11w) of the station link.
+    pub pmf: pmf::Link,
 }
 impl Axi {
     pub const fn new() -> Self {
@@ -78,7 +80,16 @@ impl Axi {
             new_client: false,
             rx_frames: 0,
             rx_mgmt: 0,
+            pmf: pmf::Link::new(),
         }
+    }
+    /// Host tests start here instead of loading the vendor firmware.
+    #[cfg(test)]
+    pub fn started(station: [u8; 6]) -> Self {
+        let mut axi = Self::new();
+        axi.init().unwrap();
+        axi.station = station;
+        axi
     }
     fn init(&mut self) -> Result<(), u32> {
         wr(OWN, 2);
@@ -347,7 +358,28 @@ impl Axi {
         Err(46)
     }
 
+    /// Authenticate or associate. An access point that still holds our last
+    /// protected association answers an association request "later" while it
+    /// checks that one (station::LATER): wait as long as it said, discarding
+    /// what arrives, and ask once more.
     fn management_exchange(
+        &mut self,
+        ap: &passive_scan::AccessPoint,
+        associate: bool,
+    ) -> Result<u16, u32> {
+        let result = self.management_request(ap, associate);
+        let Some(ms) = result.err().and_then(super::station::later) else {
+            return result;
+        };
+        let start = now();
+        while !expired(start, ms) {
+            self.take(2)?;
+            self.take(3)?;
+        }
+        // "Later" a second time is a refusal.
+        self.management_request(ap, associate).map_err(|e| if e < super::station::LATER { e } else { 49 })
+    }
+    fn management_request(
         &mut self,
         ap: &passive_scan::AccessPoint,
         associate: bool,
@@ -442,7 +474,9 @@ impl Axi {
         {
             return Err(54);
         }
-        self.transmit_ethernet(ethernet, !self.open_link)
+        self.transmit_ethernet(ethernet, !self.open_link)?;
+        self.pmf.sent();
+        Ok(())
     }
     /// The station link can carry data: keys installed, or an open network.
     pub fn link_keyed(&self) -> bool {
@@ -467,30 +501,89 @@ impl Axi {
         if self.ap_mode {
             return self.ap_poll(out, eapol);
         }
+        let mut reply = [0; pmf::REPLY];
+        let mut idle = true;
         for ring in [2, 3] {
             let Some(n) = self.take(ring)? else { continue };
+            idle = false;
             let p = &self.rx[..n];
             if let Some(frame) = super::station::eapol(p, &self.station, &self.peer) {
+                // Once a protected link has its keys, the access point encrypts
+                // its key frames like any data. One that came in the clear is
+                // not from it: hostap would end the link over a single such
+                // frame, which is what frame protection is there to stop.
+                if self.pmf.active() && self.pairwise_ready && !super::station::decrypted(p) {
+                    continue;
+                }
                 if frame.len() <= eapol.len() {
                     eapol[..frame.len()].copy_from_slice(frame);
                     return Ok((0, frame.len()));
                 }
             }
             if let Some(n) = super::station::ethernet(p, &self.station, &self.peer, out, self.open_link) {
+                if !self.open_link && out[..6] == self.station {
+                    self.pmf.heard();
+                }
                 return Ok((n, 0));
             }
+            // A deauthentication or disassociation from the access point ends the
+            // link. With management frame protection only an authentic one does
+            // (pmf.rs says what happens to the others).
             if let Some(f) = passive_scan::management_frame(p) {
-                if f.len() >= 26
-                    && matches!(f[0], 0xa0 | 0xc0)
-                    && f[10..16] == self.peer
-                    && f[16..22] == self.peer
-                    && (f[4..10] == self.station || f[4..10] == [255; 6])
-                {
-                    return Err(54);
-                }
+                let verdict = self.pmf.receive(f, &self.station, &self.peer, now(), &mut reply);
+                self.management_verdict(verdict, &reply)?;
             }
         }
+        // Only now, with what had arrived looked at, is the access point's
+        // silence judged.
+        if self.pmf.pending() {
+            let verdict = self.pmf.tick(&self.station, &self.peer, now(), expired, idle, &mut reply);
+            self.management_verdict(verdict, &reply)?;
+        }
         Ok((0, 0))
+    }
+    fn management_verdict(&mut self, verdict: pmf::Verdict, reply: &[u8; pmf::REPLY]) -> Result<(), u32> {
+        match verdict {
+            pmf::Verdict::Ignore => Ok(()),
+            pmf::Verdict::Disconnect => {
+                // The link's keys are of no more use here.
+                self.pmf.reset(false);
+                Err(54)
+            }
+            pmf::Verdict::Send(n) => {
+                // A lost SA Query is repeated and a lost answer is asked for
+                // again, so a full TX ring here is not a link failure.
+                let sent = self.transmit_management(&reply[..n]).is_ok();
+                super::radio_io::trace(7, 0x504d_0000 | u32::from(sent));
+                Ok(())
+            }
+        }
+    }
+    /// The station link is over or being left: wipe this side's copies of its keys.
+    pub fn leave(&mut self) {
+        self.pmf.reset(false);
+    }
+    /// Send an 802.11 management frame to the joined access point exactly as
+    /// built (a CCMP-protected one is already encrypted: the firmware is not
+    /// asked to protect it).
+    fn transmit_management(&mut self, frame: &[u8]) -> Result<(), u32> {
+        let n = frame.len();
+        let mut tx = [0; 32 + pmf::REPLY];
+        if n < 24 || n > pmf::REPLY {
+            return Err(52);
+        }
+        tx[..2].copy_from_slice(&((32 + n) as u16).to_le_bytes());
+        tx[2] = 12;
+        tx[3] = 0x84; // MCU management queue 1
+        tx[4] = 1; // the access point's WTBL entry (station::firmware_peer)
+        tx[5] = 0xcc; // long descriptor, native 802.11, 24-byte MAC header
+        tx[7] = 2;
+        tx[8] = frame[0] >> 4;
+        tx[11] = 0x80;
+        tx[12..14].copy_from_slice(&(7u16 << 11).to_le_bytes());
+        tx[26] = self.basic_rate;
+        tx[32..32 + n].copy_from_slice(frame);
+        self.send(1, &tx[..32 + n])
     }
     pub fn receive_eapol(&mut self, out: &mut [u8]) -> Result<usize, u32> {
         for ring in [2, 3] {
@@ -544,8 +637,19 @@ impl Axi {
                 super::radio_io::trace(4, 0x4b45_0000 | confirmed as u32);
             } else {
                 self.peer_event(0x24, self.peer)?;
+                // Unicast management frames are protected with this key in software.
+                self.pmf.set_tk(key);
             }
             self.pairwise_ready = true;
+        }
+        Ok(())
+    }
+    /// Keep the integrity group key (ID 4 or 5) that authenticates broadcast
+    /// deauthentication and disassociation. BIP is checked in software: the
+    /// firmware is not given this key.
+    pub fn install_igtk(&mut self, id: u8, key: &[u8], ipn: &[u8]) -> Result<(), u32> {
+        if self.ap_mode || !self.pmf.set_igtk(id, key, ipn) {
+            return Err(52);
         }
         Ok(())
     }
@@ -565,6 +669,7 @@ impl Axi {
         self.ap_mode = true;
         self.client_state = 0;
         self.pairwise_ready = false;
+        self.pmf.reset(false);
         // gen4m activates the role BSS when the interface is created, before any channel request.
         let mut activate = [softap::BSS, 1, 1, softap::OWN_MAC, 0, 0, 0, 0, 0, 0, softap::GROUP_WTBL, 0];
         activate[4..10].copy_from_slice(&bssid);
@@ -722,6 +827,8 @@ impl Axi {
         // (transmit_eapol protects it only once a pairwise key is installed).
         self.pairwise_ready = false;
         self.open_link = false;
+        // So does management frame protection: none until this association's keys.
+        self.pmf.reset(ap.mfp != 0 && !ap.open);
         let token = self.sequence.wrapping_add(1);
         let result = self
             .channel(ap.channel, token, false)

@@ -1,6 +1,7 @@
 //! Socket system calls: IPv4 TCP and UDP through Radio (net.rs). DNS
-//! questions to the runtime's resolver are answered here (net::answer_dns).
+//! questions to the runtime's resolver are answered here (names::answer).
 use super::device::{Kind, OpenFile};
+use super::names;
 use super::net;
 use super::syscall::{Outcome, EAGAIN, EBADF, EFAULT, EINVAL, ENOSYS};
 use super::{Runtime, Wait};
@@ -22,6 +23,8 @@ const EISCONN: i32 = -106;
 const EINPROGRESS: i32 = -115;
 const EALREADY: i32 = -114;
 const ENETUNREACH: i32 = -101;
+/// DNS answers a UDP socket keeps until the program reads them.
+const MAX_REPLIES: usize = 16;
 /// The resolver programs are told to ask (/etc/resolv.conf).
 pub const NAMESERVER: u32 = 0x0a00_0035; // 10.0.0.53
 
@@ -33,7 +36,25 @@ fn sockaddr(ip: u32, port: u16) -> [u8; 16] {
     b
 }
 
+/// A socket of some app still holds `ip` (as its peer, or as a destination the
+/// Shield allowed): the resolver must not give the address to another name.
+/// A file that is being changed right now counts as holding it.
+fn address_live(apps: &[Option<super::App>], ip: u32) -> bool {
+    apps.iter().flatten().flat_map(|a| a.fds.iter().flatten()).any(|f| match f.try_borrow() {
+        Ok(file) => match &file.kind {
+            Kind::Tcp { peer, .. } => peer.0 == ip,
+            Kind::Udp { peer, allowed, .. } => peer.is_some_and(|p| p.0 == ip) || allowed.iter().any(|a| a.0 == ip),
+            _ => false,
+        },
+        Err(_) => true,
+    })
+}
+
 impl Runtime {
+    fn pid_of(&self, i: usize) -> u32 {
+        self.apps[i].as_ref().map_or(u32::MAX, |a| a.pid)
+    }
+
     pub fn socket_call(&mut self, i: usize, n: u32, a: [u32; 7]) -> Outcome {
         match n {
             281 => Done(self.socket(i, a[0], a[1])),
@@ -174,7 +195,8 @@ impl Runtime {
                 if ip == 0x7f00_0001 && port == 0 {
                     return Done(EINVAL);
                 }
-                let host = self.net.host_for(ip);
+                // A stand-in address this app has no name for goes nowhere.
+                let Some(host) = self.net.host_of(self.pid_of(i), ip) else { return Done(net::EHOSTUNREACH) };
                 if matches!(host.as_str(), "sentinel.violet" | "shield-flows.violet")
                     || (matches!(host.as_str(), "agent-pair.violet" | "agent-relay.violet")
                         && (cfg!(moto_board) || self.apps[i].as_ref().map(|a| a.path.as_str()) != Some(super::appstore::INSTALLER)))
@@ -190,7 +212,7 @@ impl Runtime {
                 }
                 let mut file = f.borrow_mut();
                 let Kind::Tcp { slot, peer } = &mut file.kind else { return Done(EBADF) };
-                match self.net.connect(ip, port) {
+                match self.net.connect_for(self.pid_of(i), super::MAX_APPS, ip, port) {
                     Ok(s) => {
                         *slot = Some(s);
                         *peer = (ip, port);
@@ -239,17 +261,30 @@ impl Runtime {
             }
             v
         };
+        let pid = self.pid_of(i);
+        // A question for the runtime's resolver. No file is borrowed while it
+        // is answered: the resolver looks at every socket's addresses.
+        let question = match &f.borrow().kind {
+            Kind::Udp { peer, .. } => to.or(*peer).filter(|&(ip, port)| port == 53 && (ip == NAMESERVER || self.net.is_stand_in(ip) || !self.net.present)),
+            _ => None,
+        };
+        if let Some(from) = question {
+            let apps = &self.apps;
+            let answer = names::answer(&mut self.net.names, pid, &data, &mut |ip| address_live(apps, ip));
+            if let (Some(answer), Kind::Udp { replies, .. }) = (answer, &mut f.borrow_mut().kind) {
+                // A program that asks and never reads loses the oldest answers.
+                if replies.len() >= MAX_REPLIES {
+                    replies.pop_front();
+                }
+                replies.push_back((from, answer));
+            }
+            return data.len() as i32;
+        }
         let mut file = f.borrow_mut();
         match &mut file.kind {
-            Kind::Udp { peer, replies, slot, allowed } => {
+            Kind::Udp { peer, slot, allowed, .. } => {
                 let dest = to.or(*peer);
                 match dest {
-                    Some((ip, 53)) if ip == NAMESERVER || self.net.is_stand_in(ip) || !self.net.present => {
-                        if let Some(answer) = net::answer_dns(&mut self.net, &data) {
-                            replies.push_back(((ip, 53), answer));
-                        }
-                        data.len() as i32
-                    }
                     Some(d) if !allowed.contains(&d) => -13, // EACCES: send_call asks the Shield first
                     Some((ip, port)) => {
                         if data.len() > net::MAX_DATAGRAM {
@@ -257,7 +292,7 @@ impl Runtime {
                         }
                         let s = match *slot {
                             Some(s) => s,
-                            None => match self.net.udp_open() {
+                            None => match self.net.udp_open_for(pid, super::MAX_APPS) {
                                 Ok(s) => {
                                     *slot = Some(s);
                                     s
@@ -271,8 +306,10 @@ impl Runtime {
                             _ => {}
                         }
                         // A full ring drops the datagram, as a full interface queue would.
-                        self.net.send_datagram(s, ip, port, &data);
-                        data.len() as i32
+                        match self.net.send_datagram(s, pid, ip, port, &data) {
+                            Ok(_) => data.len() as i32,
+                            Err(e) => e,
+                        }
                     }
                     None => -89, // EDESTADDRREQ
                 }
@@ -306,7 +343,7 @@ impl Runtime {
         if known || dest.1 == 53 {
             return None;
         }
-        let host = self.net.host_for(dest.0);
+        let Some(host) = self.net.host_of(self.pid_of(i), dest.0) else { return Some(Done(net::EHOSTUNREACH)) };
         match self.gate_with_flags(i, &super::policy::Action::Connect { host: &host, port: dest.1 }, super::shield::FLAG_UDP) {
             super::Gate::Allow => {}
             super::Gate::Deny => return Some(Done(-13)),
@@ -428,7 +465,8 @@ impl Runtime {
         let mut file = f.borrow_mut();
         let Kind::Udp { slot, .. } = &mut file.kind else { return None };
         if slot.is_none() {
-            *slot = self.net.udp_open().ok();
+            let pid = self.apps[i].as_ref().map_or(u32::MAX, |a| a.pid);
+            *slot = self.net.udp_open_for(pid, super::MAX_APPS).ok();
         }
         let (ip, port) = self.net.local((*slot)?);
         Some((if ip == 0 { 0x0a00_0002 } else { ip }, port))

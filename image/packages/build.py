@@ -88,6 +88,14 @@ SECTIONS {
         + ["-DNDEBUG", "-I", platform_include, "-c", repo / "runtime/transport.c", "-o", transport]
     )
     manifest = json.loads((repo / "image/catalog/components.json").read_text())
+    from sign import config as signing_config
+
+    package_signer = signing_config(repo, target)
+    from sign import version_overrides
+    test_versions = version_overrides(package_signer)
+    unknown = set(test_versions) - {item.get("name") for item in manifest}
+    if unknown:
+        raise SystemExit(f"VIOLET_PACKAGE_VERSIONS names no component: {sorted(unknown)}")
     # Built-in library apps (IDs 11–14) name their source; they ship with the APP1 trailer.
     for item in manifest:
         if "entry" in item:
@@ -240,10 +248,13 @@ SECTIONS {
         moto_radio = target == "moto" and name == "radio"
         link_script = script
         if moto_radio:
-            # ABI 3 has 128 KiB of zeroed private RAM outside the package/stack.
+            # ABI 4 has 192 KiB of zeroed private RAM outside the package/stack
+            # (ABI 3 had 128 KiB; 32 socket slots' lwIP tables no longer fit it).
+            # A supervisor from before ABI 4 refuses the package instead of
+            # letting Radio fault past the memory it mapped.
             link_script = dest / "radio.ld"
             link_script.write_text(script.read_text().replace(".bss (NOLOAD)", ". = 0x02800000; .bss (NOLOAD)")
-                                   + "\nASSERT(SIZEOF(.bss) <= 0x20000, \"Radio private RAM exceeded\")\n")
+                                   + "\nASSERT(SIZEOF(.bss) <= 0x30000, \"Radio private RAM exceeded\")\n")
         elf = dest / (name + ".elf")
         run(
             [
@@ -292,14 +303,16 @@ SECTIONS {
             raise SystemExit(f"{name}: {len(image):#x} bytes, over its {window:#x}-byte package window")
         header = struct.pack(
             "<4s5I",
-            b"VPK1",
-            3 if moto_radio else package_abi(item["id"]),
+            b"VPK2",
+            4 if moto_radio else package_abi(item["id"]),
             item["id"],
             code[5],
             len(image),
             binascii.crc32(image),
         )
-        (dest / (name + ".vpk")).write_bytes(header + image)
+        # Every package carries a publisher signature over its header, image and
+        # security version (sign.py); the supervisor runs nothing without one.
+        (dest / (name + ".vpk")).write_bytes(package_signer.sign(header + image, int(test_versions.get(name, item.get("version", 1)))))
     if only:
         return
     from package_format import pack

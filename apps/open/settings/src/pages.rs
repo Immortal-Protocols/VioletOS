@@ -74,6 +74,10 @@ pub struct Status {
     pub battery: i32,
     pub volume: i32,
     pub city: usize,
+    /// The system clock was set from the network ("time" in /dev/violet/sys).
+    pub clock_set: bool,
+    /// The system clock in minutes since 1970, so the page redraws as it turns.
+    pub minute: i64,
     pub installed: Vec<Installed>,
 }
 
@@ -179,6 +183,18 @@ fn paragraph(c: &mut Canvas, f: &violet::Face, text: &str, x: i32, mut y: i32, w
         y += (f.size() * 1.4) as i32;
     }
     y
+}
+
+/// The Date & Time page's two status lines: the local time in the chosen
+/// city, and where the clock came from.
+pub fn time_lines(s: &Status) -> (String, &'static str) {
+    if !s.clock_set {
+        return ("Clock not set".into(), "Join Wi-Fi and the network sets it");
+    }
+    match violet::time::local(violet::time::zone(s.city), s.minute * 60) {
+        Some(l) => (format!("{} · {} · {}", l.time(), l.date(), l.zone()), "Set from the network"),
+        None => ("—".into(), ""),
+    }
 }
 
 pub fn menu_value(s: &Status, section: Section) -> (String, bool) {
@@ -288,6 +304,11 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
         Section::Time => {
             header(c, f, v, "‹ Settings", "Date & Time");
             f.regular(26.0).draw(c, "Home shows the date where you are", 44, 228, MUTED);
+            // The time there now, from the system clock and the city's
+            // daylight-saving rule (violet::time); nothing is fetched.
+            let (now, note) = time_lines(s);
+            f.medium(30.0).draw(c, &now, 44, 1476, if s.clock_set { CREAM } else { MUTED });
+            f.regular(24.0).draw(c, note, 44, 1516, MUTED);
             let face = f.medium(28.0);
             for (i, city) in CITIES.iter().enumerate() {
                 let r = city_rect(i);

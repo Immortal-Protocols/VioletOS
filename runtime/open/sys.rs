@@ -4,7 +4,7 @@
 extern "C" {
     fn open_retype(untyped: u32, kind: u32, bits: u32, root: u32, slot: u32) -> i32;
     fn open_object_type(which: u32) -> u32;
-    fn open_page_map(frame: u32, pd: u32, va: u32, writable: i32, cached: i32) -> i32;
+    fn open_page_map(frame: u32, pd: u32, va: u32, writable: i32, cached: i32, exec: i32) -> i32;
     fn open_page_unmap(frame: u32) -> i32;
     fn open_page_unify(frame: u32, bytes: u32) -> i32;
     fn open_pt_map(pt: u32, pd: u32, va: u32) -> i32;
@@ -223,11 +223,14 @@ pub fn retype(untyped: u32, o: Object, bits: u32, slot: u32) -> Result<(), i32> 
 fn check(e: i32) -> Result<(), i32> {
     if e == 0 { Ok(()) } else { Err(e) }
 }
-pub fn page_map(frame: u32, pd: u32, va: u32, writable: bool) -> Result<(), i32> {
-    check(unsafe { open_page_map(frame, pd, va, writable as i32, 1) })
+/// Map a page of memory, or change the rights of one mapped at `va` already.
+/// It is read-only unless `writable` and Execute-Never unless `exec`; asking
+/// for both gives a writable page that cannot be executed.
+pub fn page_map(frame: u32, pd: u32, va: u32, writable: bool, exec: bool) -> Result<(), i32> {
+    check(unsafe { open_page_map(frame, pd, va, writable as i32, 1, exec as i32) })
 }
 pub fn device_map(frame: u32, pd: u32, va: u32) -> Result<(), i32> {
-    check(unsafe { open_page_map(frame, pd, va, 1, 0) })
+    check(unsafe { open_page_map(frame, pd, va, 1, 0, 0) })
 }
 pub fn page_unmap(frame: u32) {
     unsafe { open_page_unmap(frame) };

@@ -901,7 +901,10 @@ impl Runtime {
         };
         let mut f = f.borrow_mut();
         let offset = f.offset;
+        // Violet Shield judged a write-only open as a write only: it cannot read.
+        let write_only = !super::shield::fd_reads(f.flags);
         let data: Vec<u8> = match &mut f.kind {
+            Kind::File { .. } if write_only => return EBADF,
             Kind::File { path } => {
                 let Some(c) = self.fs.contents(path) else { return EIO };
                 let start = (offset as usize).min(c.len());
@@ -911,13 +914,10 @@ impl Runtime {
             Kind::Dir { .. } => return EISDIR,
             Kind::Null | Kind::Log => Vec::new(),
             Kind::Random => {
-                let mut v = Vec::with_capacity(len as usize);
-                let mut x = sys::counter() | 1;
-                while v.len() < len as usize {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    v.push((x >> 24) as u8);
+                // The same generator as getrandom (entropy.rs); at most 64 KiB a read.
+                let mut v = alloc::vec![0u8; (len as usize).min(65536)];
+                if !self.entropy.fill(&mut v) {
+                    return EIO;
                 }
                 v
             }
@@ -1107,6 +1107,7 @@ impl Runtime {
                     if let Some(n) = (0..MAX_APPS).find(|&n| self.apps[n].as_ref().map_or(false, |a| a.path == path)) {
                         if self.foreground != Some(n) {
                             self.set_foreground(Some(n));
+                            self.shield_fronted(i, n); // Violet Shield: who put it in front
                             self.refresh(n);
                             self.lifecycle(n, LIFECYCLE_FOCUS_GAINED);
                         }
@@ -1115,6 +1116,7 @@ impl Runtime {
                     match self.launch(path, &[], Some(i)) {
                         Ok(n) => {
                             self.set_foreground(Some(n));
+                            self.shield_fronted(i, n); // Violet Shield: who put it in front
                             fill(0, 0, WIDTH, HEIGHT, 0xff000000);
                             String::from("ok\n")
                         }
@@ -1231,6 +1233,9 @@ impl Runtime {
                     _ => String::from("error"),
                 }
             }
+            // Violet Shield's own enforcement (guard.rs): "shield-local" reports the mode,
+            // quarantined apps and counts; Settings sets "shield-mode" and "shield-release NAME".
+            Some(verb @ ("shield-local" | "shield-mode" | "shield-release")) => self.shield_sys(i, verb, words.next()),
             // Violet Shield: the companion link, live rules and frozen apps, for Home.
             Some("shield") => {
                 let frozen: Vec<&str> = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).map(|a| a.name.as_str()).collect();
@@ -1328,6 +1333,7 @@ impl Runtime {
                 Some(path) => match self.launch(path, &[], Some(i)) {
                     Ok(n) => {
                         self.set_foreground(Some(n));
+                        self.shield_fronted(i, n); // Violet Shield: who put it in front
                         String::from("ok\n")
                     }
                     Err(e) => alloc::format!("error {}\n", e),
@@ -1339,6 +1345,12 @@ impl Runtime {
                 let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
                 self.wifi.command(&path, &mut words)
             }
+            // Wake locks and Power's governors (powerctl.rs); the wall clock (timesync.rs).
+            Some("wakelock" | "wakelocks" | "power") => {
+                let (pid, path) = self.apps[i].as_ref().map_or((0, ""), |a| (a.pid, a.path.as_str()));
+                super::powerctl::command(pid, path, line)
+            }
+            Some("time") if words.next().is_none() => super::timesync::command(sys::now_ns()),
             Some("log") => {
                 let rest: Vec<&str> = words.collect();
                 crate::log!("{}", rest.join(" "));

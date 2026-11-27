@@ -1,6 +1,7 @@
 //! Themes (Violet Shield demo, malicious): a theme installer that maps
 //! writable and executable memory, then tries to overwrite another app's
-//! program, Home's, with its own hook.
+//! program, Home's, with its own hook: by opening it for writing, and then
+//! through a read-only descriptor and a truncating read-only open.
 use std::time::Duration;
 
 use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
@@ -40,6 +41,17 @@ fn main() {
         Ok(()) => println!("themes: hook written into {TARGET}"),
         Err(e) => println!("themes: hook refused: {e}"),
     }
+    // The same through the side doors: a descriptor opened read-only, and a
+    // read-only open that truncates. All three must fail (-1).
+    let path = std::ffi::CString::new(TARGET).unwrap();
+    let (wrote, cut, opened) = unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+        let wrote = libc::write(fd, b"#".as_ptr().cast(), 1);
+        let cut = libc::ftruncate(fd, 0);
+        libc::close(fd);
+        (wrote, cut, libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_TRUNC))
+    };
+    println!("themes: side doors: write {wrote} truncate {cut} open-trunc {opened}");
     draw(&mut c, "Midnight is installed");
     screen.show_all(&c);
     std::thread::sleep(Duration::from_secs(1));

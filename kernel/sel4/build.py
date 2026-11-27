@@ -108,6 +108,13 @@ def build_target(target,out):
         from phone_image import factory_dtb
         update(out/"base.dtb",factory_dtb(stock.read_bytes()))
         update(plat/"factory-base.dts",subprocess.check_output(["dtc","-q","-I","dtb","-O","dts",out/"base.dtb"]))
+    # Every difference from the pinned upstream source is listed in delta.json
+    # (delta.py, README.md); an unlisted one stops the build here.
+    sys.path.insert(0,str(Path(__file__).resolve().parent))
+    import delta
+    # The handset's base device tree comes from the factory image: pinned by that image's hash.
+    derived=None if target=="qemu" else delta.handset_base(hashlib.sha256(stock.read_bytes()).hexdigest(),(plat/"factory-base.dts").read_bytes())
+    delta.enforce_tree(src,BUILD/"downloads"/(KERNEL[0]+".tar.gz"),derived)
     kernel=out/"kernel"
     run("cmake","-GNinja","-S",src,"-B",kernel,"-DCMAKE_TOOLCHAIN_FILE="+str(src/"llvm.cmake"),
         "-DTRIPLE=arm-none-eabi","-DPYTHON3="+str(py),"-DKernelPlatform=ellis",
@@ -131,6 +138,8 @@ def build_target(target,out):
                 "sel4_arch_include/aarch32/sel4/sel4_arch/invocation.h",
                 "sel4_arch_include/aarch32/sel4/sel4_arch/types_gen.h"]
     run("ninja","-C",kernel,"kernel.elf",*["libsel4/"+f for f in generated])
+    # Only the secure-monitor stubs delta.json lists may contain an SMC instruction.
+    delta.enforce_smc(subprocess.check_output([bins[0].with_name("llvm-objdump"),"-d",kernel/"kernel.elf"],text=True))
     run(py,PORT/"loader/build.py",target,stock)
 
 if __name__=="__main__":

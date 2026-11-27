@@ -75,6 +75,7 @@ pub extern "C" fn storage_task() {
             diagnostic = adopted;
         }
     }
+    let mut stages = [files::Stage::new(); 8];
     let mut records = [None; 7];
     if let Some(device) = disk.as_mut() {
         #[cfg(boot_trace)]
@@ -130,7 +131,7 @@ pub extern "C" fn storage_task() {
             let response = if badge != 3 {
                 Message::error(DENIED)
             } else if let Some(d) = disk.as_mut() {
-                files::dispatch(d, m.op - STORAGE_FILE, m).unwrap_or_else(Message::error)
+                files::dispatch(d, &mut stages, m.op - STORAGE_FILE, m).unwrap_or_else(Message::error)
             } else {
                 Message::error(OFFLINE)
             };

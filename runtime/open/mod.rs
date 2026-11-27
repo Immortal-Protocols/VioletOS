@@ -15,21 +15,30 @@ pub mod fs;
 pub mod hci;
 pub mod heap;
 pub mod inflate;
+pub mod names;
 pub mod net;
+pub mod slots;
 pub mod scanout;
 pub mod sockets;
 pub mod touch;
 pub mod policy;
 pub mod shield;
+pub mod scorer;
+pub mod scorer_model;
 pub mod guard;
 #[path = "../../services/sentinel/mod.rs"]
 pub mod sentinel;
 pub mod pool;
+pub mod vma;
+pub mod entropy;
 #[path = "../../system/supervisor/procmgr.rs"]
 pub mod procmgr;
 pub mod syscall;
 pub mod sys;
 pub mod wifi;
+pub mod powerctl;
+pub mod sntp;
+pub mod timesync;
 
 use crate::protocol::*;
 use alloc::rc::Rc;
@@ -165,7 +174,6 @@ pub struct App {
     pub threads: Vec<Thread>,
     pub fds: Vec<Option<FileRef>>,
     pub cwd: String,
-    pub stub_page: u32,
     pub events: alloc::collections::VecDeque<abi::InputEvent>,
     pub surface: Option<device::Surface>,
     pub exit_code: Option<i32>,
@@ -173,6 +181,8 @@ pub struct App {
     pub digest: [u8; 32],
     /// Not part of the boot image (written or pushed since boot).
     pub new_hash: bool,
+    /// Violet Shield: the app this program belongs to (shield.rs `owner_of`).
+    pub owner: String,
     pub frozen: Option<Frozen>,
     /// When it was last in front (ns), to close the least recently used first.
     pub used_ns: u64,
@@ -200,7 +210,8 @@ pub struct Runtime {
     home_tried: bool,
     pub shell: device::Shell,
     next_pid: u32,
-    pub random: u64,
+    /// The random generator behind getrandom, AT_RANDOM and app layouts.
+    pub entropy: entropy::Drbg,
     contact: Option<u32>,
     last_poll: u64,
     /// Loop statistics, logged every 30 s while apps run.
@@ -212,6 +223,7 @@ pub struct Runtime {
     pub camera: bool,
     pub net: net::Net,
     pub shield: ShieldPolicy,
+    pub scorer: scorer::Scorer,
     pub sentinel: sentinel::Sentinel,
     pub last_touch_ns: u64,
     pub tx_stats: Vec<Option<TxStat>>,
@@ -303,7 +315,7 @@ impl Runtime {
             foreground: None,
             shell: device::Shell::default(),
             next_pid: 100,
-            random: sys::counter() ^ 0x9e3779b97f4a7c15,
+            entropy: entropy::boot(),
             contact: None,
             last_poll: 0,
             stats: Stats::default(),
@@ -312,6 +324,7 @@ impl Runtime {
             // Radio (handset) or the emulator's host relay serves the socket pages.
             net: net::Net::new(true),
             shield: ShieldPolicy::new(),
+            scorer: scorer::Scorer::new(),
             sentinel: {
                 let mut id = [0u8; 16];
                 let (a, b) = (sys::counter() ^ 0x5bd1e995, sys::counter().rotate_left(17) ^ 0x9e3779b97f4a7c15);
@@ -337,13 +350,12 @@ impl Runtime {
         self.next_pid - 1
     }
 
+    /// 64 bits from the random generator (entropy.rs), for the runtime's own
+    /// use. Zero if it was never seeded: then no app runs (see `start`).
     pub fn next_random(&mut self) -> u64 {
-        // xorshift64*, reseeded from the counter's low bits on every call.
-        self.random ^= sys::counter() & 0xffff;
-        self.random ^= self.random >> 12;
-        self.random ^= self.random << 25;
-        self.random ^= self.random >> 27;
-        self.random.wrapping_mul(0x2545f4914f6cdd1d)
+        let mut b = [0u8; 8];
+        self.entropy.fill(&mut b);
+        u64::from_le_bytes(b)
     }
 
     /// Start a program from the file system. Scripts name their interpreter
@@ -366,6 +378,7 @@ impl Runtime {
         let image = self.fs.contents(&program).ok_or("not a file")?;
         let digest = sentinel::sha256(image);
         let new_hash = self.fs.from_layer(&program);
+        let owner = self.shield_owner(path, &digest, caller); // Violet Shield
         let measured = program.clone();
         if image.starts_with(b"#!") {
             let line_end = image.iter().position(|&b| b == b'\n').unwrap_or(image.len());
@@ -393,10 +406,15 @@ impl Runtime {
             && self.reclaim(caller)
         {}
         let index = self.apps.iter().position(|a| a.is_none()).ok_or("too many apps running")?;
+        // AT_RANDOM and a random address-space layout; without a seeded
+        // generator nothing starts, rather than start predictably.
+        let mut drawn = [0u8; 40];
+        if !self.entropy.fill(&mut drawn) && !(entropy::collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
+            return Err(String::from("no entropy to start an app"));
+        }
         let mut random = [0u8; 16];
-        let (a, b) = (self.next_random(), self.next_random());
-        random[..8].copy_from_slice(&a.to_le_bytes());
-        random[8..].copy_from_slice(&b.to_le_bytes());
+        random.copy_from_slice(&drawn[..16]);
+        let layout = procmgr::Layout::random(&drawn[16..]);
         let untyped = self.untypeds[index];
         let k = &mut self.k;
         let mut space = Space::new(k, untyped).map_err(|e| alloc::format!("address space: {}", e))?;
@@ -427,7 +445,7 @@ impl Runtime {
         .iter()
         .map(|s| String::from(*s))
         .collect();
-        let loaded = match procmgr::load(&mut space, k, &mut self.pool, image, &argv, &env, random) {
+        let loaded = match procmgr::load(&mut space, k, &mut self.pool, image, &argv, &env, random, layout) {
             Ok(l) => l,
             Err(e) => {
                 space.destroy(k, &mut self.pool);
@@ -436,8 +454,9 @@ impl Runtime {
             }
         };
         // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
-        space.add(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
-        let Some(stub_page) = space.resolve(k, &mut self.pool, procmgr::STUBS) else {
+        // The app has the page read-execute; the runtime writes it through its own mapping.
+        space.add(layout.stubs, layout.stubs + sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
+        let Some(_) = space.resolve(k, &mut self.pool, layout.stubs) else {
             space.destroy(k, &mut self.pool);
             self.release_objects(index, core::mem::take(&mut space.object_slots));
             return Err(String::from("out of memory"));
@@ -453,12 +472,12 @@ impl Runtime {
             threads: Vec::new(),
             fds: Vec::new(),
             cwd,
-            stub_page: stub_page as u32,
             events: Default::default(),
             surface: None,
             exit_code: None,
             digest,
             new_hash,
+            owner,
             frozen: None,
             used_ns: sys::now_ns(),
         };
@@ -521,14 +540,9 @@ impl Runtime {
             let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
             sys::tcb_schedule(tcb, 0, 0, tier)?;
         }
-        let stub = procmgr::STUBS + 8 * slot as u32;
-        let words = [0xe51f_f004u32, target];
-        let at = app.stub_page as usize + 8 * slot;
-        unsafe {
-            (at as *mut u32).write_volatile(words[0]);
-            ((at + 4) as *mut u32).write_volatile(words[1]);
-        }
-        app.space.sync_code(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32);
+        // The trampoline page is looked up each time, never through a kept
+        // address: no thread starts if the runtime's page is not there.
+        let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
         regs.pc = stub;
         regs.cpsr = 0x10;
         app.threads.push(Thread {
@@ -577,6 +591,10 @@ impl Runtime {
     /// Tear an app down: its threads stop and its memory returns to the pool.
     pub fn reap(&mut self, index: usize) {
         let Some(mut app) = self.apps[index].take() else { return };
+        // Its wake lock, if it held one, ends with it.
+        powerctl::app_gone(app.pid);
+        // The resolver forgets the names it resolved (names.rs).
+        self.net.forget(app.pid);
         for t in &app.threads {
             if t.alive {
                 sys::tcb_suspend(t.tcb);
@@ -632,19 +650,21 @@ impl Runtime {
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
                 let (pc, addr) = (r.mrs[0], r.mrs[1]);
-                let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr);
+                // Read, write or instruction fetch: the region must allow it (vma.rs).
+                let access = vma::access(r.mrs[2], r.mrs[3]);
+                let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
                 // Out of pages: close a background app and try again.
                 let can_reclaim = self.foreground == Some(index)
-                    && self.apps[index].as_ref().unwrap().space.find(addr).is_some_and(|v| v.prot != 0);
+                    && self.apps[index].as_ref().unwrap().space.find(addr).is_some_and(|v| access.allowed(v.prot));
                 while !resolved && can_reclaim && self.pool.available() == 0 && self.reclaim(None) {
-                    resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr);
+                    resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
                 }
                 let app = self.apps[index].as_mut().unwrap();
                 if resolved {
                     sys::reply(&[]);
                 } else {
                     let (pages, tables) = app.space.usage();
-                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, addr, pc, self.pool.available() * 64, pages * 64, tables);
+                    log!("{} (pid {}): bad memory access ({:?}) at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, access, addr, pc, self.pool.available() * 64, pages * 64, tables);
                     app.exit_code = Some(139);
                     self.reap(index);
                 }
@@ -854,6 +874,13 @@ impl Runtime {
         let t0 = sys::now_ns();
         data::flush(&mut self.fs);
         self.wifi.tick(&self.fs, t0);
+        // Network time (timesync.rs).
+        // Each request draws its own 64 bits; none if the generator is unseeded.
+        let entropy = &mut self.entropy;
+        timesync::tick(&mut self.net, t0, &mut || {
+            let mut b = [0u8; 8];
+            entropy.fill(&mut b).then(|| u64::from_le_bytes(b))
+        });
         self.usb_requests();
         self.usb_installs();
         let t1 = sys::now_ns();
@@ -985,7 +1012,7 @@ impl Runtime {
         let Some(i) = self.foreground.filter(|_| self.focused) else {
             // `bench press` on the app list taps it like a finger would.
             if b.release && self.focused && self.foreground.is_none() {
-                self.touch(b.x, b.y, !b.pressed);
+                self.synthetic_touch(b.x, b.y, !b.pressed); // not the user, to Violet Shield
                 b.pressed = !b.pressed;
                 if !b.pressed {
                     b.left -= 1;

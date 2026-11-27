@@ -2,9 +2,30 @@
 //! or an open one.
 use super::passive_scan::AccessPoint;
 
+/// The RSN element for an access point without management frame protection:
+/// CCMP-128 for group and pairwise traffic, PSK, no capabilities.
 pub const RSN: &[u8] = &[
     48, 20, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 2, 0, 0,
 ];
+pub const RSN_MAX: usize = 28;
+
+/// The RSN element this station sends to `ap`, in the association request and
+/// again in message 2 of the handshake. With management frame protection
+/// (`ap.mfp`, IEEE 802.11w) it sets MFPC, and MFPR when the access point
+/// requires protection, and names BIP-CMAC-128 after an empty PMKID list.
+pub fn rsne(ap: &AccessPoint, out: &mut [u8; RSN_MAX]) -> usize {
+    out[..RSN.len()].copy_from_slice(RSN);
+    if ap.akm == 6 {
+        out[19] = 6; // PSK with SHA-256 (00-0F-AC:6)
+    }
+    if ap.mfp == 0 {
+        return RSN.len();
+    }
+    out[1] = RSN_MAX as u8 - 2;
+    out[20] = if ap.mfp == 2 { 0xc0 } else { 0x80 };
+    out[22..].copy_from_slice(&[0, 0, 0, 15, 172, 6]);
+    RSN_MAX
+}
 
 pub fn request(ap: &AccessPoint, station: [u8; 6], associate: bool, out: &mut [u8; 128]) -> usize {
     out.fill(0);
@@ -36,8 +57,39 @@ pub fn request(ap: &AccessPoint, station: [u8; 6], associate: bool, out: &mut [u
     if ap.open {
         return pos;
     }
-    out[pos..pos + RSN.len()].copy_from_slice(RSN);
-    pos + RSN.len()
+    let mut rsn = [0; RSN_MAX];
+    let n = rsne(ap, &mut rsn);
+    out[pos..pos + n].copy_from_slice(&rsn[..n]);
+    pos + n
+}
+
+/// `response`'s error when the access point says "try again later" (status 30):
+/// it still holds a protected association with this station and is checking it
+/// with an SA Query that nobody will answer (IEEE 802.11-2020 11.3.5.3). The low
+/// bits say how long to wait, in milliseconds.
+pub const LATER: u32 = 0x4c00_0000;
+/// Longest wait an access point is given, in time units (1.024 ms): the wait
+/// and the second request happen inside the channel grant of the first, which
+/// is at least 1.6 s. hostapd names 1000.
+const LATER_LIMIT: u32 = 1150;
+
+/// The wait in milliseconds, if `error` is a "try again later".
+pub fn later(error: u32) -> Option<u32> {
+    (error & 0xff00_0000 == LATER).then_some(error & 0xffff)
+}
+
+/// The association comeback time among a response's elements (Timeout Interval,
+/// ID 56, type 3, in time units), as milliseconds with a little to spare. An
+/// access point that names none gets the standard's default of a second.
+fn comeback(mut elements: &[u8]) -> u32 {
+    let mut units = 1000;
+    while let Some(body) = elements.get(2..).and_then(|rest| rest.get(..usize::from(elements[1]))) {
+        if elements[0] == 56 && body.len() == 5 && body[0] == 3 {
+            units = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+        }
+        elements = &elements[2 + body.len()..];
+    }
+    units.min(LATER_LIMIT) * 1024 / 1000 + 25
 }
 
 // Ignore unrelated traffic. Only a successful response from this BSSID advances state.
@@ -64,6 +116,9 @@ pub fn response(
     } else {
         &frame[28..30]
     };
+    if associate && status == [30, 0] {
+        return Some(Err(LATER | comeback(&frame[30..])));
+    }
     if status != [0, 0] {
         return Some(Err(49));
     }
@@ -181,6 +236,19 @@ pub fn eapol<'a>(packet: &'a [u8], mac: &[u8; 6], ap: &[u8; 6]) -> Option<&'a [u
     };
     let len = u16::from_be_bytes(body.get(2..4)?.try_into().ok()?) as usize;
     body.get(..4 + len)
+}
+
+/// The firmware decrypted this received frame with CCMP and found nothing
+/// wrong with it: what `ethernet` asks of every data frame on a keyed link.
+/// (`eapol` also takes frames that arrived in the clear, which is how the
+/// first handshake's frames come.)
+pub fn decrypted(packet: &[u8]) -> bool {
+    packet.len() >= 16
+        && packet[9] >> 4 == 4
+        && packet[10] & 0xfe == 0
+        && packet[11] & 1 == 0
+        && (packet[6] & 0x80 != 0
+            || super::passive_scan::rx_payload(packet).and_then(|f| f.get(1)).is_some_and(|b| b & 0x40 != 0))
 }
 
 /// `open`: the link is an open network, whose frames carry no cipher.

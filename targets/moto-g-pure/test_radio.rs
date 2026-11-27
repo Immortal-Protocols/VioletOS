@@ -1,6 +1,7 @@
 //! Host tests against the exact bundle that the handset loader embeds.
 mod conn_firmware;
 mod passive_scan;
+mod pmf;
 mod softap;
 mod station;
 mod wlan_download;
@@ -181,7 +182,12 @@ fn identifies_wpa2_personal_access_point_on_channel_161() {
     required[46] = 20;
     required.extend_from_slice(&[0x40, 0]); // management frame protection required
     r.frame(&required);
-    assert!(!r.aps[0].wpa2_psk_ccmp);
+    assert!(!r.aps[0].wpa2_psk_ccmp); // required but not capable: not a valid offer
+    let caps = required.len() - 2;
+    required[caps] = 0xc0; // management frame protection capable and required
+    r.frame(&required);
+    assert!(r.aps[0].wpa2_psk_ccmp);
+    assert_eq!((r.aps[0].akm, r.aps[0].mfp), (2, 2));
     *frame.last_mut().unwrap() = 1; // enterprise AKM
     r.frame(&frame);
     assert!(!r.aps[0].wpa2_psk_ccmp);
@@ -374,3 +380,6 @@ fn authorized_ip_requires_hardware_ccmp_and_accepts_translated_frames() {
     p[22] ^= 1;
     assert!(station::eapol(&p, &mac, &ap).is_none());
 }
+
+// The register-level tests of management frame protection need no firmware
+// bundle: they are in test_pmf.rs, which `make test-unit` runs.

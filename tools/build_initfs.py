@@ -53,10 +53,27 @@ def lld_for(sysroot, host):
 CPU_FLAGS = ["-C", "target-cpu=cortex-a53", "-C", "target-feature=+neon"]
 
 
+def pie_flags(rustc):
+    """VIOLET_OPEN_PIE=1 links the Rust apps as static position-independent
+    executables, which the Open Runtime loads at a random address. rustc has no
+    static-PIE mode for this target, so the link is spelled out: musl's
+    self-relocating start file (rcrt1.o) in place of crt1.o, and no text
+    relocations. Off by default: the result links, and tools/elf_check.py sees
+    a PIE, but it has not been run on the emulator or the phone yet."""
+    if os.environ.get("VIOLET_OPEN_PIE") != "1":
+        return []
+    sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
+    crt = sysroot / "lib/rustlib" / TARGET / "lib/self-contained"
+    link = ["-pie", "--no-dynamic-linker", "-static", "-z", "text", crt / "rcrt1.o", crt / "crti.o",
+            crt / "crtbeginS.o", f"-L{crt}", crt / "crtendS.o", crt / "crtn.o"]
+    return ["-C", "relocation-model=pic", "-C", "link-self-contained=no",
+            *[part for arg in link for part in ("-C", f"link-arg={arg}")]]
+
+
 def build_rust(source, out):
     rustc, lld = toolchain()
     subprocess.run([rustc, "--edition=2021", "-O", "-C", "strip=symbols", "--target", TARGET, *CPU_FLAGS,
-                    "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
+                    *pie_flags(rustc), "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
 
 
 def build_cargo(work):
@@ -77,7 +94,7 @@ def build_cargo(work):
         f"AR_{key}": str(bins[0] / "llvm-ar"),
         f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *CPU_FLAGS]),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *CPU_FLAGS, *pie_flags(rustc)]),
         "CARGO_TARGET_DIR": str(ROOT / "build/open-cargo"),
         "RUSTC": str(rustc),
     })
@@ -302,6 +319,13 @@ def main(out, python=True, compress=False, skip=()):
             if path.is_file():
                 rel = str(path.relative_to(extra))
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
+    # The loader refuses programs that break W^X: fail here, not on the phone.
+    # Programs that are not position-independent keep a fixed code address.
+    sys.path.insert(0, str(ROOT / "tools"))
+    import elf_check
+    fixed = elf_check.check({name: data for name, (data, _) in files.items() if name.startswith(("apps/", "bin/"))})
+    if fixed:
+        print(f"fixed code address (not PIE; stack, heap and mappings still move): {' '.join(fixed)}", file=sys.stderr)
     blob = bytearray()
     dirs = sorted({str(Path(p).parent) for p in files if str(Path(p).parent) != "."} |
                   {str(q) for p in files for q in Path(p).parents if str(q) != "."})

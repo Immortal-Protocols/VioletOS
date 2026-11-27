@@ -110,3 +110,5 @@ On Linux, [Shirudo](https://github.com/shirudo-dev/shirudo) solves live detectio
 1. **Stage 1 vs. Stage 2 rollout:** Ship **Stage 1** (frozen EmbeddingGemma 2 270M text+code + Hybrid MLP head + 256-d cosine novelty, with <500 KB head updates) first and only add the **Stage 2 LoRA** (`r=8–16` on the 130M transformer) where evals show subtle evasion gaps?
 2. **Auto-containment default:** On high-confidence `P(malicious) >= 0.90`, should the iPhone automatically `FREEZE_APP` + block the host in SOCKS5 with a 10-minute TTL and notify you, or start in **Notify-only** mode until real-world false positive rate is measured?
 3. **Shield expressiveness:** Are structured declarative `VSH1` rules (path/host/port/syscall match + rate limits) enough for v1, or should we include a tiny bounded `#![no_std]` eBPF/rBPF filter VM inside `OpenRuntime` right away?
+
+**Status.** Questions 2 and 3 are partly answered in code: the phone has rate limits and a reversible quarantine of its own, and contains only on deterministic signs ([proof of concept](violet-shield-poc.md#what-the-phone-enforces-by-itself)). Rate limits are built-in constants, not yet a `VSH1` rule type.

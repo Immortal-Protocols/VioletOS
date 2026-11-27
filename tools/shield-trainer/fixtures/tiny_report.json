@@ -1,0 +1,262 @@
+{
+ "model_sha256": "55fedf7e0c94abc7b68d98dd1116c7355c5f2def23685b56d8eba0c01901f47d",
+ "t_warn": 1,
+ "t_contain": 305,
+ "shift1": 4,
+ "data": "synthetic (scenarios.py); seeds 11 train, 12 calibration, 13 test, 14 unseen families",
+ "calibration": {
+  "windows": 3011,
+  "accuracy": 0.9724,
+  "benign_windows": 2268,
+  "benign_warned": 0,
+  "benign_warn_rate_95ci": [
+   0.0,
+   0.0017
+  ],
+  "benign_contained": 0,
+  "benign_contain_rate_95ci": [
+   0.0,
+   0.0017
+  ],
+  "malicious_windows": 524,
+  "malicious_warned": 524,
+  "malicious_contained": 231,
+  "families": {
+   "hard_negative_file_manager": {
+    "n": 396,
+    "right": 396,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "benign_local": {
+    "n": 375,
+    "right": 375,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "attack_c2_beacon": {
+    "n": 148,
+    "right": 148,
+    "warn": 148,
+    "contain": 0,
+    "verdict": "exfil_or_c2"
+   },
+   "hard_negative_dev_push": {
+    "n": 407,
+    "right": 407,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "benign_scary_words": {
+    "n": 331,
+    "right": 331,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "attack_persistence": {
+    "n": 130,
+    "right": 130,
+    "warn": 130,
+    "contain": 130,
+    "verdict": "exploit_or_persistence"
+   },
+   "suspicious_new_host": {
+    "n": 98,
+    "right": 98,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "suspicious"
+   },
+   "attack_wx_shellcode": {
+    "n": 127,
+    "right": 127,
+    "warn": 127,
+    "contain": 0,
+    "verdict": "exploit_or_persistence"
+   },
+   "benign_stream": {
+    "n": 759,
+    "right": 676,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "attack_typosquat": {
+    "n": 121,
+    "right": 121,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "suspicious"
+   },
+   "attack_exfil": {
+    "n": 119,
+    "right": 119,
+    "warn": 119,
+    "contain": 101,
+    "verdict": "exfil_or_c2"
+   }
+  }
+ },
+ "test": {
+  "windows": 2997,
+  "accuracy": 0.97,
+  "benign_windows": 2246,
+  "benign_warned": 0,
+  "benign_warn_rate_95ci": [
+   0.0,
+   0.0017
+  ],
+  "benign_contained": 0,
+  "benign_contain_rate_95ci": [
+   0.0,
+   0.0017
+  ],
+  "malicious_windows": 494,
+  "malicious_warned": 492,
+  "malicious_contained": 229,
+  "families": {
+   "benign_scary_words": {
+    "n": 346,
+    "right": 346,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "benign_stream": {
+    "n": 752,
+    "right": 667,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "attack_c2_beacon": {
+    "n": 134,
+    "right": 134,
+    "warn": 134,
+    "contain": 0,
+    "verdict": "exfil_or_c2"
+   },
+   "attack_persistence": {
+    "n": 122,
+    "right": 122,
+    "warn": 122,
+    "contain": 122,
+    "verdict": "exploit_or_persistence"
+   },
+   "benign_local": {
+    "n": 363,
+    "right": 363,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "attack_wx_shellcode": {
+    "n": 118,
+    "right": 116,
+    "warn": 116,
+    "contain": 0,
+    "verdict": "exploit_or_persistence"
+   },
+   "suspicious_new_host": {
+    "n": 125,
+    "right": 125,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "suspicious"
+   },
+   "hard_negative_file_manager": {
+    "n": 372,
+    "right": 372,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "hard_negative_dev_push": {
+    "n": 413,
+    "right": 413,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "benign"
+   },
+   "attack_exfil": {
+    "n": 120,
+    "right": 120,
+    "warn": 120,
+    "contain": 107,
+    "verdict": "exfil_or_c2"
+   },
+   "attack_typosquat": {
+    "n": 132,
+    "right": 129,
+    "warn": 0,
+    "contain": 0,
+    "verdict": "suspicious"
+   }
+  }
+ },
+ "unseen_families": {
+  "windows": 300,
+  "accuracy": 0.9633,
+  "benign_windows": 157,
+  "benign_warned": 11,
+  "benign_warn_rate_95ci": [
+   0.0396,
+   0.1211
+  ],
+  "benign_contained": 0,
+  "benign_contain_rate_95ci": [
+   0.0,
+   0.0239
+  ],
+  "malicious_windows": 143,
+  "malicious_warned": 143,
+  "malicious_contained": 120,
+  "families": {
+   "attack_slow_drip_exfil": {
+    "n": 143,
+    "right": 143,
+    "warn": 143,
+    "contain": 120,
+    "verdict": "exfil_or_c2"
+   },
+   "hard_negative_user_upload": {
+    "n": 157,
+    "right": 146,
+    "warn": 11,
+    "contain": 0,
+    "verdict": "benign"
+   }
+  }
+ },
+ "relay_only_not_visible_on_device": {
+  "windows": 83,
+  "accuracy": 0.4217,
+  "benign_windows": 0,
+  "benign_warned": 0,
+  "benign_warn_rate_95ci": [
+   0.0,
+   1.0
+  ],
+  "benign_contained": 0,
+  "benign_contain_rate_95ci": [
+   0.0,
+   1.0
+  ],
+  "malicious_windows": 0,
+  "malicious_warned": 0,
+  "malicious_contained": 0,
+  "families": {
+   "attack_socks_mismatch": {
+    "n": 83,
+    "right": 35,
+    "warn": 1,
+    "contain": 0,
+    "verdict": "suspicious"
+   }
+  }
+ }
+}

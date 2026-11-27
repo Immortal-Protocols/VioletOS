@@ -42,6 +42,8 @@ fn status() -> Status {
         battery: st.get("battery").and_then(|v| v.parse().ok()).filter(|b| (0..=100).contains(b)).unwrap_or(-1),
         volume: st.get("volume").and_then(|v| v.parse().ok()).unwrap_or(-1),
         city: violet::sys("get time.city").parse().ok().filter(|&n: &usize| n < CITIES.len()).unwrap_or(0),
+        clock_set: violet::time::network_time().is_some(),
+        minute: violet::time::now_utc() / 60,
         installed: pages::parse_installed(&violet::sys("installed")),
     }
 }
@@ -271,6 +273,7 @@ mod preview {
         Status {
             wifi: "LouieDog".into(), bt_on: true, bt_open: false, shield_known: true, shield_linked: true, shield_rules: 3,
             frozen: vec![], relay: "off".into(), relay_failure: 0, battery: 82, volume: 8, city: 1,
+            clock_set: true, minute: 29_924_807, // 2026-11-24 02:47 UTC
             installed: pages::parse_installed("scorekeeper\t412345\tScorekeeper\ntips\t300000\tTip Calculator\n"),
         }
     }
@@ -281,6 +284,21 @@ mod preview {
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].title, "Dice");
         assert_eq!(a[1].title, "raw");
+    }
+
+    #[test]
+    fn time_page_lines() {
+        let mut s = status();
+        // Oakland, the evening before in Pacific standard time.
+        assert_eq!(pages::time_lines(&s), ("18:47 · Nov 23, Mon · PST (UTC-8)".into(), "Set from the network"));
+        s.city = 18; // Mumbai
+        assert_eq!(pages::time_lines(&s).0, "8:17 · Nov 24, Tue · IST (UTC+5:30)");
+        s.city = 13; // London, in July: summer time
+        s.minute = 29_704_800; // 2026-06-24 08:00 UTC
+        assert_eq!(pages::time_lines(&s).0, "9:00 · Jun 24, Wed · BST (UTC+1)");
+        // Before the network has answered, the build-time clock is not shown as the time.
+        s.clock_set = false;
+        assert_eq!(pages::time_lines(&s).0, "Clock not set");
     }
 
     /// SETTINGS_PREVIEW=dir cargo test -p settings writes each page as raw 720x1600 RGBA.

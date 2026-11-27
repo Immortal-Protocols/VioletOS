@@ -1,20 +1,48 @@
 //! TCP and UDP for open apps, through pages shared with Radio (on the handset) or with
-//! the emulator's host relay (in QEMU). The layout matches
-//! targets/moto-g-pure/ip/sockets.c and tools/net_relay.py.
+//! the emulator's host relay (in QEMU). The layout ("NET2") matches
+//! targets/moto-g-pure/ip/sockets.c and tools/net_relay.py; tools/test_net_layout.py
+//! checks that the three agree.
+//!
+//! Page 0: word 0 the magic, word 1 how the server is online, words 2-4 the
+//! slots it serves and the ring sizes. A server with another magic or other
+//! ring sizes is treated as no network at all. Slot headers of 512 bytes
+//! follow from page 1 (16 words, then from byte 64 a name of up to 253 bytes
+//! and its NUL; the rest is spare). Each slot has an 8 KiB send ring and a
+//! 16 KiB receive ring: slots 0-8 from byte 0x5000, slots 9-31 from byte
+//! 0x43000 (the Bluetooth pages, hci.rs, sit between the two runs).
+//!
+//! Of a slot's ring words the Open Runtime writes 7 (queued to send), 10
+//! (read) and 11, the server 8 (sent) and 9 (received). The server empties
+//! its two when it takes a command, so until it has (`taken`) they may
+//! still be the slot's previous connection's, perhaps another app's: nothing
+//! is read, and what is queued to send counts from zero.
+//!
+//! slots.rs decides who may take a slot; names.rs is the resolver's table.
 //!
 //! DNS never leaves the phone as a query: the Open Runtime answers a program's
 //! UDP queries to port 53 itself, giving each name an address in 198.18.0.0/15,
 //! and a connect to such an address hands Radio the name instead. Radio then
 //! resolves it on a joined network, or lets the phone's relay resolve it.
+use super::names::{self, Lookup, Names};
+use super::slots;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 const BASE: usize = 0x0940_0000;
-pub const SLOTS: usize = 8;
+pub const SLOTS: usize = slots::SLOTS;
 const TX: u32 = 8192;
 const RX: u32 = 16384;
 const STRIDE: usize = (TX + RX) as usize;
-const MAGIC: u32 = 0x3154_454e;
+const MAGIC: u32 = 0x3254_454e;
+/// Slot headers: where they start, and the size of one.
+const HEADERS: usize = 0x1000;
+const HEADER: usize = 512;
+/// The name field of a header: from byte 64, NUL-terminated.
+const NAME: usize = 256;
+/// Rings: the first run of slots, how many it holds, and the second run.
+const RINGS_A: usize = 0x5000;
+const FIRST: usize = 9;
+const RINGS_B: usize = 0x4_3000;
 pub const CMD_CONNECT: u32 = 1;
 pub const CMD_CLOSE: u32 = 2;
 /// Open a UDP socket: the rings then carry datagrams, each a little-endian
@@ -29,12 +57,12 @@ pub const CONNECTING: u32 = 1;
 pub const OPEN: u32 = 2;
 pub const PEER_CLOSED: u32 = 3;
 pub const FAILED: u32 = 4;
-/// Stand-in addresses for names: 198.18.0.0/15.
-const FAKE_BASE: u32 = 0xc612_0000;
-const FAKE_MASK: u32 = 0xfffe_0000;
+const ENETUNREACH: i32 = -101;
+/// A stand-in address whose name the resolver no longer has.
+pub const EHOSTUNREACH: i32 = -113;
 
 fn word(slot: usize, i: usize) -> *mut u32 {
-    (BASE + 256 + slot * 128 + i * 4) as *mut u32
+    (BASE + HEADERS + slot * HEADER + i * 4) as *mut u32
 }
 fn get(slot: usize, i: usize) -> u32 {
     unsafe { word(slot, i).read_volatile() }
@@ -43,110 +71,141 @@ fn set(slot: usize, i: usize, v: u32) {
     unsafe { word(slot, i).write_volatile(v) }
 }
 fn tx(slot: usize) -> *mut u8 {
-    (BASE + 4096 + slot * STRIDE) as *mut u8
+    (BASE + if slot < FIRST { RINGS_A + slot * STRIDE } else { RINGS_B + (slot - FIRST) * STRIDE }) as *mut u8
 }
 fn rx(slot: usize) -> *const u8 {
-    (BASE + 4096 + slot * STRIDE + TX as usize) as *const u8
+    unsafe { tx(slot).add(TX as usize) }
+}
+/// The server has taken the slot's last command: its rings are this use's.
+fn taken(slot: usize) -> bool {
+    get(slot, 0) == get(slot, 2)
 }
 
-/// Slots in use, one bit each. The Open Runtime is single-threaded.
-static USED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Who holds each slot. The Open Runtime is single-threaded.
+struct Shared(core::cell::UnsafeCell<slots::Table>);
+unsafe impl Sync for Shared {}
+static TABLE: Shared = Shared(core::cell::UnsafeCell::new(slots::Table::new()));
+fn table() -> &'static mut slots::Table {
+    unsafe { &mut *TABLE.0.get() }
+}
 
 /// The slot holds a connection that has not been closed.
 pub fn in_use(slot: usize) -> bool {
-    USED.load(core::sync::atomic::Ordering::SeqCst) & (1 << slot) != 0
+    table().in_use(slot)
+}
+
+/// Slots an owner (a pid, or slots::SYSTEM) holds.
+pub fn held(owner: u32) -> usize {
+    table().held(owner)
 }
 
 /// Close a connection; called when the last descriptor for it closes.
 pub fn close(slot: usize) {
+    if !table().in_use(slot) {
+        return;
+    }
     set(slot, 1, CMD_CLOSE);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     set(slot, 0, get(slot, 0).wrapping_add(1));
-    USED.fetch_and(!(1 << slot), core::sync::atomic::Ordering::SeqCst);
+    table().free(slot);
 }
 
 pub struct Net {
     /// The pages are mapped (the board has a socket server).
     pub present: bool,
-    names: Vec<String>,
+    /// The resolver's table of stand-in addresses.
+    pub names: Names,
     /// The source of the datagram read last (for recvfrom).
     pub last_from: (u32, u16),
 }
 impl Net {
     pub fn new(present: bool) -> Net {
-        Net { present, names: Vec::new(), last_from: (0, 0) }
+        Net { present, names: Names::new(), last_from: (0, 0) }
     }
-    /// 0 offline, 1 joined network, 2 phone relay, 3 the emulator's host.
-    pub fn online(&self) -> u32 {
+    /// Slots the server serves; 0 unless it speaks this layout.
+    fn served(&self) -> usize {
         if !self.present {
             return 0;
         }
         let page = BASE as *const u32;
         unsafe {
-            if page.read_volatile() != MAGIC {
+            if page.read_volatile() != MAGIC || page.add(3).read_volatile() != TX || page.add(4).read_volatile() != RX {
                 return 0;
             }
-            page.add(1).read_volatile()
+            (page.add(2).read_volatile() as usize).min(SLOTS)
         }
     }
-    /// The stand-in address for a name, allocating one the first time.
+    /// 0 offline, 1 joined network, 2 phone relay, 3 the emulator's host.
+    pub fn online(&self) -> u32 {
+        if self.served() == 0 {
+            return 0;
+        }
+        unsafe { (BASE as *const u32).add(1).read_volatile() }
+    }
+    /// The Open Runtime's own stand-in address for a name (the Sentinel's
+    /// endpoints); 0, which no connect accepts, if the table cannot hold it.
     pub fn address_for(&mut self, name: &str) -> u32 {
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
-        let index = match self.names.iter().position(|n| *n == name) {
-            Some(i) => i,
-            None => {
-                self.names.push(name);
-                self.names.len() - 1
-            }
-        };
-        FAKE_BASE + 1 + index as u32
+        self.names.resolve(slots::SYSTEM, name, &mut |_| false).unwrap_or(0)
     }
-    /// The name behind a stand-in address, or the address in dotted form.
-    pub fn host_for(&self, ip: u32) -> String {
-        match self.name_for(ip) {
-            Some(n) => String::from(n),
-            None => alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255),
+    /// The host an owner means by an address: the name behind a stand-in
+    /// address, or the address in dotted form. None for a stand-in address
+    /// this owner has no name for; that is never a real destination.
+    pub fn host_of(&mut self, owner: u32, ip: u32) -> Option<String> {
+        match self.names.lookup(owner, ip) {
+            Lookup::Name(n) => Some(String::from(n)),
+            Lookup::Stale => None,
+            Lookup::Literal => Some(alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255)),
         }
     }
-    /// An address the resolver handed out for a name.
+    /// An address the resolver hands out for names.
     pub fn is_stand_in(&self, ip: u32) -> bool {
-        ip & FAKE_MASK == FAKE_BASE
+        names::is_stand_in(ip)
     }
-    fn name_for(&self, ip: u32) -> Option<&str> {
-        if ip & FAKE_MASK != FAKE_BASE {
-            return None;
-        }
-        self.names.get((ip - FAKE_BASE).wrapping_sub(1) as usize).map(|s| s.as_str())
+    /// Forget what an owner resolved (its app exited).
+    pub fn forget(&mut self, owner: u32) {
+        self.names.purge(owner);
     }
-    /// Start a connection; returns the slot.
+    /// Start a connection of the Open Runtime's own; returns the slot.
     pub fn connect(&mut self, ip: u32, port: u16) -> Result<usize, i32> {
-        self.start(CMD_CONNECT, ip, port)
+        if ip == 0 {
+            return Err(EHOSTUNREACH);
+        }
+        self.start(slots::SYSTEM, 0, CMD_CONNECT, ip, port)
     }
-    /// Open a UDP socket; returns the slot.
-    pub fn udp_open(&mut self) -> Result<usize, i32> {
-        self.start(CMD_UDP, 0, 0)
+    /// Start a connection for an app (`owner` is its pid, `apps` how many
+    /// apps can run at once); returns the slot.
+    pub fn connect_for(&mut self, owner: u32, apps: usize, ip: u32, port: u16) -> Result<usize, i32> {
+        self.start(owner, apps, CMD_CONNECT, ip, port)
     }
-    fn start(&mut self, cmd: u32, ip: u32, port: u16) -> Result<usize, i32> {
+    /// Open a UDP socket for an app; returns the slot.
+    pub fn udp_open_for(&mut self, owner: u32, apps: usize) -> Result<usize, i32> {
+        self.start(owner, apps, CMD_UDP, 0, 0)
+    }
+    fn start(&mut self, owner: u32, apps: usize, cmd: u32, ip: u32, port: u16) -> Result<usize, i32> {
         if self.online() == 0 {
-            return Err(-101); // ENETUNREACH
+            return Err(ENETUNREACH);
         }
-        let used = USED.load(core::sync::atomic::Ordering::SeqCst);
-        let slot = (0..SLOTS).find(|&i| used & (1 << i) == 0).ok_or(-24)?;
-        USED.fetch_or(1 << slot, core::sync::atomic::Ordering::SeqCst);
-        let mut name = [0u8; 64];
-        if let Some(n) = self.name_for(ip) {
-            let b = n.as_bytes();
-            name[..b.len().min(63)].copy_from_slice(&b[..b.len().min(63)]);
+        let mut name = [0u8; NAME];
+        match self.names.lookup(owner, ip) {
+            Lookup::Name(n) if n.len() < NAME => name[..n.len()].copy_from_slice(n.as_bytes()),
+            Lookup::Literal => {}
+            _ => return Err(EHOSTUNREACH),
         }
-        for (k, chunk) in name.chunks_exact(4).enumerate() {
-            set(slot, 16 + k, u32::from_le_bytes(chunk.try_into().unwrap()));
+        // Every app the runtime can run keeps its floor, whoever asks.
+        let slot = table().alloc(owner, self.served(), apps.max(super::MAX_APPS))?;
+        for (k, b) in name.iter().enumerate() {
+            unsafe { (word(slot, 16) as *mut u8).add(k).write_volatile(*b) };
         }
         set(slot, 5, ip);
         set(slot, 6, u32::from(port));
-        // Both rings start empty for the new connection.
-        for i in [7, 8, 9, 10, 11, 12, 13] {
+        // This side's ring words start at zero; the server zeroes its own
+        // (8, 9, 12, 13) when it takes the command, after it has let go of
+        // the slot's previous connection.
+        for i in [7, 10, 11] {
             set(slot, i, 0);
         }
+        // Whose socket it is, for the server's per-app limits.
+        set(slot, 14, owner);
         set(slot, 3, CONNECTING);
         set(slot, 4, 0);
         set(slot, 1, cmd);
@@ -157,16 +216,21 @@ impl Net {
     /// State, and the error (a positive errno) when it failed. A command the
     /// server has not taken yet still counts as connecting.
     pub fn state(&self, slot: usize) -> (u32, i32) {
-        if get(slot, 0) != get(slot, 2) {
+        if !taken(slot) {
             return (CONNECTING, 0);
         }
         (get(slot, 3), get(slot, 4) as i32)
     }
     pub fn tx_space(&self, slot: usize) -> u32 {
-        TX - get(slot, 7).wrapping_sub(get(slot, 8))
+        // Nothing of this use is sent before the server takes its command.
+        let sent = if taken(slot) { get(slot, 8) } else { 0 };
+        TX.saturating_sub(get(slot, 7).wrapping_sub(sent))
     }
     pub fn rx_ready(&self, slot: usize) -> u32 {
-        get(slot, 9).wrapping_sub(get(slot, 10))
+        if !taken(slot) {
+            return 0;
+        }
+        get(slot, 9).wrapping_sub(get(slot, 10)).min(RX)
     }
     pub fn send(&mut self, slot: usize, data: &[u8]) -> usize {
         let n = (self.tx_space(slot) as usize).min(data.len());
@@ -191,17 +255,25 @@ impl Net {
     }
     /// A UDP socket's local address: (the phone's address on the network, port).
     pub fn local(&self, slot: usize) -> (u32, u16) {
+        if !taken(slot) {
+            return (0, 0);
+        }
         (get(slot, 13), get(slot, 12) as u16)
     }
-    /// Queue a datagram on a UDP slot; false when the ring has no room for it.
-    /// `name` is sent instead of a stand-in address, for Radio to resolve.
-    pub fn send_datagram(&mut self, slot: usize, ip: u32, port: u16, data: &[u8]) -> bool {
-        let name = self.name_for(ip).map(|n| String::from(n)).unwrap_or_default();
-        let name = &name.as_bytes()[..name.len().min(63)];
+    /// Queue a datagram on a UDP slot; Ok(false) when the ring has no room
+    /// for it. A name `owner` resolved is sent instead of its stand-in
+    /// address, for Radio to resolve; a stand-in address with no name is an error.
+    pub fn send_datagram(&mut self, slot: usize, owner: u32, ip: u32, port: u16, data: &[u8]) -> Result<bool, i32> {
+        let name = match self.names.lookup(owner, ip) {
+            Lookup::Name(n) if n.len() < NAME => String::from(n),
+            Lookup::Literal => String::new(),
+            _ => return Err(EHOSTUNREACH),
+        };
+        let name = name.as_bytes();
         let data = &data[..data.len().min(MAX_DATAGRAM)];
         let body = 7 + name.len() + data.len();
         if (self.tx_space(slot) as usize) < body + 2 {
-            return false;
+            return Ok(false);
         }
         let mut frame = Vec::with_capacity(body + 2);
         frame.extend_from_slice(&(body as u16).to_le_bytes());
@@ -210,7 +282,7 @@ impl Net {
         frame.push(name.len() as u8);
         frame.extend_from_slice(name);
         frame.extend_from_slice(data);
-        self.send(slot, &frame) == frame.len()
+        Ok(self.send(slot, &frame) == frame.len())
     }
     /// The next datagram a UDP slot received: its source and payload.
     pub fn recv_datagram(&mut self, slot: usize) -> Option<((u32, u16), Vec<u8>)> {
@@ -236,40 +308,4 @@ impl Net {
             set(slot, 11, 1);
         }
     }
-}
-
-/// Answer a DNS query (RFC 1035) for an A record with a stand-in address,
-/// and every other type with no records.
-pub fn answer_dns(net: &mut Net, query: &[u8]) -> Option<Vec<u8>> {
-    if query.len() < 12 || query[2] & 0x80 != 0 || u16::from_be_bytes([query[4], query[5]]) != 1 {
-        return None;
-    }
-    let mut at = 12;
-    let mut labels: Vec<&str> = Vec::new();
-    loop {
-        let len = *query.get(at)? as usize;
-        at += 1;
-        if len == 0 {
-            break;
-        }
-        if len > 63 {
-            return None;
-        }
-        labels.push(core::str::from_utf8(query.get(at..at + len)?).ok()?);
-        at += len;
-    }
-    let qtype = u16::from_be_bytes([*query.get(at)?, *query.get(at + 1)?]);
-    let question_end = at + 4;
-    let mut r = Vec::with_capacity(question_end + 16);
-    r.extend_from_slice(&query[..2]);
-    r.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
-    r.extend_from_slice(query.get(12..question_end)?);
-    if qtype == 1 && !labels.is_empty() {
-        let name = labels.join(".");
-        let ip = net.address_for(&name);
-        r[7] = 1;
-        r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
-        r.extend_from_slice(&ip.to_be_bytes());
-    }
-    Some(r)
 }

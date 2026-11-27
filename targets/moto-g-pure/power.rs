@@ -1,4 +1,5 @@
 //! MT6765 WACS2 and MT6357 channel 0 (battery voltage).
+use crate::process::policy::{percent_from_millivolts, Board, DvfsStep, Field, Opp, Reading, Regs, Sequence, Snapshot, Zone};
 use crate::protocol::*;
 
 const WRAPPER: usize = 0x09000000;
@@ -103,6 +104,35 @@ pub fn read() -> Message {
     }
     reply
 }
+/// An estimate from the cell voltage (policy::percent_from_millivolts: a
+/// generic curve, uncorrected for load), or -1 when the read failed.
+pub fn battery_percent() -> i32 {
+    let reply = read();
+    if reply.value == 0 {
+        return -1;
+    }
+    percent_from_millivolts(reply.value).map_or(-1, |p| p as i32)
+}
+
+// The governors on the handset. Untested on hardware. Nothing in this
+// repository documents the MT6765 thermal controller or its calibration, the
+// CPU PLLs, the per-point supply voltages or the SoC's suspend entry, and none
+// of it is guessed here: the board reports no sensor and no operating points,
+// so Power neither throttles nor scales and says so in its status
+// (POWER_INFO without the SENSOR and DVFS flags). Trip points are a
+// placeholder that nothing reads until a sensor exists.
+pub const ZONE: Zone = Zone { warm: 60_000, hot: 75_000, critical: 95_000, hysteresis: 5_000 };
+pub struct Hardware;
+impl Board for Hardware {
+    fn temperature(&mut self) -> Reading { Reading::Absent }
+    fn load_percent(&mut self) -> Option<u32> { None }
+    fn opps(&self) -> &'static [Opp] { &[] }
+    fn apply(&mut self, _: DvfsStep) -> bool { false }
+    fn power(&mut self, value: u32) -> bool { command(value).op == OK }
+    // No clock or supply is known to be safe to gate with the screen off.
+    fn screen_peripherals(&mut self, _: bool) {}
+    fn publish(&mut self, _: &Snapshot) {}
+}
 pub fn command(value: u32) -> Message {
     match value {
         // Runtime blanks scanout and consumes the first touch on wake.
@@ -121,45 +151,36 @@ pub fn command(value: u32) -> Message {
 
 // Radio requests are serialized by the Power process. Preserve the inherited
 // state of each masked field, including rails already enabled by firmware.
-const RADIO_FIELDS: [(u16,u16,u16);5] = [
-    (0x1a58,1,1),       // VCN18
-    (0x1c1c,3 << 8,1 << 8), // 3.3 V selector, as in mt6357-regulator.c
-    (0x1b1c,1,1),       // VCN33 shared analog supply
-    (0x0788,7 << 3,1 << 5), // XO_WCN manual mode, enabled
-    (0x1b88,1,1),       // VCN28
+// The sequence itself (order, save, verify, reverse restore) is
+// policy::Sequence, tested on the host against these same fields.
+const RADIO_FIELDS: [Field;5] = [
+    Field {addr:0x1a58,mask:1,on:1},           // VCN18
+    Field {addr:0x1c1c,mask:3 << 8,on:1 << 8}, // 3.3 V selector, as in mt6357-regulator.c
+    Field {addr:0x1b1c,mask:1,on:1},           // VCN33 shared analog supply
+    Field {addr:0x0788,mask:7 << 3,on:1 << 5}, // XO_WCN manual mode, enabled
+    Field {addr:0x1b88,mask:1,on:1},           // VCN28
 ];
-static mut RAIL_SAVED: [u16;5] = [0;5];
-static mut RAIL_COUNT: usize = 0;
+struct Pmic;
+impl Regs for Pmic {
+    fn read(&mut self, addr: u16) -> Option<u16> { pmic_read(addr) }
+    fn write(&mut self, addr: u16, value: u16) -> Option<()> { pmic_write(addr, value) }
+    fn settle(&mut self) { unsafe { delay_ms(1) } }
+}
+// Only the service thread uses the saved rail state.
+static mut RAILS: Sequence = Sequence::new();
+fn rails() -> &'static mut Sequence {
+    unsafe { &mut *core::ptr::addr_of_mut!(RAILS) }
+}
 fn restore_rails() -> Option<()> {
-    loop {
-        let count = unsafe { RAIL_COUNT };
-        if count == 0 { return Some(()); }
-        let i=count-1;
-        let (addr,mask,_) = RADIO_FIELDS[i];
-        let original = unsafe { RAIL_SAVED[i] };
-        let now = pmic_read(addr)?;
-        if now & mask != original {
-            pmic_write(addr,(now & !mask) | original)?;
-            if pmic_read(addr)? & mask != original {return None;}
-        }
-        unsafe {RAIL_COUNT = i};
-    }
+    rails().restore(&RADIO_FIELDS, &mut Pmic)
 }
 fn enable_rails() -> Option<()> {
-    if !ready() || unsafe {RAIL_COUNT} != 0 {return None;}
+    if !ready() || rails().active() != 0 {return None;}
     // Never change an active consumer's voltage.
     if pmic_read(0x1b2c)? & 0x8000 != 0 && pmic_read(0x1c1c)? & 0x300 != 0x100 {
         return None;
     }
-    for (i,(addr,mask,wanted)) in RADIO_FIELDS.iter().copied().enumerate() {
-        let original = pmic_read(addr)?;
-        unsafe { RAIL_SAVED[i]=original & mask; RAIL_COUNT=i+1; }
-        if original & mask != wanted {
-            pmic_write(addr,(original & !mask)|wanted)?;
-            if pmic_read(addr)? & mask != wanted {return None;}
-        }
-        unsafe {delay_ms(1)};
-    }
+    rails().enable(&RADIO_FIELDS, &mut Pmic)?;
     let mut status=0;
     for (i,addr) in [0x1a66,0x1b2c,0x1b96].into_iter().enumerate() {
         status |= u32::from(pmic_read(addr)? >> 15) << i;

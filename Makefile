@@ -66,6 +66,48 @@ test-memory: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/memory-test-apps) $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) targets/qemu/test_memory.py
 
+# Power's wake locks and governors, and network time (local, not in CI). The
+# time test needs this Mac to reach public NTP servers over UDP.
+.PHONY: test-power test-time
+test-power: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/power-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_power.py
+test-time: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/power-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_time.py
+
+# Open apps' sockets (local, not in CI): one app holds its share of the socket
+# slots, churns the resolver and leaves a connect hanging; a second app must
+# still fetch a page at once. Servers are on this Mac's loopback.
+# Radio's socket code against lwIP itself, on the host (local, not in CI: it
+# needs lwIP's source, which an image build downloads). A second.
+LWIP_SRC ?= build/sel4/lwip-STABLE-2_2_1_RELEASE/src
+.PHONY: test-net-lwip
+test-net-lwip:
+	@test -f $(LWIP_SRC)/core/tcp.c || { echo "no lwIP source at $(LWIP_SRC): build an image first, or set LWIP_SRC"; exit 1; }
+	@mkdir -p build/tests/netcaps
+	cc -std=gnu11 -O1 -w -I targets/moto-g-pure/ip/test/real -I targets/moto-g-pure/ip -I $(LWIP_SRC)/include targets/moto-g-pure/ip/test/real/test_lwip.c $(addprefix $(LWIP_SRC)/core/,def.c dns.c inet_chksum.c init.c ip.c mem.c memp.c netif.c pbuf.c tcp.c tcp_in.c tcp_out.c timeouts.c udp.c ipv4/acd.c ipv4/dhcp.c ipv4/etharp.c ipv4/icmp.c ipv4/ip4.c ipv4/ip4_addr.c) $(LWIP_SRC)/netif/ethernet.c -o build/tests/netcaps/sockets_lwip
+	build/tests/netcaps/sockets_lwip
+
+# Radio's TLS client against a TLS server on this Mac's loopback (local, not in
+# CI: it needs BearSSL's source, which an image build downloads). Seconds.
+.PHONY: test-radio-tls
+test-radio-tls:
+	python3 services/radio/test_tls.py
+
+.PHONY: test-net
+test-net: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/net-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_net.py
+
+# Open-app memory protection (local, not in CI): a probe app that writes to
+# its code, runs its stack and heap, and asks for W+X memory must be stopped
+# each time, and its stack, heap and mappings must move between launches.
+.PHONY: test-wx
+test-wx: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/wx-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_wx.py
+
 .PHONY: test-ladybird
 test-ladybird: qemu-image
 	$(PYTHON) targets/qemu/test_ladybird.py
@@ -101,8 +143,58 @@ test-unit:
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
 	build/tests/inflate
+	@mkdir -p build/tests/netcaps
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../../runtime/open/slots.rs"]\nmod slots;\n#[path = "../../../runtime/open/names.rs"]\nmod names;\n' > build/tests/netcaps/open_net_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/netcaps/open_net_test.rs -o build/tests/netcaps/open_net
+	build/tests/netcaps/open_net
+	cc -std=gnu11 -O1 -Wall -Wextra -Wno-unused-parameter -I targets/moto-g-pure/ip/test targets/moto-g-pure/ip/test/test_sockets.c -o build/tests/netcaps/sockets_c
+	build/tests/netcaps/sockets_c
+	python3 tools/test_net_layout.py
+	python3 tools/test_net_relay.py
+	"$(HOST_RUSTC)" --edition=2021 --test -O services/power/policy.rs -o build/tests/power_policy
+	build/tests/power_policy
+	"$(HOST_RUSTC)" --edition=2021 --test -O -A dead_code runtime/open/tests/powerctl_host.rs -o build/tests/powerctl_host
+	build/tests/powerctl_host
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/sntp.rs"]\nmod sntp;\n' > build/tests/sntp_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/sntp_test.rs -o build/tests/sntp
+	build/tests/sntp
+	@mkdir -p build/tests/memprot
+	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/memprot_host.rs -o build/tests/memprot/host
+	build/tests/memprot/host
+	python3 tools/test_elf_check.py
+	"$(HOST_RUSTC)" --edition=2021 --test -O targets/moto-g-pure/test_pmf.rs -o build/tests/wifi-pmf
+	build/tests/wifi-pmf
 	python3 apps/lib/python/test_violet.py
+	HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_host.sh
+	python3 image/packages/test_package_format.py
+	HOST_RUSTC="$(HOST_RUSTC)" system/package-manager/test_verify.sh
+	python3 kernel/sel4/test_delta.py
+	@mkdir -p build/tests/storage
+	"$(HOST_RUSTC)" --edition=2021 --test -O services/storage/tests/host.rs -o build/tests/storage/host
+	build/tests/storage/host
 	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p settings -p bitchat --target-dir ../build/host-tests
+
+# Storage on the host, longer than CI's run (local, about a minute): more
+# power-cut images per cut point and more random operations against the model.
+.PHONY: test-storage-long
+test-storage-long:
+	@mkdir -p build/tests/storage
+	"$(HOST_RUSTC)" --edition=2021 --test -O services/storage/tests/host.rs -o build/tests/storage/host
+	STORAGE_CRASH_SEEDS=8 VIOLETFS_FUZZ_ITERS=400 build/tests/storage/host
+
+# Package signatures at boot (local, not in CI): staged catalogs with a
+# patched, unsigned or foreign-signed Radio must not boot.
+.PHONY: test-packages
+test-packages: qemu-image
+	$(PYTHON) system/package-manager/test_signed_boot.py
+
+# The boot image's version floor only shows with a component above version 1
+# (local, not in CI): build an image whose Radio is version 2, run the same
+# suite against it, then build the normal image again.
+.PHONY: test-packages-floor
+test-packages-floor: setup
+	VIOLET_PACKAGE_VERSIONS=radio=2 $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) system/package-manager/test_signed_boot.py; status=$$?; $(PYTHON) tools/build_sel4.py qemu && exit $$status
 
 # The QEMU tests CI runs: one boot of the supervisor and its services (touch,
 # the watchdog, Home answering a tap), then Home, Settings and Music across
@@ -136,13 +228,28 @@ build/moto-debug: services/usb-diagnostics/host/moto_debug.c
 MOTO_WIFI_STOCK ?= build/xt2163dl/S3RHS32.20-42-13-2-3-2/stock/wifi
 HOST_RUSTC ?= $(or $(shell command -v rustc),build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc)
 test-moto-radio: moto
-	$(PYTHON) targets/moto-g-pure/test_supplicant.py
+	HOST_RUSTC="$(HOST_RUSTC)" $(PYTHON) targets/moto-g-pure/test_supplicant.py
 	"$(HOST_RUSTC)" --edition=2021 --test targets/moto-g-pure/test_history.rs -o build/sel4/moto/test-history
 	build/sel4/moto/test-history
 	$(CC) -std=c11 -Wall -Wextra -Werror targets/moto-g-pure/test_radio_memory.c -o build/sel4/moto/test-radio-memory
 	build/sel4/moto/test-radio-memory
 	VIOLET_TEST_WIFI_BUNDLE="$(abspath build/sel4/moto/wifi-firmware.bin)" VIOLET_TEST_WLAN_IMAGE="$(abspath $(MOTO_WIFI_STOCK)/WIFI_RAM_CODE_soc1_0_1_1.bin)" "$(HOST_RUSTC)" --edition=2021 --test targets/moto-g-pure/test_radio.rs -o build/sel4/moto/test-radio
 	build/sel4/moto/test-radio
+
+# The handset's WPA2 client (hostap plus targets/moto-g-pure/supplicant.c)
+# against an independent authenticator, with and without 802.11w. Local, not
+# in CI: it needs hostap's sources (kept by `make moto`, or fetched here).
+HOSTAP := wpa_supplicant-2.11
+HOSTAP_SHA256 := 912ea06f74e30a8e36fbb68064d6cdff218d8d591db0fc5d75dee6c81ac7fc0a
+build/sel4/$(HOSTAP)/src/rsn_supp/wpa.c:
+	@mkdir -p build/sel4/downloads
+	curl -fL https://w1.fi/releases/$(HOSTAP).tar.gz -o build/sel4/downloads/$(HOSTAP).tar.gz
+	echo "$(HOSTAP_SHA256)  build/sel4/downloads/$(HOSTAP).tar.gz" | shasum -a 256 -c - || { rm -f build/sel4/downloads/$(HOSTAP).tar.gz; exit 1; }
+	tar -xzf build/sel4/downloads/$(HOSTAP).tar.gz -C build/sel4
+
+.PHONY: test-wpa
+test-wpa: build/sel4/$(HOSTAP)/src/rsn_supp/wpa.c
+	HOST_RUSTC="$(HOST_RUSTC)" python3 targets/moto-g-pure/test_supplicant.py
 
 .PHONY: test-moto-ip-live
 test-moto-ip-live: moto
@@ -187,3 +294,20 @@ test-shield-proxy: qemu-image
 # Moto image with the demo apps for use with the Mac companion.
 moto-shield: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto
+# The phone's own enforcement (docs/violet-shield-poc.md). All local, none in CI
+# beyond the host tests `make test-unit` already runs (targets/qemu/test_shield_host.sh).
+.PHONY: shield-train-tiny shield-fp-report test-shield-enforce
+# Retrain the on-device scorer (standard library only, seconds) and regenerate
+# runtime/open/scorer_model.rs and the fixtures; commit what changes.
+shield-train-tiny:
+	python3 tools/shield-trainer/train_tiny.py
+# False-positive report: replay benign traces through the real policy and scorer.
+# TRACES="a.log b.log", REPLAY="--mode strict --added" to change what is measured.
+TRACES ?= $(wildcard targets/qemu/shield-traces/benign/*.log)
+shield-fp-report:
+	HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_host.sh replay $(REPLAY) $(TRACES)
+# QEMU: the demo apps against an image whose Shield starts in strict mode. The
+# normal image is rebuilt afterwards so later tests do not run strict.
+test-shield-enforce: $(SHIELD_PY)
+	VIOLET_SHIELD_MODE=strict $(MAKE) qemu-image
+	$(SHIELD_PY) targets/qemu/test_shield_enforce.py; code=$$?; $(MAKE) qemu-image; exit $$code

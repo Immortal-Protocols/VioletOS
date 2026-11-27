@@ -15,6 +15,8 @@ extern "C" {
         assoc: *const u8,
         assoc_len: usize,
         pmk: *const u8,
+        akm: i32,
+        mfp: i32,
     ) -> i32;
     fn station_wpa_rx(frame: *const u8, n: usize) -> i32;
     fn station_wpa_close();
@@ -71,6 +73,22 @@ unsafe extern "C" fn radio_set_ccmp(
     }
 }
 
+/// The integrity group key (IGTK) from the handshake or a group rekey, with
+/// its 6-byte packet number. Only a link that negotiated management frame
+/// protection takes one.
+#[no_mangle]
+unsafe extern "C" fn radio_set_igtk(ctx: *mut Axi, id: i32, key: *const u8, ipn: *const u8) -> i32 {
+    if key.is_null() || ipn.is_null() || !(4..=5).contains(&id) {
+        return -1;
+    }
+    let (key, ipn) = (slice::from_raw_parts(key, 16), slice::from_raw_parts(ipn, 6));
+    if (*ctx).install_igtk(id as u8, key, ipn).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
 /// A network's key from an app (SSID, its length, PMK), kept for this boot only.
 static mut APP_KEY: ([u8; 32], usize, [u8; 32]) = ([0; 32], 0, [0; 32]);
 
@@ -104,6 +122,9 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
         }
     }
     let mac = axi.station;
+    // The same element as in the association request (station::request).
+    let mut rsn = [0; station::RSN_MAX];
+    let rsn_len = station::rsne(ap, &mut rsn);
     let rc = unsafe {
         station_wpa_open(
             (axi as *mut Axi).cast(),
@@ -113,9 +134,11 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
             ap.ssid_len,
             ap.rsne.as_ptr(),
             ap.rsne_len,
-            station::RSN.as_ptr(),
-            station::RSN.len(),
+            rsn.as_ptr(),
+            rsn_len,
             profile.data.as_ptr(),
+            if ap.akm == 6 { 6 } else { 2 },
+            i32::from(ap.mfp),
         )
     };
     for byte in &mut profile.data {
@@ -145,7 +168,7 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
                 radio_io::trace(4, 0x10000 | ((result as u32 & 0xff) << 8) | u32::from(frame[6]));
                 match result {
                     1 => return Ok(()),
-                    -1 => return Err(JOIN_AUTH),
+                    -1 | -2 => return Err(JOIN_AUTH),
                     _ => {}
                 }
             }
@@ -154,6 +177,8 @@ pub fn authorize(axi: &mut Axi, ap: &AccessPoint) -> Result<(), u32> {
     })();
     if result.is_err() {
         unsafe { station_wpa_close() };
+        // Keys this handshake may already have installed are of no more use.
+        axi.leave();
     }
     result
 }
@@ -262,7 +287,10 @@ unsafe extern "C" fn radio_l2_recv(p: *mut u8, n: usize) -> i32 {
             ap_wpa_rx(key.as_ptr(), size);
             0
         }
-        Ok((_, size)) if station_wpa_rx(key.as_ptr(), size) >= 0 => 0,
+        // A key frame after the handshake. Only hostap deciding that the
+        // link must go (-1) ends it. A frame it merely rejects (-2: replayed
+        // counter, bad MIC, malformed) can be anybody's and is dropped.
+        Ok((_, size)) if station_wpa_rx(key.as_ptr(), size) != -1 => 0,
         _ => {
             LINK_ERROR = true;
             -1
@@ -315,6 +343,9 @@ pub unsafe fn join_ip(dev: *mut Axi) -> bool {
 pub unsafe fn close() {
     station_net_close();
     station_wpa_close();
+    if !DEVICE.is_null() {
+        (*DEVICE).leave();
+    }
     DEVICE = core::ptr::null_mut();
     LINK_ERROR = false;
     TX_FAILURES = 0;

@@ -2,51 +2,61 @@
   {
     "id": 1,
     "name": "launcher",
-    "required": true
+    "required": true,
+    "version": 1
   },
   {
     "id": 3,
     "name": "runtime",
-    "required": true
+    "required": true,
+    "version": 1
   },
   {
     "id": 4,
     "name": "touch",
-    "required": true
+    "required": true,
+    "version": 1
   },
   {
     "id": 5,
     "name": "display",
-    "required": true
+    "required": true,
+    "version": 1
   },
   {
     "id": 6,
     "name": "storage",
-    "required": false
+    "required": false,
+    "version": 1
   },
   {
     "id": 7,
     "name": "radio",
-    "required": false
+    "required": false,
+    "version": 1
   },
   {
     "id": 8,
     "name": "power",
-    "required": false
+    "required": false,
+    "version": 1
   },
   {
     "id": 22,
     "name": "audio",
-    "required": false
+    "required": false,
+    "version": 1
   },
   {
     "id": 24,
     "name": "open",
-    "required": false
+    "required": false,
+    "version": 1
   },
   {
     "id": 25,
     "name": "camera",
-    "required": false
+    "required": false,
+    "version": 1
   }
 ]

@@ -18,10 +18,17 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 | `make test-emulator` | Eight QEMU scenarios covering touch transfer failures, controller recovery and watchdog handling; where touch works, a tap on Home must open Settings. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds test program, then checks the PCM, the recording and the on-screen volume. |
+| `make test-power` | Wake locks and Power's governors in QEMU: a test program takes a lock while the test feeds a temperature and a CPU load to the emulated sensor; checks the accounting, throttling, a failing sensor and the shutdown at a critical temperature. See [Power](services/power/README.md). |
+| `make test-time` | The emulated phone sets its clock from public NTP servers (needs the Mac to reach them over UDP) and an app's wall clock follows. |
+| `make test-net-lwip` | Radio's socket code for open apps against lwIP itself, on this Mac (a second; needs lwIP's source from an image build): a slot reused mid-stream, connections that never finish closing, names nobody answers. |
+| `make test-net` | Open apps' sockets in QEMU, against servers on this Mac's loopback: one test app resolves more names than the resolver keeps, opens sockets until it is refused and leaves a connect to a host that never answers hanging; a second app must still fetch a page at once. |
 | `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime, started from their Home icons: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. The programs live in [targets/qemu/open-test-apps](targets/qemu/open-test-apps) and only this test's image carries them. |
+| `make test-wx` | Open-app memory protection in QEMU: a probe app that writes to its code and constants, runs its stack and heap, and asks for writable+executable memory is stopped each time, system calls refuse to write where the app may not, and the stack, heap and mappings move between launches. See [Memory protection](runtime/open/README.md#how-it-works). |
 | `make test-wifi-app` | Drives Settings › Wi-Fi by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
+| `make test-wpa` | Host only, no QEMU: the handset's WPA2 client against an independent authenticator, PSK and PSK-SHA256, with and without 802.11w protected management frames (fetches hostap's sources once). |
 | `make test-open-apps` | Drives Home, Settings (a chosen city kept in `/data` across a restart, Wi-Fi, Agent Apps) and Music. |
 | `make test-shield` | Violet Shield end to end in QEMU with the Python companion simulator. Signed warnings appear on Home while the demo apps keep running. See [the proof of concept](docs/violet-shield-poc.md). |
+| `make test-shield-enforce` | The phone's own Shield enforcement in QEMU (built-in rules, quarantine, the on-device scorer) against a strict-mode image, with no signed command. Its host tests run in `make test-unit`. |
 | `make test-agent` | The voice agent in QEMU with the real Mac app: QR pairing through a local relay, an encrypted install that survives a restart and gets a Home icon, Python installed as a package with a Python app, listening from the background, deleting an app from Settings, reconnect and unpair. See [the agent](apps/open/agent/README.md) and [Violet Agent for macOS](companion/mac/README.md). |
 | `make test-locomo` | Generates a Cool Jazz track in the signed Locomo Music release, transfers it over the paired connection and checks audio in QEMU. See [Locomo Music](companion/mac/README.md#locomo-music). |
 | `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
@@ -55,7 +62,7 @@ The open apps in [`apps/open`](apps/open) need their own toolchains. Each is opt
 
 From the bottom up:
 
-1. **seL4 kernel** ([kernel/sel4](kernel/sel4/README.md)). A pinned upstream seL4 for AArch32, built per target with the [board configuration](platform/sel4/board/). The [loader](boot/loader/README.md) checks the handset's live memory map, stages the kernel and first task, and enters seL4.
+1. **seL4 kernel** ([kernel/sel4](kernel/sel4/README.md)). A pinned upstream seL4 for AArch32, built per target with the [board configuration](platform/sel4/board/). It is not a verified seL4 configuration; the kernel README lists every difference from upstream, and the build checks the list. The [loader](boot/loader/README.md) checks the handset's live memory map, stages the kernel and first task, and enters seL4.
 2. **Supervisor** ([system/supervisor](system/supervisor/README.md)). The first task. It reads the package catalog, builds every process's address space and capabilities, maps each device into exactly one process, starts everything, and restarts the group or rolls back to the previous catalog after a fault or stall. The [package manager](system/package-manager/README.md) installs and removes components.
 3. **Services**, one process per device or function. Only the service that owns a device can touch it.
 4. **Two app interfaces.** [Runtime](runtime/README.md) gives built-in apps Subscribe, Get and Execute operations over a 14-word IPC message, decides which app is in front, and routes requests to services through worker threads. The [Open Runtime](runtime/open/README.md) gives open apps the Linux ARM system call interface plus `/dev/violet/{screen,events,sys,audio}`, and is itself one of Runtime's clients.
@@ -77,7 +84,7 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 5 | [Display](services/display/README.md) | Presents built-in apps' surfaces to the screen. The Open Runtime draws there itself while an open app is in front. |
 | 6 | [Storage](services/storage/README.md) | Checkpoints, per-app files and the package catalog on disk (virtio in QEMU, eMMC on the handset). |
 | 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets and, on the handset, Bluetooth HCI. |
-| 8 | [Power](services/power/README.md) | Battery, sleep and shutdown; brokers the PMIC for Audio and Camera. |
+| 8 | [Power](services/power/README.md) | Battery, sleep and shutdown, wake locks, the thermal and frequency governors (emulator only so far); brokers the PMIC for Audio and Camera. |
 | 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
 | 15–20 | Runtime workers | Runtime's per-service request threads. |
 | 21 | [USB Diagnostics](services/usb-diagnostics/README.md) | Handset only: status, package staging, flashing and test requests from the Mac. |

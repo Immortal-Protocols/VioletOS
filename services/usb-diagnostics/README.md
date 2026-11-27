@@ -8,11 +8,11 @@ Run `build/moto-package reboot-bootloader` to restart the handset into fastboot,
 
 ## Replace Diagnostics over USB
 
-Build a replacement with `make moto-component NAME=usb-diagnostics`. On a handset running a baseline with package 21, run `tools/moto-install-diagnostics build/sel4/moto/packages/usb-diagnostics.vpk`. The installer signs the VPK using this build's developer key and waits for a status snapshot from the replacement. The supervisor restarts the managed processes for the trial. It commits the catalog only after the Mac confirms the new generation. A candidate fault or a 45-second confirmation timeout restarts the previous catalog. A reboot before confirmation also loads the previous catalog.
+Build a replacement with `make moto-component NAME=usb-diagnostics`. On a handset running a baseline with package 21, run `tools/moto-install-diagnostics build/sel4/moto/packages/usb-diagnostics.vpk`. The package already carries the build's signature; the installer adds a detached signature by this build's developer key, which a developer image requires to start the trial without a tap on the handset (release images have no such path, so there Diagnostics changes only with the boot image), and waits for a status snapshot from the replacement. The supervisor restarts the managed processes for the trial. It commits the catalog only after the Mac confirms the new generation. A candidate fault or a 45-second confirmation timeout restarts the previous catalog. A reboot before confirmation also loads the previous catalog.
 
 Use `build/moto-package diagnostics-recovery` to read the most recent trial failure in this boot.
 
-Run `make test-moto-diagnostics` to exercise a confirmed replacement, a process fault and a missed confirmation. QEMU runs the Moto supervisor. The confirmation test substitutes a storage acknowledgment and checks the resulting catalog bytes. The timeout test shortens the trial on a disposable copy of the image. USB enumeration, transfer and persistence across a physical reboot require the Moto.
+Run `make test-moto-diagnostics` to exercise a confirmed replacement, a process fault and a missed confirmation. QEMU runs the Moto supervisor. The test signs its edited packages again with the build's developer key, since the supervisor runs nothing else. The confirmation test substitutes a storage acknowledgment and checks the resulting catalog bytes. The timeout test shortens the trial on a disposable copy of the image. USB enumeration, transfer and persistence across a physical reboot require the Moto.
 
 ## Physical validation on the XT2163DL
 

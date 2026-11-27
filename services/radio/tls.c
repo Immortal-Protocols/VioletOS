@@ -117,6 +117,32 @@ static int read_body(br_sslio_context *io, size_t n, unsigned char *body,
   *size = used;
   return br_ssl_engine_last_error(&client.eng) == 0;
 }
+// The TLS client, with only what its two cipher suites and TLS 1.2 use. This
+// is br_ssl_client_init_full without the algorithms those never reach (3DES,
+// CBC and CCM records, ChaCha20-Poly1305, MD5 and the TLS 1.0 and SHA-384
+// PRFs), so that code is not linked into Radio. Certificate checking is the
+// same: RSA and ECDSA signatures over SHA-1 to SHA-512.
+static void profile(void) {
+  static const br_hash_class *const hashes[] = {
+      &br_sha1_vtable, &br_sha224_vtable, &br_sha256_vtable, &br_sha384_vtable,
+      &br_sha512_vtable};
+  br_ssl_client_zero(&client);
+  br_ssl_engine_set_versions(&client.eng, BR_TLS12, BR_TLS12);
+  br_x509_minimal_init(&verifier, &br_sha256_vtable, TAs, TAs_NUM);
+  br_ssl_client_set_default_rsapub(&client);
+  br_ssl_engine_set_default_rsavrfy(&client.eng);
+  br_ssl_engine_set_default_ecdsa(&client.eng);
+  br_x509_minimal_set_rsa(&verifier, br_ssl_engine_get_rsavrfy(&client.eng));
+  br_x509_minimal_set_ecdsa(&verifier, br_ssl_engine_get_ec(&client.eng),
+                            br_ssl_engine_get_ecdsa(&client.eng));
+  for (int id = br_sha1_ID; id <= br_sha512_ID; id++) {
+    br_ssl_engine_set_hash(&client.eng, id, hashes[id - br_sha1_ID]);
+    br_x509_minimal_set_hash(&verifier, id, hashes[id - br_sha1_ID]);
+  }
+  br_ssl_engine_set_x509(&client.eng, &verifier.vtable);
+  br_ssl_engine_set_prf_sha256(&client.eng, &br_tls12_sha256_prf);
+  br_ssl_engine_set_default_aes_gcm(&client.eng);
+}
 // HTTPS GET over the radio tunnel. The certificate must chain to ISRG Root X1
 // and match `host`; only a 200 response is accepted.
 static int https_get(const char *host, const char *path, unsigned char *body,
@@ -126,10 +152,9 @@ static int https_get(const char *host, const char *path, unsigned char *body,
   unsigned char seed[32];
   if (!radio_entropy(seed))
     return 0;
-  br_ssl_client_init_full(&client, &verifier, TAs, TAs_NUM);
+  profile();
   static const char *protocols[] = {"http/1.1"};
   br_ssl_engine_set_protocol_names(&client.eng, protocols, 1);
-  br_ssl_engine_set_versions(&client.eng, BR_TLS12, BR_TLS12);
   br_ssl_engine_set_suites(&client.eng, suites, 2);
   unsigned now = radio_unix_time();
   if (!now) return 0;

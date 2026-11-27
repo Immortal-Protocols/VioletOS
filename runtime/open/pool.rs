@@ -1,7 +1,8 @@
 //! Physical memory for apps: the supervisor's pool untypeds, cut into 64 KiB
 //! pages. Every page stays mapped in the Open Runtime at POOL_VA + index * 64 KiB,
-//! so reading or writing app memory is a plain memory access. Apps get copies
-//! of the page capabilities.
+//! writable and Execute-Never, so reading or writing app memory is a plain
+//! memory access and nothing an app wrote can run in this process. Apps get
+//! copies of the page capabilities, mapped with their own rights (procmgr.rs).
 use super::sys::*;
 use alloc::vec::Vec;
 
@@ -87,7 +88,9 @@ impl Pool {
                     pt_map(pt, SLOT_PD, va)?;
                     mapped_tables += 1;
                 }
-                page_map(first_slot + index, SLOT_PD, va, true)?;
+                // Writable, never executable: this is app-controlled data (and
+                // the runtime's heap) inside the runtime's own address space.
+                page_map(first_slot + index, SLOT_PD, va, true, false)?;
                 index += 1;
             }
         }
