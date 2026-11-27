@@ -16,24 +16,26 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 LIMIT = 0x06000000
 TARGET = "armv7-unknown-linux-musleabihf"
+AARCH64 = "aarch64-unknown-linux-musl"
 
 
-def toolchain():
+def toolchain(target=TARGET):
     """rustc with the musl target installed, and the rust-lld that ships with it."""
     import shutil
     candidates = [os.environ.get("VIOLET_HOST_RUSTC"), shutil.which("rustc"),
                   str(ROOT / "build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc")]
     # Any rustup toolchain under build/ with the target (Ladybird's, for one).
     candidates += sorted(glob.glob(str(ROOT / "build/*/rustup/toolchains/*/bin/rustc")))
+    candidates.append(str(ROOT / "build/ladybird-native/toolchain/bin/rustc"))
     for rustc in filter(None, candidates):
         if not Path(rustc).exists():
             continue
         sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
         host = next(line.split()[1] for line in subprocess.run([rustc, "-vV"], capture_output=True, text=True).stdout.splitlines()
                     if line.startswith("host:"))
-        if (sysroot / "lib/rustlib" / TARGET).is_dir():
+        if (sysroot / "lib/rustlib" / target).is_dir():
             return Path(rustc), lld_for(sysroot, host)
-    raise SystemExit(f"Install the Rust target first: rustup target add {TARGET}")
+    raise SystemExit(f"Install the Rust target first: rustup target add {target}")
 
 
 def lld_for(sysroot, host):
@@ -59,11 +61,17 @@ def build_rust(source, out):
                     "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
 
 
-def build_cargo(work):
+def native_cflags(target):
+    if target == AARCH64:
+        return "--target=aarch64-linux-musl -mcpu=cortex-a53"
+    return "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard"
+
+
+def build_cargo(work, target=TARGET, packages=None):
     """The Cargo workspace in apps/ (the built-in apps and their shared crate),
-    for ARMv7 musl. ring, under rustls, compiles a little C with the NDK's clang."""
+    for ARM musl. ring, under rustls, compiles a little C with the NDK's clang."""
     import shutil
-    rustc, lld = toolchain()
+    rustc, lld = toolchain(target)
     cargo = rustc.parent / "cargo"
     if not cargo.exists():
         cargo = Path(shutil.which("cargo") or "cargo")
@@ -71,13 +79,13 @@ def build_cargo(work):
     bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
     if not bins:
         raise SystemExit("Install the Android NDK (its clang builds ring for the Rust apps)")
-    key = TARGET.replace("-", "_")
+    key = target.replace("-", "_")
     env = dict(os.environ, **{
         f"CC_{key}": str(bins[0] / "clang"),
         f"AR_{key}": str(bins[0] / "llvm-ar"),
-        f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
+        f"CFLAGS_{key}": native_cflags(target),
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *CPU_FLAGS]),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *(CPU_FLAGS if target == TARGET else ["-C", "target-cpu=cortex-a53", "-C", "relocation-model=static"])]),
         "CARGO_TARGET_DIR": str(ROOT / "build/open-cargo"),
         "RUSTC": str(rustc),
     })
@@ -87,11 +95,13 @@ def build_cargo(work):
     listed = re.search(r"members\s*=\s*\[(.*?)\]", (ROOT / "apps/Cargo.toml").read_text(), re.S).group(1)
     members = [m.split("/")[-1] for m in re.findall(r'"([^"]+)"', listed)]
     chosen = [arg for m in members if m not in skip for arg in ("-p", m)] if skip else ["--workspace"]
-    subprocess.run([cargo, "build", "--release", "--target", TARGET, *chosen], cwd=ROOT / "apps", env=env, check=True)
-    return ROOT / "build/open-cargo" / TARGET / "release"
+    if packages is not None:
+        chosen = [arg for p in packages for arg in ("-p", p)]
+    subprocess.run([cargo, "build", "--release", "--target", target, *chosen], cwd=ROOT / "apps", env=env, check=True)
+    return ROOT / "build/open-cargo" / target / "release"
 
 
-def ladybird_toolchain(version):
+def ladybird_toolchain(version, target=TARGET):
     """A rustc at least as new as Ladybird's pinned Rust, with the musl target.
     VIOLET_LADYBIRD_RUSTC names one; otherwise rustup's toolchain of that
     version (in ~/.rustup or in a RUSTUP_HOME under build/), or rustc on PATH."""
@@ -102,6 +112,7 @@ def ladybird_toolchain(version):
     candidates += sorted(glob.glob(str(Path.home() / f".rustup/toolchains/{version}-*/bin/rustc")))
     candidates += sorted(glob.glob(str(ROOT / f"build/*/rustup/toolchains/{version}-*/bin/rustc")))
     candidates += [shutil.which("rustc")]
+    candidates.append(str(ROOT / "build/ladybird-native/toolchain/bin/rustc"))
     for rustc in filter(None, candidates):
         if not Path(rustc).exists():
             continue
@@ -110,13 +121,13 @@ def ladybird_toolchain(version):
         have = tuple(int(n) for n in release.split("-")[0].split(".") if n.isdigit())
         host = next((line.split()[1] for line in info.splitlines() if line.startswith("host:")), "")
         sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
-        if have >= wanted and (sysroot / "lib/rustlib" / TARGET).is_dir():
+        if have >= wanted and (sysroot / "lib/rustlib" / target).is_dir():
             return Path(rustc), lld_for(sysroot, host)
     raise SystemExit(f"Ladybird needs Rust {version} with the musl target: "
-                     f"rustup toolchain install {version} --target {TARGET}")
+                     f"rustup toolchain install {version} --target {target}")
 
 
-def build_ladybird(folder):
+def build_ladybird(folder, target=TARGET):
     """The Ladybird browser: its own Cargo workspace on Ladybird's Rust HTML
     parser, fetched at a pinned commit, built with Ladybird's Rust version."""
     import shutil
@@ -125,11 +136,11 @@ def build_ladybird(folder):
     checkout = fetch_ladybird.main()
     version = next(line.split('"')[1] for line in (checkout / "rust-toolchain.toml").read_text().splitlines()
                    if line.strip().startswith("channel"))
-    rustc, lld = ladybird_toolchain(version)
+    rustc, lld = ladybird_toolchain(version, target)
     cargo = rustc.parent / "cargo"
     if not cargo.exists():
         cargo = Path(shutil.which("cargo") or "cargo")
-    key = TARGET.replace("-", "_")
+    key = target.replace("-", "_")
     # No target RUSTFLAGS: the parser's build script runs cargo metadata for the
     # host, which would inherit them. rustc infers the lld flavor from rust-lld.
     env = dict(os.environ, **{
@@ -145,9 +156,17 @@ def build_ladybird(folder):
     bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
     if bins:
         env.update({f"CC_{key}": str(bins[0] / "clang"), f"AR_{key}": str(bins[0] / "llvm-ar"),
-                    f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard"})
-    subprocess.run([cargo, "build", "--release", "--locked", "--target", TARGET], cwd=folder, env=env, check=True)
-    return ROOT / "build/ladybird-cargo" / TARGET / "release/ladybird"
+                    f"CFLAGS_{key}": native_cflags(target)})
+    import build_ladybird_media
+    arch = "aarch64" if target == AARCH64 else "armv7"
+    env["VIOLET_FFMPEG"] = str(build_ladybird_media.build(arch))
+    env["VIOLET_MUSL_INCLUDE"] = str(build_ladybird_media.sysroot(arch) / "include")
+    command = [cargo, "rustc", "--release", "--locked", "--features", "webm", "--target", target]
+    if target == AARCH64:
+        # The 64-bit ELF loader starts ET_EXEC files without dynamic relocations.
+        command += ["--", "-C", "relocation-model=static"]
+    subprocess.run(command, cwd=folder, env=env, check=True)
+    return ROOT / "build/ladybird-cargo" / target / "release/ladybird"
 
 
 def build_go(folder, out):
@@ -194,10 +213,23 @@ def root_certificates():
                              capture_output=True, check=True).stdout
         if pem.count(b"BEGIN CERTIFICATE") > 50:
             return pem
-    for bundle in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem"):
+    # macOS also ships a legacy OpenBSD /etc/ssl/cert.pem. Prefer the
+    # maintained Mozilla bundle if the system keychain cannot export its roots.
+    for bundle in ("/etc/ssl/certs/ca-certificates.crt", "/opt/homebrew/etc/ca-certificates/cert.pem",
+                   "/usr/local/etc/ca-certificates/cert.pem", "/etc/ssl/cert.pem"):
         if Path(bundle).is_file():
             return Path(bundle).read_bytes()
     return b""
+
+
+def network_files():
+    """Resolver configuration and trusted roots shared by the phone and QEMU guest filesystems."""
+    return {
+        "etc/resolv.conf": b"nameserver 10.0.0.53\noptions attempts:2 timeout:2\n",
+        "etc/hosts": b"127.0.0.1 localhost\n",
+        "etc/nsswitch.conf": b"hosts: files dns\n",
+        "etc/ssl/certs/ca-certificates.crt": root_certificates(),
+    }
 
 
 def entry(name, data, mode, mtime=0):
@@ -214,7 +246,7 @@ def entry(name, data, mode, mtime=0):
 HANDSET_SKIP = {"gonet", "pyhello", "pynet", "pypaint", "pytone"}
 
 
-def main(out, python=True, compress=False, skip=()):
+def main(out, python=True, compress=False, skip=(), browser_aarch64=False, directory=False):
     """compress=True writes "VGZ1", the gzip length, then the gzip of the
     archive (the handset carries it compressed in its boot image's ramdisk)."""
     out = Path(out)
@@ -226,14 +258,22 @@ def main(out, python=True, compress=False, skip=()):
     folders = [ROOT / "apps/open"] + [Path(d) for d in os.environ.get("VIOLET_OPEN_EXTRA_APPS", "").split(":") if d]
     skip = set(skip) | {n for n in os.environ.get("VIOLET_OPEN_SKIP", "").split(",") if n}
     apps = sorted((a for d in folders for a in d.iterdir()), key=lambda a: a.name)
+    target = AARCH64 if browser_aarch64 else TARGET
+    if browser_aarch64:
+        # A focused image for the 64-bit Open Runtime. Other app builders and
+        # optional payloads currently produce ARMv7 binaries.
+        apps = [ROOT / "apps/open/home", ROOT / "apps/open/ladybird"]
+        skip = set()
     cargo_out = None
     for app in apps:
         if not app.is_dir() or app.name in skip:
             continue
         if app.name == "ladybird":
             try:
-                binary = build_ladybird(app)
+                binary = build_ladybird(app, target)
             except (SystemExit, subprocess.CalledProcessError) as e:
+                if browser_aarch64:
+                    raise
                 print(f"skipping ladybird: {e}", file=sys.stderr)
                 continue
             files[f"apps/{app.name}"] = (binary.read_bytes(), 0o100755)
@@ -241,8 +281,10 @@ def main(out, python=True, compress=False, skip=()):
         if (app / "Cargo.toml").exists():
             if cargo_out is None:
                 try:
-                    cargo_out = build_cargo(work)
+                    cargo_out = build_cargo(work, target, ["home"] if browser_aarch64 else None)
                 except (SystemExit, subprocess.CalledProcessError) as e:
+                    if browser_aarch64:
+                        raise
                     print(f"skipping the Rust apps: {e}", file=sys.stderr)
                     cargo_out = False
             if cargo_out:
@@ -285,23 +327,28 @@ def main(out, python=True, compress=False, skip=()):
     titles = [f"{a.name}\t{(a / 'app.txt').read_text().strip()}" for a in apps
               if (a / "app.txt").exists() and built(a.name)]
     files["apps/.home"] = ("\n".join(titles).encode() + b"\n", 0o100644)
-    # Name lookups go to the Open Runtime's own DNS answerer; certificates for TLS.
-    files["etc/resolv.conf"] = (b"nameserver 10.0.0.53\noptions attempts:2 timeout:2\n", 0o100644)
-    files["etc/hosts"] = (b"127.0.0.1 localhost\n", 0o100644)
-    files["etc/nsswitch.conf"] = (b"hosts: files dns\n", 0o100644)
-    files["etc/ssl/certs/ca-certificates.crt"] = (root_certificates(), 0o100644)
+    for pathname, content in network_files().items():
+        files[pathname] = (content, 0o100644)
     # Python from tools/build_python.py, when it has been built.
     extra = os.environ.get("VIOLET_INITFS_EXTRA")
     # VIOLET_OPEN_NO_PYTHON=1 leaves Python out, as on the handset (make test-agent installs it as a package).
     python = python and os.environ.get("VIOLET_OPEN_NO_PYTHON") != "1"
     if not extra and python and (ROOT / "build/open-toolchain/python-root/bin/python3").exists():
         extra = str(ROOT / "build/open-toolchain/python-root")
-    if extra:
+    if extra and not browser_aarch64:
         # A prepared tree (for example /bin/python3 and /lib) merged at the root.
         for path in sorted(Path(extra).rglob("*")):
             if path.is_file():
                 rel = str(path.relative_to(extra))
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
+    if directory:
+        for name, (content, mode) in files.items():
+            path = out / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            path.chmod(stat.S_IMODE(mode))
+        return
+
     blob = bytearray()
     dirs = sorted({str(Path(p).parent) for p in files if str(Path(p).parent) != "."} |
                   {str(q) for p in files for q in Path(p).parents if str(q) != "."})
@@ -321,5 +368,13 @@ def main(out, python=True, compress=False, skip=()):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else ROOT / "build/sel4/qemu/initfs.cpio",
-         compress="--gzip" in sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("out", type=Path, nargs="?")
+    parser.add_argument("--gzip", action="store_true")
+    parser.add_argument("--browser-aarch64", action="store_true",
+                        help="build a static 64-bit Home and Ladybird image for QEMU, including VP9/Opus")
+    args = parser.parse_args()
+    directory = "qemu-aarch64" if args.browser_aarch64 else "qemu"
+    main(args.out or ROOT / "build/sel4" / directory / "initfs.cpio",
+         compress=args.gzip, browser_aarch64=args.browser_aarch64)

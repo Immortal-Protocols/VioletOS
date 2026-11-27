@@ -1,0 +1,79 @@
+--- a/src/arch/arm/64/traps.S
++++ b/src/arch/arm/64/traps.S
+@@ -228,6 +228,16 @@
+ 
+     lsp_i   x19
+ 
++    /* VioletOS: SVC 0 is the Linux AArch64 userspace ABI. Its x7 is
++     * unrestricted. The runtime needs a fault even if x7 coincides with
++     * a native syscall number. Native libsel4 callers use SVC 1.
++     * x7 and x8 have already been saved by kernel_enter. */
++    and     x24, x25, #0xffff
++    cbnz    x24, 1f
++    mov     x2, xzr
++    b       c_handle_syscall
++1:
++
+ #ifdef CONFIG_FASTPATH
+     cmp     x7, #SYSCALL_CALL
+     b.eq    c_handle_fastpath_call
+--- a/src/arch/arm/object/tcb.c
++++ b/src/arch/arm/object/tcb.c
+@@ -11,13 +11,25 @@
+ #include <machine/registerset.h>
+ #include <object/structures.h>
+ #include <arch/machine.h>
++#include <machine/fpu.h>
+ 
+ word_t CONST Arch_decodeTransfer(word_t flags)
+ {
+-    return 0;
++    return flags & 3;
+ }
+ 
+-exception_t CONST Arch_performTransfer(word_t arch, tcb_t *tcb_src, tcb_t *tcb_dest)
++exception_t Arch_performTransfer(word_t arch, tcb_t *tcb_src, tcb_t *tcb_dest)
+ {
++#if defined(CONFIG_ARCH_AARCH64) && defined(CONFIG_HAVE_FPU)
++    // Save live SIMD registers before reading or replacing the saved image.
++    if (arch == 1 && tcb_src != tcb_dest) {
++        fpuRelease(tcb_src);
++        fpuRelease(tcb_dest);
++        tcb_dest->tcbArch.tcbContext.fpuState = tcb_src->tcbArch.tcbContext.fpuState;
++    } else if (arch == 2) {
++        fpuRelease(tcb_dest);
++        memzero(&tcb_dest->tcbArch.tcbContext.fpuState, sizeof(tcb_dest->tcbArch.tcbContext.fpuState));
++    }
++#endif
+     return EXCEPTION_NONE;
+ }
+--- a/include/object/tcb.h
++++ b/include/object/tcb.h
+@@ -286,7 +286,7 @@
+ exception_t lookupExtraCaps(tcb_t *thread, word_t *bufferPtr, seL4_MessageInfo_t info);
+ word_t setMRs_syscall_error(tcb_t *thread, word_t *receiveIPCBuffer);
+ word_t CONST Arch_decodeTransfer(word_t flags);
+-exception_t CONST Arch_performTransfer(word_t arch, tcb_t *tcb_src,
++exception_t Arch_performTransfer(word_t arch, tcb_t *tcb_src,
+                                        tcb_t *tcb_dest);
+ 
+ #ifdef CONFIG_DEBUG_BUILD
+--- a/src/api/faults.c
++++ b/src/api/faults.c
+@@ -204,8 +204,16 @@
+         copyMRsFault(sender, receiver, MessageID_Syscall, n_syscallMessage,
+                      receiveIPCBuffer);
+ 
++#ifdef CONFIG_ARCH_AARCH64
++        // The Linux syscall number is in x8. Preserve the normal fault layout
++        // and attach this value after it for the native VioletOS dispatcher.
++        setMR(receiver, receiveIPCBuffer, n_syscallMessage,
++              seL4_Fault_UnknownSyscall_get_syscallNumber(sender->tcbFault));
++        return setMR(receiver, receiveIPCBuffer, n_syscallMessage + 1, getRegister(sender, X8));
++#else
+         return setMR(receiver, receiveIPCBuffer, n_syscallMessage,
+                      seL4_Fault_UnknownSyscall_get_syscallNumber(sender->tcbFault));
++#endif
+     }
+ 
+     case seL4_Fault_UserException: {

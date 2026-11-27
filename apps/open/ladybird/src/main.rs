@@ -4,14 +4,18 @@
 //! Ladybird parses each page into the Rust DOM in dom.rs; style.rs computes
 //! styles from the HTML defaults, `<style>` sheets and `style` attributes;
 //! layout.rs lays the page out for the 720-pixel-wide screen; this file
-//! paints it, scrolls it, follows links and keeps the history. Scripts are
-//! not run. Pages load over HTTPS (rustls) or HTTP in a background thread.
+//! paints it, scrolls it, follows links and keeps the history. AArch64 images
+//! can install upstream LibWeb and LibJS to execute inline page scripts. Pages load over HTTPS (rustls) or HTTP in a background thread.
 mod ak_runtime;
 mod dom;
+mod document;
 mod layout;
+mod media;
 mod net;
 mod style;
 mod url;
+#[cfg(all(target_os="linux", target_arch="aarch64"))]
+mod upstream_view;
 mod names {
     #![allow(non_upper_case_globals)]
     include!(concat!(env!("OUT_DIR"), "/names.rs"));
@@ -47,6 +51,7 @@ a { color: #1a55c4; }
 <h2>Try</h2>
 <ul>
 <li><a href="http://info.cern.ch/hypertext/WWW/TheProject.html">The first web page</a> (HTTP)</li>
+<li><a href="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm">Play a flower video</a> (MDN, 5 seconds)</li>
 <li><a href="https://example.com/">example.com</a> (HTTPS)</li>
 <li><a href="https://news.ycombinator.com/">Hacker News</a></li>
 <li><a href="https://lite.cnn.com/">CNN Lite</a></li>
@@ -54,7 +59,7 @@ a { color: #1a55c4; }
 <li><a href="https://en.m.wikipedia.org/wiki/Ladybird_(web_browser)">Ladybird on Wikipedia</a></li>
 <li><a href="https://ladybird.org/">ladybird.org</a></li>
 </ul>
-<p class=note>Pages are parsed by Ladybird's tokenizer and tree builder from LibWeb, compiled for ARMv7 and linked into this Rust app. Scripts do not run.</p>
+<p class=note>Pages are parsed by Ladybird's tokenizer and tree builder from LibWeb, compiled into this VioletOS app.</p>
 </body></html>"#;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,13 +99,27 @@ const MAX_SHEET_BYTES: usize = 512 << 10;
 /// sheets it links to. Runs on the loader thread.
 fn prepare(name: &str, page: net::Page, fetch_sheets: bool) -> Fetched {
     let started = Instant::now();
-    let text = net::decode(&page.body, &page.content_type);
-    let html = if page.content_type.contains("html") || page.content_type.contains("xml") || text.trim_start().starts_with('<') {
-        text
-    } else if page.content_type.starts_with("text/") {
-        format!("<pre>{}</pre>", escape(&text))
+    let html = if media::is_webm(&page.content_type) {
+        String::from("<title>WebM video</title>")
     } else {
-        format!("<h1>{}</h1><p>{} bytes of {}.</p>", escape(name), page.body.len(), escape(&page.content_type))
+        let text = net::decode(&page.body, &page.content_type);
+        if page.content_type.contains("html") || page.content_type.contains("xml") || text.trim_start().starts_with('<') {
+            if fetch_sheets && document::available() {
+                match document::execute(&page.url.document(), &text) {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        eprintln!("ladybird: document process failed for {name}: {error}");
+                        text
+                    }
+                }
+            } else {
+                text
+            }
+        } else if page.content_type.starts_with("text/") {
+            format!("<pre>{}</pre>", escape(&text))
+        } else {
+            format!("<h1>{}</h1><p>{} bytes of {}.</p>", escape(name), page.body.len(), escape(&page.content_type))
+        }
     };
     let document = dom::parse(&html);
     let parse_ms = started.elapsed().as_millis();
@@ -132,6 +151,7 @@ struct Browser {
     fonts: Fonts,
     c: Canvas,
     page: Option<Shown>,
+    playback: Option<media::Playback>,
     scroll: i32,
     history: Vec<(Location, i32)>,
     loading: Option<(u64, Location)>,
@@ -173,6 +193,7 @@ impl Browser {
         if push && let Some(page) = &self.page {
             self.history.push((page.location.clone(), self.scroll));
         }
+        self.playback = None;
         self.generation += 1;
         println!("ladybird: navigate {}", to.text());
         match &to {
@@ -223,6 +244,8 @@ impl Browser {
             Some(f) => layout.anchors.get(f).copied().unwrap_or(0),
             None => 0,
         };
+        self.playback = (page.status == 200 && media::is_webm(&page.content_type))
+            .then(|| media::Playback::start(page.body));
         self.page = Some(Shown { location, layout });
         self.serial += 1;
         self.status.clear();
@@ -369,6 +392,10 @@ impl Browser {
         let origin = (around - (band_h - room) / 2).clamp(0, content - band_h);
         let mut c = old.filter(|layer| layer.h == band_h as usize)
             .unwrap_or_else(|| Canvas::new(W, band_h as usize));
+        if let Some(player) = &self.playback {
+            player.draw(&mut c, &self.fonts);
+            return (c, 0);
+        }
         match &self.page {
             None => c.fill(c.bounds(), rgb(0xff, 0xff, 0xff)),
             Some(page) => {
@@ -447,6 +474,7 @@ impl Browser {
 
     fn tap(&mut self, x: i32, y: i32) {
         if violet::HOME_BOX.contains(x, y) {
+            if let Some(p) = &self.playback { p.pause(true); }
             violet::home();
             return;
         }
@@ -483,6 +511,16 @@ impl Browser {
         if y < TOOLBAR {
             return;
         }
+        if let Some(player) = &self.playback {
+            if player.ended() {
+                if let Some(page) = &self.page {
+                    self.navigate(page.location.clone(), false);
+                }
+            } else {
+                player.toggle();
+            }
+            return;
+        }
         let (px, py) = (x, y - TOOLBAR + self.scroll);
         let href = self.page.as_ref().and_then(|p| {
             // The closest link area under the finger, with a little slack.
@@ -509,7 +547,7 @@ pub fn register_names() {
 #[cfg(target_os = "macos")]
 fn render_to_file(input: &str, output: &str, scroll: i32) {
     let (tx, _rx) = mpsc::channel::<Loaded>();
-    let mut b = Browser { fonts: Fonts::regular_and_bold(), c: Canvas::new(W, H), page: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, keyboard: Keyboard::address(), tx, serial: 0 };
+    let mut b = Browser { fonts: Fonts::regular_and_bold(), c: Canvas::new(W, H), page: None, playback: None, scroll: 0, history: Vec::new(), loading: None, generation: 0, status: String::new(), editing: None, keyboard: Keyboard::address(), tx, serial: 0 };
     let body = std::fs::read(input).expect("input");
     let url = Url::parse("http://localhost/").unwrap();
     let sheets: Vec<String> = std::env::args().skip(5).map(|p| std::fs::read_to_string(p).expect("style sheet")).collect();
@@ -527,6 +565,21 @@ fn render_to_file(input: &str, output: &str, scroll: i32) {
 }
 
 fn main() {
+    #[cfg(all(target_os="linux", target_arch="aarch64"))]
+    if upstream_view::available() || std::env::args().nth(1).as_deref() == Some("--upstream") {
+        let mut trace = false;
+        let mut url = None;
+        for arg in std::env::args().skip(1) {
+            match arg.as_str() {
+                "--upstream" => {}
+                "--trace-upstream" => trace = true,
+                _ => url = Some(arg),
+            }
+        }
+        let url = url.unwrap_or_else(|| "about:newtab".into());
+        if let Err(e) = upstream_view::run(&url, trace) { eprintln!("ladybird: upstream view: {e}"); }
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         let args: Vec<String> = std::env::args().collect();
@@ -546,6 +599,7 @@ fn main() {
         fonts: Fonts::regular_and_bold(),
         c: Canvas::new(1, 1), // swapped for the screen while chrome is drawn
         page: None,
+        playback: None,
         scroll: 0,
         history: Vec::new(),
         loading: None,
@@ -557,19 +611,23 @@ fn main() {
         serial: 0,
     };
     println!("ladybird: starting (Ladybird HTML parser {})", env!("LADYBIRD_COMMIT"));
-    b.navigate(Location::Start, false);
+    let start = std::env::args().nth(1).and_then(|url| Url::parse(&url)).map_or(Location::Start, Location::Web);
+    b.navigate(start, false);
 
     // What the compositor's layer shows: page, scroll it was painted around, typing.
     let mut synced: Option<(u64, i32, bool)> = None;
     let mut press: Option<(i32, i32)> = None; // a press that may become a tap
     let mut chrome = true;
     loop {
-        let wait = if b.loading.is_some() { 60 } else { 250 };
+        let wait = if b.playback.is_some() { 16 } else if b.loading.is_some() { 60 } else { 250 };
         let mut band_at = None;
         match events.recv_timeout(Duration::from_millis(wait)) {
             Ok(e) if e.focus_gained() => {
                 chrome = true;
                 synced = None;
+            }
+            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => {
+                if let Some(p) = &b.playback { p.pause(true); }
             }
             Ok(e) if e.kind == compositor::SCROLL => {
                 b.scroll = e.value;
@@ -608,7 +666,8 @@ fn main() {
         }
         let editing = b.editing.is_some();
         let key = (b.serial, b.scroll, editing);
-        if synced != Some(key) || band_at.is_some() {
+        let new_frame = b.playback.as_ref().is_some_and(media::Playback::take_dirty);
+        if synced != Some(key) || band_at.is_some() || new_frame {
             if synced.map_or(true, |s| s.2 != editing) {
                 let bottom = if editing { KEYBOARD_TOP } else { H as i32 };
                 comp.set_viewport(view, Rect::new(0, TOOLBAR, W as i32, bottom));

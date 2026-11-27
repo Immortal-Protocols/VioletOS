@@ -26,6 +26,23 @@ fn names(source: &str, macro_name: &str) -> Vec<(String, String)> {
 }
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_WEBM").is_some() {
+        println!("cargo:rerun-if-changed=src/webm.c");
+        println!("cargo:rerun-if-env-changed=VIOLET_FFMPEG");
+        println!("cargo:rerun-if-env-changed=VIOLET_MUSL_INCLUDE");
+        let prefix = PathBuf::from(env::var_os("VIOLET_FFMPEG").expect("FFmpeg prefix"));
+        let mut shim = cc::Build::new();
+        shim.file("src/webm.c").include(prefix.join("include"));
+        if let Some(include) = env::var_os("VIOLET_MUSL_INCLUDE") {
+            shim.flag("-isystem").flag(PathBuf::from(include).to_str().unwrap());
+        }
+        shim.compile("violet_webm");
+        println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
+        for lib in ["avformat", "avcodec", "swscale", "swresample", "avutil"] {
+            println!("cargo:rerun-if-changed={}", prefix.join(format!("lib/lib{lib}.a")).display());
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
+    }
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let web = manifest.join("../../../build/ladybird/Libraries/LibWeb");
     let pointer = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap().parse::<usize>().unwrap() / 8;

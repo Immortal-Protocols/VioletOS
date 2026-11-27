@@ -9,8 +9,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(not(target_arch = "aarch64"))]
 const BASE: usize = 0x0940_0000;
-pub const SLOTS: usize = 8;
+// The 64-bit QEMU root maps the relay above its embedded ELF and filesystem.
+#[cfg(target_arch = "aarch64")]
+pub const BASE: usize = 0x7_0000_0000;
+pub const SLOTS: usize = if cfg!(target_arch = "aarch64") { 64 } else { 8 };
+const DATA_OFFSET: usize = (256 + 128 * SLOTS + 4095) & !4095;
 const TX: u32 = 8192;
 const RX: u32 = 16384;
 const STRIDE: usize = (TX + RX) as usize;
@@ -43,14 +48,14 @@ fn set(slot: usize, i: usize, v: u32) {
     unsafe { word(slot, i).write_volatile(v) }
 }
 fn tx(slot: usize) -> *mut u8 {
-    (BASE + 4096 + slot * STRIDE) as *mut u8
+    (BASE + DATA_OFFSET + slot * STRIDE) as *mut u8
 }
 fn rx(slot: usize) -> *const u8 {
-    (BASE + 4096 + slot * STRIDE + TX as usize) as *const u8
+    (BASE + DATA_OFFSET + slot * STRIDE + TX as usize) as *const u8
 }
 
 /// Slots in use, one bit each. The Open Runtime is single-threaded.
-static USED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static USED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The slot holds a connection that has not been closed.
 pub fn in_use(slot: usize) -> bool {
@@ -178,7 +183,7 @@ impl Net {
         set(slot, 7, head.wrapping_add(n as u32));
         n
     }
-    pub fn recv(&mut self, slot: usize, max: usize) -> Vec<u8> {
+    pub fn peek(&self, slot: usize, max: usize) -> Vec<u8> {
         let n = (self.rx_ready(slot) as usize).min(max);
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         let tail = get(slot, 10);
@@ -186,7 +191,11 @@ impl Net {
         for k in 0..n {
             out.push(unsafe { rx(slot).add((tail.wrapping_add(k as u32) % RX) as usize).read_volatile() });
         }
-        set(slot, 10, tail.wrapping_add(n as u32));
+        out
+    }
+    pub fn recv(&mut self, slot: usize, max: usize) -> Vec<u8> {
+        let out = self.peek(slot, max);
+        set(slot, 10, get(slot, 10).wrapping_add(out.len() as u32));
         out
     }
     /// A UDP socket's local address: (the phone's address on the network, port).

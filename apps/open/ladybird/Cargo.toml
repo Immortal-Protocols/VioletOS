@@ -16,6 +16,12 @@ violet = { path = "../../lib/violet" }
 ak = { path = "../../../build/ladybird/AK/Rust" }
 libweb_html_tokenizer = { path = "../../../build/ladybird/Libraries/LibWeb/HTML/Parser/Rust" }
 
+[features]
+webm = []
+
+[build-dependencies]
+cc = "1"
+
 [profile.release]
 opt-level = 3
 strip = true

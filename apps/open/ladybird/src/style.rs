@@ -102,7 +102,7 @@ impl Style {
 
 const HIDDEN: &[&str] = &[
     "head", "script", "style", "title", "meta", "link", "base", "template", "svg", "math", "iframe", "object", "embed",
-    "canvas", "video", "audio", "source", "track", "map", "area", "datalist", "param", "noembed", "noframes", "dialog",
+    "canvas", "audio", "source", "track", "map", "area", "datalist", "param", "noembed", "noframes", "dialog",
 ];
 const BLOCKS: &[&str] = &[
     "html", "body", "div", "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "dl", "dt", "dd", "blockquote", "pre",

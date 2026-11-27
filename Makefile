@@ -16,18 +16,41 @@ build/sel4/viewer: tools/emulator/viewer.c
 	mkdir -p $(@D)
 	$(CC) $(VIEWER_FLAGS) -std=c11 -O2 -Wall -Wextra $(shell sdl2-config --cflags) $< -o $@ $(shell sdl2-config --libs)
 VIEWER := build/sel4/viewer
+AARCH64_VIEWER := $(VIEWER)
 ifeq ($(shell uname -s),Darwin)
 VIEWER_FLAGS := -x objective-c
 VIEWER := build/sel4/VioletOS.app/Contents/MacOS/viewer
-$(VIEWER): build/sel4/viewer tools/emulator/Info.plist tools/emulator/VioletOS.icns
-	mkdir -p $(@D)
-	mkdir -p build/sel4/VioletOS.app/Contents/Resources
-	cp tools/emulator/Info.plist build/sel4/VioletOS.app/Contents/
-	cp tools/emulator/VioletOS.icns build/sel4/VioletOS.app/Contents/Resources/
-	cp $< $@
+AARCH64_APP := build/sel4/VioletOS-AArch64.app
+AARCH64_VIEWER := $(AARCH64_APP)/Contents/MacOS/viewer
+$(VIEWER): APP := build/sel4/VioletOS.app
+$(AARCH64_VIEWER): APP := $(AARCH64_APP)
+$(AARCH64_VIEWER): APP_ID := org.immortal-protocols.violetos.emulator.aarch64
+$(VIEWER) $(AARCH64_VIEWER): build/sel4/viewer tools/emulator/Info.plist tools/emulator/VioletOS.icns
+	mkdir -p $(@D) $(APP)/Contents/Resources
+	cp tools/emulator/Info.plist $(APP)/Contents/
+	$(if $(APP_ID),plutil -replace CFBundleIdentifier -string $(APP_ID) $(APP)/Contents/Info.plist)
+	cp tools/emulator/VioletOS.icns $(APP)/Contents/Resources/
+	cp $< $@.new
+	mv -f $@.new $@
+	codesign --force --sign - $(APP)
 endif
 emulator: qemu-image $(VIEWER)
 	$(PYTHON) tools/run.py $(VIEWER)
+# The optional 64-bit seL4 desktop keeps its own guest image and RAM.
+AARCH64_DESKTOP := build/sel4/qemu-aarch64-desktop
+.PHONY: qemu-image-aarch64 emulator-aarch64 test-ladybird-aarch64-media
+qemu-image-aarch64: setup
+	$(PYTHON) targets/qemu/aarch64/desktop.py --out $(AARCH64_DESKTOP)
+emulator-aarch64: qemu-image-aarch64 $(AARCH64_VIEWER)
+	$(PYTHON) targets/qemu/aarch64/viewer.py --out $(AARCH64_DESKTOP) --viewer $(AARCH64_VIEWER)
+test-ladybird-aarch64-media: qemu-image-aarch64
+	$(PYTHON) targets/qemu/aarch64/viewer.py --out $(AARCH64_DESKTOP) --test media \
+	    --screenshot $(AARCH64_DESKTOP)/media.png
+
+.PHONY: test-ladybird-aarch64-audio-mixer
+test-ladybird-aarch64-audio-mixer: setup
+	$(PYTHON) tools/ladybird_native/build_audio.py --test
+
 test-emulator: qemu-image
 	@set -e; for mode in normal delayed drop-before drop-after stuck setup reset1 reset2; do \
 	  $(PYTHON) targets/qemu/test_guest.py --spi $$mode --watchdog-enabled; \
@@ -69,6 +92,43 @@ test-memory: setup
 .PHONY: test-ladybird
 test-ladybird: qemu-image
 	$(PYTHON) targets/qemu/test_ladybird.py
+
+# In an offline guest, test decoded video and sound after a native touch.
+.PHONY: test-ladybird-upstream-media
+test-ladybird-upstream-media: setup
+	$(PYTHON) targets/qemu/aarch64/desktop.py --upstream-media-test --release-services "$${LADYBIRD_RELEASE_SERVICES:-build/ladybird-native/release-audio/root}" --out build/sel4/qemu-aarch64-upstream-media
+	$(PYTHON) targets/qemu/aarch64/viewer.py --out build/sel4/qemu-aarch64-upstream-media --test upstream-media --screenshot build/sel4/qemu-aarch64-upstream-media/media.png --timeout 360
+
+YOUTUBE_IMAGE := build/sel4/qemu-aarch64-youtube-iframe
+YOUTUBE_CHECK := --out $(YOUTUBE_IMAGE) --test youtube --player-rect 30 168 604 294 --screenshot $(YOUTUBE_IMAGE)/playing.png --timeout 660
+.PHONY: qemu-image-ladybird-youtube test-ladybird-youtube-iframe emulator-ladybird-youtube
+qemu-image-ladybird-youtube: setup
+	$(PYTHON) targets/qemu/aarch64/desktop.py --youtube-iframe-test --out $(YOUTUBE_IMAGE) \
+	    --browser-root "$${LADYBIRD_BROWSER_ROOT:-build/ladybird-native/headless-root}" \
+	    --release-services "$${LADYBIRD_RELEASE_SERVICES:-build/ladybird-native/release-audio/root}"
+test-ladybird-youtube-iframe: qemu-image-ladybird-youtube
+	$(PYTHON) targets/qemu/aarch64/viewer.py $(YOUTUBE_CHECK)
+emulator-ladybird-youtube: qemu-image-ladybird-youtube $(AARCH64_VIEWER)
+	VIOLET_QEMU_TITLE="VioletOS · YouTube playback" $(PYTHON) targets/qemu/aarch64/viewer.py $(YOUTUBE_CHECK) --show-after-playback $(AARCH64_VIEWER)
+
+.PHONY: test-ladybird-upstream-view
+test-ladybird-upstream-view: setup
+	$(PYTHON) targets/qemu/aarch64/desktop.py --presentation-test --out build/sel4/qemu-aarch64-presentation
+	$(PYTHON) targets/qemu/aarch64/viewer.py --out build/sel4/qemu-aarch64-presentation --test presentation --timeout 240 --screenshot build/sel4/qemu-aarch64-presentation/presentation.png
+
+.PHONY: test-ladybird-media
+test-ladybird-media: qemu-image
+	VIOLET_TEST_WEBM=1 $(PYTHON) targets/qemu/test_ladybird.py
+
+# Upstream ARM64 Linux baseline. Run this inside a Linux QEMU guest.
+.PHONY: test-ladybird-youtube-reference
+LADYBIRD_YOUTUBE_URL ?= https://www.youtube.com/watch?v=YE7VzlLtp-4
+LADYBIRD_YOUTUBE_SECONDS ?= 20
+test-ladybird-youtube-reference:
+	mkdir -p build
+	$(PYTHON) targets/qemu/test_ladybird_youtube.py "$(LADYBIRD_YOUTUBE_URL)" \
+	    --seconds "$(LADYBIRD_YOUTUBE_SECONDS)" --audio-monitor @DEFAULT_MONITOR@ \
+	    --screenshot build/ladybird-youtube.png
 
 .PHONY: test-wifi-app
 test-wifi-app: qemu-image

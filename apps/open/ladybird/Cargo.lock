@@ -265,6 +265,7 @@ name = "ladybird"
 version = "0.1.0"
 dependencies = [
  "ak",
+ "cc",
  "libweb_html_tokenizer",
  "violet",
 ]

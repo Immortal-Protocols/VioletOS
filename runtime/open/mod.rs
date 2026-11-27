@@ -18,6 +18,7 @@ pub mod inflate;
 pub mod net;
 pub mod scanout;
 pub mod sockets;
+pub mod unix_message;
 pub mod touch;
 pub mod policy;
 pub mod shield;
@@ -100,6 +101,7 @@ pub enum Wait {
     Audio { fd: i32, buf: u32, len: u32 },
     /// A blocking connect, or a send waiting for room in the socket's ring.
     Connect { fd: i32 },
+    UnixMessage(Rc<unix_message::Message>),
     Send { fd: i32, buf: u32, len: u32 },
     /// Held by a Violet Shield freeze; answered with EACCES when the app thaws.
     Frozen,
@@ -156,6 +158,17 @@ pub struct Thread {
 
 pub type FileRef = Rc<RefCell<device::OpenFile>>;
 
+/// An fd owns one reference to an open file description and its own descriptor flags.
+#[derive(Clone)]
+pub struct Descriptor {
+    pub file: FileRef,
+    pub cloexec: bool,
+}
+impl core::ops::Deref for Descriptor {
+    type Target = FileRef;
+    fn deref(&self) -> &FileRef { &self.file }
+}
+
 pub struct App {
     pub pid: u32,
     pub name: String,
@@ -163,7 +176,7 @@ pub struct App {
     pub space: Space,
     pub cnode: u32,
     pub threads: Vec<Thread>,
-    pub fds: Vec<Option<FileRef>>,
+    pub fds: Vec<Option<Descriptor>>,
     pub cwd: String,
     pub stub_page: u32,
     pub events: alloc::collections::VecDeque<abi::InputEvent>,
@@ -463,7 +476,7 @@ impl Runtime {
             used_ns: sys::now_ns(),
         };
         for _ in 0..3 {
-            app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
+            app.fds.push(Some(Descriptor { file: Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2))), cloexec: false }));
         }
         let regs = sys::Regs { sp: loaded.sp, ..Default::default() };
         self.apps[index] = Some(app);
@@ -679,7 +692,7 @@ impl Runtime {
                     let result = match wait {
                         Wait::Futex { .. } => syscall::ETIMEDOUT,
                         Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Sleep => 0,
-                        Wait::Read { .. } | Wait::RecvFrom { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
+                        Wait::UnixMessage(_) | Wait::Read { .. } | Wait::RecvFrom { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
                         Wait::Connect { .. } => -110,
                         Wait::Frozen => syscall::EACCES,
                         Wait::Present { result } => result,

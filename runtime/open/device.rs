@@ -39,6 +39,7 @@ pub enum Kind {
     Epoll { interest: Vec<(i32, u32, u64)>, reported: Vec<(i32, u32)> },
     EventFd { count: u64 },
     Pipe { buffer: Rc<RefCell<VecDeque<u8>>>, write: bool, peer_open: Rc<RefCell<u32>> },
+    Local(super::sockets::LocalStream),
     /// A TCP socket: its slot once connect was called, and the peer.
     Tcp { slot: Option<usize>, peer: (u32, u16) },
     /// A UDP socket: DNS questions to the runtime's resolver are answered here;
@@ -733,6 +734,10 @@ impl Runtime {
                 let r = self.write_audio(i, *fd, *buf, *len);
                 (r != 0).then_some(r)
             }
+            Wait::UnixMessage(message) => {
+                let result = self.unix_message_now(i, message);
+                (result != super::syscall::EAGAIN).then_some(result)
+            }
             Wait::Connect { fd } => self.connect_result(i, *fd),
             Wait::Send { fd, buf, len } => {
                 let r = self.write(i, *fd, *buf, *len, None);
@@ -788,6 +793,7 @@ impl Runtime {
         let Some(Some(f)) = app.fds.get(fd as usize) else { return 0x20 };
         let f = f.borrow();
         match &f.kind {
+            Kind::Local(stream) => stream.poll_mask(),
             Kind::Events => {
                 if app.events.is_empty() { 4 } else { 5 }
             }
@@ -940,6 +946,15 @@ impl Runtime {
                 }
                 let n = pending.len().min(len as usize);
                 pending.drain(..n).collect()
+            }
+            Kind::Local(stream) => {
+                let (data, _) = match stream.preview(len as usize) {
+                    Ok(packet) => packet,
+                    Err(error) => return error,
+                };
+                if !self.wr(i, buf, &data) { return EFAULT; }
+                stream.consume(data.len());
+                return data.len() as i32;
             }
             Kind::Tcp { slot: None, .. } => return -107, // ENOTCONN
             Kind::Tcp { slot: Some(slot), .. } => {

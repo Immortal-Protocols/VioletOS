@@ -5,7 +5,10 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod socketpair;
+
 fn main() {
+    socketpair::run();
     println!("hello from rust std on violet");
     let v: Vec<u64> = (1..=20).map(|n| n * n).collect();
     println!("sum of squares: {}", v.iter().sum::<u64>());
