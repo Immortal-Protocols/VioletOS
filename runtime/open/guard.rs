@@ -41,7 +41,12 @@ impl Runtime {
 
     /// Check `action` by app `i` against the active Shields and record it.
     pub fn gate(&mut self, i: usize, action: &Action<'_>) -> Gate {
-        let who = self.subject(i);
+        self.gate_with_flags(i, action, 0)
+    }
+
+    pub fn gate_with_flags(&mut self, i: usize, action: &Action<'_>, flags: u8) -> Gate {
+        let mut who = self.subject(i);
+        who.flags |= flags;
         let now = sys::now_ns();
         match self.shield.evaluate(now, &who, action) {
             ShieldVerdict::Allow | ShieldVerdict::LogAlert { .. } => Gate::Allow,

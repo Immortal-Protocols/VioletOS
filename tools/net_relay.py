@@ -29,7 +29,7 @@ import threading
 import time
 
 LOCAL_COMPANION = Path(__file__).resolve().parents[1] / "build/local-companion/connection.json"
-LOCAL_NAMES = {"agent-pair.violet", "agent-relay.violet", "sentinel.violet"}
+LOCAL_NAMES = {"agent-pair.violet", "agent-relay.violet", "sentinel.violet", "shield-flows.violet"}
 
 PAGE = 0x49230000 - 0x40000000
 SLOTS, TX, RX = 8, 8192, 16384
@@ -101,6 +101,8 @@ class Relay(threading.Thread):
             only_violet = os.environ.get("VIOLET_NET_SOCKS_SCOPE") == "violet"
             target = self.hosts.get(name) or self.hosts.get(f"{host}:{port}")
             local = local_companion() if not self.socks_proxy and not target else None
+            if host == "shield-flows.violet" and (only_violet or self.hosts):
+                raise ConnectionRefusedError(111, "partial proxy coverage")
             if local and host == "agent-relay.violet" and port == 80:
                 sock = socket.create_connection(("127.0.0.1", local["relayPort"]), timeout=2)
             elif local and (not host.endswith(".violet") or host in LOCAL_NAMES):

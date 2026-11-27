@@ -120,6 +120,7 @@ pub const FLAG_BACKGROUND: u8 = 1 << 0;
 pub const FLAG_CROSS_APP: u8 = 1 << 1;
 pub const FLAG_NEW_HASH: u8 = 1 << 2;
 pub const FLAG_HIGH_PRIORITY: u8 = 1 << 3;
+pub const FLAG_UDP: u8 = 1 << 5;
 pub const FLAG_DEV_PUSH: u8 = 1 << 4;
 
 /// Compact 64-byte record, as laid out in the RFC.

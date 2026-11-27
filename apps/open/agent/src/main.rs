@@ -504,7 +504,7 @@ impl Agent {
                 if let Some(request) = self.locomo.resume() {
                     self.send_json(request);
                 }
-                self.shield_requested = !self.emulator && v["shield"].as_bool() == Some(true);
+                self.shield_requested = v["shield"].as_bool() == Some(true);
                 if !self.shield_requested { self.shield_polled = None; }
                 let name = text("name");
                 if !name.is_empty() && name != self.saved.peer_name {

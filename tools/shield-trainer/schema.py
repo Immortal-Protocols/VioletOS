@@ -80,7 +80,8 @@ class TelemetryWindow:
         for ev in self.events:
             prev = merged[-1] if merged else None
             if ev.kind == "SOCK_TX" and prev is not None and prev.kind == "SOCK_TX" and _bytes(ev.detail) is not None and _bytes(prev.detail) is not None:
-                seen = None if prev.socks5_seen is None and ev.socks5_seen is None else bool(prev.socks5_seen) and bool(ev.socks5_seen)
+                observations = (prev.socks5_seen, ev.socks5_seen)
+                seen = False if False in observations else None if None in observations else True
                 merged[-1] = TraceEvent(prev.dt_ms, "SOCK_TX", f"{_bytes(prev.detail) + _bytes(ev.detail)}B", False, seen)
             else:
                 merged.append(ev)

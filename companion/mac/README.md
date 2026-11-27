@@ -22,6 +22,8 @@ Build the companion and run `make emulator` from the same checkout. In the emula
 
 The **Violet Shield** tab shows the Sentinel link and model verdicts. Signed warnings appear in the Shield badge on VioletOS Home. The Mac serves the emulator's Sentinel and TCP relay. Build with the Shield model assets in `build/shield` to enable AI scoring. Built-in checks can still warn when the model is unavailable. Use the same checkout and `VIOLET_SHIELD_KEY` (if set) for the VioletOS image and Mac companion so they share the pinned public key. A Moto paired with this Mac sends Shield telemetry over its encrypted Agent connection, including when Violet Relay on an iPhone provides Phone Internet.
 
+For paired Agent telemetry, Sentinel polls the active TCP proxy over an authenticated SOCKS connection to `shield-flows.violet:7001`. The Mac and iPhone relays return the connecting peer’s targets, byte counts and flow ages. Sentinel forwards each snapshot with its boot-relative sampling time over the encrypted Agent session. The Mac matches it against kernel timestamps and writes the observer name to `shield-status.json` as `flow_observer`. Direct Wi-Fi, older relays and expired observations leave the cross-check unknown. A partial snapshot can corroborate a listed connection. Only a complete snapshot can establish a missing one.
+
 ## How it fits together
 
 | Piece | Where |
