@@ -91,6 +91,11 @@ test-locomo:
 test-open-apps: qemu-image
 	$(PYTHON) targets/qemu/test_open_apps.py
 
+# The power key, the passcode lock across a restart, and power off. Local only.
+.PHONY: test-lock
+test-lock: qemu-image
+	$(PYTHON) targets/qemu/test_lock.py
+
 # Host unit tests (CI): each test finishes in well under a second.
 HOST_CARGO ?= $(or $(shell command -v cargo),$(dir $(HOST_RUSTC))cargo)
 .PHONY: test-unit
@@ -101,6 +106,9 @@ test-unit:
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/inflate.rs"]\nmod inflate;\n' > build/tests/inflate_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/inflate_test.rs -o build/tests/inflate
 	build/tests/inflate
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/lock.rs"]\nmod lock;\n' > build/tests/lock_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O -A dead_code build/tests/lock_test.rs -o build/tests/lock
+	build/tests/lock
 	python3 apps/lib/python/test_violet.py
 	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p settings -p bitchat --target-dir ../build/host-tests
 

@@ -56,6 +56,10 @@ pub struct State {
     pub shield: Shield,
     /// The voice agent is listening (in front or in the background).
     pub listening: bool,
+    /// The phone is locked: the lock screen is drawn instead of the grid.
+    pub lock: Option<crate::lock::Lock>,
+    /// The power sheet is up (the power key was held).
+    pub sheet: Option<crate::lock::Sheet>,
 }
 
 /// What a press landed on: an app, or the Shield pill.
@@ -146,6 +150,16 @@ pub fn draw_clipped(c: &mut Canvas, f: &Fonts, art: &Art, s: &State, r: Rect) {
 
 pub fn draw(c: &mut Canvas, f: &Fonts, art: &Art, s: &State) {
     c.copy_rows(&art.wallpaper, 0, H as i32);
+    match &s.lock {
+        Some(lock) => crate::lock::draw(c, f, s.now.as_ref(), lock),
+        None => grid(c, f, art, s),
+    }
+    if let Some(sheet) = &s.sheet {
+        crate::lock::draw_sheet(c, f, sheet);
+    }
+}
+
+fn grid(c: &mut Canvas, f: &Fonts, art: &Art, s: &State) {
     let date = s.now.as_ref().map(|t| t.date()).unwrap_or_else(|| "VioletOS".to_string());
     let date_face = f.regular(55.0);
     let date_width = pill_rect().x0 - if s.listening { 94 } else { 64 };

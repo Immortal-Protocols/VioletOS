@@ -7,6 +7,7 @@ pub mod compositor;
 pub mod device;
 pub mod http;
 pub mod keyboard;
+pub mod keypad;
 pub mod paper;
 pub mod text;
 pub mod wifi;

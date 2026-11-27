@@ -30,6 +30,8 @@ pub mod procmgr;
 pub mod syscall;
 pub mod sys;
 pub mod wifi;
+pub mod lock;
+pub mod power;
 
 use crate::protocol::*;
 use alloc::rc::Rc;
@@ -226,6 +228,8 @@ pub struct Runtime {
     pub ring: touch::Ring,
     /// The app whose threads run in the foreground tier (MCS), as last applied.
     tiered: Option<usize>,
+    /// The power key, the screen lock and its passcode (power.rs).
+    pub power: power::Power,
 }
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
@@ -327,6 +331,7 @@ impl Runtime {
             beam: scanout::Beam::default(),
             ring: touch::Ring::default(),
             tiered: None,
+            power: power::Power::default(),
             // Requests made before this boot are not repeated.
             usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
         })
@@ -869,6 +874,7 @@ impl Runtime {
             // Home starts the first time the open apps come to the front, so it
             // costs nothing on a system that never shows them.
             self.home_tried = true;
+            self.lock_at_start();
             self.start_home();
         }
         if focused && !self.focused {
@@ -880,8 +886,16 @@ impl Runtime {
                 self.shell.arm_with(self.ring.down);
             }
             if let Some(i) = self.foreground {
-                self.refresh(i);
+                // Locked, Home draws its lock screen: what it showed before stays hidden.
+                if !self.power.locked {
+                    self.refresh(i);
+                }
                 self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
+            }
+            // Runtime turned the microphone off with the screen: an agent
+            // listening from the background hears again.
+            if self.audio && self.background_listener().is_some() {
+                device::mic::resume();
             }
         }
         if !focused && self.focused {
@@ -1086,6 +1100,7 @@ impl Runtime {
                 self.poll_runtime();
                 self.stats.slowest_poll = self.stats.slowest_poll.max(sys::now_ns().wrapping_sub(now));
             }
+            self.power_tick(now);
             self.drain_touch();
             self.set_tiers();
             self.bench_tick(now);

@@ -13,6 +13,7 @@ pub fn run() -> ! {
             (CAMERA_COMPONENT,PMIC_ACCESS,GET|EXECUTE) => power_backend::camera_pmic(m.op,m.value,m.arg),
             (7,RADIO_RAILS,EXECUTE) if m.value <= 1 => power_backend::radio_rails(m.value != 0),
             (3,POWER,GET) => power_backend::read(),
+            (3,POWER_KEY,GET) => power_backend::key(),
             (3,POWER,EXECUTE) if m.value <= 2 => power_backend::command(m.value),
             _ => Message::error(DENIED),
         };

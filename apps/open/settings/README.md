@@ -7,6 +7,8 @@ One app for the phone's settings, opened from its icon on Home:
 - **Phone Link**: Violet Shield's link to your iPhone, and Phone Internet: a pairing code to type into Violet Relay, **Turn on**/**Turn off** and **New code**. The choice and code are kept in `/data/relay`, and the Open Runtime turns Phone Internet back on after a restart.
 - **Date & Time**: the city whose date Home shows (the shared setting `time.city`).
 - **Agent Apps**: every app Violet Agent installed, with its size; **Delete** (tap twice to confirm) removes one, **Delete all** removes them all.
+- **Passcode**: set, change or turn off the passcode (4 to 8 digits) that locks the phone. With one set, the power button locks the phone and it starts locked. Changing it or turning it off asks for the one in use. The Open Runtime keeps and checks it; Settings never stores the digits.
+- **Power**: **Power off** (tap twice to confirm). Holding the power button offers the same on any screen.
 - **About**: the system, battery, volume and network.
 
 `SETTINGS_PREVIEW=dir cargo test -p settings` (in `apps/`) draws every page as raw 720 × 1600 RGBA, `WIFI_PREVIEW=dir` the Wi-Fi pages.

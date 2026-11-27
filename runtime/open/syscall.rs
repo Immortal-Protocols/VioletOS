@@ -171,7 +171,12 @@ impl Runtime {
                 _ => return Err(ENOTDIR),
             }
         };
-        Ok(fs::normalize(&base, &path))
+        let path = fs::normalize(&base, &path);
+        // The passcode's record is the runtime's alone.
+        if path == super::lock::FILE {
+            return Err(EACCES);
+        }
+        Ok(path)
     }
     fn timespec(&mut self, i: usize, ptr: u32, time64: bool) -> Option<u64> {
         if time64 {

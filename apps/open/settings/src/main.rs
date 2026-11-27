@@ -1,6 +1,8 @@
 //! Settings: Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone
-//! Internet), the clock's city, the apps Violet Agent built, and About.
+//! Internet), the clock's city, the apps Violet Agent built, the passcode,
+//! power off, and About.
 mod pages;
+mod passcode;
 mod wifi;
 mod wifi_ui;
 
@@ -43,6 +45,7 @@ fn status() -> Status {
         volume: st.get("volume").and_then(|v| v.parse().ok()).unwrap_or(-1),
         city: violet::sys("get time.city").parse().ok().filter(|&n: &usize| n < CITIES.len()).unwrap_or(0),
         installed: pages::parse_installed(&violet::sys("installed")),
+        passcode: violet::fields(&violet::sys("lock")).get("set").is_some_and(|v| v == "1"),
     }
 }
 
@@ -62,6 +65,7 @@ struct App {
     down: Option<(i32, i32)>,
     confirm: Option<usize>,
     note: String,
+    passcode: passcode::Passcode,
 }
 
 impl App {
@@ -74,6 +78,7 @@ impl App {
             pressed: self.pressed,
             confirm: self.confirm,
             note: &self.note,
+            passcode: &self.passcode,
         }
     }
 
@@ -90,6 +95,7 @@ impl App {
         self.confirm = None;
         self.note.clear();
         self.refresh();
+        self.passcode = passcode::Passcode::new(self.status.passcode);
         if section == Section::Wifi {
             self.wifi.enter();
         }
@@ -107,7 +113,29 @@ impl App {
             // Saved settings and Phone Internet are managed by the runtime.
             // Release this screen's memory when the user returns to Home.
             Hit::Back if self.section == Section::Menu => std::process::exit(0),
+            // Out of the number pad, back to the Passcode page.
+            Hit::Back if self.section == Section::Passcode && self.passcode.step != passcode::Step::Overview => self.go(Section::Passcode),
             Hit::Back => self.go(Section::Menu),
+            Hit::PasscodeSet => self.passcode.begin(false),
+            Hit::PasscodeOff => self.passcode.begin(true),
+            Hit::Pad(key) => {
+                self.passcode.key(key, &mut |line| violet::sys(line));
+                if self.passcode.good {
+                    println!("settings: {}", self.passcode.note);
+                    self.status.passcode = self.passcode.set;
+                }
+            }
+            Hit::PowerOff if self.confirm == Some(pages::CONFIRM_POWER) => {
+                self.confirm = None;
+                println!("settings: powering off");
+                let answer = violet::sys("power off");
+                // Still here: the phone did not go down.
+                println!("settings: power off -> {answer}");
+                if answer != "ok" {
+                    self.note = "Couldn’t power off".into();
+                }
+            }
+            Hit::PowerOff => self.confirm = Some(pages::CONFIRM_POWER),
             Hit::Row(i) => self.go(MENU[i].0),
             Hit::Relay => {
                 let answer = if self.relay_on { violet::sys("relay off") } else { violet::sys(&format!("relay on {}", self.code)) };
@@ -211,6 +239,7 @@ fn main() {
         down: None,
         confirm: None,
         note: String::new(),
+        passcode: passcode::Passcode::default(),
     };
     if saved.is_empty() {
         app.save_relay();
@@ -272,6 +301,7 @@ mod preview {
             wifi: "LouieDog".into(), bt_on: true, bt_open: false, shield_known: true, shield_linked: true, shield_rules: 3,
             frozen: vec![], relay: "off".into(), relay_failure: 0, battery: 82, volume: 8, city: 1,
             installed: pages::parse_installed("scorekeeper\t412345\tScorekeeper\ntips\t300000\tTip Calculator\n"),
+            passcode: true,
         }
     }
 
@@ -290,9 +320,15 @@ mod preview {
         let fonts = Fonts::load();
         let s = status();
         let mut c = Canvas::new(violet::W, violet::H);
+        let overview = passcode::Passcode::new(true);
+        let mut entry = passcode::Passcode::new(true);
+        entry.begin(false);
+        entry.key(violet::keypad::PadKey::Digit(2), &mut |_| String::new());
         for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth), ("phone", Section::PhoneLink),
-                                ("time", Section::Time), ("apps", Section::AgentApps), ("about", Section::About)] {
-            let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
+                                ("time", Section::Time), ("apps", Section::AgentApps), ("about", Section::About),
+                                ("passcode", Section::Passcode), ("passcode-entry", Section::Passcode), ("power", Section::Power)] {
+            let passcode = if name == "passcode-entry" { &entry } else { &overview };
+            let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "", passcode };
             pages::draw(&mut c, &fonts, &v);
             let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
             std::fs::write(format!("{dir}/{name}.rgba"), bytes).unwrap();

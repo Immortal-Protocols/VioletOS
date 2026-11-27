@@ -2,13 +2,14 @@
 //! app: the ones that ship with the phone, then the ones installed since. It
 //! stays running; "home" in /dev/violet/sys brings it back to the front.
 mod clock;
+mod lock;
 mod ui;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clock::Glance;
-use violet::{device::{TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen};
+use violet::{device::{KEY_DOWN, KEY_POWER, TOUCH_DOWN, TOUCH_UP}, keypad, Canvas, Fonts, Screen};
 
 use violet::CITIES;
 
@@ -38,7 +39,7 @@ fn main() {
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut art = ui::Art::new();
-    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, shield: Default::default(), listening: false };
+    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, shield: Default::default(), listening: false, lock: None, sheet: None };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
     let refresh = move || {
@@ -50,6 +51,13 @@ fn main() {
     let status = |s: &mut ui::State, art: &mut ui::Art| {
         s.apps = ui::apps(&std::fs::read_to_string("/apps/.home").unwrap_or_default());
         art.prepare(&fonts, &s.apps);
+        // The runtime says whether the phone is locked; Home only shows it.
+        let (locked, wait) = lock::Lock::state();
+        if !locked {
+            s.lock = None;
+        } else {
+            s.lock.get_or_insert_with(Default::default).set_wait(wait);
+        }
         s.listening = violet::fields(&violet::sys("status")).get("listening").is_some_and(|v| v == "1");
         s.running = violet::sys("running").split_whitespace().map(String::from).collect();
         let sh = violet::fields(&violet::sys("shield"));
@@ -72,6 +80,7 @@ fn main() {
     let mut last_fetch = Instant::now();
     let mut last_status = Instant::now();
     let mut shown_day = None;
+    let mut shown_minute = None;
     // Home polls and draws only while it is in front.
     let mut focused = true;
     loop {
@@ -89,7 +98,72 @@ fn main() {
                     refresh();
                 }
             }
-            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
+            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => {
+                focused = false;
+                s.sheet = None;
+                if let Some(l) = &mut s.lock {
+                    l.typed.clear();
+                    l.pressed = None;
+                }
+            }
+            // The power key was held: offer to power off.
+            Ok(e) if e.kind == KEY_DOWN && e.code == KEY_POWER => {
+                println!("home: power sheet");
+                s.pressed = None;
+                s.sheet = Some(lock::Sheet::default());
+                draw(&mut c, &mut s, &art, &glance, &mut screen);
+            }
+            Ok(e) if e.kind == TOUCH_DOWN && s.sheet.is_some() => {
+                let hit = lock::sheet_hit(e.x, e.y);
+                if hit.is_none() && !lock::CARD.contains(e.x, e.y) {
+                    s.sheet = None;
+                } else if let Some(sheet) = &mut s.sheet {
+                    sheet.pressed = hit;
+                }
+                draw(&mut c, &mut s, &art, &glance, &mut screen);
+            }
+            Ok(e) if e.kind == TOUCH_UP && s.sheet.is_some() => {
+                match s.sheet.as_mut().and_then(|sheet| sheet.pressed.take()) {
+                    Some(lock::SheetHit::Off) => {
+                        s.sheet = Some(lock::Sheet { pressed: None, going: true });
+                        draw(&mut c, &mut s, &art, &glance, &mut screen);
+                        println!("home: powering off");
+                        let answer = violet::sys("power off");
+                        // Still here: the phone did not go down.
+                        println!("home: power off -> {answer}");
+                        if answer != "ok" {
+                            s.sheet = None;
+                            s.launch_error = Some("Couldn’t power off".into());
+                        }
+                    }
+                    Some(lock::SheetHit::Cancel) => s.sheet = None,
+                    None => {}
+                }
+                draw(&mut c, &mut s, &art, &glance, &mut screen);
+            }
+            Ok(e) if e.kind == TOUCH_DOWN && s.lock.is_some() => {
+                let key = keypad::key_at(e.x, e.y);
+                if let (Some(l), Some(k)) = (&mut s.lock, key) {
+                    l.pressed = Some(k);
+                    let r = keypad::key_rect(k).inset(-16);
+                    ui::draw_clipped(&mut c, &fonts, &art, &s, r);
+                    screen.show(&c, r);
+                }
+            }
+            Ok(e) if e.kind == TOUCH_UP && s.lock.is_some() => {
+                let Some(k) = s.lock.as_mut().and_then(|l| l.pressed.take()) else { continue };
+                if s.lock.as_mut().is_some_and(|l| l.key(k)) {
+                    println!("home: unlocked");
+                    s.lock = None;
+                    status(&mut s, &mut art);
+                    draw(&mut c, &mut s, &art, &glance, &mut screen);
+                } else {
+                    for r in [keypad::key_rect(k).inset(-16), lock::entry_rect(), keypad::key_rect(keypad::PadKey::Ok).inset(-16)] {
+                        ui::draw_clipped(&mut c, &fonts, &art, &s, r);
+                        screen.show(&c, r);
+                    }
+                }
+            }
             Ok(e) if e.kind == TOUCH_DOWN => {
                 // Only the pressed icon is redrawn.
                 s.pressed = ui::hit(&s, e.x, e.y);
@@ -145,13 +219,20 @@ fn main() {
             last_fetch = Instant::now();
             refresh();
         }
-        if last_status.elapsed() > Duration::from_secs(2) {
+        // Once a second while a wait counts down, otherwise every two.
+        let waiting = s.lock.as_ref().is_some_and(|l| l.wait > 0);
+        if last_status.elapsed() > Duration::from_secs(if waiting { 1 } else { 2 }) {
             last_status = Instant::now();
             let (apps, running, shield, listening) = (s.apps.clone(), s.running.clone(), s.shield.clone(), s.listening);
+            let lock = s.lock.as_ref().map(|l| l.wait);
             status(&mut s, &mut art);
-            let day = glance.as_ref().and_then(|g| g.now()).map(|t| t.day);
-            if day != shown_day || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening {
+            let now = glance.as_ref().and_then(|g| g.now());
+            let (day, minute) = (now.as_ref().map(|t| t.day), now.as_ref().map(|t| t.minute).filter(|_| s.lock.is_some()));
+            if day != shown_day || minute != shown_minute || lock != s.lock.as_ref().map(|l| l.wait)
+                || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening
+            {
                 shown_day = day;
+                shown_minute = minute;
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
             }
         }
@@ -171,7 +252,7 @@ mod preview {
         }
         ui::State {
             now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None,
-            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true,
+            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true, lock: None, sheet: None,
         }
     }
 
@@ -218,7 +299,16 @@ mod preview {
         let art = art(&s);
         println!("home preview: art in {:?}", t.elapsed());
         ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
-        let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
-        std::fs::write(out, bytes).unwrap();
+        let rgba = |c: &violet::Canvas| -> Vec<u8> { c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect() };
+        std::fs::write(&out, rgba(&c)).unwrap();
+        // Beside it: the lock screen, and the power sheet over Home.
+        let mut s = s;
+        s.lock = Some(crate::lock::Lock { typed: "25".into(), pressed: None, note: "Wrong passcode".into(), wait: 0 });
+        ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
+        std::fs::write(format!("{out}.lock"), rgba(&c)).unwrap();
+        s.lock = None;
+        s.sheet = Some(crate::lock::Sheet::default());
+        ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
+        std::fs::write(format!("{out}.sheet"), rgba(&c)).unwrap();
     }
 }
