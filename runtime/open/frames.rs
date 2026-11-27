@@ -71,6 +71,18 @@ pub struct Bench {
     pub release: bool,
 }
 
+/// The agent's finger (`gesture` in /dev/violet/sys): from (x1, y1) to (x2, y2)
+/// over `ms` milliseconds through the same path as a touch on the glass; a tap
+/// when both points are the same.
+#[derive(Clone, Copy)]
+pub struct Gesture {
+    pub from: (i32, i32),
+    pub to: (i32, i32),
+    pub ms: u64,
+    /// When the finger went down (0: not yet).
+    pub start_ns: u64,
+}
+
 #[derive(Default)]
 pub struct Frames {
     pub since_ns: u64,

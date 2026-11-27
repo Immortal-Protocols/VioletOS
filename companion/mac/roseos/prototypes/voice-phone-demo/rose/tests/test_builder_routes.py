@@ -1,0 +1,222 @@
+"""Builder API v1 on the remote listener: mounted only with a builder, and only for signed requests from a paired
+device. No network, port or phone: FastAPI's test client against build_remote_app."""
+import base64
+import hashlib
+import json
+import os
+import os
+import tempfile
+import time
+import unittest
+from unittest import mock
+from pathlib import Path
+from types import SimpleNamespace
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from fastapi.testclient import TestClient
+
+from rose.app_builder import toolchain
+from rose.app_builder.service import Builder, Refused, Unavailable
+from rose.remote import Remote, build_remote_app
+from rose.tests.test_app_builder import HAS_SDK, JAVA_HOME, SDK, fake_backup
+
+
+class Device:
+    def __init__(self):
+        self.key = ec.generate_private_key(ec.SECP256R1())
+        self.spki = self.key.public_key().public_bytes(serialization.Encoding.DER,
+                                                       serialization.PublicFormat.SubjectPublicKeyInfo)
+        self.id = hashlib.sha256(self.spki).hexdigest()
+
+    def headers(self, method, path, pin):
+        t = str(int(time.time() * 1000))
+        nonce = base64.urlsafe_b64encode(os.urandom(16)).rstrip(b'=').decode()
+        msg = ('rose-auth-v1\n' + method + '\n' + path + '\n' + t + '\n' + nonce + '\n' + pin).encode()
+        sig = self.key.sign(msg, ec.ECDSA(hashes.SHA256()))
+        return {'X-Rose-Device': self.id, 'X-Rose-Time': t, 'X-Rose-Nonce': nonce,
+                'X-Rose-Signature': base64.b64encode(sig).decode()}
+
+
+def label(source, kind, request, cancelled):
+    (source / 'res/values/notes.xml').write_text('<resources><string name="note">x</string></resources>')
+
+
+async def _ws(ws, **kw):
+    await ws.close()
+
+
+def server(**extra):
+    return SimpleNamespace(phone=None, serve_audio=_ws, serve_events=_ws, serve_phone=_ws, **extra)
+
+
+class Routes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        (root / 'remote').mkdir(mode=0o700)
+        self.remote = Remote(directory=root / 'remote', name='test', hosts=lambda: [])
+        self.device = Device()
+        self.remote.devices.enroll(self.device.spki, 'phone', 'Pixel', '100.64.0.2')
+        tools = toolchain.Tools(SDK, JAVA_HOME, timeout_s=300, key_creation=True)
+        self.builder = Builder(root / 'builder', tools, label, backup=fake_backup)
+        self.addCleanup(self.builder.ledger.close)
+        self.server = server(app_builder=self.builder)
+        self.client = TestClient(build_remote_app(self.server, self.remote))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def signed(self, method, path, json=None):
+        h = self.device.headers(method, path, self.remote.identity.pin)
+        return self.client.request(method, path, json=json, headers=h)
+
+    def test_requests_are_not_screened(self):
+        # Requests an earlier text screen refused (other platforms, capabilities) are ordinary requests: accepted.
+        for i, text in enumerate(('an iPhone app for my lists', 'make a website for my bakery',
+                                  'a VPN app that blocks trackers', 'a custom keyboard')):
+            r = self.signed('POST', '/builder/v1/projects', {'schemaVersion': 1, 'clientRequestId': f'n{i}',
+                                                             'description': text})
+            self.assertEqual(r.status_code, 200, text)
+            self.assertEqual((set(r.json()) - {'schemaVersion'}, r.json()['notes']), ({'projectId', 'jobId', 'notes'}, []))
+        self.assertEqual(len(self.signed('GET', '/builder/v1/projects').json()['projects']), 4)
+
+    def test_validation_idempotency_and_signing_still_refuse(self):
+        ok = {'schemaVersion': 1, 'clientRequestId': 'v1', 'description': 'a stopwatch'}
+        for bad in ({**ok, 'schemaVersion': 2}, {**ok, 'extra': 1}, {**ok, 'description': ''},
+                    {**ok, 'description': 'x' * 4001}, {**ok, 'clientRequestId': 'x' * 65}):
+            r = self.signed('POST', '/builder/v1/projects', bad)
+            self.assertEqual((r.status_code, r.json()['schemaVersion']), (400, 1), bad)
+        first = self.signed('POST', '/builder/v1/projects', ok).json()
+        self.assertEqual(self.signed('POST', '/builder/v1/projects', ok).json()['jobId'], first['jobId'])
+        r = self.signed('POST', '/builder/v1/projects', {**ok, 'description': 'a timer'})  # same id, other text
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.post('/builder/v1/projects', json=ok).status_code, 401)  # unsigned
+        self.assertEqual(len(self.signed('GET', '/builder/v1/projects').json()['projects']), 1)
+
+    def test_not_mounted_without_a_builder(self):
+        bare = TestClient(build_remote_app(server(), self.remote))
+        self.assertEqual(bare.get('/builder/v1/projects').status_code, 404)
+
+    def test_unsigned_and_unknown_devices_are_refused(self):
+        self.assertEqual(self.client.get('/builder/v1/projects').status_code, 401)
+        stranger = Device()
+        h = stranger.headers('GET', '/builder/v1/projects', self.remote.identity.pin)
+        r = self.client.get('/builder/v1/projects', headers=h)
+        self.assertEqual((r.status_code, r.json()['final']), (401, True))
+        h = self.device.headers('GET', '/builder/v1/jobs/x', self.remote.identity.pin)  # signed for another path
+        self.assertEqual(self.client.get('/builder/v1/projects', headers=h).status_code, 401)
+
+    def test_create_job_cancel_and_library(self):
+        r = self.signed('POST', '/builder/v1/projects',
+                        {'schemaVersion': 1, 'clientRequestId': 'r1', 'description': 'A habit tracker'})
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out['schemaVersion'], 1)
+        again = self.signed('POST', '/builder/v1/projects',
+                            {'schemaVersion': 1, 'clientRequestId': 'r1', 'description': 'A habit tracker'}).json()
+        self.assertEqual(again['projectId'], out['projectId'])
+        job = self.signed('GET', f'/builder/v1/jobs/{out["jobId"]}').json()
+        self.assertEqual((job['state'], job['attempt']), ('queued', 1))
+        lib = self.signed('GET', '/builder/v1/projects').json()
+        self.assertEqual(lib['projects'][0]['activeJob'], {'jobId': out['jobId'], 'state': 'queued'})
+        r = self.signed('POST', f'/builder/v1/jobs/{out["jobId"]}/cancel', {'schemaVersion': 1})
+        self.assertEqual(r.json()['status'], 'accepted')
+        self.assertEqual(self.signed('GET', '/builder/v1/jobs/nope').status_code, 404)
+        bad = self.signed('POST', '/builder/v1/projects', {'schemaVersion': 1, 'description': 'x'})
+        self.assertEqual(bad.status_code, 400)
+        h = self.device.headers('POST', '/builder/v1/projects', self.remote.identity.pin)
+        big = self.client.post('/builder/v1/projects', content=b'{' + b' ' * 20000 + b'}', headers=h)
+        self.assertEqual(big.status_code, 400)
+        h = self.device.headers('POST', '/builder/v1/projects', self.remote.identity.pin)
+        deep = self.client.post('/builder/v1/projects', content=b'[' * 16000, headers=h)
+        self.assertEqual(deep.status_code, 400)
+        r = self.client.get('/builder/v1/projects')
+        self.assertEqual((r.status_code, r.json()['schemaVersion']), (401, 1))
+
+    def test_library_serves_each_version_its_api_report_summary(self):
+        # docs/APP-BUILDER.md §3.3 `apiReport`; the cases are rose/tests/fixtures/api-report-summary-v1.json.
+        from rose.tests.test_app_api_summary import CASES
+        ledger = self.builder.ledger
+        for n, (rid, case) in enumerate((('r1', 'legacy-no-report'), ('r2', 'incomplete-zero-counts')), 1):
+            if n == 1:
+                job = ledger.create('phone', rid, 'x', 'X')
+                project = job['projectId']
+            else:
+                job = ledger.revise('phone', project, rid, 'more')  # its answer has only the jobId
+            ledger.advance(job['jobId'], 'building', 'b', 'b')
+            ledger.allocate_version(job['jobId'])
+            ledger.bind_signer(project, 'a' * 64)
+            ledger.deliver(job['jobId'], str(n), f'rev{n}', f'{n}' * 64, 10, 'x', api_report=CASES[case]['stored'])
+        r = self.signed('GET', '/builder/v1/projects')
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([v['apiReport'] for v in r.json()['projects'][0]['versions']],
+                         [CASES['legacy-no-report']['apiReport'], CASES['incomplete-zero-counts']['apiReport']])
+        r = self.client.get('/builder/v1/projects')  # still only for a paired, signed device
+        self.assertEqual(r.status_code, 401)
+        self.assertNotIn('apiReport', r.text)
+
+    def test_artifact_paths_are_not_files(self):
+        for sha in ('0' * 64, '..%2F..%2Fetc%2Fpasswd', 'A' * 64):
+            self.assertEqual(self.signed('GET', f'/builder/v1/artifacts/{sha}').status_code, 404, sha)
+
+    def test_the_invite_route_answers_once_and_refuses_in_words(self):
+        """POST projects/<id>/invite (§7.7a): the builder's answer, no-store; a refusal as {error, reason,
+        retryable}, recorded in fixtures/builder-hosting-v1.json for the Agent; unsigned is refused."""
+        from rose.tests.test_app_host_agent import HOSTING_WIRE, TOKEN
+        path = '/builder/v1/projects/p1/invite'
+        body = {'schemaVersion': 1, 'account': 'me'}
+        self.assertEqual(self.client.post(path, json=body).status_code, 401)
+        answer = {'projectId': 'p1', 'versionCode': 2, 'account': 'me', 'invite': TOKEN, 'expiresInS': 604800}
+        with mock.patch.object(self.builder, 'invite', lambda device, project, data: answer):
+            r = self.signed('POST', path, body)
+        self.assertEqual((r.status_code, r.json(), r.headers['cache-control']),
+                         (200, {'schemaVersion': 1, **answer}, 'no-store'))
+        refusals = {}
+        for name, raised, status in (
+                ('invalid_account', Refused('account must be 1 to 128 bytes of text with no ":" or control character',
+                                            reason='invalid_account'), 400),
+                ('not_hosted', Unavailable('This app\'s server is not set up in its agent container.', 'not_hosted',
+                                           False), 409),
+                ('already_enrolled', Unavailable('That account is already signed up to this app.', 'already_enrolled',
+                                                 False), 409),
+                ('server_unavailable', Unavailable('This app\'s server could not issue an invite now; try again.',
+                                                   'server_unavailable', True), 409),
+                ('invites_unsupported', Unavailable('This app\'s backend has no sign-in invites.',
+                                                    'invites_unsupported', False), 409)):
+            def refuse(device, project, data, raised=raised):
+                raise raised
+            with mock.patch.object(self.builder, 'invite', refuse):
+                r = self.signed('POST', path, body)
+            self.assertEqual(r.status_code, status, name)
+            refusals[name] = {'status': status, 'body': r.json()}
+        self.assertEqual(refusals['server_unavailable']['body']['retryable'], True)
+        r = self.signed('POST', '/builder/v1/projects/' + 'f' * 16 + '/invite', body)
+        self.assertEqual(r.status_code, 404)  # the real builder: an unknown project
+        refusals['not_found'] = {'status': 404, 'body': r.json()}
+        if os.environ.get('ROSE_WRITE_WIRE_FIXTURE') == '1':
+            recorded = json.loads(HOSTING_WIRE.read_text()) if HOSTING_WIRE.exists() else {}
+            HOSTING_WIRE.write_text(json.dumps({**recorded, 'refusals': refusals}, indent=1, sort_keys=True) + '\n')
+        self.assertEqual(json.loads(HOSTING_WIRE.read_text())['refusals'], refusals)
+
+    @unittest.skipUnless(HAS_SDK or os.environ.get('ROSE_REQUIRE_APP_BUILD'), 'needs the pinned Android SDK')
+    def test_signed_download_of_a_built_version(self):
+        out = self.signed('POST', '/builder/v1/projects',
+                          {'schemaVersion': 1, 'clientRequestId': 'r', 'description': 'Notes'}).json()
+        self.builder.run_next()
+        version = self.signed('GET', '/builder/v1/projects').json()['projects'][0]['versions'][0]
+        r = self.signed('GET', f'/builder/v1/artifacts/{version["apk"]["sha256"]}')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.content), version['apk']['size'])
+        self.assertEqual(hashlib.sha256(r.content).hexdigest(), version['apk']['sha256'])
+        self.assertEqual(self.client.get(f'/builder/v1/artifacts/{version["apk"]["sha256"]}').status_code, 401)
+        receipt = {'schemaVersion': 1, 'projectId': out['projectId'],
+                   'packageName': 'app.rose.gen.p' + out['projectId'], 'versionCode': 1,
+                   'signerSha256': self.signed('GET', '/builder/v1/projects').json()['projects'][0]['signerSha256'],
+                   'status': 'installed', 'detail': ''}
+        self.assertEqual(self.signed('POST', '/builder/v1/installs', receipt).json(),
+                         {'schemaVersion': 1, 'recorded': True})
+
+
+if __name__ == '__main__':
+    unittest.main()

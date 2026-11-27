@@ -220,6 +220,8 @@ pub struct Runtime {
     pub wifi: wifi::Wifi,
     /// Present cost, input-to-frame latency and touch polling (frames.rs).
     pub frames: frames::Frames,
+    /// The agent's finger in progress (frames.rs Gesture).
+    pub gesture: Option<frames::Gesture>,
     /// The panel's scan line and frame count (scanout.rs).
     pub beam: scanout::Beam,
     /// Reports Touch reads on its interrupt (touch.rs, handset).
@@ -324,6 +326,7 @@ impl Runtime {
             last_sentinel: 0,
             wifi: wifi::Wifi::default(),
             frames: frames::Frames::default(),
+            gesture: None,
             beam: scanout::Beam::default(),
             ring: touch::Ring::default(),
             tiered: None,
@@ -977,6 +980,32 @@ impl Runtime {
 
     /// Synthetic presses from `bench tap`: a touch down on the app in front,
     /// then, 150 ms later, focus handed back so it drops the press.
+    /// Move the agent's finger: down, a sample every 16 ms along the line, then up.
+    fn gesture_tick(&mut self, now: u64) {
+        let Some(mut g) = self.gesture else { return };
+        if !self.focused {
+            self.gesture = None;
+            return;
+        }
+        if g.start_ns == 0 {
+            g.start_ns = now;
+            self.touch(g.from.0, g.from.1, true);
+            self.gesture = Some(g);
+            return;
+        }
+        let t = ((now - g.start_ns) / 1_000_000).min(g.ms);
+        let at = |a: i32, b: i32| a + ((b - a) as i64 * t as i64 / g.ms.max(1) as i64) as i32;
+        let (x, y) = (at(g.from.0, g.to.0), at(g.from.1, g.to.1));
+        if t >= g.ms {
+            self.touch(g.to.0, g.to.1, true);
+            self.touch(g.to.0, g.to.1, false);
+            self.gesture = None;
+        } else {
+            self.touch(x, y, true);
+            self.gesture = Some(g);
+        }
+    }
+
     fn bench_tick(&mut self, now: u64) {
         let Some(mut b) = self.frames.bench else { return };
         if now < b.next_ns {
@@ -1089,6 +1118,7 @@ impl Runtime {
             self.drain_touch();
             self.set_tiers();
             self.bench_tick(now);
+            self.gesture_tick(now);
             self.beam.tick();
             self.flush_presents();
             self.check_waiters();
