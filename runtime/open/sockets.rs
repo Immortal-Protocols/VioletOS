@@ -175,7 +175,7 @@ impl Runtime {
                     return Done(EINVAL);
                 }
                 let host = self.net.host_for(ip);
-                if host == "sentinel.violet"
+                if matches!(host.as_str(), "sentinel.violet" | "shield-flows.violet")
                     || (matches!(host.as_str(), "agent-pair.violet" | "agent-relay.violet")
                         && (cfg!(moto_board) || self.apps[i].as_ref().map(|a| a.path.as_str()) != Some(super::appstore::INSTALLER)))
                 {
@@ -307,7 +307,7 @@ impl Runtime {
             return None;
         }
         let host = self.net.host_for(dest.0);
-        match self.gate(i, &super::policy::Action::Connect { host: &host, port: dest.1 }) {
+        match self.gate_with_flags(i, &super::policy::Action::Connect { host: &host, port: dest.1 }, super::shield::FLAG_UDP) {
             super::Gate::Allow => {}
             super::Gate::Deny => return Some(Done(-13)),
             super::Gate::Frozen => return Some(Block(Wait::Frozen, None)),

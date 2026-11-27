@@ -60,6 +60,7 @@ struct SentinelRecord {
 
     var txBytes: UInt64? { sendBytes(detail) }
 
+    var udp: Bool { flags & 32 != 0 }
     var background: Bool { flags & 1 != 0 }
     var crossApp: Bool { flags & 2 != 0 }
     var newHash: Bool { flags & 4 != 0 }
@@ -105,7 +106,10 @@ struct TelemetryWindow {
         for ev in events {
             if ev.kind == "SOCK_TX", let prev = merged.last, prev.kind == "SOCK_TX",
                let a = sendBytes(prev.detail), let b = sendBytes(ev.detail) {
-                let seen: Bool? = (prev.socksSeen == nil && ev.socksSeen == nil) ? nil : (prev.socksSeen == true && ev.socksSeen == true)
+                let seen: Bool?
+                if prev.socksSeen == false || ev.socksSeen == false { seen = false }
+                else if prev.socksSeen == true && ev.socksSeen == true { seen = true }
+                else { seen = nil }
                 merged[merged.count - 1] = WindowEvent(dtMs: prev.dtMs, kind: "SOCK_TX", detail: "\(a + b)B", crossApp: false, socksSeen: seen)
             } else {
                 merged.append(ev)
@@ -177,6 +181,7 @@ final class AppTrack {
     var records: [SentinelRecord] = []
     var knownHosts: [String] = []
     var exited = false
+    var proxyScoredThrough: Int64 = -1
     var dirtySince: Date?
     var lastScored: Date?
     var lastWarning = Date.distantPast
@@ -201,12 +206,12 @@ final class AppTrack {
     }
 
     /// `windows.py window_for`.
-    func window(socksSeen: Set<String>, unreported: [SocksOnlyFlow]) -> TelemetryWindow {
+    func window(unreported: [SocksOnlyFlow], observation: (SentinelRecord) -> Bool?) -> TelemetryWindow {
         let shown = records.filter { ShieldSchema.windowKinds.contains($0.kind) }
         let base = shown.first?.tMs ?? 0
         let events = shown.map { r in
             WindowEvent(dtMs: max(0, r.tMs - base), kind: r.kind, detail: r.detail, crossApp: r.crossApp,
-                        socksSeen: (r.kind == "SOCK_CONN" || r.kind == "SOCK_TX") ? socksSeen.contains(r.target) : nil)
+                        socksSeen: (r.kind == "SOCK_CONN" || r.kind == "SOCK_TX") ? observation(r) : nil)
         }
         let last = records.last
         return TelemetryWindow(appPath: "/apps/\(name)", sha: sha8, newHash: last?.newHash ?? false, background: last?.background ?? false,

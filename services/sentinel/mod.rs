@@ -305,6 +305,7 @@ pub const FRAME_HELLO: u8 = 0x01;
 pub const FRAME_EVENTS: u8 = 0x02;
 pub const FRAME_HEARTBEAT: u8 = 0x03;
 pub const FRAME_RESULT: u8 = 0x04;
+pub const FRAME_PROXY_SNAPSHOT: u8 = 0x05;
 pub const FRAME_SHIELD: u8 = 0x10;
 
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -406,7 +407,80 @@ enum Link {
     Agent { last_poll_ns: u64 },
 }
 
+// Only the privileged runtime opens this endpoint, through the current data proxy.
+// The reply is opaque to Sentinel and can only become an observation (frame 5).
+#[cfg(not(test))]
+#[derive(Default)]
+struct ProxyObserver {
+    slot: Option<usize>,
+    route: u32,
+    connected_at: u64,
+    requested_at: Option<u64>,
+    next_poll: u64,
+    reply: Vec<u8>,
+}
+
+#[cfg(not(test))]
+impl ProxyObserver {
+    fn reset(&mut self) {
+        if let Some(slot) = self.slot.take() { net::close(slot); }
+        *self = Self::default();
+    }
+
+    fn poll(&mut self, net: &mut Net, now: u64, tx: &mut Vec<u8>) {
+        let route = net.online();
+        if self.route != route && self.slot.is_some() {
+            self.reset();
+            tx.extend(frame(FRAME_PROXY_SNAPSHOT, &[]));
+        }
+        if !matches!(route, 2 | 3) { return; }
+        if self.slot.is_none() {
+            if now < self.next_poll { return; }
+            let address = net.address_for("shield-flows.violet");
+            self.slot = net.connect(address, 7001).ok();
+            self.route = route;
+            self.connected_at = now;
+            self.next_poll = now + 3_000_000_000;
+        }
+        let Some(slot) = self.slot else { return };
+        let state = net.state(slot).0;
+        if state == net::CONNECTING && now - self.connected_at < 8_000_000_000 { return; }
+        if state == net::OPEN {
+            if let Some(request) = self.requested_at {
+                self.reply.extend(net.recv(slot, 3002 - self.reply.len()));
+                if self.reply.len() >= 2 {
+                    let size = u16::from_le_bytes([self.reply[0], self.reply[1]]) as usize;
+                    if (1..=3000).contains(&size) && self.reply.len() == size + 2 && now - request <= 2_000_000_000 {
+                        let mut body = Vec::from((self.connected_at / 1_000_000).to_le_bytes());
+                        body.extend((request / 1_000_000).to_le_bytes());
+                        body.extend(&self.reply[2..]);
+                        tx.extend(frame(FRAME_PROXY_SNAPSHOT, &body));
+                        self.reply.clear();
+                        self.requested_at = None;
+                        self.next_poll = now + 1_000_000_000;
+                        return;
+                    }
+                    if (1..=3000).contains(&size) && self.reply.len() < size + 2
+                        && now - request < 2_000_000_000 { return; }
+                } else if now - request < 2_000_000_000 {
+                    return;
+                }
+            } else {
+                if now >= self.next_poll && tx.len() < 1900 && net.send(slot, &[1]) == 1 {
+                    self.requested_at = Some(now);
+                }
+                return;
+            }
+        }
+        self.reset();
+        tx.extend(frame(FRAME_PROXY_SNAPSHOT, &[]));
+        self.next_poll = now + 3_000_000_000;
+    }
+}
+
 pub struct Sentinel {
+    #[cfg(not(test))]
+    observer: ProxyObserver,
     pub verifier: Verifier,
     pub chain: MeasurementChain,
     /// pid -> program, newest last (a few apps run at once).
@@ -431,6 +505,7 @@ impl Sentinel {
         let mut chain = MeasurementChain::new(boot_id);
         chain.extend(MEASURE_KEY, &sha256(&companion_key));
         Sentinel {
+            observer: ProxyObserver::default(),
             verifier: Verifier { companion_key, last_seq: 0 },
             chain,
             apps: Vec::new(),
@@ -508,6 +583,7 @@ impl Sentinel {
             if let Link::Up { slot } | Link::Connecting { slot, .. } = self.link {
                 net::close(slot);
             }
+            self.observer.reset();
             self.start_link();
             crate::log!("sentinel: linked through Mac Agent");
         }
@@ -578,7 +654,12 @@ impl Sentinel {
         }
         if now_ns.wrapping_sub(self.last_heartbeat_ns) >= 2_000_000_000 {
             self.last_heartbeat_ns = now_ns;
-            let hb = self.heartbeat(now_ns, active_shields, telemetry_dropped);
+            let heartbeat = self.heartbeat(now_ns, active_shields, telemetry_dropped);
+            // Earlier events may still be queued when the Agent transport is busy.
+            let through = self.offline.front().and_then(|line| line.split_once('\t'))
+                .and_then(|(ms, _)| ms.parse::<u64>().ok()).map(|ms| ms.saturating_sub(1))
+                .unwrap_or(now_ns / 1_000_000);
+            let hb = format!("{} {}", heartbeat, through);
             self.tx.extend_from_slice(&frame(FRAME_HEARTBEAT, hb.as_bytes()));
         }
     }
@@ -627,9 +708,11 @@ impl Sentinel {
             }
             Link::Agent { last_poll_ns } => {
                 if now_ns.saturating_sub(last_poll_ns) > 5_000_000_000 {
+                    self.observer.reset();
                     self.link = Link::Down { retry_at_ns: now_ns };
                     crate::log!("sentinel: Mac Agent link lost");
                 } else {
+                    self.observer.poll(net, now_ns, &mut self.tx);
                     self.receive(now_ns, &mut commands);
                     self.collect(now_ns, active_shields, telemetry_dropped);
                 }

@@ -1222,8 +1222,7 @@ impl Runtime {
                 }
                 _ => String::from("error\n"),
             },
-            Some("shield-agent") if cfg!(moto_board)
-                && self.apps[i].as_ref().is_some_and(|app| app.path == super::appstore::INSTALLER) =>
+            Some("shield-agent") if self.apps[i].as_ref().is_some_and(|app| app.path == super::appstore::INSTALLER) =>
             {
                 match words.next() {
                     Some("pull") => self.sentinel.agent_pull(sys::now_ns(), false),

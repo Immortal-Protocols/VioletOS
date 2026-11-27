@@ -83,6 +83,13 @@ final class Shield {
     private var verdictTransport = ""
     private var linkUpSince: Date?
     private var snap = ShieldSnapshot()
+    private var proxySnapshot: RelayFlowSnapshot?
+    private var proxySampleMs: Int64 = 0
+    private var proxyStartMs: Int64 = 0
+    private var proxyReceived = Date.distantPast
+    private var proxyFlagged = Set<Int>()
+    private var proxyReports: [(target: String, time: Int64)] = []
+    private var telemetryThroughMs: Int64 = 0
     private var pending: [UInt64: String] = [:]
     private var scoring = Set<UInt32>()
     private var flaggedFlows = Set<Int>()
@@ -203,6 +210,10 @@ final class Shield {
     private func replaceLink(_ next: SentinelLink, route: String) {
         link?.close()
         link = next
+        resetProxy()
+        lock.lock()
+        reported.removeAll()
+        lock.unlock()
         tracks.removeAll()
         scoring.removeAll()
         pending.removeAll()
@@ -227,6 +238,7 @@ final class Shield {
     fileprivate func linkClosed(_ l: SentinelLink, _ why: String) {
         guard link === l else { return }
         link = nil
+        resetProxy()
         agentSession = nil
         lastAgentFrame = nil
         pending.removeAll()
@@ -259,9 +271,12 @@ final class Shield {
             // "uptime_ms seq chain dropped active frozen accepted rejected"
             let f = text.split(separator: " ")
             if f.count >= 8 {
+                telemetryThroughMs = f.count >= 9 ? Int64(f[8]) ?? 0 : Int64(f[0]) ?? 0
                 snap.chain = String(f[2].prefix(16))
                 snap.heartbeat = "up \(Int(f[0]).map { $0 / 1000 } ?? 0)s · chain #\(f[1]) · \(f[3]) dropped"
             }
+        case 0x05 where agentSession != nil:
+            receiveProxy(payload)
         case 0x04:
             let f = text.split(separator: " ")
             if f.count >= 2, let seq = UInt64(f[1]) {
@@ -280,6 +295,46 @@ final class Shield {
         publish()
     }
 
+    private func resetProxy() {
+        proxyStartMs = 0
+        proxySampleMs = 0
+        proxySnapshot = nil
+        proxyFlagged.removeAll()
+        proxyReports.removeAll()
+        telemetryThroughMs = 0
+    }
+
+    private func receiveProxy(_ payload: Data) {
+        guard payload.count > 16, payload.count <= 3016,
+              let snapshot = try? JSONDecoder().decode(RelayFlowSnapshot.self, from: payload.dropFirst(16)),
+              ["Mac", "iPhone"].contains(snapshot.source) else { resetProxy(); return }
+        let start = payload.withUnsafeBytes { Int64(littleEndian: $0.loadUnaligned(as: Int64.self)) }
+        let sample = payload.withUnsafeBytes { Int64(littleEndian: $0.loadUnaligned(fromByteOffset: 8, as: Int64.self)) }
+        guard start >= 0, sample >= start,
+              snapshot.flows.allSatisfy({ flow in
+                  flow.ageMs >= 0 && flow.endedMsAgo.map { (0...flow.ageMs).contains($0) } != false
+                      && flow.target.utf8.count <= 300 && flow.id > 0
+              })
+        else { resetProxy(); return }
+        if proxyStartMs != start {
+            proxyFlagged.removeAll()
+            proxyReports = proxyReports.filter { $0.time >= start }
+        }
+        proxyStartMs = start
+        proxySampleMs = sample
+        proxySnapshot = snapshot
+        proxyReceived = Date()
+        if snapshot.complete { proxyFlagged.formIntersection(snapshot.flows.map(\.id)) }
+        proxyReports = proxyReports.filter { $0.time >= sample - 185_000 }
+        // Rescore once a sample covers a previously unobserved network call.
+        for t in tracks.values where !t.exited {
+            if t.records.contains(where: { ($0.kind == "SOCK_CONN" || $0.kind == "SOCK_TX")
+                && $0.tMs > t.proxyScoredThrough && $0.tMs <= sample - 2000 && $0.tMs >= start }) {
+                t.dirtySince = t.dirtySince ?? Date()
+            }
+        }
+    }
+
     private func ingest(_ r: SentinelRecord) {
         let t: AppTrack
         if let existing = tracks[r.pid] {
@@ -293,6 +348,10 @@ final class Shield {
         switch r.kind {
         case "EXIT": t.exited = true
         case "SOCK_CONN":
+            if agentSession != nil && !r.udp {
+                proxyReports.append((r.target.lowercased(), r.tMs))
+                if proxyReports.count > 4096 { proxyReports.removeFirst(1024) }
+            }
             lock.lock(); reported[r.target.lowercased()] = r.arrived; lock.unlock()
             t.dirtySince = t.dirtySince ?? Date()
         default:
@@ -322,15 +381,25 @@ final class Shield {
         publish()
     }
 
-    private func socksSeen(_ now: Date) -> Set<String> {
-        guard agentSession == nil else { return [] }
+    private func socksSeen(_ now: Date) -> Set<String>? {
+        // Direct Sentinel sessions use this Mac relay. Agent sessions supply a proxy snapshot.
+        guard agentSession == nil else { return nil }
         lock.lock(); defer { lock.unlock() }
         return Set(flows.values.filter { now.timeIntervalSince($0.started) < 180 }.map(\.target))
     }
 
     private func evaluate(_ t: AppTrack) {
         let now = Date()
-        let window = t.window(socksSeen: socksSeen(now), unreported: [])
+        let local = socksSeen(now)
+        let window = t.window(unreported: []) { r in
+            guard !r.udp, let host = r.target.split(separator: ":").dropLast().last,
+                  !["agent-relay.violet", "agent-pair.violet", "time.violet"].contains(host) else { return nil }
+            if self.agentSession == nil { return local?.contains(r.target.lowercased()) }
+            guard now.timeIntervalSince(self.proxyReceived) < 5 else { return nil }
+            return self.proxySnapshot?.observation(for: r.target, eventMs: r.tMs,
+                                                   sessionMs: self.proxyStartMs, sampleMs: self.proxySampleMs)
+        }
+        t.proxyScoredThrough = proxySampleMs - 2000
         // Tier 0: rules no window text can talk its way past.
         if let rule = tier0(t, window) {
             let d = ShieldDecision(time: now, pid: t.pid, app: t.name, tier: "tier0", verdict: "exploit_or_persistence", pMalicious: 1,
@@ -437,7 +506,20 @@ final class Shield {
 
     /// The relay saw a connection VioletOS never reported: telemetry is missing or tampered.
     private func checkUnreportedFlows(_ now: Date) {
-        guard agentSession == nil, let up = linkUpSince, now.timeIntervalSince(up) > 5 else { return }
+        if agentSession != nil {
+            guard let snapshot = proxySnapshot, now.timeIntervalSince(proxyReceived) < 5 else { return }
+            var missing: [SocksOnlyFlow] = []
+            for flow in snapshot.flows where !proxyFlagged.contains(flow.id) {
+                let started = proxySampleMs - Int64(flow.ageMs)
+                guard started > proxyStartMs + 2000, flow.ageMs >= 5000, telemetryThroughMs >= started + 5000 else { continue }
+                proxyFlagged.insert(flow.id)
+                if proxyReports.contains(where: { $0.target == flow.kernelTarget && abs($0.time - started) <= 15_000 }) { continue }
+                missing.append(.init(target: flow.target, tx: flow.up, rx: flow.down))
+            }
+            reportUnmatched(missing)
+            return
+        }
+        guard let up = linkUpSince, now.timeIntervalSince(up) > 5 else { return }
         lock.lock()
         let candidates = flows.values.filter { f in
             !flaggedFlows.contains(f.id) && f.started > up.addingTimeInterval(2) && now.timeIntervalSince(f.started) > 3
@@ -449,12 +531,16 @@ final class Shield {
             unreported.append(f)
         }
         lock.unlock()
+        reportUnmatched(unreported.map { SocksOnlyFlow(target: $0.target, tx: $0.up, rx: $0.down) })
+    }
+
+    private func reportUnmatched(_ unreported: [SocksOnlyFlow]) {
         guard !unreported.isEmpty else { return }
         let ghost = tracks[0] ?? AppTrack(pid: 0, name: "unattributed", sha8: "00000000")
         tracks[0] = ghost
-        let window = ghost.window(socksSeen: [], unreported: unreported.map { SocksOnlyFlow(target: $0.target, tx: $0.up, rx: $0.down) })
+        let window = ghost.window(unreported: unreported) { _ in nil }
         let hosts = unreported.map(\.target)
-        let d = ShieldDecision(time: now, pid: 0, app: "unattributed", tier: "relay", verdict: "exfil_or_c2", pMalicious: 1,
+        let d = ShieldDecision(time: Date(), pid: 0, app: "unattributed", tier: "relay", verdict: "exfil_or_c2", pMalicious: 1,
                                action: "block_host", tags: [("socks_sentinel_mismatch", 1)], novelty: 0, tokens: 0, latencyMs: 0,
                                hosts: hosts, window: window.canonicalText(), warned: warn(ghost),
                                note: "relay saw a connection the Sentinel never reported")
@@ -542,6 +628,7 @@ final class Shield {
     private func writeStatus(_ s: ShieldSnapshot) {
         let decisions = s.decisions.prefix(30).map(decisionFields)
         let obj: [String: Any] = ["model": s.modelState, "compute_units": s.computeUnits, "signer": s.signer, "link": s.link, "link_up": s.linkUp,
+                                  "flow_observer": agentSession == nil ? (s.linkUp ? "Mac" : "") : (Date().timeIntervalSince(proxyReceived) < 5 ? proxySnapshot?.source ?? "" : ""),
                                   "boot_id": s.bootId, "chain": s.chain, "heartbeat": s.heartbeat, "events": s.events,
                                   "windows_scored": s.windowsScored, "shields_sent": s.shieldsSent, "shields_accepted": s.shieldsAccepted,
                                   "shields_rejected": s.shieldsRejected, "auto_contain": false,

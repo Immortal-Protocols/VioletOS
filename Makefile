@@ -170,7 +170,7 @@ moto-component: setup
 
 # Violet Shield (docs/violet-shield-poc.md).
 SHIELD_PY := build/shield/venv/bin/python
-.PHONY: shield-setup shield-train test-shield-unit test-shield moto-shield
+.PHONY: shield-setup shield-train test-shield-unit test-shield test-shield-proxy moto-shield
 $(SHIELD_PY):
 	$(PYTHON) -m venv build/shield/venv
 	$(SHIELD_PY) -m pip install -q torch "transformers>=5.24" sentence-transformers coremltools numpy cryptography pillow
@@ -181,6 +181,9 @@ test-shield-unit: $(SHIELD_PY)
 	SHIELD_PYTHON=$(SHIELD_PY) HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_unit.sh
 test-shield: qemu-image $(SHIELD_PY)
 	$(SHIELD_PY) targets/qemu/test_shield.py
+SHIELD_PROXY ?= Mac
+test-shield-proxy: qemu-image
+	$(PYTHON) targets/qemu/test_shield_proxy.py "$(SHIELD_PROXY)"
 # Moto image with the demo apps for use with the Mac companion.
 moto-shield: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto

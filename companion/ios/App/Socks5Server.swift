@@ -27,6 +27,40 @@ final class RelayCounters {
     }
 }
 
+// A snapshot travels over the authenticated proxy connection selected by the runtime.
+// Ages use the proxy's monotonic clock, so the three devices need no shared wall clock.
+struct RelayFlowSnapshot: Codable {
+    struct Flow: Codable {
+        let id: Int
+        let target: String
+        let ageMs: Int
+        let up: UInt64
+        let down: UInt64
+        let endedMsAgo: Int?
+        // TelemetryEvent stores the first 40 UTF-8 bytes of the host.
+        var kernelTarget: String {
+            guard let colon = target.lastIndex(of: ":") else { return target }
+            return String(decoding: target[..<colon].utf8.prefix(40), as: UTF8.self) + target[colon...]
+        }
+    }
+    let source: String
+    let complete: Bool
+    let flows: [Flow]
+
+    func observation(for target: String, eventMs: Int64, sessionMs: Int64, sampleMs: Int64) -> Bool? {
+        // Allow for the SOCKS handshake and the bounded snapshot round trip.
+        let grace: Int64 = 2000
+        guard eventMs >= sessionMs, eventMs >= sampleMs - 175_000, eventMs <= sampleMs + grace else { return nil }
+        for flow in flows where flow.kernelTarget == target.lowercased() {
+            let started = sampleMs - Int64(flow.ageMs)
+            if started > eventMs + grace { continue }
+            if let ended = flow.endedMsAgo, sampleMs - Int64(ended) + grace < eventMs { continue }
+            return true
+        }
+        return complete && eventMs <= sampleMs - grace ? false : nil
+    }
+}
+
 /// SOCKS5 server (RFC 1928 CONNECT + RFC 1929 username/password) that dials out over cellular only.
 final class RelayServer {
     let queue = DispatchQueue(label: "com.immortal.violet.relay.net")
@@ -50,6 +84,64 @@ final class RelayServer {
         self.port = port
         self.tryPort = port
         self.credentials = (username, password)
+    }
+
+    private struct ObservedFlow {
+        let peer: NWEndpoint.Host
+        let target: String
+        let start = ProcessInfo.processInfo.systemUptime
+        var ended: TimeInterval?
+        var up: UInt64 = 0
+        var down: UInt64 = 0
+    }
+    private var observed: [Int: ObservedFlow] = [:]
+    private var nextFlow = 0
+    private var incompleteUntil: TimeInterval = 0
+
+    fileprivate func beginFlow(peer: NWEndpoint.Host, target: String) -> Int {
+        let now = ProcessInfo.processInfo.systemUptime
+        observed = observed.filter { $0.value.ended.map { now - $0 < 180 } ?? true }
+        if observed.count >= 256, let oldest = observed.keys.min() {
+            observed.removeValue(forKey: oldest)
+            incompleteUntil = now + 180
+        }
+        nextFlow += 1
+        observed[nextFlow] = ObservedFlow(peer: peer, target: target.lowercased())
+        return nextFlow
+    }
+
+    fileprivate func transfer(_ id: Int, bytes: Int, up: Bool) {
+        if up { observed[id]?.up += UInt64(bytes) } else { observed[id]?.down += UInt64(bytes) }
+    }
+
+    fileprivate func endFlow(_ id: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if observed[id] == nil { incompleteUntil = now + 180 }
+        observed[id]?.ended = now
+    }
+
+    fileprivate func evidence(for peer: NWEndpoint.Host) -> Data {
+        let now = ProcessInfo.processInfo.systemUptime
+        #if os(iOS)
+        let source = "iPhone"
+        #else
+        let source = "Mac"
+        #endif
+        var flows = observed.compactMap { id, f -> RelayFlowSnapshot.Flow? in
+            guard f.peer == peer, f.ended.map({ now - $0 < 180 }) ?? true else { return nil }
+            return .init(id: id, target: f.target, ageMs: Int((now - f.start) * 1000),
+                         up: f.up, down: f.down, endedMsAgo: f.ended.map { Int((now - $0) * 1000) })
+        }.sorted { $0.id > $1.id }
+        var complete = now >= incompleteUntil && !sessions.values.contains { session in
+            session.peer == peer && session.observationID.map { observed[$0] == nil } == true
+        }
+        while true {
+            let snapshot = RelayFlowSnapshot(source: source, complete: complete, flows: flows)
+            if let data = try? JSONEncoder().encode(snapshot), data.count <= 3000 { return data }
+            guard !flows.isEmpty else { return Data() }
+            flows.removeLast(max(1, flows.count / 4))
+            complete = false
+        }
     }
 
     func start() {
@@ -148,9 +240,15 @@ final class RelayServer {
         user == credentials.user && pass == credentials.pass
     }
 
-    /// Change the relay password (a new pairing). Existing sessions keep running.
+    /// New credentials start a fresh observation history. Existing data streams can finish.
     func setPassword(_ password: String) {
-        queue.async { self.credentials.pass = password }
+        queue.async {
+            guard self.credentials.pass != password else { return }
+            for session in Array(self.sessions.values) { session.pairingChanged() }
+            self.observed.removeAll()
+            self.incompleteUntil = 0
+            self.credentials.pass = password
+        }
     }
 }
 
@@ -181,6 +279,12 @@ final class Socks5Session {
     #if os(macOS)
     private var flowId: Int?
     #endif
+    private var currentPairing = false
+    fileprivate var observationID: Int?
+    fileprivate var peer: NWEndpoint.Host? {
+        if case .hostPort(let host, _) = client.endpoint { return host }
+        return nil
+    }
     private var upDone = false, downDone = false
     var onFinish: (() -> Void)?
 
@@ -211,7 +315,7 @@ final class Socks5Session {
             finish("handshake timeout")
         case "connecting" where idle > Self.connectTimeout:
             fail(.ttlExpired, "connect to \(target) timed out")
-        case "relay" where idle > Self.idleTimeout:
+        case "evidence" where idle > Self.handshakeTimeout, "relay" where idle > Self.idleTimeout:
             finish(nil)  // quiet idle close
         default:
             break
@@ -263,6 +367,7 @@ final class Socks5Session {
                         let u = String(decoding: user, as: UTF8.self)
                         let p = String(decoding: pass, as: UTF8.self)
                         if self.server.checkCredentials(user: u, pass: p) {
+                            self.currentPairing = true
                             self.write([0x01, 0x00]) { self.readRequest() }
                         } else {
                             self.counters.authFailures += 1
@@ -283,6 +388,11 @@ final class Socks5Session {
                 self.read(2) { p in
                     let port = UInt16(p[0]) << 8 | UInt16(p[1])
                     guard cmd == 0x01 else { return self.fail(.commandNotSupported, "command \(cmd) not supported") }
+                    if case .name(let name, _) = host, name.lowercased() == "shield-flows.violet" {
+                        guard port == 7001, self.currentPairing, self.peer != nil else { return self.fail(.notAllowed, nil) }
+                        self.phase = "evidence"
+                        return self.write([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]) { self.readEvidenceRequest() }
+                    }
                     if case .name("time.violet", _) = host { return self.sendTime() }
                     if case .name(let name, _) = host,
                        name.lowercased() == "sentinel.violet" || name.lowercased() == "sentinel.violet." {
@@ -319,6 +429,7 @@ final class Socks5Session {
     private func connect(host: NWEndpoint.Host, port: UInt16) {
         target = "\(host):\(port)"
         targetHost = Self.name(of: host)
+        if currentPairing, let peer { observationID = server.beginFlow(peer: peer, target: "\(targetHost):\(port)") }
         #if os(macOS)
         flowId = Shield.shared.flowStarted(host: targetHost, port: port)
         #endif
@@ -396,6 +507,15 @@ final class Socks5Session {
         }
     }
 
+    private func readEvidenceRequest() {
+        read(1) { request in
+            guard request[0] == 1, let peer = self.peer else { return self.finish("invalid flow request") }
+            let data = self.server.evidence(for: peer)
+            let size = data.count
+            self.write([UInt8(truncatingIfNeeded: size), UInt8(size >> 8)] + data) { self.readEvidenceRequest() }
+        }
+    }
+
     private func sendInvitation(_ invitation: (@escaping (String?) -> Void) -> Void) {
         invitation { [weak self] code in
             guard let self else { return }
@@ -424,6 +544,12 @@ final class Socks5Session {
         }
     }
     #endif
+
+    fileprivate func pairingChanged() {
+        currentPairing = false
+        observationID = nil
+        if phase == "evidence" { finish(nil) }
+    }
 
     func abort(_ why: String) {
         finish(why)
@@ -488,6 +614,7 @@ final class Socks5Session {
             guard let self, !self.finished else { return }
             if let data, !data.isEmpty {
                 self.lastActivity = Date()
+                if let id = self.observationID { self.server.transfer(id, bytes: data.count, up: up) }
                 if up { self.counters.bytesUp += UInt64(data.count) } else { self.counters.bytesDown += UInt64(data.count) }
                 #if os(macOS)
                 if let id = self.flowId { Shield.shared.flowBytes(id, up: up ? data.count : 0, down: up ? 0 : data.count) }
@@ -516,6 +643,7 @@ final class Socks5Session {
     private func finish(_ error: String?) {
         guard !finished else { return }
         finished = true
+        if let id = observationID { server.endFlow(id) }
         if let error { counters.noteError(error) }
         #if os(macOS)
         if let id = flowId { Shield.shared.flowEnded(id) }
