@@ -202,6 +202,49 @@ def build_c(folder, out):
     subprocess.run([clang, *flags, "-O2", *link, *sources, "-lm", *tail, "-o", out], check=True)
 
 
+# The dynamic loader the Open Runtime runs (runtime/open/elf.rs): musl's libc.so.
+LOADER = "lib/ld-musl-armhf.so.1"
+
+
+def musl_loader():
+    """musl's shared libc.so, which is also its dynamic loader, built once
+    (out of tree, from the musl source tools/build_python.py fetches) into
+    build/open-toolchain/musl-shared. Only images that set VIOLET_OPEN_LDSO=1
+    (make test-abi) ship it, as /lib/ld-musl-armhf.so.1."""
+    work = ROOT / "build/open-toolchain/musl-shared"
+    lib = work / "lib/libc.so"
+    if lib.exists():
+        return lib
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_python
+    source = build_python.fetch(build_python.MUSL)
+    b = build_python.ndk_bin()
+    builtins = next(b.parent.glob("lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
+    tools = {"AR": str(b / "llvm-ar"), "RANLIB": str(b / "llvm-ranlib")}
+    work.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, CC=f"{b / 'clang'} {build_python.FLAGS}", **tools)
+    subprocess.run([source / "configure", "--prefix=/", "--target=arm-linux-musleabihf", "--disable-static"],
+                   cwd=work, env=env, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["make", f"-j{os.cpu_count()}", *[f"{k}={v}" for k, v in tools.items()], f"LIBCC={builtins}", "lib/libc.so"],
+                   cwd=work, check=True, stdout=subprocess.DEVNULL)
+    return lib
+
+
+def build_c_dynamic(folder, out):
+    """A C program linked against musl's libc.so, run by /lib/ld-musl-armhf.so.1
+    (a folder with a file named "dynamic"; only with VIOLET_OPEN_LDSO=1)."""
+    if os.environ.get("VIOLET_OPEN_LDSO") != "1":
+        raise SystemExit("dynamically linked programs need VIOLET_OPEN_LDSO=1")
+    clang, flags, _, _ = c_toolchain()
+    sysroot = ROOT / "build/open-toolchain/sysroot"
+    lib = musl_loader()
+    builtins = next(Path(clang).parent.parent.glob("lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
+    sources = sorted(str(p) for p in folder.glob("*.c"))
+    subprocess.run([clang, *flags, "-O2", "-fPIE", "-pie", "-fuse-ld=lld", "-nostdlib", sysroot / "lib/Scrt1.o",
+                    sysroot / "lib/crti.o", *sources, f"-L{lib.parent}", "-lc", builtins, sysroot / "lib/crtn.o",
+                    f"-Wl,-dynamic-linker,/{LOADER}", "-o", out], check=True)
+
+
 def root_certificates():
     """The build machine's trusted roots: the macOS system store (its
     /etc/ssl/cert.pem is a smaller, older set) or the Linux bundle."""
@@ -215,6 +258,73 @@ def root_certificates():
         if Path(bundle).is_file():
             return Path(bundle).read_bytes()
     return b""
+
+
+# An app's manifest: what it may use (runtime/open/policy.rs). "caps:" names
+# capabilities, "data:" files directly in /data it shares; '#' starts a comment.
+# An app without one gets only its own /data, the screen and touch.
+MANIFEST = "manifest.txt"
+CAPS = ("net", "audio-out", "mic", "camera", "hci", "wifi-admin", "system")
+SHARE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,22}")
+SERVE = ("apps", "lan")
+
+
+def read_manifest(text, where, others=()):
+    """The manifest's lines, checked: a typo here would silently take a power
+    away (or, in a shared name, hand another app's files out), so it fails the build."""
+    out = []
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, sep, rest = line.partition(":")
+        words = rest.replace(",", " ").split()
+        if not sep or key.strip() not in ("caps", "data", "tmp", "serve"):
+            raise SystemExit(f"{where}:{n}: expected 'caps: ...', 'data: ...', 'tmp: ...' or 'serve: ...'")
+        if key.strip() == "serve":
+            # Who its sockets serve (runtime/open/loopback.rs serve_words):
+            # other apps over loopback, and the network on the wildcard.
+            bad = [w for w in words if w not in SERVE]
+            if bad:
+                raise SystemExit(f"{where}:{n}: unknown serve: words {bad} (known: {' '.join(SERVE)})")
+        elif key.strip() == "caps":
+            bad = [w for w in words if w not in CAPS]
+            if bad:
+                raise SystemExit(f"{where}:{n}: unknown capabilities {bad} (known: {' '.join(CAPS)})")
+        elif key.strip() == "tmp":
+            # Reserved /tmp names (.NAME and .NAME.*): only image apps that list them.
+            bad = [w for w in words if not (w.startswith(".") and SHARE.fullmatch(w[1:]))]
+            if bad:
+                raise SystemExit(f"{where}:{n}: a tmp: name starts with '.' (got {bad})")
+        else:
+            for w in words:
+                owner = w.split(".", 1)[0]
+                if not SHARE.fullmatch(w) or owner in others:
+                    raise SystemExit(f"{where}:{n}: cannot share /data/{w} (a hidden name, a path, or another app's own)")
+        out.append(f"{key.strip()}: {' '.join(words)}")
+    return out
+
+
+def pack_manifests(apps):
+    """/apps/.manifests: "@NAME", then that app's checked manifest lines."""
+    names = {a.name for a in apps}
+    text = ""
+    for a in sorted(apps, key=lambda a: a.name):
+        m = a / MANIFEST
+        if m.exists():
+            lines = read_manifest(m.read_text(), m, names - {a.name})
+            text += f"@{a.name}\n" + "".join(line + "\n" for line in lines)
+    return text
+
+
+def envelope(manifest_text, program):
+    """An Agent-built program with its manifest after it (the manifest, its
+    u16 LE length, "VMF1"), as runtime/open/policy.rs `envelope` reads it.
+    At the end, so the program still starts as itself (the Mac tells a
+    Python app by its "#!")."""
+    import struct
+    body = "".join(line + "\n" for line in read_manifest(manifest_text, "manifest")).encode()
+    return program + body + struct.pack("<H", len(body)) + b"VMF1"
 
 
 def entry(name, data, mode, mtime=0):
@@ -277,7 +387,7 @@ def main(out, python=True, compress=False, skip=()):
         if (app / "main.c").exists():
             binary = work / app.name
             try:
-                build_c(app, binary)
+                (build_c_dynamic if (app / "dynamic").exists() else build_c)(app, binary)
             except (SystemExit, StopIteration) as e:
                 print(f"skipping {app.name}: {e}", file=sys.stderr)
                 continue
@@ -293,7 +403,7 @@ def main(out, python=True, compress=False, skip=()):
             files[f"apps/{app.name}"] = (binary.read_bytes(), 0o100755)
             continue
         for path in sorted(app.rglob("*")):
-            if path.is_file():
+            if path.is_file() and path != app / MANIFEST:
                 rel = f"apps/{app.name}/{path.relative_to(app)}"
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
     # Apps with an app.txt get an icon on Home under their titles (a script
@@ -302,6 +412,8 @@ def main(out, python=True, compress=False, skip=()):
     titles = [f"{a.name}\t{(a / 'app.txt').read_text().strip()}" for a in apps
               if (a / "app.txt").exists() and built(a.name)]
     files["apps/.home"] = ("\n".join(titles).encode() + b"\n", 0o100644)
+    # What each app may use (its manifest.txt), in one file only the image provides.
+    files["apps/.manifests"] = (pack_manifests([a for a in apps if a.is_dir() and built(a.name)]).encode(), 0o100644)
     # Name lookups go to the Open Runtime's own DNS answerer; certificates for TLS.
     files["etc/resolv.conf"] = (b"nameserver 10.0.0.53\noptions attempts:2 timeout:2\n", 0o100644)
     files["etc/hosts"] = (b"127.0.0.1 localhost\n", 0o100644)
@@ -319,11 +431,14 @@ def main(out, python=True, compress=False, skip=()):
             if path.is_file():
                 rel = str(path.relative_to(extra))
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
+    # musl's dynamic loader, for dynamically linked programs (make test-abi).
+    if os.environ.get("VIOLET_OPEN_LDSO") == "1":
+        files[LOADER] = (musl_loader().read_bytes(), 0o100755)
     # The loader refuses programs that break W^X: fail here, not on the phone.
     # Programs that are not position-independent keep a fixed code address.
     sys.path.insert(0, str(ROOT / "tools"))
     import elf_check
-    fixed = elf_check.check({name: data for name, (data, _) in files.items() if name.startswith(("apps/", "bin/"))})
+    fixed = elf_check.check({name: data for name, (data, _) in files.items() if name.startswith(("apps/", "bin/", LOADER))})
     if fixed:
         print(f"fixed code address (not PIE; stack, heap and mappings still move): {' '.join(fixed)}", file=sys.stderr)
     blob = bytearray()

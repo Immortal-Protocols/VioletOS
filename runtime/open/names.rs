@@ -195,7 +195,9 @@ impl Names {
 }
 
 /// Answer a DNS question (RFC 1035): an A record gets the name's stand-in
-/// address, every other type no records (so programs fall back from AAAA).
+/// address, every other type no records (so programs fall back from AAAA:
+/// there is no IPv6 route; sockaddr.rs takes IPv4-mapped addresses), and
+/// localhost its loopback addresses (127.0.0.1, ::1).
 /// None for anything that is not one well-formed question.
 pub fn answer(names: &mut Names, owner: u32, query: &[u8], live: &mut dyn FnMut(u32) -> bool) -> Option<Vec<u8>> {
     if query.len() < 12 || query.len() > MAX_QUERY || query[2] & 0x80 != 0 || u16::from_be_bytes([query[4], query[5]]) != 1 {
@@ -227,7 +229,25 @@ pub fn answer(names: &mut Names, owner: u32, query: &[u8], live: &mut dyn FnMut(
     // A response, recursion desired and available, one question.
     r.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
     r.extend_from_slice(question);
-    if qtype == 1 && !name.is_empty() {
+    // "localhost" and names under it (RFC 6761) are this phone: the loopback
+    // addresses, never a stand-in, never a question for Radio or a relay.
+    let normal = normalise(&name);
+    let local = normal.as_deref().is_some_and(|n| n == "localhost" || n.ends_with(".localhost"));
+    if local && (qtype == 1 || qtype == 28) {
+        r[7] = 1;
+        let v4 = qtype == 1;
+        r.extend_from_slice(&[0xc0, 12, 0, qtype as u8, 0, 1, 0, 0, 0, 60, 0, if v4 { 4 } else { 16 }]);
+        if v4 {
+            r.extend_from_slice(&[127, 0, 0, 1]);
+        } else {
+            r.extend_from_slice(&[0; 15]);
+            r.push(1);
+        }
+    } else if qtype != 1 && !name.is_empty() && normal.is_none() {
+        // AAAA and every other type: no records (programs fall back to A),
+        // but a name that cannot be one is NXDOMAIN, as its A question is.
+        r[3] |= NXDOMAIN;
+    } else if qtype == 1 && !name.is_empty() {
         match names.resolve(owner, &name, live) {
             Ok(ip) => {
                 r[7] = 1;
@@ -442,6 +462,49 @@ mod tests {
             assert_eq!((r[3] & 15, r[7]), (0, 0));
         }
         assert_eq!(n.len(), 0);
+    }
+
+    #[test]
+    fn dns_aaaa_falls_back_cleanly() {
+        let mut n = Names::new();
+        // A name that can be one: no records and no error, so a resolver that
+        // asked A and AAAA together keeps the A answer; nothing is allocated.
+        let r = answer(&mut n, 100, &question("v6first.example", 28), &mut none()).unwrap();
+        assert_eq!((r[3] & 15, r[7], r.len()), (0, 0, question("v6first.example", 28).len()));
+        assert_eq!(n.len(), 0);
+        // One that cannot be: NXDOMAIN, as its A question gets.
+        for bad in ["10.0.0.9", "bad name.example", "0x7f000001"] {
+            for qtype in [1u16, 28] {
+                let r = answer(&mut n, 100, &question(bad, qtype), &mut none()).unwrap();
+                assert_eq!((r[3] & 15, r[7]), (NXDOMAIN, 0), "{} {}", bad, qtype);
+            }
+        }
+        // The A answer for the same name still works and is unchanged by the AAAA.
+        let a = answer(&mut n, 100, &question("v6first.example", 1), &mut none()).unwrap();
+        assert_eq!(a[7], 1);
+        assert_eq!(n.len(), 1);
+    }
+
+    #[test]
+    fn dns_localhost_is_loopback_not_a_stand_in() {
+        let mut n = Names::new();
+        for name in ["localhost", "LocalHost.", "app.localhost"] {
+            let q = question(name, 1);
+            let r = answer(&mut n, 100, &q, &mut none()).unwrap();
+            assert_eq!((r[3] & 15, r[7]), (0, 1), "{}", name);
+            assert_eq!(&r[q.len()..], &[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+            let q6 = question(name, 28);
+            let r6 = answer(&mut n, 100, &q6, &mut none()).unwrap();
+            assert_eq!((r6[3] & 15, r6[7]), (0, 1));
+            let rr = &r6[q6.len()..];
+            assert_eq!(&rr[..12], &[0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+            assert_eq!(&rr[12..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        }
+        // Not a name lookalike.
+        let r = answer(&mut n, 100, &question("notlocalhost", 1), &mut none()).unwrap();
+        let ip = u32::from_be_bytes(r[r.len() - 4..].try_into().unwrap());
+        assert!(is_stand_in(ip));
+        assert_eq!(n.len(), 1);
     }
 
     #[test]

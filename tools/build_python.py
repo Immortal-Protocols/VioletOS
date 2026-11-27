@@ -113,11 +113,17 @@ def build_python():
     # Answers configure cannot find out by running target programs.
     # Modules a phone app does not need, left out so Python fits the handset's app
     # space (tools/build_python_package.py): the CJK codecs alone are over a megabyte.
+    # _posixsubprocess stays: subprocess (and so asyncio) imports it, and the
+    # Open Runtime runs fork, vfork and execve.
     unused = ["_codecs_cn", "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
               "_multibytecodec", "_xxsubinterpreters", "_xxinterpchannels", "_lsprof", "spwd", "syslog",
-              "termios", "_posixshmem", "_multiprocessing", "_crypt", "audioop", "_posixsubprocess"]
-    site.write_text("ac_cv_file__dev_ptmx=no\nac_cv_file__dev_ptc=no\nac_cv_buggy_getaddrinfo=no\n" +
-                    "".join(f"py_cv_module_{m}=n/a\n" for m in unused))
+              "termios", "_posixshmem", "_multiprocessing", "_crypt", "audioop"]
+    answers = ("ac_cv_file__dev_ptmx=no\nac_cv_file__dev_ptc=no\nac_cv_buggy_getaddrinfo=no\n" +
+               "".join(f"py_cv_module_{m}=n/a\n" for m in unused))
+    # Configure again when the answers change (a module added or left out).
+    if not site.exists() or site.read_text() != answers:
+        (build / "Makefile").unlink(missing_ok=True)
+    site.write_text(answers)
     # pkg-config sees only the target's libraries, never the Mac's.
     env = dict(os.environ, CC=str(cc), AR=str(b / "llvm-ar"), RANLIB=str(b / "llvm-ranlib"),
                READELF=str(b / "llvm-readelf"), CONFIG_SITE=str(site),

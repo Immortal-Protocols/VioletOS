@@ -53,13 +53,20 @@ pub struct State {
     pub running: HashSet<String>,
     pub pressed: Option<usize>,
     pub launch_error: Option<String>,
+    /// The newest notification an app posted ("notifications" in
+    /// /dev/violet/sys, which only Home may read, and not while locked).
+    pub notice: Option<String>,
+    /// A passcode is set ("passcode" in /dev/violet/sys): Home shows Lock,
+    /// which locks the phone now ("lock").
+    pub can_lock: bool,
     pub shield: Shield,
     /// The voice agent is listening (in front or in the background).
     pub listening: bool,
 }
 
-/// What a press landed on: an app, or the Shield pill.
+/// What a press landed on: an app, the Shield pill, or Lock.
 pub const PILL: usize = usize::MAX;
+pub const LOCK: usize = usize::MAX - 1;
 
 pub const MAX_APPS: usize = 15;
 const COLUMNS: [i32; 3] = [144, 360, 572];
@@ -88,9 +95,17 @@ pub fn pill_rect() -> Rect {
     Rect::new(398, 100, 674, 182)
 }
 
+/// Lock, under the pill, on the notification line's right.
+pub fn lock_rect() -> Rect {
+    Rect::new(538, 204, 674, 268)
+}
+
 pub fn hit(s: &State, x: i32, y: i32) -> Option<usize> {
     if s.shield.known && pill_rect().contains(x, y) {
         return Some(PILL);
+    }
+    if s.can_lock && lock_rect().contains(x, y) {
+        return Some(LOCK);
     }
     (0..s.apps.len()).find(|&i| tile_rect(i, &s.apps).contains(x, y))
 }
@@ -99,6 +114,8 @@ pub fn hit(s: &State, x: i32, y: i32) -> Option<usize> {
 pub fn region(s: &State, pressed: usize) -> Rect {
     if pressed == PILL {
         pill_rect().inset(-12)
+    } else if pressed == LOCK {
+        lock_rect().inset(-4)
     } else {
         let tile = tile_rect(pressed, &s.apps);
         Rect::new(tile.x0 - 14, tile.y0, tile.x1 + 14, tile.y1 + 6)
@@ -161,9 +178,21 @@ pub fn draw(c: &mut Canvas, f: &Fonts, art: &Art, s: &State) {
         c.arc(mx, top + 15.0, 11.0, 3.0, -std::f32::consts::PI, 0.0, paper::GOOD);
         c.line(mx, top + 26.0, mx, top + 31.0, 3.0, paper::GOOD);
     }
+    // The line under the date stops short of Lock when it is shown.
+    let line = if s.can_lock { lock_rect().x0 - 70 } else { W as i32 - 100 };
     if let Some(message) = &s.launch_error {
         let face = f.regular(29.0);
-        face.draw(c, &face.fit(message, W as i32 - 100), 50, 250, paper::ALERT);
+        face.draw(c, &face.fit(message, line), 50, 250, paper::ALERT);
+    } else if let Some(notice) = &s.notice {
+        let face = f.regular(29.0);
+        face.draw(c, &face.fit(notice, line), 50, 250, MUTED);
+    }
+    if s.can_lock {
+        let r = lock_rect();
+        let pressed = s.pressed == Some(LOCK);
+        c.round_rect(r, 32.0, if pressed { rgb(0x43, 0x3a, 0x4a) } else { rgb(0x28, 0x25, 0x21) });
+        let face = f.regular(30.0);
+        face.centered(c, "Lock", r.x0, r.x1, r.y0 + 43, if pressed { MUTED } else { CREAM });
     }
     let label = f.regular(32.0);
     for (i, a) in s.apps.iter().enumerate() {

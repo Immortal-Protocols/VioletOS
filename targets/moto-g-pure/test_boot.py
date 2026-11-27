@@ -186,8 +186,9 @@ with TemporaryDirectory() as tmp:
         # This guest has no Moto eMMC or touch controller. Check the first
         # displayed Home frame itself, past the supervisor's start marker.
         if args.diagnostics_trial != "confirm":
-            # (Home is an open app: its paper background, top left and mid-screen.)
-            for x, y, color in [(0, 0, 0xff2c2b26), (160 * 3, 55 * 4, 0xff2b2a27)]:
+            # (Home is an open app: the runtime's trusted band over its top
+            # rows, runtime/open/trusted_ui.rs, and Home's paper mid-screen.)
+            for x, y, color in [(0, 0, 0xff0c0a10), (160 * 3, 55 * 4, 0xff2b2a27)]:
                 address = 0x79450000 + 4 * (720 * y + x)
                 while True:
                     value = command("human-monitor-command", {"command-line": f"xp /1wx {address:#x}"})

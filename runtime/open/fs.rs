@@ -161,6 +161,11 @@ impl Fs {
     pub fn from_layer(&self, path: &str) -> bool {
         self.layer.contains_key(path)
     }
+    /// A file as the boot image (or a package) has it, whatever was written
+    /// over it since: for what only the image may say (/apps/.manifests).
+    pub fn image_contents(&self, path: &str) -> Option<&'static [u8]> {
+        self.image.get(path).map(|e| e.data)
+    }
 
     pub fn stat(&self, path: &str) -> Option<Stat> {
         if path.starts_with("/dev/violet/") || matches!(path, "/dev/null" | "/dev/urandom" | "/dev/random" | "/dev/tty") {

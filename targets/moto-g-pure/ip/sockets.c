@@ -10,12 +10,13 @@
 // that fit the 49 pages of a supervisor that says nothing). Slot headers of
 // 512 bytes follow from page 1, 16 words each: 0 command serial and
 // 1 command (Open Runtime), 2 serial done and 3 state and 4 error (Radio),
+// 15 connections waiting on a listening slot (Radio),
 // 5 IPv4 address and 6 port, 7 bytes queued to send and 9 bytes received in
 // total (written by their producers), 8 bytes sent and 10 bytes read (written
 // by their consumers), 11 shut down sending, 14 who the socket is for (0 the
 // Open Runtime itself, else an app; Radio only counts by it); from byte 64 a
 // host name to resolve instead of the address (up to 253 bytes and a NUL);
-// the rest is spare. Radio alone writes words 8, 9, 12 and 13, and empties
+// the rest is spare. Radio alone writes words 8, 9, 12, 13 and 15, and empties
 // them when it takes a command: until then (serial done != command serial)
 // they are the previous use's, and the Open Runtime reads nothing from the
 // receive ring (what it queues to send before then is the new use's, counted
@@ -28,7 +29,21 @@
 // (u8) and the name (sending only: a name is resolved instead of the
 // address), then the payload. Word 12 is the socket's local port and 13 the
 // address this phone has on the network. Through the phone's relay (SOCKS,
-// TCP only) a UDP slot fails with ENETUNREACH.
+// TCP only) a UDP slot fails with ENETUNREACH. A UDP slot binds the port in
+// word 6 (0: any).
+//
+// A listening slot (command 4) listens on the port in word 6, every address
+// of the phone, with the backlog in word 5 (at most LISTEN_BACKLOG): OPEN, word
+// 12 the port and 13 the phone's address. A connection that arrives waits,
+// parked in lwIP with its window shut (it holds none of Radio's receive
+// buffers), until an accept takes it or PARK_MS pass; word 15 says
+// how many wait. An accepting slot (command 5) takes the oldest waiting on the
+// listening slot in word 5, if that slot is the same owner's: OPEN (or
+// PEER_CLOSED) with the peer's port in word 12 and its address in 13, or
+// FAILED with EAGAIN when none waits. The phone's relay carries outgoing
+// connections only: there a listen fails with EOPNOTSUPP. Waiting connections
+// rank below every slot's (lwIP gives them up to a slot's connect) and above
+// closing ones; at most PARKED wait on the phone, PARKED_EACH for one owner.
 //
 // Nothing here waits. A connect is a state machine stepped once per call of
 // open_sockets_poll (resolve, connect, then the relay's handshake), each step
@@ -44,17 +59,30 @@
 #include "lwip/udp.h"
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"
+// tcp_ack_now (to advertise a parked connection's shut window at once).
+#ifndef tcp_ack_now
+#include "lwip/priv/tcp_priv.h"
+#endif
 #include <string.h>
 
 enum { SLOTS = 32, TX = 8192, RX = 16384, STRIDE = TX + RX };
 enum { HEADERS = 0x1000, HEADER = 512, NAME = 256, RINGS_A = 0x5000, FIRST = 9, RINGS_B = 0x43000 };
 enum { MAGIC = 0x3254454e };  // "NET2"
-enum { CMD_CONNECT = 1, CMD_CLOSE = 2, CMD_UDP = 3 };
+enum { CMD_CONNECT = 1, CMD_CLOSE = 2, CMD_UDP = 3, CMD_LISTEN = 4, CMD_ACCEPT = 5 };
 enum { IDLE, CONNECTING, OPEN, PEER_CLOSED, FAILED };
 enum {
-  E_NONAME = 2, E_INVALID = 22, E_NETUNREACH = 101, E_RESET = 104, E_NOBUFS = 105, E_TIMEOUT = 110,
-  E_REFUSED = 111, E_UNREACH = 113
+  E_NONAME = 2, E_AGAIN = 11, E_INVALID = 22, E_OPNOTSUPP = 95, E_ADDRINUSE = 98, E_NETUNREACH = 101, E_RESET = 104,
+  E_NOBUFS = 105, E_TIMEOUT = 110, E_REFUSED = 111, E_UNREACH = 113
 };
+// Connections waiting to be accepted: on the phone, and on one listener.
+// They (and the handshakes before them) have a priority above a closing
+// connection's (drop) and below every slot's: lwIP gives a closing
+// connection up to an arriving one, and an arriving one to a slot's connect.
+// One owner (an app, word 14) may have at most PARKED_EACH waiting, so one
+// app with two listeners and a peer that keeps dialling in cannot leave every
+// other app's listener resetting what arrives. A connection not accepted in
+// PARK_MS is reset: an app that never accepts holds nothing for long.
+enum { PARKED = 8, PARKED_EACH = PARKED / 2, LISTEN_BACKLOG = 4, PARKED_PRIO = TCP_PRIO_MIN + 1, PARK_MS = 10000 };
 enum { MAX_DATAGRAM = 1472, MAX_NAME = 253 };
 // How long a step of a connect may take.
 enum { RESOLVE_MS = 5000, CONNECT_MS = 8000, RELAY_MS = 5000 };
@@ -68,12 +96,12 @@ enum { LEGACY_EXTENT = 0x31000, MAX_EXTENT = 0x100000 };
 // most ASKS_EACH out, all apps together APP_ASKS, which leaves lwIP's table
 // (DNS_TABLE_SIZE) ASKS_EACH for the Open Runtime's own sockets and the rest
 // for Radio itself.
-enum { ASKS_EACH = 4, APP_ASKS = 32, ASKS = APP_ASKS + ASKS_EACH };
+enum { ASKS_EACH = 3, APP_ASKS = 36, ASKS = APP_ASKS + ASKS_EACH };
 _Static_assert(DNS_TABLE_SIZE >= ASKS + 4, "lwIP's table of names is smaller than the questions slots may ask");
 
 struct slot {
   unsigned cmd_seq, cmd, done_seq, state, error, ip, port, tx_head, tx_tail, rx_head, rx_tail, shut;
-  unsigned local_port, local_ip, owner, reserved;
+  unsigned local_port, local_ip, owner, waiting;
   char name[NAME];
   unsigned char spare[HEADER - 64 - NAME];
 };
@@ -82,7 +110,7 @@ _Static_assert(sizeof(struct slot) == HEADER, "slot header size");
 _Static_assert(RX >= TCP_WND, "receive ring smaller than the TCP window");
 
 // Where a slot's connect has got to.
-enum { P_IDLE, P_RESOLVE, P_CONNECT, P_HELLO, P_AUTH, P_REPLY, P_UP };
+enum { P_IDLE, P_RESOLVE, P_CONNECT, P_HELLO, P_AUTH, P_REPLY, P_UP, P_LISTEN };
 // A name lookup: not asked, asked, answered, failed.
 enum { D_NONE, D_WAIT, D_OK, D_FAILED };
 
@@ -90,6 +118,8 @@ static volatile unsigned *page;
 static struct state {
   struct tcp_pcb *pcb;
   struct udp_pcb *udp;
+  // A listening slot's lwIP listener.
+  struct tcp_pcb *listener;
   ip_addr_t addr;
   // When the current step gives up (radio_monotonic_ms).
   unsigned deadline;
@@ -103,8 +133,18 @@ static struct state {
   unsigned owner;
   // The question this slot waits on, plus one (asks[]).
   unsigned char ask;
-  unsigned char phase, dns, sent, connected, failed, eof, relay, waiting, shut;
+  unsigned char phase, dns, sent, connected, failed, eof, relay, waiting, shut, backlog;
 } s[SLOTS];
+// Connections that came to a listening slot, waiting for an accept.
+static struct parked {
+  struct tcp_pcb *pcb;
+  // Counts the entry's uses (as a slot's gen), and the order they came in.
+  unsigned gen, order;
+  // When it came (radio_monotonic_ms).
+  unsigned since;
+  unsigned char used, listener, eof;
+} parked[PARKED];
+static unsigned arrivals;
 static struct ask {
   unsigned owner, gen;
   // The slot waiting for the answer, or -1 once it has moved on.
@@ -145,8 +185,53 @@ static int tagged(void *arg) {
   return i < SLOTS && s[i].gen == v >> 8 ? (int)i : -1;
 }
 
+// A parked connection's tag: its entry and the entry's use count.
+static void *park_tag(int k) { return (void *)(uintptr_t)((unsigned)k | parked[k].gen << 8); }
+static int park_tagged(void *arg) {
+  unsigned v = (unsigned)(uintptr_t)arg, k = v & 255;
+  return k < PARKED && parked[k].used && parked[k].gen == v >> 8 ? (int)k : -1;
+}
+// Say how many connections wait on listening slot i.
+static void publish(int i) {
+  unsigned n = 0;
+  for (int k = 0; k < PARKED; k++) n += parked[k].used && parked[k].listener == i;
+  slot(i)->waiting = n;
+}
+// Let go of a parked entry (its connection is gone, or a slot has it now).
+static void unpark(int k) {
+  int i = parked[k].listener;
+  parked[k].used = 0;
+  parked[k].pcb = NULL;
+  parked[k].gen = (parked[k].gen + 1) & 0xffffff;
+  publish(i);
+}
+// Reset a waiting connection.
+static void reset_parked(int k) {
+  struct tcp_pcb *pcb = parked[k].pcb;
+  unpark(k);
+  tcp_arg(pcb, NULL);
+  tcp_recv(pcb, NULL);
+  tcp_err(pcb, NULL);
+  tcp_abort(pcb);
+}
+// The connections waiting on listening slot i, reset.
+static void unpark_all(int i) {
+  for (int k = 0; k < PARKED; k++)
+    if (parked[k].used && parked[k].listener == i) reset_parked(k);
+}
+// Those waiting on it for PARK_MS or more, reset.
+static void unpark_stale(int i, unsigned now) {
+  for (int k = 0; k < PARKED; k++)
+    if (parked[k].used && parked[k].listener == i && now - parked[k].since >= PARK_MS) reset_parked(k);
+}
+
 static void drop(int i) {
   if (s[i].udp) udp_remove(s[i].udp);
+  if (s[i].listener) {
+    unpark_all(i);
+    tcp_arg(s[i].listener, NULL);
+    tcp_close(s[i].listener);
+  }
   // The question it waits on stays lwIP's, and its owner's, until answered.
   if (s[i].ask) asks[s[i].ask - 1].slot = -1;
   if (s[i].pcb) {
@@ -474,13 +559,122 @@ static void on_datagram(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip
   pbuf_free(p);
 }
 
-static int udp_start(int i) {
+// 0, or the error a UDP slot fails with.
+static unsigned udp_start(int i) {
   s[i].udp = udp_new();
-  if (!s[i].udp) return 0;
-  if (udp_bind(s[i].udp, IP4_ADDR_ANY, 0) != ERR_OK) return 0;
+  if (!s[i].udp) return E_NOBUFS;
+  if (udp_bind(s[i].udp, IP4_ADDR_ANY, slot(i)->port & 0xffff) != ERR_OK) return E_ADDRINUSE;
   udp_recv(s[i].udp, on_datagram, tag(i));
   slot(i)->local_port = s[i].udp->local_port;
-  return 1;
+  return 0;
+}
+
+// A connection for listening slot i: parked, window shut, until an accept
+// takes it. Refused (lwIP resets it) past the slot's backlog, its owner's
+// PARKED_EACH or PARKED. Its window is shut at once (lwIP then drops and
+// acknowledges with a zero window whatever the peer sends, so none of it sits
+// in PBUF_POOL, which every frame Radio receives comes from); the peer sends
+// again once an accept opens it. Bytes that came with the handshake's last
+// segment, before the window was shut, are refused here and kept by lwIP:
+// at most one segment a parked connection.
+static err_t on_parked_received(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+  int k = park_tagged(arg);
+  if (k < 0) {
+    if (p) pbuf_free(p);
+    return ERR_OK;
+  }
+  if (!p) {
+    parked[k].eof = 1;
+    return ERR_OK;
+  }
+  // Not yet: lwIP keeps the bytes and offers them again once a slot has them.
+  return ERR_MEM;
+}
+static void on_parked_error(void *arg, err_t err) {
+  int k = park_tagged(arg);
+  if (k >= 0) unpark(k);
+}
+static err_t on_accept(void *arg, struct tcp_pcb *pcb, err_t err) {
+  int i = tagged(arg), free = -1;
+  unsigned mine = 0;
+  if (i < 0 || err != ERR_OK || !pcb || s[i].phase != P_LISTEN) return ERR_VAL;
+  for (int k = 0; k < PARKED; k++) {
+    if (!parked[k].used) free = free < 0 ? k : free;
+    else mine += parked[k].listener == i;
+  }
+  unsigned owners = 0;
+  for (int k = 0; k < PARKED; k++) owners += parked[k].used && s[parked[k].listener].owner == s[i].owner;
+  if (free < 0 || mine >= s[i].backlog || owners >= PARKED_EACH) return ERR_MEM;
+  parked[free] = (struct parked){pcb, parked[free].gen, arrivals++, radio_monotonic_ms(), 1, (unsigned char)i, 0};
+  pcb->rcv_wnd = 0;
+  pcb->rcv_ann_wnd = 0;
+  tcp_ack_now(pcb);
+  // lwIP counts it against the listener's backlog until accepted.
+  tcp_backlog_delayed(pcb);
+  tcp_setprio(pcb, PARKED_PRIO);
+  tcp_arg(pcb, park_tag(free));
+  tcp_recv(pcb, on_parked_received);
+  tcp_err(pcb, on_parked_error);
+  publish(i);
+  return ERR_OK;
+}
+// Listen on the port in word 6 with the backlog in word 5.
+static void listen_start(int i, unsigned online) {
+  volatile struct slot *q = slot(i);
+  unsigned port = q->port & 0xffff, backlog = q->ip;
+  if (online == 2) return fail(i, E_OPNOTSUPP);
+  if (!port) return fail(i, E_INVALID);
+  if (backlog < 1) backlog = 1;
+  if (backlog > LISTEN_BACKLOG) backlog = LISTEN_BACKLOG;
+  struct tcp_pcb *pcb = tcp_new();
+  if (!pcb) return fail(i, E_NOBUFS);
+  // A port the last listener's connections still hold in TIME_WAIT is free again.
+  ip_set_option(pcb, SOF_REUSEADDR);
+  tcp_setprio(pcb, PARKED_PRIO);
+  if (tcp_bind(pcb, IP4_ADDR_ANY, port) != ERR_OK) {
+    tcp_close(pcb);
+    return fail(i, E_ADDRINUSE);
+  }
+  err_t err;
+  struct tcp_pcb *l = tcp_listen_with_backlog_and_err(pcb, backlog, &err);
+  if (!l) {
+    tcp_close(pcb);
+    return fail(i, E_NOBUFS);
+  }
+  s[i].listener = l;
+  s[i].backlog = backlog;
+  s[i].phase = P_LISTEN;
+  tcp_arg(l, tag(i));
+  tcp_accept(l, on_accept);
+  q->local_port = port;
+  if (netif_default) q->local_ip = host_order(&netif_default->ip_addr);
+  q->state = OPEN;
+}
+// Give slot i the oldest connection waiting on the listening slot in word 5.
+static void accept_start(int i) {
+  volatile struct slot *q = slot(i);
+  unsigned l = q->ip;
+  int k = -1;
+  if (l >= count || s[l].phase != P_LISTEN || s[l].owner != s[i].owner) return fail(i, E_INVALID);
+  for (int n = 0; n < PARKED; n++)
+    if (parked[n].used && parked[n].listener == l && (k < 0 || (int)(parked[n].order - parked[k].order) < 0)) k = n;
+  if (k < 0) return fail(i, E_AGAIN);
+  struct tcp_pcb *pcb = parked[k].pcb;
+  s[i].eof = parked[k].eof;
+  unpark(k);
+  tcp_backlog_accepted(pcb);
+  tcp_setprio(pcb, TCP_PRIO_NORMAL);
+  // Open the window it was parked with: the peer sends (again) now.
+  if (pcb->rcv_wnd < TCP_WND) tcp_recved(pcb, TCP_WND - pcb->rcv_wnd);
+  s[i].pcb = pcb;
+  s[i].connected = 1;
+  s[i].phase = P_UP;
+  tcp_arg(pcb, tag(i));
+  tcp_recv(pcb, on_received);
+  tcp_err(pcb, on_error);
+  q->local_port = pcb->remote_port;
+  q->local_ip = host_order(&pcb->remote_ip);
+  q->state = s[i].eof ? PEER_CLOSED : OPEN;
 }
 
 // The Open Runtime has given the slot a new command since this poll looked:
@@ -569,6 +763,7 @@ static void renew(int i) {
   q->rx_head = 0;
   q->local_port = 0;
   q->local_ip = 0;
+  q->waiting = 0;
   barrier();
 }
 
@@ -584,11 +779,14 @@ static void command(int i, unsigned online, unsigned now) {
   q->state = CONNECTING;
   q->error = 0;
   if (cmd == CMD_UDP) {
-    if (online == 2 || !udp_start(i)) return fail(i, E_NETUNREACH);
+    unsigned e = online == 2 ? E_NETUNREACH : udp_start(i);
+    if (e) return fail(i, e);
     s[i].phase = P_UP;
     q->state = OPEN;
     return;
   }
+  if (cmd == CMD_LISTEN) return listen_start(i, online);
+  if (cmd == CMD_ACCEPT) return accept_start(i);
   if (cmd != CMD_CONNECT) return fail(i, E_INVALID);
   if (q->name[0]) {
     char name[NAME];
@@ -705,6 +903,9 @@ void open_sockets_poll(void *base, unsigned online) {
       // A connection this Radio does not have (it restarted): reset, not silence.
       unsigned state = q->state;
       if (state == CONNECTING || state == OPEN || state == PEER_CLOSED) fail(i, E_RESET);
+    } else if (s[i].phase == P_LISTEN) {
+      // Connections arrive by on_accept; accepts are commands.
+      unpark_stale(i, now);
     } else if (s[i].phase != P_UP) {
       advance(i, now);
     } else {

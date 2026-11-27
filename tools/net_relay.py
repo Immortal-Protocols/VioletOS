@@ -17,9 +17,20 @@ Agent pairing without setting environment variables.
 
 A UDP slot (command 3) is a Mac UDP socket; datagrams cross the rings framed
 as in net.rs. VIOLET_NET_UDP=0 refuses UDP, like a network that blocks it.
+A port the app bound (word 6) is what it is told it has (word 12); the Mac
+side takes any port (on loopback, the one VIOLET_NET_LISTEN maps it to), and
+`forwarded` maps the one to the other for tests.
+
+A listening slot (command 4) is a Mac listener on 127.0.0.1 (never the Mac's
+other addresses), on the port VIOLET_NET_LISTEN maps the app's port to
+({"8080": 18080}) or any; `forwarded` maps the app's port to it. Connections
+wait there, at most the backlog (word 5), word 15 counting them, until an
+accepting slot (command 5, word 5 the listener) of the same owner takes the
+oldest. With a SOCKS relay set, listening fails with EOPNOTSUPP, as through
+the phone's relay.
 
 As Radio does, the relay empties its side of a slot's rings (words 8, 9, 12,
-13) when it takes a command, and refuses a "name" that is an IPv4 address
+13, 15) when it takes a command, and refuses a "name" that is an IPv4 address
 written out: the Open Runtime never sends one, and the Mac's resolver would
 dial it as the address.
 
@@ -55,6 +66,9 @@ HEADERS, HEADER, NAME = 0x1000, 512, 256
 RINGS_A, FIRST, RINGS_B = 0x5000, 9, 0x43000
 SIZE = RINGS_B + (SLOTS - FIRST) * STRIDE
 IDLE, CONNECTING, OPEN, PEER_CLOSED, FAILED = range(5)
+CMD_CONNECT, CMD_CLOSE, CMD_UDP, CMD_LISTEN, CMD_ACCEPT = range(1, 6)
+# What one listener keeps waiting (sockets.c LISTEN_BACKLOG).
+LISTEN_BACKLOG = 4
 # How long a UDP datagram waits for its name to resolve.
 RESOLVE_SECONDS = 5
 
@@ -127,6 +141,11 @@ class Relay(threading.Thread):
         # and the name being looked up with the time to stop waiting for it.
         self.udp_names = [{} for _ in range(SLOTS)]
         self.udp_waiting = [None] * SLOTS
+        # Listening slots: (Mac listener, backlog, connections waiting, owner).
+        self.listening = [None] * SLOTS
+        # An app's bound or listening port -> the Mac's port, ("tcp"|"udp", port) keys.
+        self.forwarded = {}
+        self.listen_ports = {int(k): int(v) for k, v in json.loads(os.environ.get("VIOLET_NET_LISTEN", "{}")).items()}
         self.hosts = json.loads(os.environ.get("VIOLET_NET_HOSTS", "{}"))
         proxy = os.environ.get("VIOLET_NET_SOCKS")
         self.socks_proxy = None
@@ -143,6 +162,15 @@ class Relay(threading.Thread):
         struct.pack_into("<I", self.mem, HEADERS + slot * HEADER + 4 * i, v & 0xFFFFFFFF)
 
     def drop(self, slot):
+        if self.listening[slot]:
+            listener, _, waiting, _ = self.listening[slot]
+            for conn in [listener] + [c for c, _ in waiting]:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            self.listening[slot] = None
+        self.forwarded = {k: v for k, v in self.forwarded.items() if v[1] != slot}
         self.udp[slot] = False
         self.shut[slot] = False
         self.uses[slot] += 1
@@ -277,15 +305,76 @@ class Relay(threading.Thread):
             self.put(slot, 4, 101)
             self.put(slot, 3, FAILED)
             return
+        wanted = self.word(slot, 6) & 0xFFFF
+        if wanted and ("udp", wanted) in self.forwarded:
+            return self.fail(slot, 98)  # EADDRINUSE, as lwIP's udp_bind on a port a slot holds
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("0.0.0.0", 0))
+        try:
+            # A port VIOLET_NET_LISTEN maps is the test's, on loopback.
+            sock.bind(("127.0.0.1", self.listen_ports[wanted]) if wanted in self.listen_ports else ("0.0.0.0", 0))
+        except OSError:
+            sock.close()
+            return self.fail(slot, 98)
         sock.setblocking(False)
         self.socks[slot] = sock
         self.udp[slot] = True
-        self.put(slot, 12, sock.getsockname()[1])
+        if wanted:
+            self.forwarded[("udp", wanted)] = (sock.getsockname()[1], slot)
+        self.put(slot, 12, wanted or sock.getsockname()[1])
         self.put(slot, 13, struct.unpack(">I", socket.inet_aton(self.lan_address()))[0])
         self.put(slot, 4, 0)
         self.put(slot, 3, OPEN)
+
+    def listen(self, slot):
+        """A listening slot: a Mac listener on loopback for the app's port."""
+        port, backlog = self.word(slot, 6) & 0xFFFF, min(max(self.word(slot, 5), 1), LISTEN_BACKLOG)
+        if self.socks_proxy:
+            return self.fail(slot, 95)  # EOPNOTSUPP: the relay carries outgoing connections only
+        if not port or ("tcp", port) in self.forwarded:
+            return self.fail(slot, 22 if not port else 98)
+        try:
+            listener = socket.create_server(("127.0.0.1", self.listen_ports.get(port, 0)), backlog=backlog)
+        except OSError:
+            return self.fail(slot, 98)  # EADDRINUSE
+        listener.setblocking(False)
+        self.listening[slot] = (listener, backlog, [], self.word(slot, 14))
+        self.forwarded[("tcp", port)] = (listener.getsockname()[1], slot)
+        self.put(slot, 12, port)
+        self.put(slot, 13, struct.unpack(">I", socket.inet_aton(self.lan_address()))[0])
+        self.put(slot, 15, 0)
+        self.put(slot, 4, 0)
+        self.put(slot, 3, OPEN)
+
+    def accept(self, slot):
+        """Give a slot the oldest connection waiting on the listener in word 5."""
+        at = self.word(slot, 5)
+        held = self.listening[at] if at < SLOTS else None
+        if not held or held[3] != self.word(slot, 14):
+            return self.fail(slot, 22)  # EINVAL: not that owner's listener
+        if not held[2]:
+            return self.fail(slot, 11)  # EAGAIN: none waiting
+        conn, (host, port) = held[2].pop(0)
+        self.put(at, 15, len(held[2]))
+        conn.setblocking(False)
+        self.socks[slot] = conn
+        self.put(slot, 12, port)
+        self.put(slot, 13, struct.unpack(">I", socket.inet_aton(host))[0])
+        self.put(slot, 4, 0)
+        self.put(slot, 3, OPEN)
+
+    def take_waiting(self, slot):
+        """Connections that reached a listening slot's Mac listener, up to its backlog."""
+        listener, backlog, waiting, _ = self.listening[slot]
+        while len(waiting) < backlog:
+            try:
+                waiting.append(listener.accept())
+            except (BlockingIOError, OSError):
+                break
+        self.put(slot, 15, len(waiting))
+
+    def fail(self, slot, error):
+        self.put(slot, 4, error)
+        self.put(slot, 3, FAILED)
 
     @staticmethod
     def lan_address():
@@ -310,6 +399,11 @@ class Relay(threading.Thread):
     def pump_udp(self, slot):
         sock = self.socks[slot]
         base = rings(slot)
+        # A slot on a VIOLET_NET_LISTEN port listens on the Mac's loopback in
+        # place of the network: what comes from loopback comes, as the phone
+        # sees it, from the Mac's LAN address (never from the phone's own
+        # 127.0.0.1), and an answer to that address goes back over loopback.
+        lan = self.lan_address() if sock.getsockname()[0] == "127.0.0.1" else None
         head, tail = self.word(slot, 7), self.word(slot, 8)
         if self.superseded(slot):
             return
@@ -351,6 +445,8 @@ class Relay(threading.Thread):
             tail = (tail + 2 + body) & 0xFFFFFFFF
             if host is None or 7 + nl > body:
                 continue
+            if lan and host == lan:
+                host = "127.0.0.1"
             try:
                 sock.sendto(f[7 + nl:], (host, port))
             except (OSError, UnicodeError):
@@ -362,6 +458,8 @@ class Relay(threading.Thread):
                 data, (h, p) = sock.recvfrom(2048)
             except (BlockingIOError, OSError):
                 break
+            if lan and h.startswith("127."):
+                h = lan
             frame = struct.pack("<HIHB", len(data) + 7, struct.unpack(">I", socket.inet_aton(h))[0], p, 0) + data
             if RX - ((rin - rout) & 0xFFFFFFFF) < len(frame):
                 continue  # the app is not reading: drop it
@@ -375,6 +473,8 @@ class Relay(threading.Thread):
         return self.word(slot, 0) != self.word(slot, 2)
 
     def pump(self, slot):
+        if self.listening[slot]:
+            return self.take_waiting(slot)
         sock = self.socks[slot]
         if not sock or self.word(slot, 3) not in (OPEN, PEER_CLOSED):
             return
@@ -441,9 +541,13 @@ class Relay(threading.Thread):
                     self.drop(slot)
                     # This side's ring words start empty for the new use; the
                     # old connection is gone and can put nothing more in them.
-                    for i in (8, 9, 12, 13):
+                    for i in (8, 9, 12, 13, 15):
                         self.put(slot, i, 0)
-                    if command == 1:
+                    if command == CMD_LISTEN:
+                        self.listen(slot)
+                    elif command == CMD_ACCEPT:
+                        self.accept(slot)
+                    elif command == 1:
                         # Taken at once; the state stays CONNECTING until the dial ends.
                         self.put(slot, 4, 0)
                         self.put(slot, 3, CONNECTING)

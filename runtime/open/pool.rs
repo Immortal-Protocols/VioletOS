@@ -10,6 +10,14 @@ pub struct Pool {
     first_slot: u32,
     free: Vec<u32>,
     pub total: usize,
+    /// Which pages are free (lifecycle.rs): a page given back while still
+    /// free, or one that was never the apps', is refused and counted, not
+    /// handed out again (a stale give-back of a page taken again is not caught).
+    map: super::lifecycle::PageMap,
+    /// Pages the apps may ever hold (the pool less the heap and the image).
+    pub app_pages: usize,
+    /// Refused give-backs since boot.
+    pub refused: u32,
 }
 
 /// The kernel memory the Open Runtime carves its own objects from.
@@ -18,11 +26,14 @@ pub struct Kernel {
     free_slots: Vec<u32>,
     /// MCS: Reply objects answered and ready for reuse, by slot.
     idle_replies: Vec<u32>,
+    /// A small untyped kept for Reply objects (0: none yet), so carving app
+    /// slices from the rest of kernel memory cannot starve them.
+    pub replies: u32,
 }
 
 impl Kernel {
     pub fn new() -> Self {
-        Self { next_slot: SLOT_DYNAMIC, free_slots: Vec::new(), idle_replies: Vec::new() }
+        Self { next_slot: SLOT_DYNAMIC, free_slots: Vec::new(), idle_replies: Vec::new(), replies: 0 }
     }
     pub fn slot(&mut self) -> u32 {
         if let Some(s) = self.free_slots.pop() {
@@ -38,6 +49,9 @@ impl Kernel {
         if let Some(idle) = self.idle_replies.pop() {
             move_cap(SLOT_REPLY, idle)?;
             self.release(idle);
+            return Ok(());
+        }
+        if self.replies != 0 && retype(self.replies, Object::Reply, 0, SLOT_REPLY).is_ok() {
             return Ok(());
         }
         retype(SLOT_KERNEL, Object::Reply, 0, SLOT_REPLY)
@@ -99,7 +113,9 @@ impl Pool {
         unsafe { super::heap::HEAP.add(POOL_VA, heap_pages * PAGE) };
         let free = (heap_pages as u32..POOL_PAGES as u32).rev().collect();
         let _ = mapped_tables;
-        Ok((Pool { first_slot, free, total: POOL_PAGES }, heap_pages * PAGE))
+        let map = super::lifecycle::PageMap::new(heap_pages..POOL_PAGES);
+        let app_pages = POOL_PAGES - heap_pages;
+        Ok((Pool { first_slot, free, total: POOL_PAGES, map, app_pages, refused: 0 }, heap_pages * PAGE))
     }
     pub fn cap(&self, index: u32) -> u32 {
         self.first_slot + index
@@ -110,6 +126,11 @@ impl Pool {
     /// A zeroed page.
     pub fn take(&mut self) -> Option<u32> {
         let index = self.free.pop()?;
+        if !self.map.take(index) {
+            // On the free list but not free: never hand it out twice.
+            self.refused += 1;
+            return self.take();
+        }
         unsafe { core::ptr::write_bytes(page_va(index) as *mut u8, 0, PAGE) };
         Some(index)
     }
@@ -124,9 +145,19 @@ impl Pool {
             return None;
         }
         self.free.drain(..count);
+        for i in first..first + count as u32 {
+            self.map.take(i);
+        }
+        self.map.retire_top(count);
+        self.app_pages -= count;
         Some(page_va(first))
     }
     pub fn give_back(&mut self, index: u32) {
-        self.free.push(index);
+        if self.map.give(index) {
+            self.free.push(index);
+        } else {
+            self.refused += 1;
+            crate::log!("pool: refused page {} given back while free or not the apps'", index);
+        }
     }
 }

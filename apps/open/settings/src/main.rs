@@ -3,6 +3,8 @@
 mod pages;
 mod wifi;
 mod wifi_ui;
+mod fetch;
+mod updates;
 
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
@@ -45,6 +47,7 @@ fn status() -> Status {
         clock_set: violet::time::network_time().is_some(),
         minute: violet::time::now_utc() / 60,
         installed: pages::parse_installed(&violet::sys("installed")),
+        passcode: violet::fields(&violet::sys("passcode")).get("set").is_some_and(|v| v == "1"),
     }
 }
 
@@ -58,6 +61,7 @@ struct App {
     section: Section,
     status: Status,
     wifi: wifi::App,
+    updates: updates::App,
     code: String,
     relay_on: bool,
     pressed: Option<Hit>,
@@ -94,6 +98,9 @@ impl App {
         self.refresh();
         if section == Section::Wifi {
             self.wifi.enter();
+        }
+        if section == Section::Updates {
+            self.updates.enter();
         }
     }
 
@@ -145,6 +152,13 @@ impl App {
             }
             Hit::Delete(i) => self.confirm = Some(i),
             Hit::DeleteAll => self.confirm = Some(usize::MAX),
+            // The runtime takes the screen and asks for the digits itself;
+            // Settings hears FOCUS_GAINED when it is done, and refreshes.
+            Hit::PassSet | Hit::PassOff => {
+                let answer = violet::sys(if hit == Hit::PassSet { "passcode set" } else { "passcode off" });
+                println!("settings: passcode {} -> {}", if hit == Hit::PassSet { "set" } else { "off" }, answer);
+                self.note = if answer == "ok" { String::new() } else { "Couldn't start. Try again.".into() };
+            }
         }
     }
 
@@ -162,6 +176,13 @@ impl App {
 
     /// True when the screen needs drawing.
     fn touch(&mut self, kind: u16, x: i32, y: i32) -> bool {
+        if self.section == Section::Updates {
+            self.updates.touch(kind, x, y);
+            if self.updates.exit {
+                self.go(Section::Menu);
+            }
+            return true;
+        }
         if self.section == Section::Wifi {
             self.wifi.touch(kind, x, y);
             if self.wifi.exit {
@@ -207,6 +228,7 @@ fn main() {
         section: Section::Menu,
         status: status(),
         wifi: wifi::App::new(),
+        updates: updates::App::new(),
         code,
         relay_on,
         pressed: None,
@@ -222,6 +244,8 @@ fn main() {
     let draw = |c: &mut Canvas, app: &App| {
         if app.section == Section::Wifi {
             app.wifi.draw(c, &fonts);
+        } else if app.section == Section::Updates {
+            app.updates.draw(c, &fonts);
         } else {
             pages::draw(c, &fonts, &app.view());
         }
@@ -235,7 +259,8 @@ fn main() {
             screen.show_all(&c);
             dirty = false;
         }
-        let animating = app.section == Section::Wifi && app.wifi.animating();
+        let animating = (app.section == Section::Wifi && app.wifi.animating())
+            || (app.section == Section::Updates && app.updates.animating());
         let timeout = if animating { Duration::from_millis(120) } else { Duration::from_secs(1) };
         let mut next = match events.recv_timeout(timeout) {
             Ok(e) => Some(e),
@@ -254,7 +279,10 @@ fn main() {
             }
             next = events.try_recv().ok();
         }
-        if app.section == Section::Wifi {
+        if app.section == Section::Updates {
+            // The download runs in its own thread; follow its progress.
+            dirty = true;
+        } else if app.section == Section::Wifi {
             dirty |= app.wifi.tick(&mut wifi_poll);
         } else if last_poll.elapsed() >= Duration::from_secs(if app.section == Section::PhoneLink { 1 } else { 3 }) {
             last_poll = Instant::now();
@@ -275,6 +303,7 @@ mod preview {
             frozen: vec![], relay: "off".into(), relay_failure: 0, battery: 82, volume: 8, city: 1,
             clock_set: true, minute: 29_924_807, // 2026-11-24 02:47 UTC
             installed: pages::parse_installed("scorekeeper\t412345\tScorekeeper\ntips\t300000\tTip Calculator\n"),
+            passcode: true,
         }
     }
 
@@ -309,7 +338,7 @@ mod preview {
         let s = status();
         let mut c = Canvas::new(violet::W, violet::H);
         for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth), ("phone", Section::PhoneLink),
-                                ("time", Section::Time), ("apps", Section::AgentApps), ("about", Section::About)] {
+                                ("time", Section::Time), ("apps", Section::AgentApps), ("passcode", Section::Passcode), ("about", Section::About)] {
             let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
             pages::draw(&mut c, &fonts, &v);
             let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();

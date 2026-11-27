@@ -63,6 +63,28 @@ def rebuild_v2(stock, replacement=None, *, kernel=None):
     return bytes(rebuilt)
 
 
+def v2_payload_length(image):
+    """Bytes of an Android v2 boot image up to the end of its last section.
+
+    This is what the bootloader reads of a boot partition, and so what a
+    full-system update (tools/ota_bundle.py) puts in a slot: VioletOS's
+    boot.img continues with the storage volume, boot history and catalog
+    banks, which belong to boot_b and not to the slot image.
+    """
+    if len(image) < V2_HEADER_SIZE or image[:8] != b"ANDROID!":
+        raise ValueError("Expected a complete Android v2 header")
+    page, version = struct.unpack_from("<II", image, 36)
+    if version != 2 or page < V2_HEADER_SIZE or page & (page - 1):
+        raise ValueError("Expected boot header version 2 with a valid page size")
+    cursor = page
+    for _, size_field in V2_SECTIONS:
+        size, = struct.unpack_from("<I", image, size_field)
+        cursor += size + (-size % page)
+    if cursor > len(image):
+        raise ValueError("Boot image sections run past its end")
+    return cursor
+
+
 def factory_dtb(stock):
     """Extract the single MT6765 base tree from the pinned Motorola image."""
     if hashlib.sha256(stock).hexdigest() != "36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a":

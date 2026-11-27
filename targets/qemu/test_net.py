@@ -11,6 +11,14 @@ hanging; "netpeer" must then fetch a page at once:
 - one app holds at most its share of the socket slots (slots.rs: 9 of 32 with the emulator's eight apps);
 - a connect that does not answer delays no other app's sockets.
 
+Then "netserve" checks listening sockets and IPv6 (net2): servers on the
+phone's loopback (http.server with urllib, asyncio, which needs socketpair),
+a refused loopback port, AF_INET6 sockets on ::1, on ::ffff:127.0.0.1 and on
+the dual-stack wildcard, only IPv4 answers for a name (AAAA has none, so an
+IPv6-only lookup finds nothing), ENETUNREACH for a real IPv6 address, UDP on
+loopback with the sender's port, and a TCP listener and a bound UDP socket on
+the wildcard that this Mac reaches through the relay (VIOLET_NET_LISTEN).
+
 The host tests in `make test-unit` cover the same rules without QEMU; this
 checks them end to end through the image.
 """
@@ -21,6 +29,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -37,7 +46,7 @@ import run
 HOLE_SECONDS = 40
 
 SCRIPT = r'''#!/usr/bin/env python3
-import mmap, os, re, struct, sys, time
+import mmap, os, re, socket, struct, sys, time
 ram = open(sys.argv[1], "r+b")
 log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
 
@@ -90,8 +99,8 @@ if (stale, unknown, badname) != ("113", "113", "refused"):
     fail(f"an address with no name must be EHOSTUNREACH (113) and a bad name refused: stale={stale} unknown={unknown} badname={badname}")
 until("nethog did not fill its share of the slots", lambda: line(r"nethog: held=(\d+) errno=(\d+)"), 120)
 held, error = line(r"nethog: held=(\d+) errno=(\d+)")
-if (held, error) != ("9", "24"):
-    fail(f"one app should hold 9 sockets and then get EMFILE (24), got held={held} errno={error}")
+if (held, error) != (os.environ["NET_SHARE"], "24"):
+    fail(f"one app should hold {os.environ['NET_SHARE']} sockets and then get EMFILE (24), got held={held} errno={error}")
 until("nethog did not start the hanging connect", lambda: "nethog: hanging started=True" in everything())
 until("nethog did not go to the background", lambda: home_shown() > shown)
 open_icon("netpeer")
@@ -106,9 +115,55 @@ if int(took) > 5000:
     fail(f"netpeer needed {took} ms beside a connect that does not answer")
 until("nethog's connect never timed out", lambda: line(r"nethog: hole=(\d+) after=\d+s still_held=(\d+)"), 90)
 hole, still = line(r"nethog: hole=(\d+) after=\d+s still_held=(\d+)")
-if (hole, still) != ("110", "8"):
-    fail(f"the hanging connect should end in ETIMEDOUT (110) with 8 sockets still held, got hole={hole} still_held={still}")
-print(f"netpeer fetched its page in {took} ms beside 9 held sockets and a hanging connect", file=sys.stderr)
+if (hole, still) != ("110", str(int(os.environ["NET_SHARE"]) - 1)):
+    fail(f"the hanging connect should end in ETIMEDOUT (110) with one socket fewer still held, got hole={hole} still_held={still}")
+print(f"netpeer fetched its page in {took} ms beside {held} held sockets and a hanging connect", file=sys.stderr)
+
+# Listening sockets and IPv6.
+until("netpeer did not go to the background", lambda: home_shown() > shown + 1, 30)
+open_icon("netserve")
+want = {
+    "http": "served-on-the-phone", "refused": "errno111", "v6": "::1,::1,six", "mapped": "127.0.0.1,mapped,::1",
+    "dual": "::,::1,dual", "families": "AF_INET", "v6lookup": "none", "global6": "errno101", "pair": "pair",
+    "asyncio": "ASYNC", "udp": "dgram,127.0.0.1,True",
+}
+for name, value in want.items():
+    until(f"netserve did not report {name}", lambda: line(rf"netserve: {name}=(\S+)"), 60)
+    got = line(rf"netserve: {name}=(\S+)")[0]
+    if got != value:
+        fail(f"netserve {name}: wanted {value}, got {got}")
+until("netserve did not listen on the network", lambda: line(r"netserve: listening=(\d+)"), 30)
+mac_port = int(os.environ["NET_LISTEN_PORT"])
+reply = b""
+for attempt in range(50):
+    try:
+        with socket.create_connection(("127.0.0.1", mac_port), timeout=10) as conn:
+            conn.sendall(b"hello-from-the-mac")
+            while chunk := conn.recv(64):
+                reply += chunk
+        break
+    except OSError:
+        time.sleep(0.2)
+if reply != b"phone:hello-from-the-mac":
+    fail(f"the phone's listener answered {reply!r}")
+until("netserve did not report lan_tcp", lambda: line(r"netserve: lan_tcp=(\S+)"), 30)
+if line(r"netserve: lan_tcp=(\S+)")[0] != "hello-from-the-mac":
+    fail("the listener read something else")
+until("netserve did not bind UDP", lambda: line(r"netserve: udp_bound=(\d+)"), 30)
+mac_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+mac_udp.settimeout(1)
+answer = None
+for attempt in range(20):
+    mac_udp.sendto(b"datagram-from-the-mac", ("127.0.0.1", mac_port))
+    try:
+        answer = mac_udp.recv(64)
+        break
+    except OSError:
+        pass
+if answer != b"phone:datagram-from-the-mac":
+    fail(f"the phone's bound UDP socket answered {answer!r}")
+until("netserve did not finish", lambda: "netserve: done=1" in everything(), 30)
+print("netserve: loopback and network listeners, socketpair, asyncio, IPv6 sockets, AAAA fallback", file=sys.stderr)
 '''
 
 PAGE = b"<html><title>Violet net test</title>" + b"x" * 4000 + b"</html>"
@@ -164,11 +219,29 @@ os.environ["VIOLET_NET_HOSTS"] = json.dumps({
 })
 os.environ["NET_PAGE_BYTES"] = str(len(PAGE))
 
+
+def share():
+    """One app's share of the slots (slots.rs share()), from the sources."""
+    slots = (ROOT / "runtime/open/slots.rs").read_text()
+    const = lambda name: int(re.search(rf"pub const {name}: usize = (\d+);", slots).group(1))
+    apps = max(int(n) for n in re.findall(r"pub const MAX_APPS: usize = (\d+);", (ROOT / "runtime/open/mod.rs").read_text()))
+    spare = max(0, min(const("SLOTS"), 32) - const("RESERVED") - apps * const("APP_FLOOR"))
+    return min(const("APP_FLOOR") + (spare + 1) // 2, const("APP_MAX"))
+
+
+os.environ["NET_SHARE"] = str(share())
+# The port the Mac reaches netserve's network listener (and UDP socket) on.
+with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    free = probe.getsockname()[1]
+os.environ["NET_LISTEN_PORT"] = str(free)
+os.environ["VIOLET_NET_LISTEN"] = json.dumps({"8090": free})
+
 with TemporaryDirectory(prefix="violet-net-") as directory:
     source = run.IMAGE
     cpio = (source / "initfs.cpio").read_bytes()
     listed = home_grid.apps(cpio)
-    if "nethog" not in listed or "netpeer" not in listed:
+    if not {"nethog", "netpeer", "netserve"} <= set(listed):
         raise SystemExit("The image lacks the net test apps; run make test-net, which builds them in.")
     image = Path(directory)
     for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):
@@ -181,4 +254,4 @@ with TemporaryDirectory(prefix="violet-net-") as directory:
     status = run.main(str(viewer))
     if status != 0:
         raise SystemExit(f"net test failed (viewer status {status})")
-    print("Sockets verified: bounded resolver, per-app slot share, no head-of-line blocking")
+    print("Sockets verified: bounded resolver, per-app slot share, no head-of-line blocking, listening and IPv6")

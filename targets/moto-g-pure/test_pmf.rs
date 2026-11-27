@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 mod passive_scan;
 mod pmf;
+mod sae;
 #[path = "test_radio_bus.rs"]
 mod radio_io;
 mod softap;
@@ -586,4 +587,51 @@ fn association_is_tried_again_when_the_access_point_says_come_back() {
     let mut axi = wlan_axi::Axi::started(STATION);
     assert_eq!(axi.associate(&access_point(2)), Err(49));
     assert_eq!(requests().len(), 1);
+}
+
+#[test]
+fn sae_frames_go_to_and_come_from_the_access_point() {
+    let mut ap = access_point(2);
+    ap.akm = 8;
+    let mut rsn = [0; station::RSN_MAX];
+    let n = station::rsne(&ap, &mut rsn);
+    assert_eq!(rsn[16..20], [0, 15, 172, 8], "SAE in the RSN element");
+    assert_eq!(rsn[20], 0xc0, "with protection capable and required");
+    assert_eq!(n, station::RSN_MAX);
+    // SAE never goes out without MFPC, even for an access point the scan
+    // left at mfp 0.
+    let mut loose = ap;
+    loose.mfp = 0;
+    let n = station::rsne(&loose, &mut rsn);
+    assert_eq!((n, rsn[16..20].to_vec(), rsn[20]), (station::RSN_MAX, vec![0, 15, 172, 8], 0x80));
+    assert_eq!(rsn[22..], [0, 0, 0, 15, 172, 6], "with BIP-CMAC-128");
+    let pwe = sae::hunting_and_pecking(b"password", &STATION, &AP).unwrap();
+    let mut n = 0u8;
+    let mut s = sae::Sae::new(&pwe, false, &mut |b: &mut [u8; 32]| {
+        n += 1;
+        b.fill(n);
+        true
+    })
+    .unwrap();
+    let mut body = [0u8; sae::BODY_MAX];
+    let len = s.message(&mut body);
+    let mut frame = [0u8; 24 + sae::BODY_MAX];
+    let f = station::sae_request(&ap, STATION, &body[..len], &mut frame);
+    assert_eq!(f, 24 + 104);
+    assert_eq!(frame[0], 0xb0);
+    assert_eq!(frame[4..10], AP);
+    assert_eq!(frame[10..16], STATION);
+    assert_eq!(frame[24..30], [3, 0, 1, 0, 0, 0]);
+    // The access point's answer, as it would arrive.
+    let mut reply = frame[..f].to_vec();
+    reply[4..10].copy_from_slice(&STATION);
+    reply[10..16].copy_from_slice(&AP);
+    assert_eq!(station::sae_response(&reply, &ap, STATION), Some(&reply[24..]));
+    // Not from this access point, not SAE, or protected: not for the exchange.
+    for (at, value) in [(10, 9u8), (24, 0), (1, 0x40), (0, 0x10)] {
+        let mut bad = reply.clone();
+        bad[at] = value;
+        assert_eq!(station::sae_response(&bad, &ap, STATION), None, "{at}");
+    }
+    assert_eq!(station::sae_response(&reply[..29], &ap, STATION), None);
 }

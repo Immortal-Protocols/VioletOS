@@ -1,0 +1,5 @@
+# What netserve may use (runtime/open/policy.rs; packed into /apps/.manifests by tools/build_initfs.py).
+caps: net
+# Its listener and bound UDP socket on the wildcard take the network's
+# connections and datagrams (runtime/open/loopback.rs serve_words).
+serve: lan

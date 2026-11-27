@@ -6,9 +6,10 @@
 // every SYN, acknowledges data and FINs, and never closes.
 //
 // It is here for the claims that rest on what lwIP does, not on what
-// sockets.c does: that lwIP gives a closing connection up to a new one, that
-// it calls back for every question it was asked, and what it reads as an
-// address.
+// sockets.c does: that lwIP gives a closing connection up to a new one (an
+// arriving one included), that it calls back for every question it was asked,
+// what it reads as an address, and how it listens: a backlog that drops SYNs,
+// bytes kept until an accept, a port free again at once.
 #include "../../sockets.c"
 #include "lwip/init.h"
 #include "lwip/ip4.h"
@@ -62,20 +63,24 @@ static void inject(unsigned from, unsigned proto, const unsigned char *body, uns
   if (ip4_input(p, &nif) != ERR_OK) pbuf_free(p);
 }
 
-// The peer's side of each connection, by this phone's port.
+// The peer's side of each connection, by this phone's port, the peer's
+// address and the peer's port (80, unless the peer dialled in).
 static struct conn {
-  unsigned port, host, theirs, mine, fins;
+  unsigned port, host, theirs, mine, fins, from, inbound;
+  // The window this phone advertised last, and the segments it sent.
+  unsigned wnd, seen;
 } conns[512];
-static unsigned conn_count, syns, queries, answer_names;
+static unsigned conn_count, syns, queries, answer_names, resets;
 static char asked_names[512][64];
-static struct conn *conn_of(unsigned port, unsigned host) {
+static struct conn *conn_at(unsigned port, unsigned host, unsigned from) {
   for (unsigned k = 0; k < conn_count; k++)
-    if (conns[k].port == port && conns[k].host == host) return &conns[k];
+    if (conns[k].port == port && conns[k].host == host && conns[k].from == from) return &conns[k];
   return NULL;
 }
+static struct conn *conn_of(unsigned port, unsigned host) { return conn_at(port, host, 80); }
 static void segment(struct conn *c, unsigned flags, const void *data, unsigned n) {
   unsigned char t[1500] = {0};
-  put16(t, 80);
+  put16(t, c->from);
   put16(t + 2, c->port);
   put32(t + 4, c->mine);
   put32(t + 8, c->theirs);
@@ -131,15 +136,28 @@ static void network(void) {
       }
       if (b[9] != 6) continue;
       unsigned port = be16(t), seq = be32(t + 4), flags = t[13], data = body - (t[12] >> 4) * 4;
-      struct conn *c = conn_of(port, host);
-      if (flags & 4) continue;  // RST
+      struct conn *c = conn_at(port, host, be16(t + 2));
+      if (c) {
+        c->wnd = be16(t + 14);
+        c->seen++;
+      }
+      if (flags & 4) {
+        resets += c != NULL;
+        continue;
+      }
+      if (flags & 2 && c && c->inbound) {
+        // This phone answers a SYN the peer sent: the handshake's last step.
+        c->theirs = seq + 1;
+        segment(c, 0x10, NULL, 0);
+        continue;
+      }
       if (flags & 2) {
         syns++;
         if (!c) {
           assert(conn_count < 512);
           c = &conns[conn_count++];
         }
-        *c = (struct conn){port, host, seq + 1, 7000 + 1000 * conn_count, 0};
+        *c = (struct conn){port, host, seq + 1, 7000 + 1000 * conn_count, 0, 80, 0};
         segment(c, 0x12, NULL, 0);
         continue;
       }
@@ -193,6 +211,113 @@ static unsigned own_questions(unsigned owner) {
   return n;
 }
 #define RUN(test) (test(), printf("ok   %s\n", #test))
+
+// A peer dials this phone's `port` from `from`.
+static struct conn *dial_in(unsigned host, unsigned from, unsigned port) {
+  assert(conn_count < 512);
+  struct conn *c = &conns[conn_count++];
+  *c = (struct conn){port, host, 0, 90000 + 1000 * conn_count, 0, from, 1};
+  segment(c, 0x02, NULL, 0);
+  return c;
+}
+static void app_send(int i, const char *d, unsigned n) {
+  volatile struct slot *q = slot(i);
+  for (unsigned k = 0; k < n; k++) tx_ring(i)[(q->tx_head + k) % TX] = d[k];
+  q->tx_head = q->tx_head + n;
+}
+static unsigned pcbs_from(unsigned from) {
+  unsigned n = 0;
+  for (struct tcp_pcb *p = tcp_active_pcbs; p; p = p->next) n += p->remote_port == from;
+  return n;
+}
+
+static void a_listener_takes_connections_from_the_network(void) {
+  as_owner = 9;
+  start(5, CMD_LISTEN, 2, 8080, NULL);
+  step(5);
+  assert(state(5) == OPEN && slot(5)->local_port == 8080);
+  struct conn *a = dial_in(ip4(192, 168, 1, 50), 50000, 8080);
+  struct conn *b = dial_in(ip4(192, 168, 1, 51), 50001, 8080);
+  step(5);
+  // (lwIP took the pcbs from connections the earlier tests left closing.)
+  assert(a->theirs && b->theirs && slot(5)->waiting == 2);
+  // Past the backlog lwIP does not answer the SYN at all.
+  struct conn *late = dial_in(ip4(192, 168, 1, 52), 50002, 8080);
+  step(5);
+  assert(late->theirs == 0 && slot(5)->waiting == 2);
+  // A waiting connection's window is shut: bytes sent before the accept are
+  // dropped (and acknowledged with a zero window), so lwIP holds none.
+  assert(a->wnd == 0 && b->wnd == 0);
+  segment(a, 0x18, "hello", 5);
+  step(5);
+  assert(a->wnd == 0);
+  for (struct tcp_pcb *p = tcp_active_pcbs; p; p = p->next) assert(!p->refused_data && !p->ooseq);
+  start(6, CMD_ACCEPT, 5, 0, NULL);
+  step(5);
+  assert(state(6) == OPEN && slot(6)->local_ip == ip4(192, 168, 1, 50) && slot(6)->local_port == 50000);
+  assert(slot(5)->waiting == 1);
+  // The accept opens the window, and the peer sends again.
+  assert(a->wnd == TCP_WND);
+  a->mine -= 5;
+  segment(a, 0x18, "hello", 5);
+  for (int k = 0; k < 8 && ready(6) < 5; k++) step(250);
+  assert(ready(6) == 5 && !memcmp(rx_ring(6), "hello", 5));
+  unsigned acked = a->theirs;
+  app_send(6, "hi!", 3);
+  step(5);
+  assert(a->theirs == acked + 3);
+  // Closing the listener resets the connection still waiting, not the accepted one.
+  start(5, CMD_CLOSE, 0, 0, NULL);
+  step(5);
+  assert(pcbs_from(50001) == 0 && pcbs_from(50000) == 1 && state(6) == OPEN);
+  // The port can be listened on again at once.
+  start(5, CMD_LISTEN, 2, 8080, NULL);
+  step(5);
+  assert(state(5) == OPEN);
+  start(5, CMD_CLOSE, 0, 0, NULL);
+  start(6, CMD_CLOSE, 0, 0, NULL);
+  step(5);
+  as_owner = 0;
+}
+
+// A LAN peer that fills parked connections with out-of-order segments, then
+// the missing first one, would once have had lwIP keep about four pool pbufs
+// for each as refused data, with no end: with all of PBUF_POOL gone, Radio
+// could receive no frame at all. Shut windows keep the pool whole.
+static void parked_connections_hold_no_pool_buffers(void) {
+  as_owner = 11;
+  start(7, CMD_LISTEN, 4, 8081, NULL);
+  step(5);
+  assert(state(7) == OPEN);
+  struct conn *c[4];
+  for (int k = 0; k < 4; k++) c[k] = dial_in(ip4(192, 168, 1, 60 + k), 51000 + k, 8081);
+  step(5);
+  assert(slot(7)->waiting == 4);
+  static char data[4 * TCP_MSS];
+  memset(data, 'x', sizeof data);
+  for (int k = 0; k < 4; k++) {
+    unsigned base = c[k]->mine;
+    for (int n = 3; n >= 0; n--) {
+      c[k]->mine = base + n * TCP_MSS;
+      segment(c[k], 0x18, data, TCP_MSS);
+    }
+    c[k]->mine = base + 4 * TCP_MSS;
+  }
+  step(5);
+  for (struct tcp_pcb *p = tcp_active_pcbs; p; p = p->next) assert(!p->refused_data && !p->ooseq);
+  // Every pool buffer is still there for the next frames.
+  struct pbuf *pool[PBUF_POOL_SIZE];
+  for (int k = 0; k < PBUF_POOL_SIZE; k++) assert((pool[k] = pbuf_alloc(PBUF_RAW, 64, PBUF_POOL)));
+  for (int k = 0; k < PBUF_POOL_SIZE; k++) pbuf_free(pool[k]);
+  // Not accepted in PARK_MS: reset.
+  for (int k = 0; k < 4; k++) assert(pcbs_from(51000 + k) == 1);
+  for (int k = 0; k < 50 && slot(7)->waiting; k++) step(250);
+  assert(slot(7)->waiting == 0);
+  for (int k = 0; k < 4; k++) assert(pcbs_from(51000 + k) == 0);
+  start(7, CMD_CLOSE, 0, 0, NULL);
+  step(5);
+  as_owner = 0;
+}
 
 static void closing_connections_give_way_to_new_ones(void) {
   // An app in its share of the slots, against a server that never closes.
@@ -312,6 +437,8 @@ int main(void) {
   RUN(a_reused_slot_starts_empty);
   RUN(a_name_that_is_an_address_is_refused);
   RUN(one_app_cannot_fill_the_name_table);
+  RUN(a_listener_takes_connections_from_the_network);
+  RUN(parked_connections_hold_no_pool_buffers);
   puts("sockets.c with lwIP: all tests passed");
   return 0;
 }

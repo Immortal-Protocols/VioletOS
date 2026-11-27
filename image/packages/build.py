@@ -197,8 +197,12 @@ SECTIONS {
                 "--crate-type=staticlib",
                 "--target=armv7a-none-eabi",
                 "-Cpanic=abort",
-                # The Open Runtime (with the Sentinel) is optimised for size; its window is 0x60000 bytes.
+                # The Open Runtime (with the Sentinel) is optimised for size; its window is 0x80000 bytes.
                 "-Copt-level=z" if name == "open" else "-Copt-level=s",
+                # The Open Runtime is also optimised together with core and
+                # alloc (fat LTO): their unused generic code goes, which keeps
+                # the handset catalog inside its 1 MiB banks.
+                *(["-Clto=fat"] if name == "open" else []),
                 # One codegen unit: smaller code.
                 "-Ccodegen-units=1",
                 *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
@@ -298,7 +302,7 @@ SECTIONS {
                 raise ValueError("application exceeds 64 KiB package slot")
         # The supervisor rejects a package over its image window and boots
         # whatever older copy it has, so stop here instead.
-        window = 0x38000 if item["id"] == 3 else 0x60000 if item["id"] == 24 else 0x3E000
+        window = 0x38000 if item["id"] == 3 else 0x80000 if item["id"] == 24 else 0x3E000
         if len(image) > window:
             raise SystemExit(f"{name}: {len(image):#x} bytes, over its {window:#x}-byte package window")
         header = struct.pack(

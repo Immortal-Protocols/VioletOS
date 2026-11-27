@@ -15,6 +15,9 @@ mod vma;
 mod entropy;
 #[path = "../../../system/supervisor/procmgr.rs"]
 mod procmgr;
+// The signal gate's words, which procmgr writes into the trampoline page.
+#[path = "../signal.rs"]
+mod signal;
 
 mod syscall {
     pub const ENOMEM: i32 = -12;
@@ -207,7 +210,7 @@ fn world() -> World {
 fn started(kind: u16, layout: Layout) -> (World, procmgr::Loaded) {
     let mut w = world();
     let args = [String::from("/apps/test")];
-    let loaded = load(&mut w.space, &mut w.k, &mut w.pool, &program(kind), &args, &[], [7; 16], layout).unwrap();
+    let loaded = load(&mut w.space, &mut w.k, &mut w.pool, &program(kind), None, &args, &[], [7; 16], layout).unwrap();
     (w, loaded)
 }
 /// A byte the test's "app" writes and maps from files; the loaded program has none.
@@ -491,7 +494,7 @@ fn loader_refuses_programs_that_break_wx() {
     let try_load = |image: &[u8]| {
         sys::HW.with(|h| *h.borrow_mut() = Default::default());
         let mut w = world();
-        load(&mut w.space, &mut w.k, &mut w.pool, image, &[], &[], [0; 16], Layout::fixed()).map(|_| ()).err()
+        load(&mut w.space, &mut w.k, &mut w.pool, image, None, &[], &[], [0; 16], Layout::fixed()).map(|_| ()).err()
     };
     let rwx = elf(2, 0x10000, &[(0x10000, vec![0; 64], 64, 7)]);
     assert_eq!(try_load(&rwx), Some("a segment is writable and executable"));
@@ -520,7 +523,7 @@ fn loader_refuses_programs_that_break_wx() {
 fn loader_survives_hostile_headers() {
     let try_load = |image: &[u8]| {
         let mut w = world();
-        load(&mut w.space, &mut w.k, &mut w.pool, image, &[], &[], [0; 16], Layout::fixed()).map(|_| ()).err()
+        load(&mut w.space, &mut w.k, &mut w.pool, image, None, &[], &[], [0; 16], Layout::fixed()).map(|_| ()).err()
     };
     let good = elf(2, 0x10000, &[(0x10000, vec![0; 64], 64, 5)]);
     assert_eq!(try_load(&good), None);
@@ -718,7 +721,7 @@ fn mmap_and_brk_keep_writable_memory_away_from_code() {
     sys::HW.with(|h| *h.borrow_mut() = Default::default());
     let mut w = world();
     let image = elf(2, 0x10000, &[(0x10000, vec![0; 0x100], 0x100, 5)]);
-    load(&mut w.space, &mut w.k, &mut w.pool, &image, &[], &[], [0; 16], Layout::fixed()).unwrap();
+    load(&mut w.space, &mut w.k, &mut w.pool, &image, None, &[], &[], [0; 16], Layout::fixed()).unwrap();
     let start = w.space.brk_start;
     assert_eq!(start, 0x11000);
     assert_eq!(w.space.set_brk(&mut w.k, &mut w.pool, start + 0x1000), start, "refused: brk does not move");
@@ -1165,4 +1168,164 @@ fn seed_needs_enough_credited_jitter() {
         t
     });
     assert!(drbg.seeded() && !drbg.hardware);
+}
+
+// ---- the Linux ABI cluster: PT_INTERP, fork, the signal gate (procmgr.rs) ----
+
+/// `elf` with PT_PHDR and a PT_INTERP naming `interp` placed after the headers.
+fn dynamic_elf(kind: u16, entry: u32, segments: &[(u32, Vec<u8>, u32, u32)], interp: &str) -> Vec<u8> {
+    let mut image = elf(kind, entry, segments);
+    // Two more program headers go after the existing ones: move the segment data along.
+    let phnum = segments.len();
+    let extra = 64;
+    let mut out = image[..52 + 32 * phnum].to_vec();
+    out.extend(vec![0u8; extra]);
+    out.extend_from_slice(&image[52 + 32 * phnum..]);
+    for i in 0..phnum {
+        let at = 52 + 32 * i + 4;
+        let off = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) + extra as u32;
+        out[at..at + 4].copy_from_slice(&off.to_le_bytes());
+    }
+    let path_at = out.len() as u32;
+    out.extend_from_slice(interp.as_bytes());
+    out.push(0);
+    let n = interp.len() as u32 + 1;
+    let headers = [[6, 52, 52, 52, 32 * (phnum as u32 + 2), 32 * (phnum as u32 + 2), 4, 4], [3, path_at, 0, 0, n, n, 4, 1]];
+    for (k, h) in headers.iter().enumerate() {
+        let at = 52 + 32 * (phnum + k);
+        for (j, w) in h.iter().enumerate() {
+            out[at + 4 * j..at + 4 * j + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    out[44..46].copy_from_slice(&((phnum + 2) as u16).to_le_bytes());
+    image.clear();
+    out
+}
+fn musl_like_loader(code_with_data: bool) -> Vec<u8> {
+    let code_at = if code_with_data { 0x1000 } else { 0x10000 };
+    elf(3, code_at + 0x100, &[(0, vec![0x41; 0x200], 0x200, 4), (code_at, vec![0x42; 0x400], 0x400, 5), (0x20000, vec![0x43; 0x40], 0x2000, 6)])
+}
+fn aux(w: &mut World, sp: u32) -> Vec<(u32, u32)> {
+    let argc = w.read(sp, 4).map(|b| u32::from_le_bytes(b[..4].try_into().unwrap())).unwrap();
+    let mut at = sp + 4 + 4 * (argc + 1);
+    while w.read(at, 4).unwrap() != [0, 0, 0, 0] {
+        at += 4;
+    }
+    at += 4;
+    let mut out = Vec::new();
+    loop {
+        let b = w.read(at, 8).unwrap();
+        let (k, v) = (u32::from_le_bytes(b[..4].try_into().unwrap()), u32::from_le_bytes(b[4..].try_into().unwrap()));
+        if k == 0 {
+            return out;
+        }
+        out.push((k, v));
+        at += 8;
+    }
+}
+
+#[test]
+fn a_dynamic_program_starts_in_musls_loader() {
+    let main = dynamic_elf(3, 0x10010, &[(0, vec![0x11; 0x100], 0x100, 4), (0x10000, vec![0x22; 0x100], 0x100, 5), (0x20000, vec![0x33; 0x10], 0x1000, 6)], "/lib/ld-musl-armhf.so.1");
+    let ld = musl_like_loader(false);
+    let layout = Layout::random(&[0x5a; 24]);
+    let mut w = world();
+    let args = [String::from("/apps/dyn")];
+    let loaded = load(&mut w.space, &mut w.k, &mut w.pool, &main, Some(&ld), &args, &[], [1; 16], layout).unwrap();
+    let a = aux(&mut w, loaded.sp);
+    let get = |key| a.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap();
+    let ld_base = get(7);
+    assert!(ld_base >= vma::MMAP_BASE && ld_base < layout.mmap_top && ld_base & 0xffff == 0, "AT_BASE {ld_base:#x} in the mmap area");
+    assert_eq!(loaded.entry, ld_base + 0x10100, "the thread starts in the loader");
+    assert_eq!(get(9), layout.pie_base + 0x10010, "AT_ENTRY is the program's");
+    assert_eq!(get(3), layout.pie_base + 52, "AT_PHDR is the program's");
+    // Both images' code is read-execute, their data read-write, nothing both.
+    assert_eq!(sys::at(ld_base + 0x10000), Some((false, true)));
+    assert_eq!(sys::at(ld_base + 0x20000), Some((true, false)));
+    assert_eq!(sys::at(layout.pie_base + 0x10000), Some((false, true)));
+    assert_eq!(w.read(ld_base + 0x10000, 4).unwrap(), vec![0x42; 4]);
+    assert!(!vma::mixed(&w.space.vmas));
+    // The heap follows the program, not the loader.
+    assert!(w.space.brk_start >= layout.pie_base + 0x21000 && w.space.brk_start < vma::MMAP_BASE);
+}
+
+#[test]
+fn a_static_program_keeps_at_base_zero() {
+    let (mut s, l) = started(3, Layout::random(&[0x5a; 24]));
+    assert_eq!(aux(&mut s, l.sp).iter().find(|(k, _)| *k == 7).map(|(_, v)| *v), Some(0));
+}
+
+#[test]
+fn a_dynamic_program_needs_a_proper_loader() {
+    let main = dynamic_elf(3, 0x10010, &[(0, vec![0x11; 0x100], 0x100, 4), (0x10000, vec![0x22; 0x100], 0x100, 5)], "/lib/ld-musl-armhf.so.1");
+    let try_load = |ld: Option<&[u8]>| {
+        let mut w = world();
+        load(&mut w.space, &mut w.k, &mut w.pool, &main, ld, &[], &[], [0; 16], Layout::fixed()).map(|_| ()).err()
+    };
+    assert!(try_load(None).unwrap().contains("dynamic loader"));
+    assert_eq!(try_load(Some(&musl_like_loader(true))), Some("code shares a 64 KiB page with data"), "the loader obeys W^X too");
+    assert_eq!(try_load(Some(&program(2))), Some("/lib/ld-musl-armhf.so.1 is not a dynamic loader"), "not position-independent");
+    assert_eq!(try_load(Some(&main)), Some("/lib/ld-musl-armhf.so.1 is not a dynamic loader"), "a loader with an interpreter");
+    let other = dynamic_elf(3, 0x10010, &[(0x10000, vec![0x22; 0x100], 0x100, 5)], "/lib/ld-linux-armhf.so.3");
+    let mut w = world();
+    assert!(load(&mut w.space, &mut w.k, &mut w.pool, &other, Some(&musl_like_loader(false)), &[], &[], [0; 16], Layout::fixed()).is_err());
+}
+
+#[test]
+fn fork_copies_owned_memory_and_drops_device_pages() {
+    let (mut w, _) = started(2, Layout::fixed());
+    assert!(w.write(0x39cf0, b"parent"));
+    // A device page (the screen surface): mapped, not the app's to copy.
+    w.space.add(0x5000_0000, 0x5001_0000, RW);
+    let device = w.pool.take().unwrap();
+    w.space.map(&mut w.k, &w.pool, 0x5000_0000, device, false).unwrap();
+    let mut child = Space::new(&mut w.k, 2).unwrap();
+    let before = w.pool.available();
+    w.space.fork_into(&mut child, &mut w.k, &mut w.pool).unwrap();
+    let (owned, _) = w.space.usage();
+    assert_eq!(before - w.pool.available(), owned, "one new page per page the parent owns");
+    assert_eq!(child.brk, w.space.brk);
+    assert_eq!(child.layout, w.space.layout);
+    assert!(child.find(0x5000_0000).is_none(), "the device region is not the child's");
+    assert_eq!(child.vmas.len() + 1, w.space.vmas.len());
+    let mut got = [0u8; 6];
+    assert!(child.read(&mut w.k, &mut w.pool, 0x39cf0, &mut got));
+    assert_eq!(&got, b"parent");
+    assert!(child.write(&mut w.k, &mut w.pool, 0x39cf0, b"child!"));
+    assert_eq!(w.read(0x39cf0, 6).unwrap(), b"parent".to_vec(), "the parent keeps its own copy");
+    // The child's code is executable and was made visible to instruction fetch.
+    let text = sys::HW.with(|h| h.borrow().unifies.len());
+    assert!(text > 0);
+}
+
+#[test]
+fn fork_without_pool_room_fails_cleanly() {
+    // Out of pool pages: an error, and the caller destroys the half-made child.
+    let mut w2 = world();
+    load(&mut w2.space, &mut w2.k, &mut w2.pool, &program(2), None, &[], &[], [0; 16], Layout::fixed()).unwrap();
+    while w2.pool.available() > 1 {
+        w2.pool.take();
+    }
+    let mut c2 = Space::new(&mut w2.k, 3).unwrap();
+    assert!(w2.space.fork_into(&mut c2, &mut w2.k, &mut w2.pool).is_err());
+    c2.destroy(&mut w2.k, &mut w2.pool);
+}
+
+#[test]
+fn the_trampoline_page_holds_the_signal_gate() {
+    let (mut w, _) = started(2, Layout::fixed());
+    w.space.add(STUBS, STUBS + 0x10000, RX);
+    assert_eq!(w.space.stub(&mut w.k, &mut w.pool, 3, 0x20d91), Some(STUBS + 24));
+    assert_eq!(w.space.gate(), STUBS + signal::GATE_OFFSET);
+    let words: Vec<u32> = (0..signal::GATE.len() as u32)
+        .map(|k| {
+            let mut b = [0u8; 4];
+            w.space.read(&mut w.k, &mut w.pool, STUBS + signal::GATE_OFFSET + 4 * k, &mut b);
+            u32::from_le_bytes(b)
+        })
+        .collect();
+    assert_eq!(words, signal::GATE.to_vec());
+    // No trampoline reaches the gate.
+    assert_eq!(w.space.stub(&mut w.k, &mut w.pool, (signal::GATE_OFFSET / 8) as usize, 0x20d91), None);
+    w.no_app_bytes_in_executable_pages();
 }

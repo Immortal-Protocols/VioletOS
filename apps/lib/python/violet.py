@@ -316,7 +316,9 @@ _KINDS = {1: "down", 2: "move", 3: "up", 4: "key", 5: "key"}
 def _decode(raw):
     _, kind, code, x, y, value = _EVENT.unpack(raw)
     if kind == 7:
-        return Event({1: "focus", 2: "blur", 3: "quit"}.get(value, "focus"), value=value)
+        # 4: memory is low, free caches (runtime/open/abi.rs LIFECYCLE_LOW_MEMORY).
+        # An unknown value is "other", never "focus" (which means draw again).
+        return Event({1: "focus", 2: "blur", 3: "quit", 4: "lowmemory"}.get(value, "other"), value=value)
     return Event(_KINDS.get(kind, "other"), x, y, code, value)
 
 
@@ -399,6 +401,22 @@ def home():
     sys_command("home")
 
 
+def ask(cap, timeout=120):
+    """Ask the user for 'net', 'mic', 'camera' or 'hci' (the app must declare it
+    in manifest.txt and be on screen), waiting for the answer; True if allowed.
+    Call it before the first socket or open of the device: until the user
+    answers, those fail with PermissionError rather than wait."""
+    if FAKE:
+        return True
+    import time
+    end = time.monotonic() + timeout
+    while True:
+        said = sys_command("consent " + cap)
+        if said != "pending" or time.monotonic() > end:
+            return said == "allow"
+        time.sleep(0.2)
+
+
 def _data_dir():
     if FAKE:
         d = os.environ.get("VIOLET_FAKE_DATA") or os.path.join(os.environ.get("TMPDIR", "/tmp"), "violet-data")
@@ -407,16 +425,46 @@ def _data_dir():
     return "/data"
 
 
+def _app():
+    """This app's name: NAME of /apps/NAME (or /apps/NAME/main.py)."""
+    parts = os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else "/").split("/")
+    return parts[2] if len(parts) > 2 and parts[1] == "apps" else ""
+
+
+def _file(name):
+    """The file in /data for save(name): an app may keep files only under its
+    own name (/data/APP or /data/APP.something), so other names get the
+    app's name in front. Names in /data are kept up to 16 characters, so a
+    longer one becomes APP. and a hash of the key (never a cut-off name,
+    which two keys could share or another app could own)."""
+    app = _app()
+    if FAKE or not app:
+        return name[:16]
+    if name == app and len(app) <= 16:
+        return app
+    key = name[len(app) + 1:] if name.startswith(app + ".") else name
+    full = app + "." + key
+    if len(full) <= 16:
+        return full
+    room = 16 - len(app) - 1
+    if room < 3:
+        raise ValueError("violet: app name %r is too long to keep files (at most 12 characters)" % app)
+    h = 0xcbf29ce484222325
+    for b in key.encode():
+        h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+    return app + "." + ("%016x" % h)[:room]
+
+
 def save(name, value):
-    """Keep a small JSON value across restarts (/data/NAME, up to 4 KiB)."""
-    with open(os.path.join(_data_dir(), name[:16]), "w") as f:
+    """Keep a small JSON value across restarts (/data/APP.NAME, up to 4 KiB)."""
+    with open(os.path.join(_data_dir(), _file(name)), "w") as f:
         json.dump(value, f, separators=(",", ":"))
 
 
 def load(name, default=None):
     """What save(name, ...) kept, or default."""
     try:
-        with open(os.path.join(_data_dir(), name[:16])) as f:
+        with open(os.path.join(_data_dir(), _file(name))) as f:
             return json.load(f)
     except (OSError, ValueError):
         return default
@@ -431,7 +479,14 @@ def play(pcm):
     if FAKE:
         return
     if _audio is None:
-        _audio = os.open("/dev/violet/audio", os.O_WRONLY)
+        try:
+            _audio = os.open("/dev/violet/audio", os.O_WRONLY)
+        except PermissionError:
+            # The app's manifest does not ask for audio-out: no sound, no crash.
+            print("violet: no sound (add 'caps: audio-out' to manifest.txt)", flush=True)
+            _audio = -1
+    if _audio < 0:
+        return
     sent = 0
     while sent < len(pcm):
         sent += os.write(_audio, pcm[sent:sent + 16384])

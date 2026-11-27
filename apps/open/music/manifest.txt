@@ -1,0 +1,4 @@
+# What Locomo Music may use (runtime/open/policy.rs; packed into /apps/.manifests by tools/build_initfs.py).
+caps: net audio-out
+# /tmp/.locomo.*: the requests and tracks it exchanges with the Agent (src/locomo.rs).
+tmp: .locomo

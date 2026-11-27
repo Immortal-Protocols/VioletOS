@@ -46,7 +46,7 @@ Run high-performance, fully capable apps in **essentially any language**—inclu
 | File | Role |
 | --- | --- |
 | `runtime/open/abi.rs` | Language-agnostic binary structs for `/dev/violet/{screen,audio,events,sys}` |
-| `runtime/open/policy.rs` | Single choke-point `Policy` trait (`OpenPolicy` default; future sandboxing hook) |
+| `runtime/open/policy.rs` | The capability policy (since replaced `OpenPolicy`): default deny, per-app manifests, per-app `/data`, read-only `/apps` (see [runtime/open/README.md](../runtime/open/README.md), Policy) |
 | `runtime/open/syscall.rs` | `seL4_Fault_UnknownSyscall` → ARM EABI syscall dispatcher & async `WaitOn` |
 | `runtime/open/mod.rs` | Open Runtime main event loop (never blocks on I/O; stashes reply caps) |
 | `system/supervisor/procmgr.rs` | Full-DRAM `PagePool`, demand-paged `VmaTable`, ELF32 + `#!` shebang loader, threads |
@@ -86,7 +86,7 @@ The Open Runtime is component 24. Unmodified Rust `std`, C (musl), Go and CPytho
 | 1. Hardware and services | The supervisor gives the Open Runtime a 384 MiB (QEMU) or 256 MiB (handset) page pool beyond the kernel's 50 MiB. Floating point and NEON work in apps. Audio plays raw PCM from apps. Radio serves apps' TCP connections (DNS answered by the Open Runtime). **Not done:** a persistent folder file system (writes stay in memory); listening sockets and general UDP; the rest of the handset's DRAM. |
 | 2. Process manager, first C and Rust programs | Done: 64 KiB demand paging, a static ELF loader (ET_EXEC and static PIE), about 150 system calls, `/dev/violet/{screen,events,sys,audio}`. |
 | 3. Zero-build Python | Done: CPython 3.12.16 built statically against musl with zlib; `#!/bin/python3` scripts and bare `.py` files run from `/apps`. Drawing is raw `mmap` pixels for now. |
-| 4. Threads, epoll, sockets, Go | Threads, futexes, `epoll`, `poll`, eventfd, pipes and TCP sockets are done; Go runs (`GODEBUG=asyncpreemptoff=1`) including `net/http` and TLS. **Not done:** signal delivery. |
+| 4. Threads, epoll, sockets, Go | Threads, futexes, `epoll`, `poll`, eventfd, pipes and TCP sockets are done; Go runs (`GODEBUG=asyncpreemptoff=1`) including `net/http` and TLS. Signals are delivered now (handlers, faults, asynchronous preemption; `make test-abi` runs Go without the flag); the flag stays until that suite has passed on the emulator and the handset. |
 | 5. Polish | Not started: dynamic linking, background lifecycle beyond "keep running", multiple cores. |
 
 Decisions made while implementing:

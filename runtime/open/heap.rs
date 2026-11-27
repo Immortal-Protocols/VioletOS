@@ -14,6 +14,12 @@ unsafe impl Sync for Heap {}
 #[global_allocator]
 pub static HEAP: Heap = Heap { head: core::cell::UnsafeCell::new(null_mut()) };
 
+/// Bytes handed to the heap in all, for the `memory` report.
+static TOTAL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Below this much free heap the lifecycle closes cached apps (mod.rs): an
+/// allocation that fails takes every open app down with the runtime.
+pub const LOW_BYTES: usize = 4 << 20;
+
 const ALIGN: usize = 8;
 const HEADER: usize = 8;
 fn round(n: usize) -> usize {
@@ -27,7 +33,11 @@ impl Heap {
         let block = start as *mut Free;
         (*block).size = len & !(ALIGN - 1);
         (*block).next = null_mut();
+        TOTAL.fetch_add(len & !(ALIGN - 1), core::sync::atomic::Ordering::Relaxed);
         self.insert(block);
+    }
+    pub fn total(&self) -> usize {
+        TOTAL.load(core::sync::atomic::Ordering::Relaxed)
     }
     unsafe fn insert(&self, block: *mut Free) {
         let head = &mut *self.head.get();

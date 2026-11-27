@@ -186,8 +186,8 @@ class Format(unittest.TestCase):
             inspect(self.keys.dev.sign(body[:HEADER] + b"\0" + body[HEADER + 1 :], 1))
         # Window limits are unchanged: the trailer does not count against the image.
         self.assertEqual(inspect(self.keys.dev.sign(unsigned(7, size=0x3E000), 1)), 7)
-        self.assertEqual(inspect(self.keys.dev.sign(unsigned(24, size=0x60000), 1)), 24)
-        for identity, size in [(7, 0x3F000), (3, 0x39000), (24, 0x61000)]:
+        self.assertEqual(inspect(self.keys.dev.sign(unsigned(24, size=0x80000), 1)), 24)
+        for identity, size in [(7, 0x3F000), (3, 0x39000), (24, 0x81000)]:
             with self.assertRaises(ValueError):
                 inspect(self.keys.dev.sign(unsigned(identity, size=size), 1))
         # The handset's Radio is ABI 3 (128 KiB of private RAM) or ABI 4 (192 KiB); nothing else is.

@@ -32,13 +32,19 @@ fn fetch(name: &str) -> Result<Glance, String> {
     })
 }
 
+/// "TITLE<TAB>TEXT" lines from "notifications": the newest, as "Title · text".
+fn latest_notice(lines: &str) -> Option<String> {
+    let (title, text) = lines.lines().filter_map(|l| l.split_once('\t')).last()?;
+    Some(format!("{title} · {text}"))
+}
+
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut art = ui::Art::new();
-    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, shield: Default::default(), listening: false };
+    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, notice: None, can_lock: false, shield: Default::default(), listening: false };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
     let refresh = move || {
@@ -52,6 +58,8 @@ fn main() {
         art.prepare(&fonts, &s.apps);
         s.listening = violet::fields(&violet::sys("status")).get("listening").is_some_and(|v| v == "1");
         s.running = violet::sys("running").split_whitespace().map(String::from).collect();
+        s.notice = latest_notice(&violet::sys("notifications"));
+        s.can_lock = violet::fields(&violet::sys("passcode")).get("set").is_some_and(|v| v == "1");
         let sh = violet::fields(&violet::sys("shield"));
         s.shield = ui::Shield {
             known: sh.contains_key("linked"),
@@ -104,6 +112,11 @@ fn main() {
                     let r = ui::region(&s, i);
                     ui::draw_clipped(&mut c, &fonts, &art, &s, r);
                     screen.show(&c, r);
+                    // Lock: the runtime's lock screen comes up at once.
+                    if i == ui::LOCK {
+                        println!("home: lock -> {}", violet::sys("lock").trim());
+                        continue;
+                    }
                     // The pill opens Settings, where the phone's links are.
                     let (name, path) = match s.apps.get(i) {
                         Some(a) => (a.name.clone(), a.path()),
@@ -147,10 +160,10 @@ fn main() {
         }
         if last_status.elapsed() > Duration::from_secs(2) {
             last_status = Instant::now();
-            let (apps, running, shield, listening) = (s.apps.clone(), s.running.clone(), s.shield.clone(), s.listening);
+            let (apps, running, shield, listening, notice, can_lock) = (s.apps.clone(), s.running.clone(), s.shield.clone(), s.listening, s.notice.clone(), s.can_lock);
             status(&mut s, &mut art);
             let day = glance.as_ref().and_then(|g| g.now()).map(|t| t.day);
-            if day != shown_day || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening {
+            if day != shown_day || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening || notice != s.notice || can_lock != s.can_lock {
                 shown_day = day;
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
             }
@@ -170,7 +183,7 @@ mod preview {
             listing += &format!("{n}\t{t}\n");
         }
         ui::State {
-            now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None,
+            now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None, notice: None, can_lock: true,
             shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true,
         }
     }
@@ -179,6 +192,29 @@ mod preview {
         let mut a = ui::Art::new();
         a.prepare(&violet::Fonts::load(), &s.apps);
         a
+    }
+
+    /// The newest notification, and nothing for a refusal (locked: "error not allowed").
+    #[test]
+    fn notices() {
+        assert_eq!(super::latest_notice("DICE\trolled 6\nCHAT\tnew message\n").as_deref(), Some("CHAT · new message"));
+        assert_eq!(super::latest_notice("error not allowed"), None);
+        assert_eq!(super::latest_notice(""), None);
+    }
+
+    /// Lock (shown only with a passcode set) is hit on its own, apart from the pill and every tile.
+    #[test]
+    fn lock_button() {
+        let mut s = state(3);
+        let r = ui::lock_rect();
+        let (x, y) = ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2);
+        assert_eq!(ui::hit(&s, x, y), Some(ui::LOCK));
+        assert!(r.y0 >= ui::pill_rect().y1, "below the pill");
+        for i in 0..s.apps.len() {
+            assert!(ui::tile_rect(i, &s.apps).y0 >= r.y1, "above tile {i}");
+        }
+        s.can_lock = false;
+        assert_eq!(ui::hit(&s, x, y), None, "no passcode: no Lock");
     }
 
     /// The built-in apps come first, in their order; installed apps follow; Home is not listed.

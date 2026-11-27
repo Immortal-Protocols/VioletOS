@@ -1,0 +1,2 @@
+# What notes may use (runtime/open/policy.rs; packed into /apps/.manifests by tools/build_initfs.py).
+caps: net

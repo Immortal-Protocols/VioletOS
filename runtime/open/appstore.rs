@@ -49,6 +49,8 @@ pub struct Entry {
     pub time: u32,
     /// Unpacked into /bin and /lib (not stored in the directory: read from the data).
     pub package: bool,
+    /// The app's manifest (policy.rs `envelope`), from the data; empty if none.
+    pub manifest: String,
 }
 
 #[derive(Default)]
@@ -128,6 +130,11 @@ fn word(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 
+/// A new install's name is at most this long: Storage keeps /data names of
+/// up to 16 characters, and the app's files are /data/NAME and /data/NAME.KEY
+/// (violet.py `_file`), so a key gets at least three.
+pub const NEW_NAME: usize = 12;
+
 /// A program name /apps can hold: 1-23 of a-z 0-9 _ -, not starting with '.'.
 pub fn valid_name(name: &str) -> bool {
     (1..=23).contains(&name.len())
@@ -144,7 +151,7 @@ fn decode(raw: &[u8]) -> Option<(u32, Vec<Entry>)> {
         if name.is_empty() {
             continue;
         }
-        entries.push(Entry { name, title: text(&e[24..48]), first: word(e, 48), len: word(e, 52), crc: word(e, 56), time: word(e, 60), package: false });
+        entries.push(Entry { name, title: text(&e[24..48]), first: word(e, 48), len: word(e, 52), crc: word(e, 56), time: word(e, 60), package: false, manifest: String::new() });
     }
     Some((word(raw, 8), entries))
 }
@@ -232,6 +239,9 @@ impl Store {
                         continue;
                     }
                 };
+                // Its manifest goes to the policy (manifest.rs); /apps/NAME is the program.
+                let (manifest, program) = unwrap_manifest(program);
+                e.manifest = manifest;
                 let path = alloc::format!("/apps/{}", e.name);
                 if let Some(f) = fs.writable(&path, true, true, 0) {
                     *f = program;
@@ -296,7 +306,7 @@ impl Store {
         if self.sectors == 0 {
             return Err("no app storage");
         }
-        if !valid_name(name) {
+        if !valid_name(name) || name.len() > NEW_NAME {
             return Err("bad name");
         }
         let path = alloc::format!("/apps/{}", name);
@@ -324,13 +334,19 @@ impl Store {
         } else {
             None
         };
+        // A damaged manifest is refused here, before anything is stored.
+        if !package && super::policy::envelope(program.as_deref().unwrap_or(&data)) == (Some(""), &[][..]) {
+            return Err("damaged manifest");
+        }
         if !write(first, &data) || !flush() {
             return Err("write failed");
         }
         let mut entries = self.entries.clone();
         let title: String = title.chars().filter(|c| *c != '\t' && *c != '\n').take(23).collect();
-        let bytes = data.len();
-        let entry = Entry { name: String::from(name), title, first, len: bytes as u32, crc: crc32(&data), time, package };
+        let (bytes, crc) = (data.len(), crc32(&data));
+        // An Agent-built app's manifest travels at the end of its program (policy.rs `envelope`).
+        let (manifest, program) = if package { (String::new(), Vec::new()) } else { unwrap_manifest(program.unwrap_or(data)) };
+        let entry = Entry { name: String::from(name), title, first, len: bytes as u32, crc, time, package, manifest };
         if let Some(index) = existing {
             entries[index] = entry;
         } else {
@@ -342,7 +358,7 @@ impl Store {
         if package {
             let _ = fs.unlink(&path, false);
         } else if let Some(file) = fs.writable(&path, true, true, time) {
-            *file = program.unwrap_or(data);
+            *file = program;
         }
         self.titles(fs, None);
         Ok(bytes)
@@ -399,6 +415,11 @@ fn expand(data: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Split an Agent-built program's manifest off it (policy.rs `split_manifest`, host-tested).
+fn unwrap_manifest(program: Vec<u8>) -> (String, Vec<u8>) {
+    super::policy::split_manifest(program)
+}
+
 pub fn is_package(data: &[u8]) -> bool {
     data.len() > 8 && &data[..4] == b"VGZ1"
 }
@@ -432,7 +453,7 @@ mod tests {
     use super::*;
     #[test]
     fn directory_round_trip() {
-        let e = Entry { name: "scorekeeper".into(), title: "Scorekeeper".into(), first: 8, len: 1000, crc: 7, time: 9, package: false };
+        let e = Entry { name: "scorekeeper".into(), title: "Scorekeeper".into(), first: 8, len: 1000, crc: 7, time: 9, package: false, manifest: String::new() };
         let raw = encode(3, &[e]);
         let (g, entries) = decode(&raw).unwrap();
         assert_eq!(g, 3);

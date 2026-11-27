@@ -66,6 +66,21 @@ test-memory: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/memory-test-apps) $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) targets/qemu/test_memory.py
 
+# Background lifecycle (local, not in CI): an app left behind Home freezes
+# after its grace and runs again in front; a child of the app in front runs
+# past that (Jobs); under pool pressure background
+# apps hear LOW_MEMORY and frozen ones are closed (status 137) while the app
+# in front and Home survive; a closed app opens again. Then the idle cost at
+# Home: QEMU's CPU time over 20 s, measured from this Mac (test_idle.py),
+# with the Open Runtime's own loop rate held to the 620/s baseline.
+.PHONY: test-lifecycle test-idle
+test-lifecycle: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/memory-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_lifecycle.py
+	$(PYTHON) targets/qemu/test_idle.py
+test-idle: qemu-image
+	$(PYTHON) targets/qemu/test_idle.py
+
 # Power's wake locks and governors, and network time (local, not in CI). The
 # time test needs this Mac to reach public NTP servers over UDP.
 .PHONY: test-power test-time
@@ -78,7 +93,9 @@ test-time: setup
 
 # Open apps' sockets (local, not in CI): one app holds its share of the socket
 # slots, churns the resolver and leaves a connect hanging; a second app must
-# still fetch a page at once. Servers are on this Mac's loopback.
+# still fetch a page at once. Servers are on this Mac's loopback. A third app
+# then serves on the phone's loopback (TCP, UDP, asyncio, AF_INET6) and on the
+# network, where this Mac connects to it through the relay.
 # Radio's socket code against lwIP itself, on the host (local, not in CI: it
 # needs lwIP's source, which an image build downloads). A second.
 LWIP_SRC ?= build/sel4/lwip-STABLE-2_2_1_RELEASE/src
@@ -107,6 +124,35 @@ test-net: setup
 test-wx: setup
 	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/wx-test-apps) $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) targets/qemu/test_wx.py
+
+# Linux ABI for open apps (local, not in CI, a few minutes): signals (handlers,
+# faults, asynchronous delivery, timers), fork, execve, posix_spawn, wait, and a
+# dynamically linked C program, from C, Rust and Go (targets/qemu/abi-test-apps).
+# The image ships musl's dynamic loader (VIOLET_OPEN_LDSO=1).
+.PHONY: test-abi
+test-abi: setup
+	VIOLET_OPEN_LDSO=1 VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/abi-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	@mkdir -p build/tests/abi
+	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/abi_host.rs -o build/tests/abi/host
+	VIOLET_ABI_REQUIRE_LIBC=1 build/tests/abi/host the_shipped_loader
+	$(PYTHON) targets/qemu/test_abi.py
+
+# The capability policy (local, not in CI): an app without a manifest must not
+# reach another app's /data, write /apps, open the microphone, camera,
+# Bluetooth or audio, make sockets, or give the system's sys commands.
+.PHONY: test-policy
+test-policy: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/policy-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_policy.py
+
+# The trusted system UI (local, not in CI, about four minutes): the band over a
+# full-screen app, a secure prompt the app cannot see touches under or draw
+# over, sys commands an app may not give, a passcode set in Settings, the lock
+# screen at the next boot with its back-off, and a notification shown as a count.
+.PHONY: test-trusted-ui
+test-trusted-ui: setup
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/trusted-ui-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_trusted_ui.py
 
 .PHONY: test-ladybird
 test-ladybird: qemu-image
@@ -147,6 +193,10 @@ test-unit:
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../../runtime/open/slots.rs"]\nmod slots;\n#[path = "../../../runtime/open/names.rs"]\nmod names;\n' > build/tests/netcaps/open_net_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/netcaps/open_net_test.rs -o build/tests/netcaps/open_net
 	build/tests/netcaps/open_net
+	@mkdir -p build/tests/net2
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../../runtime/open/loopback.rs"]\nmod loopback;\n#[path = "../../../runtime/open/sockaddr.rs"]\nmod sockaddr;\n' > build/tests/net2/open_listen_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O -A dead_code build/tests/net2/open_listen_test.rs -o build/tests/net2/open_listen
+	build/tests/net2/open_listen
 	cc -std=gnu11 -O1 -Wall -Wextra -Wno-unused-parameter -I targets/moto-g-pure/ip/test targets/moto-g-pure/ip/test/test_sockets.c -o build/tests/netcaps/sockets_c
 	build/tests/netcaps/sockets_c
 	python3 tools/test_net_layout.py
@@ -158,20 +208,40 @@ test-unit:
 	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../runtime/open/sntp.rs"]\nmod sntp;\n' > build/tests/sntp_test.rs
 	"$(HOST_RUSTC)" --edition=2021 --test -O build/tests/sntp_test.rs -o build/tests/sntp
 	build/tests/sntp
+	@mkdir -p build/tests/lifecycle
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../../runtime/open/lifecycle.rs"]\nmod lifecycle;\n' > build/tests/lifecycle/lifecycle_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O -A dead_code build/tests/lifecycle/lifecycle_test.rs -o build/tests/lifecycle/lifecycle
+	build/tests/lifecycle/lifecycle
 	@mkdir -p build/tests/memprot
 	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/memprot_host.rs -o build/tests/memprot/host
 	build/tests/memprot/host
+	@mkdir -p build/tests/abi
+	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/abi_host.rs -o build/tests/abi/host
+	build/tests/abi/host
 	python3 tools/test_elf_check.py
 	"$(HOST_RUSTC)" --edition=2021 --test -O targets/moto-g-pure/test_pmf.rs -o build/tests/wifi-pmf
 	build/tests/wifi-pmf
+	@mkdir -p build/tests/bt-wifi
+	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/hci_host.rs -o build/tests/bt-wifi/hci_host
+	build/tests/bt-wifi/hci_host
+	"$(HOST_RUSTC)" --edition=2021 --test -O targets/moto-g-pure/test_sae.rs -o build/tests/bt-wifi/sae
+	build/tests/bt-wifi/sae
+	@mkdir -p build/tests/trustedui
+	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/sysui_host.rs -o build/tests/trustedui/sysui_host
+	build/tests/trustedui/sysui_host
 	python3 apps/lib/python/test_violet.py
 	HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_host.sh
 	python3 image/packages/test_package_format.py
 	HOST_RUSTC="$(HOST_RUSTC)" system/package-manager/test_verify.sh
+	HOST_RUSTC="$(HOST_RUSTC)" system/package-manager/test_ota.sh
 	python3 kernel/sel4/test_delta.py
 	@mkdir -p build/tests/storage
 	"$(HOST_RUSTC)" --edition=2021 --test -O services/storage/tests/host.rs -o build/tests/storage/host
 	build/tests/storage/host
+	@mkdir -p build/tests/policy
+	"$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/policy_host.rs -o build/tests/policy/host
+	build/tests/policy/host
+	python3 tools/test_manifests.py
 	cd apps && RUSTC="$(abspath $(HOST_RUSTC))" "$(abspath $(HOST_CARGO))" test --release --locked --lib --bins -p violet -p home -p settings -p bitchat --target-dir ../build/host-tests
 
 # Storage on the host, longer than CI's run (local, about a minute): more
@@ -195,6 +265,17 @@ test-packages: qemu-image
 test-packages-floor: setup
 	VIOLET_PACKAGE_VERSIONS=radio=2 $(PYTHON) tools/build_sel4.py qemu
 	$(PYTHON) system/package-manager/test_signed_boot.py; status=$$?; $(PYTHON) tools/build_sel4.py qemu && exit $$status
+
+# Full-system updates (local, not in CI; about 15 minutes): an image of system
+# version 2 that trusts a test CA for its update server, with tools/ota_boot.py
+# as the bootloader: refused bundles, a signed update staged, booted as a
+# trial and marked, then a release that does not start and the fallback. The
+# normal image is built again afterwards.
+OTA_TEST_ENV = VIOLET_SYSTEM_VERSION=2 VIOLET_UPDATE_URL=https://updates.violet.test/latest.vota
+.PHONY: test-ota
+test-ota: setup
+	$(OTA_TEST_ENV) VIOLET_UPDATE_TEST_ROOT=$$($(PYTHON) targets/qemu/test_ota.py --prepare) $(PYTHON) tools/build_sel4.py qemu
+	$(PYTHON) targets/qemu/test_ota.py; status=$$?; $(PYTHON) tools/build_sel4.py qemu && exit $$status
 
 # The QEMU tests CI runs: one boot of the supervisor and its services (touch,
 # the watchdog, Home answering a tap), then Home, Settings and Music across
@@ -250,6 +331,21 @@ build/sel4/$(HOSTAP)/src/rsn_supp/wpa.c:
 .PHONY: test-wpa
 test-wpa: build/sel4/$(HOSTAP)/src/rsn_supp/wpa.c
 	HOST_RUSTC="$(HOST_RUSTC)" python3 targets/moto-g-pure/test_supplicant.py
+
+# WPA3-Personal SAE (targets/moto-g-pure/sae.rs) against hostap's own SAE on
+# OpenSSL 3 as the access point, anti-clogging tokens included (local, not CI;
+# a few seconds). Needs Homebrew's openssl@3 or OPENSSL_PREFIX.
+OPENSSL_PREFIX ?= $(or $(shell brew --prefix openssl@3 2>/dev/null),/opt/homebrew/opt/openssl@3)
+SAE_REF := common/sae common/dragonfly crypto/crypto_openssl crypto/sha256-prf crypto/sha256-kdf crypto/dh_groups utils/common utils/wpabuf utils/wpa_debug utils/os_unix ap/comeback_token
+SAE_REF_FLAGS := -O1 -DCONFIG_SAE -DCONFIG_ECC -DCONFIG_SHA256 -DCONFIG_NO_RANDOM_POOL -DCONFIG_NO_STDOUT_DEBUG -Ibuild/sel4/$(HOSTAP)/src -Ibuild/sel4/$(HOSTAP)/src/utils -I$(OPENSSL_PREFIX)/include
+.PHONY: test-sae
+test-sae: build/sel4/$(HOSTAP)/src/rsn_supp/wpa.c
+	@mkdir -p build/tests/bt-wifi/sae-hostap
+	for f in $(SAE_REF); do cc $(SAE_REF_FLAGS) -w -c build/sel4/$(HOSTAP)/src/$$f.c -o build/tests/bt-wifi/sae-hostap/$$(basename $$f).o || exit 1; done
+	cc $(SAE_REF_FLAGS) -Wall -c targets/moto-g-pure/test_sae_hostap.c -o build/tests/bt-wifi/sae-hostap/harness.o
+	ar rcs build/tests/bt-wifi/sae-hostap/libsaeref.a build/tests/bt-wifi/sae-hostap/*.o
+	"$(HOST_RUSTC)" --edition=2021 --test -O --cfg hostap targets/moto-g-pure/test_sae.rs -L build/tests/bt-wifi/sae-hostap -l static=saeref -L $(OPENSSL_PREFIX)/lib -l crypto -o build/tests/bt-wifi/sae-hostap/sae
+	build/tests/bt-wifi/sae-hostap/sae
 
 .PHONY: test-moto-ip-live
 test-moto-ip-live: moto

@@ -8,14 +8,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import elf_check
 
 
-def elf(kind, segments, interp=False):
-    """A minimal 32-bit ARM ELF: PT_LOAD (vaddr, memsz, flags) and maybe PT_INTERP."""
+def elf(kind, segments, interp=None):
+    """A minimal 32-bit ARM ELF: PT_LOAD (vaddr, memsz, flags) and maybe PT_INTERP naming `interp`."""
     headers = [(1, 0, vaddr, vaddr, 0, memsz, flags, 0x10000) for vaddr, memsz, flags in segments]
-    if interp:
-        headers.append((3, 0, 0, 0, 0, 0, 4, 1))
+    path = b""
+    if interp is not None:
+        path = interp.encode() + b"\0"
+        headers.append((3, 52 + 32 * (len(headers) + 1), 0, 0, len(path), len(path), 4, 1))
     ident = b"\x7fELF\x01\x01\x01" + bytes(9)
     head = ident + struct.pack("<HHIIIIIHHHHHH", kind, 40, 1, 0x10000, 52, 0, 0, 52, 32, len(headers), 40, 0, 0)
-    return head + b"".join(struct.pack("<8I", *h) for h in headers)
+    return head + b"".join(struct.pack("<8I", *h) for h in headers) + path
 
 
 SHIPPED = [(0x10000, 0xd8c, 4), (0x20d90, 0x8f60, 5), (0x39cf0, 0x310, 6), (0x49d30, 0x80c, 6)]
@@ -45,7 +47,16 @@ class ElfCheck(unittest.TestCase):
         self.assertEqual(elf_check.problems(elf_check.inspect(elf(2, [(0x10000, 0x10001, 6), (0x21000, 64, 5)]))), why)
 
     def test_interpreter(self):
-        self.assertEqual(elf_check.problems(elf_check.inspect(elf(3, SHIPPED, interp=True))), ["dynamically linked"])
+        # Only musl's loader, and only when the image ships it.
+        self.assertEqual(elf_check.problems(elf_check.inspect(elf(3, SHIPPED, interp=elf_check.LOADER))), [])
+        self.assertEqual(elf_check.problems(elf_check.inspect(elf(3, SHIPPED, interp="/lib/ld-linux-armhf.so.3"))),
+                         ["dynamically linked against /lib/ld-linux-armhf.so.3 (only /lib/ld-musl-armhf.so.1 is supported)"])
+        dynamic = {"apps/d": elf(3, SHIPPED, interp=elf_check.LOADER)}
+        with self.assertRaises(SystemExit) as refused:
+            elf_check.check(dynamic)
+        self.assertIn("the image has no /lib/ld-musl-armhf.so.1", str(refused.exception))
+        dynamic["lib/ld-musl-armhf.so.1"] = elf(3, SHIPPED)
+        self.assertEqual(elf_check.check(dynamic), [])
 
     def test_not_a_program(self):
         for data in [b"", b"#!/bin/sh\n", elf(2, SHIPPED)[:40], elf(1, SHIPPED), b"\x7fELF\x02" + bytes(60)]:

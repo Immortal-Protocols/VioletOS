@@ -1,5 +1,5 @@
 //! Infrastructure station management frames for a WPA2-Personal CCMP network
-//! or an open one.
+//! or an open one, and the frames that carry WPA3-Personal SAE (sae.rs).
 use super::passive_scan::AccessPoint;
 
 /// The RSN element for an access point without management frame protection:
@@ -13,16 +13,19 @@ pub const RSN_MAX: usize = 28;
 /// again in message 2 of the handshake. With management frame protection
 /// (`ap.mfp`, IEEE 802.11w) it sets MFPC, and MFPR when the access point
 /// requires protection, and names BIP-CMAC-128 after an empty PMKID list.
+/// SAE (AKM 8) always sets MFPC: WPA3-Personal requires it, and an access
+/// point refuses SAE without it.
 pub fn rsne(ap: &AccessPoint, out: &mut [u8; RSN_MAX]) -> usize {
     out[..RSN.len()].copy_from_slice(RSN);
-    if ap.akm == 6 {
-        out[19] = 6; // PSK with SHA-256 (00-0F-AC:6)
+    if ap.akm == 6 || ap.akm == 8 {
+        out[19] = ap.akm; // PSK with SHA-256 (00-0F-AC:6) or SAE (00-0F-AC:8)
     }
-    if ap.mfp == 0 {
+    let mfp = if ap.akm == 8 { ap.mfp.max(1) } else { ap.mfp };
+    if mfp == 0 {
         return RSN.len();
     }
     out[1] = RSN_MAX as u8 - 2;
-    out[20] = if ap.mfp == 2 { 0xc0 } else { 0x80 };
+    out[20] = if mfp == 2 { 0xc0 } else { 0x80 };
     out[22..].copy_from_slice(&[0, 0, 0, 15, 172, 6]);
     RSN_MAX
 }
@@ -61,6 +64,32 @@ pub fn request(ap: &AccessPoint, station: [u8; 6], associate: bool, out: &mut [u
     let n = rsne(ap, &mut rsn);
     out[pos..pos + n].copy_from_slice(&rsn[..n]);
     pos + n
+}
+
+/// An SAE authentication frame (algorithm 3) to `ap`: `body` is what sae.rs
+/// `Sae::message` wrote, from the algorithm number on.
+pub fn sae_request(ap: &AccessPoint, station: [u8; 6], body: &[u8], out: &mut [u8]) -> usize {
+    let n = 24 + body.len();
+    out[..24].fill(0);
+    out[0] = 0xb0;
+    out[4..10].copy_from_slice(&ap.bssid);
+    out[10..16].copy_from_slice(&station);
+    out[16..22].copy_from_slice(&ap.bssid);
+    out[24..n].copy_from_slice(body);
+    n
+}
+
+/// The body of an SAE authentication frame from `ap` to this station, for
+/// sae.rs `Sae::receive`; None for any other frame.
+pub fn sae_response<'a>(frame: &'a [u8], ap: &AccessPoint, station: [u8; 6]) -> Option<&'a [u8]> {
+    (frame.len() >= 30
+        && frame[0] == 0xb0
+        && frame[1] & 0x43 == 0
+        && frame[4..10] == station
+        && frame[10..16] == ap.bssid
+        && frame[16..22] == ap.bssid
+        && frame[24..26] == [3, 0])
+        .then(|| &frame[24..])
 }
 
 /// `response`'s error when the access point says "try again later" (status 30):

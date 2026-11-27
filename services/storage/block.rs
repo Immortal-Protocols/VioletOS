@@ -196,6 +196,45 @@ impl Disk {
         self.write(APPS + index, bytes)
     }
 }
+/// Full-system updates (services/storage/slotwrite.rs, tools/ota_boot.py):
+/// on a data disk large enough (make test-ota makes one), misc at 16 MiB
+/// with bootloader_control in its fifth sector, then two 64 MiB boot slots.
+/// A smaller disk has no slots and updates are unavailable.
+#[allow(dead_code)]
+const OTA_MISC: usize = 32768;
+#[allow(dead_code)]
+const OTA_SLOT: [usize; 2] = [34816, 34816 + 131072];
+#[allow(dead_code)]
+const OTA_SLOT_SECTORS: usize = 131072;
+impl Disk {
+    /// (bootloader_control sector, first sector of slot A and B, sectors per slot).
+    #[allow(dead_code)]
+    pub fn slot_geometry(&self) -> Option<(u32, [u32; 2], u32)> {
+        if self.sectors < OTA_SLOT[1] + OTA_SLOT_SECTORS {
+            return None;
+        }
+        Some(((OTA_MISC + 4) as u32, [OTA_SLOT[0] as u32, OTA_SLOT[1] as u32], OTA_SLOT_SECTORS as u32))
+    }
+    /// Only the metadata sector and the two slots, never the volume or apps.
+    #[allow(dead_code)]
+    fn slot_sector(&self, lba: u32) -> Result<usize, ()> {
+        let lba = lba as usize;
+        match self.slot_geometry() {
+            Some(_) if lba == OTA_MISC + 4 || (OTA_SLOT[0]..OTA_SLOT[1] + OTA_SLOT_SECTORS).contains(&lba) => Ok(lba),
+            _ => Err(()),
+        }
+    }
+    #[allow(dead_code)]
+    pub fn slot_read(&mut self, lba: u32) -> Result<Sector, ()> {
+        let at = self.slot_sector(lba)?;
+        self.read(at)
+    }
+    #[allow(dead_code)]
+    pub fn slot_write(&mut self, lba: u32, bytes: &mut Sector) -> Result<(), ()> {
+        let at = self.slot_sector(lba)?;
+        self.write(at, bytes)
+    }
+}
 #[allow(dead_code)]
 const APPS: usize = 4096;
 #[allow(dead_code)]

@@ -15,6 +15,10 @@
 
 include!(env!("VIOLET_PACKAGE_KEYS_RS"));
 
+/// Full-system update manifests, signed by the same keys (ota.rs).
+#[path = "ota.rs"]
+pub mod ota;
+
 pub const HEADER: usize = 24;
 /// Trailer bytes under the signature: magic, key ID, version, target.
 pub const SIGNED_TRAILER: usize = 16;
@@ -406,6 +410,69 @@ mod root {
             return false;
         };
         p256(&*(key as *const [u8; 65]), &sha256(bytes(data, size)), &signature)
+    }
+    /// This boot image's own system version (VIOLET_SYSTEM_VERSION at build time).
+    const SYSTEM_VERSION: u32 = super::ota::system_version();
+    /// A full-system update's manifest, the first ota::MANIFEST bytes at
+    /// `manifest`, for an inactive slot of `slot_sectors` sectors. Returns
+    /// its version (never 0) when it is signed by a pinned key for this
+    /// target and is not older than this system; then `*sectors` is the
+    /// image's length in sectors. When `digest` is not null it must also be
+    /// the manifest's digest (what Storage read back). Otherwise returns 0
+    /// and `*why` is the refusal (1 format, 2 target, 3 key, 4 signature,
+    /// 5 version, 6 size, 7 digest).
+    #[no_mangle]
+    unsafe extern "C" fn ota_verify(manifest: *const u8, slot_sectors: u32, digest: *const u8, sectors: *mut u32, why: *mut u32) -> u32 {
+        use super::ota::{check, matches, Refusal, MANIFEST};
+        if manifest.is_null() || sectors.is_null() || why.is_null() {
+            return 0;
+        }
+        let result = check(bytes(manifest, MANIFEST as u32), TARGET, KEYS, SYSTEM_VERSION, slot_sectors, sha256, p256)
+            .and_then(|m| if digest.is_null() { Ok(m) } else { matches(&m, &*(digest as *const [u8; 32])).map(|_| m) });
+        match result {
+            Ok(m) => {
+                *sectors = m.sectors();
+                *why = 0;
+                m.version
+            }
+            Err(r) => {
+                *sectors = 0;
+                *why = match r {
+                    Refusal::Format => 1,
+                    Refusal::Target => 2,
+                    Refusal::Key => 3,
+                    Refusal::Signature => 4,
+                    Refusal::Version => 5,
+                    Refusal::Size => 6,
+                    Refusal::Digest => 7,
+                };
+                0
+            }
+        }
+    }
+    /// The version in the image, where tools/ota_bundle.py finds it.
+    #[used]
+    static SYSTEM_VERSION_NOTE: [u8; super::ota::NOTE] = super::ota::version_note(SYSTEM_VERSION);
+    #[no_mangle]
+    unsafe extern "C" fn ota_system_version() -> u32 {
+        // Read through the note so the linker keeps it.
+        let note = core::ptr::read_volatile(core::ptr::addr_of!(SYSTEM_VERSION_NOTE));
+        super::ota::note_version(&note).unwrap_or(SYSTEM_VERSION)
+    }
+    static mut MARK: super::ota::Mark = super::ota::Mark::new();
+    /// The components (re)start: the slot is not marked until they run healthy.
+    #[no_mangle]
+    unsafe extern "C" fn ota_mark_restart() {
+        (*core::ptr::addr_of_mut!(MARK)).restart()
+    }
+    /// Whether to ask Storage to mark the running slot now (ota.rs `Mark`).
+    #[no_mangle]
+    unsafe extern "C" fn ota_mark_due(healthy: bool, now: u32) -> bool {
+        (*core::ptr::addr_of_mut!(MARK)).due(healthy, now)
+    }
+    #[no_mangle]
+    unsafe extern "C" fn ota_mark_result(ok: bool, now: u32, second: u32) {
+        (*core::ptr::addr_of_mut!(MARK)).result(ok, now, second)
     }
 }
 

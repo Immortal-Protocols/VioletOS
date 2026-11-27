@@ -1,0 +1,2 @@
+# What this app may use on the phone (see AGENTS.md): it beeps.
+caps: audio-out

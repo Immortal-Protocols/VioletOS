@@ -55,6 +55,13 @@ class Violet(unittest.TestCase):
         # The Home button's press and lift are not the app's; the other tap is.
         self.assertEqual(kinds, [("focus", 0, 0), ("down", 300, 700), ("up", 300, 700)])
 
+    def test_lifecycle_values(self):
+        # EVENT_LIFECYCLE (7): LOW_MEMORY (4) is not a focus event, nor is an unknown value.
+        raw = lambda value: violet._EVENT.pack(0, 7, 0, 0, 0, value)
+        kinds = [violet._decode(raw(v)).kind for v in (1, 2, 3, 4, 9)]
+        self.assertEqual(kinds, ["focus", "blur", "quit", "lowmemory", "other"])
+        self.assertFalse(violet._decode(raw(4)).focus)
+
     def test_timeout_ticks(self):
         ticks = [e for e in violet.events(timeout=0.01) if e is None]
         self.assertGreaterEqual(len(ticks), 3)
@@ -63,6 +70,30 @@ class Violet(unittest.TestCase):
         self.assertEqual(violet.load("score", 0), 0)
         violet.save("score", {"home": 3})
         self.assertEqual(violet.load("score"), {"home": 3})
+
+    def test_data_names_on_the_phone(self):
+        # As on the phone: /data/APP or /data/APP.KEY, never over 16 characters,
+        # never a name another app owns, and two keys never share a file.
+        fake, argv = violet.FAKE, sys.argv
+        try:
+            violet.FAKE = False
+            sys.argv = ["/apps/scorekeeper"]
+            self.assertEqual(violet._file("scorekeeper"), "scorekeeper")
+            self.assertEqual(violet._file("best"), "scorekeeper.best")
+            self.assertEqual(violet._file("scorekeeper.best"), "scorekeeper.best")
+            a, b = violet._file("highscore"), violet._file("highscore2")
+            self.assertNotEqual(a, b)
+            for n in (a, b):
+                self.assertTrue(n.startswith("scorekeeper.") and len(n) <= 16, n)
+            sys.argv = ["/bin/python3", "/apps/weatherforec/main.py"][1:]
+            for key in ("city", "forecast-cache", "x" * 40):
+                n = violet._file(key)
+                self.assertTrue(n.startswith("weatherforec.") and len(n) <= 16, n)
+            sys.argv = ["/apps/neighbourhoodw"]
+            with self.assertRaises(ValueError):
+                violet._file("longer-key")
+        finally:
+            violet.FAKE, sys.argv = fake, argv
 
 
 if __name__ == "__main__":

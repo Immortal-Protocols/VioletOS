@@ -10,10 +10,18 @@
 //! The runtime's copies to and from app memory check the same regions.
 //! The trampoline page belongs to the runtime: the app cannot unmap, replace
 //! or change it, so its pool page never returns to the pool while the app lives.
-//! The ELF loader handles static executables (ET_EXEC) and static PIE (ET_DYN
-//! without an interpreter), places them by a random layout, and builds the
-//! Linux initial stack with its auxiliary vector.
+//! The ELF loader handles static executables (ET_EXEC), static PIE (ET_DYN
+//! without an interpreter) and programs linked against musl's dynamic loader
+//! (PT_INTERP naming /lib/ld-musl-armhf.so.1 only, which is then loaded too,
+//! at a random address in the mmap area, under the same W^X rules), places
+//! them by a random layout, and builds the Linux initial stack with its
+//! auxiliary vector. The header checks are in ../../runtime/open/elf.rs.
+//! The trampoline page also holds the signal gate (../../runtime/open/signal.rs).
+//! `fork_into` copies an address space for fork(2).
+#[path = "../../runtime/open/elf.rs"]
+pub mod elf;
 use super::pool::{page_va, Kernel, Pool};
+use super::signal::{GATE, GATE_OFFSET};
 use super::sys::{self, Object, PAGE, PAGE_BITS};
 use super::syscall::{EACCES, EEXIST, ENOMEM};
 use super::vma::{self, HW_NONE, HW_RW, HW_RX};
@@ -219,16 +227,53 @@ impl Space {
     pub fn stub(&mut self, k: &mut Kernel, pool: &mut Pool, slot: usize, target: u32) -> Option<u32> {
         let stubs = self.layout.stubs;
         let whole = Vma { start: stubs, end: stubs.checked_add(PAGE as u32)?, prot: PROT_READ | PROT_EXEC };
-        if slot >= PAGE / 8 || self.find(stubs) != Some(&whole) {
+        if slot >= (GATE_OFFSET / 8) as usize || self.find(stubs) != Some(&whole) {
             return None;
         }
-        let at = self.page(k, pool, stubs)? + 8 * slot;
+        let page = self.page(k, pool, stubs)?;
+        let at = page + 8 * slot;
         unsafe {
             (at as *mut u32).write_volatile(0xe51f_f004);
             ((at + 4) as *mut u32).write_volatile(target);
+            // The signal gate, after the trampolines (rewritten with each: it costs little).
+            for (n, word) in GATE.iter().enumerate() {
+                ((page + GATE_OFFSET as usize + 4 * n) as *mut u32).write_volatile(*word);
+            }
         }
         self.sync_code(stubs, whole.end);
         Some(stubs + 8 * slot as u32)
+    }
+
+    /// Where the signal gate is in the app.
+    pub fn gate(&self) -> u32 {
+        self.layout.stubs + GATE_OFFSET
+    }
+
+    /// fork(2): give `child` (a new, empty space) a copy of this one: its
+    /// regions, layout and break, and a copy of every page it owns, the
+    /// trampoline page included. Pages a device owns (the screen surface)
+    /// are not copied and their regions are dropped. Nothing is shared, so
+    /// nothing needs copy-on-write. On error the caller destroys `child`.
+    pub fn fork_into(&self, child: &mut Space, k: &mut Kernel, pool: &mut Pool) -> Result<(), i32> {
+        child.layout = self.layout;
+        child.brk_start = self.brk_start;
+        child.brk = self.brk;
+        child.vmas = self.vmas.clone();
+        for (&p, _) in self.pages.iter().filter(|(_, page)| !page.owned) {
+            vma::carve(&mut child.vmas, p << PAGE_BITS, (p << PAGE_BITS).saturating_add(PAGE as u32));
+        }
+        for (&p, page) in self.pages.iter().filter(|(_, page)| page.owned) {
+            let index = pool.take().ok_or(ENOMEM)?;
+            unsafe { core::ptr::copy_nonoverlapping(page_va(page.pool) as *const u8, page_va(index) as *mut u8, PAGE) };
+            if let Err(e) = child.map(k, pool, p << PAGE_BITS, index, true) {
+                pool.give_back(index);
+                return Err(e);
+            }
+        }
+        for v in self.vmas.iter().filter(|v| v.prot & PROT_EXEC != 0) {
+            child.sync_code(v.start, v.end);
+        }
+        Ok(())
     }
 
     /// The runtime's view of an app address inside a region, for the
@@ -392,22 +437,7 @@ impl Space {
     /// layout's mmap top.
     pub fn free_range(&self, len: u32) -> Option<u32> {
         // Mappings start on a 64 KiB page so unmapping one frees whole pages.
-        let len = align_up(len, PAGE as u32);
-        let mut top = self.layout.mmap_top;
-        for v in self.vmas.iter().rev() {
-            if v.start >= top {
-                continue;
-            }
-            let floor = align_up(v.end.max(MMAP_BASE), PAGE as u32);
-            if floor <= top && top - floor >= len {
-                return Some(top - len);
-            }
-            top = top.min(align_down(v.start, PAGE as u32));
-            if top <= MMAP_BASE {
-                return None;
-            }
-        }
-        (top >= MMAP_BASE + len).then(|| top - len)
+        elf::free_in(&self.vmas, self.layout.mmap_top, len)
     }
     pub fn overlaps(&self, start: u32, end: u32) -> bool {
         vma::union(&self.vmas, start, end) != 0
@@ -469,13 +499,6 @@ impl Space {
     }
 }
 
-fn u16_at(b: &[u8], at: usize) -> u32 {
-    u32::from(u16::from_le_bytes([b[at], b[at + 1]]))
-}
-fn u32_at(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
 pub const AT_NULL: u32 = 0;
 const AT_PHDR: u32 = 3;
 const AT_PHENT: u32 = 4;
@@ -498,96 +521,79 @@ const AT_EXECFN: u32 = 31;
 /// half, thumb, fast mult, VFP, EDSP, NEON, VFPv3, TLS, VFPv4, IDIVA, IDIVT, VFPD32.
 const HWCAP: u32 = 2 | 4 | 16 | 64 | 128 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | 524288;
 
-/// Load a static ELF executable at `layout` and build its stack. `random`
-/// fills AT_RANDOM. Each segment gets the protection its header asks for
-/// (text read-execute, constants read-only, data read-write); a program with
-/// a segment both writable and executable, or with code sharing a 64 KiB page
-/// with any other segment (the hardware runs whole pages), is refused. The
-/// stack is never executable.
+/// The dynamic loader a program needs, if it is dynamically linked: only
+/// elf::LOADER is ever named (a program naming another is refused by `load`).
+pub fn interp(image: &[u8]) -> Option<&'static str> {
+    elf::plan(image).ok().filter(|p| p.interp).map(|_| elf::LOADER)
+}
+
+/// Place one ELF image's segments at `base` (all below `limit`). Each
+/// segment gets the protection its header asks for (text read-execute,
+/// constants read-only, data read-write); code sharing a 64 KiB page with
+/// anything else is refused. Returns the end of the highest segment.
+fn segments(space: &mut Space, k: &mut Kernel, pool: &mut Pool, image: &[u8], plan: &elf::Plan, base: u32, limit: u32, code: &mut Vec<(u32, u32)>) -> Result<u32, &'static str> {
+    let mut end = 0u32;
+    for s in &plan.segs {
+        // The regions by the W^X rules (elf.rs, shared with execve's dry run `elf::check`).
+        let (va, seg_end, start, stop) = elf::region(&mut space.vmas, s, base, limit)?;
+        space.sync(start, stop);
+        // elf::plan checked that the file holds [offset, offset + filesz).
+        let data = image.get(s.offset as usize..(s.offset + s.filesz) as usize).ok_or("bad segment")?;
+        if !space.place(k, pool, va, data) {
+            return Err("out of memory loading the program");
+        }
+        // Touch the rest so the bss pages exist and are zero.
+        let mut a = align_down(va + s.filesz, PAGE as u32);
+        while a < seg_end {
+            space.resolve(k, pool, a.max(va)).ok_or("out of memory")?;
+            a += PAGE as u32;
+        }
+        if s.flags & 1 != 0 {
+            code.push((va, seg_end));
+        }
+        end = end.max(seg_end);
+    }
+    Ok(end)
+}
+
+/// Load an ELF executable at `layout` and build its stack. `random` fills
+/// AT_RANDOM. A dynamically linked program needs `interp`, the contents of
+/// its loader (elf::LOADER, from the system image; the caller looks it up):
+/// the loader goes at a random address in the mmap area, the thread starts
+/// at its entry, and AT_BASE tells it where it is. A program with a segment
+/// both writable and executable, or with code sharing a 64 KiB page with any
+/// other segment (the hardware runs whole pages), is refused, and so is a
+/// loader that breaks the same rules. The stack is never executable.
 pub fn load(
     space: &mut Space,
     k: &mut Kernel,
     pool: &mut Pool,
     image: &[u8],
+    interp: Option<&[u8]>,
     argv: &[String],
     envp: &[String],
     random: [u8; 16],
     layout: Layout,
 ) -> Result<Loaded, &'static str> {
-    if image.len() < 52 || &image[..4] != b"\x7fELF" || image[4] != 1 || image[5] != 1 {
-        return Err("not a 32-bit little-endian ELF file");
-    }
-    if u16_at(image, 18) != 40 {
-        return Err("not an ARM executable");
-    }
-    let kind = u16_at(image, 16);
-    let (phoff, phentsize, phnum) = (u32_at(image, 28) as usize, u16_at(image, 42) as usize, u16_at(image, 44) as usize);
-    let headers_end = phentsize.checked_mul(phnum).and_then(|n| n.checked_add(phoff));
-    if phentsize < 32 || headers_end.map_or(true, |e| e > image.len()) {
-        return Err("bad program headers");
-    }
-    let base = match kind {
-        2 => 0,
-        3 => layout.pie_base,
-        _ => return Err("not an executable"),
-    };
+    let plan = elf::plan(image)?;
+    let base = if plan.pie { layout.pie_base } else { 0 };
     space.layout = layout;
-    let mut end = 0u32;
-    let mut phdr_va = 0u32;
     let mut code: Vec<(u32, u32)> = Vec::new();
-    for i in 0..phnum {
-        let h = &image[phoff + i * phentsize..];
-        let (ptype, offset, vaddr, filesz, memsz, flags) =
-            (u32_at(h, 0), u32_at(h, 4), u32_at(h, 8), u32_at(h, 16), u32_at(h, 20), u32_at(h, 24));
-        if ptype == 3 {
-            return Err("dynamically linked: build it statically");
+    let end = segments(space, k, pool, image, &plan, base, MMAP_BASE, &mut code)?;
+    let main_entry = base.wrapping_add(plan.entry);
+    let (mut entry, mut ld_base) = (main_entry, 0);
+    if plan.interp {
+        let ld_image = interp.ok_or("its dynamic loader /lib/ld-musl-armhf.so.1 is not in the system image")?;
+        let ld = elf::plan(ld_image)?;
+        if !ld.loader_ok() {
+            return Err("/lib/ld-musl-armhf.so.1 is not a dynamic loader");
         }
-        if ptype == 6 {
-            phdr_va = base.wrapping_add(vaddr);
-        }
-        if ptype != 1 || memsz == 0 {
-            continue;
-        }
-        let file_end = offset.checked_add(filesz).map(|e| e as usize).filter(|&e| e <= image.len());
-        let Some(file_end) = file_end.filter(|_| filesz <= memsz) else { return Err("bad segment") };
-        let va = base.checked_add(vaddr).ok_or("bad segment address")?;
-        let seg_end = va.checked_add(memsz).filter(|&e| e <= MMAP_BASE).ok_or("segment too high")?;
-        if flags & 3 == 3 {
-            return Err("a segment is writable and executable");
-        }
-        let mut prot = PROT_READ;
-        if flags & 2 != 0 { prot |= PROT_WRITE; }
-        if flags & 1 != 0 { prot |= PROT_EXEC; }
-        // Neighbouring data segments may share a 4 KiB page; it keeps both protections.
-        let (start, stop) = (align_down(va, 4096), align_up(seg_end, 4096));
-        let shared: Vec<Vma> = space.vmas.iter().filter(|v| v.end > start && v.start < stop).copied().collect();
-        // Never code with anything else: the merged page would run both.
-        if shared.iter().any(|v| (v.prot ^ prot) & PROT_EXEC != 0) {
-            return Err("code shares a 64 KiB page with data");
-        }
-        space.add(start, stop, prot);
-        for v in shared {
-            space.add(v.start.max(start), v.end.min(stop), v.prot | prot);
-        }
-        if !space.place(k, pool, va, &image[offset as usize..file_end]) {
-            return Err("out of memory loading the program");
-        }
-        // Touch the rest so the bss pages exist and are zero.
-        let mut a = align_down(va + filesz, PAGE as u32);
-        while a < seg_end {
-            space.resolve(k, pool, a.max(va)).ok_or("out of memory")?;
-            a += PAGE as u32;
-        }
-        if flags & 1 != 0 {
-            code.push((va, seg_end));
-        }
-        if phdr_va == 0 && offset as usize <= phoff && phoff < file_end {
-            phdr_va = va.wrapping_add(phoff as u32 - offset);
-        }
-        end = end.max(seg_end);
-    }
-    if end == 0 {
-        return Err("no loadable segments");
+        let (lo, hi) = ld.span();
+        let lo = align_down(lo, PAGE as u32);
+        let at = space.free_range(hi - lo).ok_or("no room for the dynamic loader")?;
+        ld_base = at.wrapping_sub(lo);
+        segments(space, k, pool, ld_image, &ld, ld_base, layout.mmap_top, &mut code)?;
+        entry = ld_base.wrapping_add(ld.entry);
     }
     if vma::mixed(&space.vmas) {
         return Err("code shares a 64 KiB page with data");
@@ -595,6 +601,8 @@ pub fn load(
     for (start, stop) in code {
         space.sync_code(start, stop);
     }
+    let phdr_va = plan.phdr_at(base);
+    let (phentsize, phnum) = (plan.phentsize, plan.phnum);
     // The heap starts a random distance past the program.
     let heap = align_up(end, 4096);
     space.brk_start = heap.checked_add(layout.brk_gap).filter(|&b| b <= MMAP_BASE).unwrap_or(heap);
@@ -627,12 +635,12 @@ pub fn load(
     let execfn = arg_ptrs.first().copied().unwrap_or(0);
     let aux = [
         (AT_PHDR, phdr_va),
-        (AT_PHENT, phentsize as u32),
-        (AT_PHNUM, phnum as u32),
+        (AT_PHENT, phentsize),
+        (AT_PHNUM, phnum),
         (AT_PAGESZ, 4096),
-        (AT_BASE, 0),
+        (AT_BASE, ld_base),
         (AT_FLAGS, 0),
-        (AT_ENTRY, base.wrapping_add(u32_at(image, 24))),
+        (AT_ENTRY, main_entry),
         (AT_UID, 0),
         (AT_EUID, 0),
         (AT_GID, 0),
@@ -664,5 +672,5 @@ pub fn load(
     if !space.write(k, pool, sp, &bytes) {
         return Err("out of memory building the stack");
     }
-    Ok(Loaded { entry: base.wrapping_add(u32_at(image, 24)), sp })
+    Ok(Loaded { entry, sp })
 }

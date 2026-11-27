@@ -1,0 +1,7 @@
+# What Settings may use (runtime/open/policy.rs; packed into /apps/.manifests by tools/build_initfs.py).
+# net: it downloads system updates (src/updates.rs, src/fetch.rs).
+caps: net wifi-admin system audio-out
+# Saved networks and the Phone Internet choice (also read by runtime/open/wifi.rs).
+data: networks relay
+# /tmp/.ota-chunk: each piece of a system update it stages (src/updates.rs, runtime/open/update.rs).
+tmp: .ota-chunk

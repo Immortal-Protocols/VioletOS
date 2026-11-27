@@ -18,6 +18,10 @@
 //! is read, and what is queued to send counts from zero.
 //!
 //! slots.rs decides who may take a slot; names.rs is the resolver's table.
+//! A listening slot (CMD_LISTEN) holds no connection: the server counts the
+//! connections waiting on it in word 15, and each accept (CMD_ACCEPT) takes
+//! one into a slot of its own, so accepted connections count against the
+//! app's share like any other. Loopback sockets never come here (loopback.rs).
 //!
 //! DNS never leaves the phone as a query: the Open Runtime answers a program's
 //! UDP queries to port 53 itself, giving each name an address in 198.18.0.0/15,
@@ -50,6 +54,18 @@ pub const CMD_CLOSE: u32 = 2;
 /// name length (u8, sending only) and name, then the payload. Radio puts the
 /// socket's local port in word 12 and the address it has on the network in 13.
 pub const CMD_UDP: u32 = 3;
+/// Listen for connections from the network: word 5 the backlog, word 6 the
+/// port (never 0: the Open Runtime picks ports, loopback.rs). Radio listens
+/// on every address the phone has; OPEN once listening (word 12 the port, 13
+/// the phone's address), and word 15 counts the connections waiting to be
+/// accepted. FAILED with EADDRINUSE, or EOPNOTSUPP through the phone's relay
+/// (it carries outgoing connections only).
+pub const CMD_LISTEN: u32 = 4;
+/// Take the oldest connection waiting on a listening slot (word 5) of the
+/// same owner: OPEN (or PEER_CLOSED) with the peer's port in word 12 and its
+/// address in 13; FAILED with EAGAIN when none is waiting, EINVAL when word 5
+/// is not that owner's listener.
+pub const CMD_ACCEPT: u32 = 5;
 /// The largest UDP payload an app can send.
 pub const MAX_DATAGRAM: usize = 1472;
 pub const IDLE: u32 = 0;
@@ -99,20 +115,76 @@ pub fn held(owner: u32) -> usize {
     table().held(owner)
 }
 
+/// Who holds a slot (a pid, or slots::SYSTEM).
+pub fn owner(slot: usize) -> Option<u32> {
+    table().owner(slot)
+}
+
+/// An address in dotted form.
+pub fn literal(ip: u32) -> String {
+    alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255)
+}
+
 /// Close a connection; called when the last descriptor for it closes.
 pub fn close(slot: usize) {
     if !table().in_use(slot) {
         return;
     }
+    // A socket with bytes the server has not sent yet lingers, and is closed
+    // once they are gone (a stream also once the peer has closed: it is shut
+    // for sending, so the server sends them, then FIN), or after LINGER_NS
+    // (linger_tick). As on Linux, `send` then `close` (or exit) delivers
+    // what was sent, a datagram included.
+    let stream = matches!(get(slot, 1), CMD_CONNECT | CMD_ACCEPT);
+    if (stream || get(slot, 1) == CMD_UDP) && taken(slot) && get(slot, 3) == OPEN && get(slot, 7) != get(slot, 8) {
+        let l = lingering();
+        if l.0 & (1 << slot) == 0 {
+            if stream {
+                set(slot, 11, 1);
+            }
+            l.0 |= 1 << slot;
+            l.1[slot] = super::sys::now_ns() + LINGER_NS;
+            return;
+        }
+    }
+    lingering().0 &= !(1 << slot);
     set(slot, 1, CMD_CLOSE);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     set(slot, 0, get(slot, 0).wrapping_add(1));
     table().free(slot);
 }
 
+/// How long a closed stream may keep its slot to deliver what it sent.
+const LINGER_NS: u64 = 5_000_000_000;
+/// Closed streams still delivering (a bit per slot) and when each gives up.
+struct Linger(core::cell::UnsafeCell<(u32, [u64; SLOTS])>);
+unsafe impl Sync for Linger {}
+static LINGER: Linger = Linger(core::cell::UnsafeCell::new((0, [0; SLOTS])));
+fn lingering() -> &'static mut (u32, [u64; SLOTS]) {
+    unsafe { &mut *LINGER.0.get() }
+}
+/// Finish the closes that were waiting: sent and answered with the peer's
+/// close, failed, or out of time. Run from the loop.
+pub fn linger_tick(now: u64) {
+    let l = lingering();
+    for slot in 0..SLOTS {
+        if l.0 & (1 << slot) != 0
+            && ((get(slot, 7) == get(slot, 8) && (get(slot, 3) != OPEN || get(slot, 1) == CMD_UDP))
+                || get(slot, 3) == FAILED
+                || now > l.1[slot])
+        {
+            close(slot);
+        }
+    }
+}
+
 pub struct Net {
     /// The pages are mapped (the board has a socket server).
     pub present: bool,
+    /// Loopback connections open on the phone (loopback.rs).
+    pub pipes: super::loopback::Budget,
+    /// Where the next port 0 bind starts looking.
+    pub next_port: u16,
     /// The resolver's table of stand-in addresses.
     pub names: Names,
     /// The source of the datagram read last (for recvfrom).
@@ -120,7 +192,7 @@ pub struct Net {
 }
 impl Net {
     pub fn new(present: bool) -> Net {
-        Net { present, names: Names::new(), last_from: (0, 0) }
+        Net { present, pipes: super::loopback::Budget::new(), next_port: super::loopback::EPHEMERAL, names: Names::new(), last_from: (0, 0) }
     }
     /// Slots the server serves; 0 unless it speaks this layout.
     fn served(&self) -> usize {
@@ -154,7 +226,7 @@ impl Net {
         match self.names.lookup(owner, ip) {
             Lookup::Name(n) => Some(String::from(n)),
             Lookup::Stale => None,
-            Lookup::Literal => Some(alloc::format!("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255)),
+            Lookup::Literal => Some(literal(ip)),
         }
     }
     /// An address the resolver hands out for names.
@@ -181,12 +253,29 @@ impl Net {
     pub fn udp_open_for(&mut self, owner: u32, apps: usize) -> Result<usize, i32> {
         self.start(owner, apps, CMD_UDP, 0, 0)
     }
+    /// Open a UDP socket on a port the app bound (0: any).
+    pub fn udp_bind_for(&mut self, owner: u32, apps: usize, port: u16) -> Result<usize, i32> {
+        self.start(owner, apps, CMD_UDP, 0, port)
+    }
+    /// Listen on the network for an app; returns the slot.
+    pub fn listen_for(&mut self, owner: u32, apps: usize, port: u16, backlog: u32) -> Result<usize, i32> {
+        self.start(owner, apps, CMD_LISTEN, backlog, port)
+    }
+    /// Take a connection waiting on an app's listening slot; returns its new slot.
+    pub fn accept_for(&mut self, owner: u32, apps: usize, listener: usize) -> Result<usize, i32> {
+        self.start(owner, apps, CMD_ACCEPT, listener as u32, 0)
+    }
+    /// Connections waiting on a listening slot.
+    pub fn waiting(&self, slot: usize) -> u32 {
+        if self.state(slot).0 == OPEN { get(slot, 15) } else { 0 }
+    }
     fn start(&mut self, owner: u32, apps: usize, cmd: u32, ip: u32, port: u16) -> Result<usize, i32> {
         if self.online() == 0 {
             return Err(ENETUNREACH);
         }
         let mut name = [0u8; NAME];
-        match self.names.lookup(owner, ip) {
+        // Only a connect's word 5 is an address (a listen's is its backlog, an accept's a slot).
+        match if cmd == CMD_CONNECT { self.names.lookup(owner, ip) } else { Lookup::Literal } {
             Lookup::Name(n) if n.len() < NAME => name[..n.len()].copy_from_slice(n.as_bytes()),
             Lookup::Literal => {}
             _ => return Err(EHOSTUNREACH),
@@ -199,7 +288,7 @@ impl Net {
         set(slot, 5, ip);
         set(slot, 6, u32::from(port));
         // This side's ring words start at zero; the server zeroes its own
-        // (8, 9, 12, 13) when it takes the command, after it has let go of
+        // (8, 9, 12, 13, 15) when it takes the command, after it has let go of
         // the slot's previous connection.
         for i in [7, 10, 11] {
             set(slot, i, 0);
@@ -253,7 +342,8 @@ impl Net {
         set(slot, 10, tail.wrapping_add(n as u32));
         out
     }
-    /// A UDP socket's local address: (the phone's address on the network, port).
+    /// A UDP or listening socket's local address: (the phone's address on the
+    /// network, port); an accepted connection's peer.
     pub fn local(&self, slot: usize) -> (u32, u16) {
         if !taken(slot) {
             return (0, 0);

@@ -1,10 +1,10 @@
 //! Stopwatch: start, pause and reset, to the tenth of a second. The time is
-//! kept in /data/stopwatch, so a paused watch survives a restart.
+//! kept in /data/NAME (this app's own name in /data: an app may keep files
+//! only under its own name), so a paused watch survives a restart.
 use std::time::{Duration, Instant};
 
 use violet::{colors::*, Canvas, Fonts, Rect, Screen, W};
 
-const SAVED: &str = "/data/stopwatch";
 const START: Rect = Rect::new(60, 1000, 660, 1130);
 const RESET: Rect = Rect::new(60, 1170, 660, 1300);
 const DIGITS: Rect = Rect::new(0, 560, W as i32, 760);
@@ -21,13 +21,19 @@ impl Watch {
     }
 }
 
+/// /data/NAME, NAME being the app's: the program is /apps/NAME.
+fn saved() -> String {
+    let program = std::env::args().next().unwrap_or_default();
+    format!("/data/{}", program.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("stopwatch"))
+}
+
 fn load() -> Duration {
-    let tenths = std::fs::read_to_string(SAVED).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let tenths = std::fs::read_to_string(saved()).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
     Duration::from_millis(tenths * 100)
 }
 
 fn save(d: Duration) {
-    if let Err(e) = std::fs::write(SAVED, format!("{}\n", d.as_millis() / 100)) {
+    if let Err(e) = std::fs::write(saved(), format!("{}\n", d.as_millis() / 100)) {
         println!("stopwatch: could not save: {e}");
     }
 }

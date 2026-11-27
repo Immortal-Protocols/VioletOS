@@ -60,8 +60,8 @@ enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7, OPEN_RT = 
        CAMERA_LIFE_BADGE = 13, CAMERA_PLATFORM = 0x4043 };
 // Every other package ends below its two-page stack at 0x13e000. The Open
 // Runtime's stack is at OPEN_STACK_TOP instead, so its image may run on up to
-// 0x160000, well below its IPC buffer at 0x200000.
-enum { OPEN_WINDOW = 0x60000 };
+// 0x180000, well below its IPC buffer at 0x200000.
+enum { OPEN_WINDOW = 0x80000 };
 // The Open Runtime's CSpace and the capabilities the supervisor places in it.
 // Runtime knows it as client 9, an identity no catalog app uses.
 enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
@@ -72,12 +72,11 @@ enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN
        // The Open Runtime's priority while it waits for events (it starts at the
        // 100 every process runs at), and the badge its timer signals with.
        OPEN_EVENT_PRIORITY = 150, OPEN_TIMER_BADGE = 1u << 27, OPEN_TIMER_IRQ = 30 };
-// Each resident app needs 512 KiB, with room left over for shared runtime objects.
-#ifdef VIOLET_QEMU
+// Each resident app needs 512 KiB, with room left over for shared runtime
+// objects: 8 MiB holds the Open Runtime's twelve app slices (runtime/open/mod.rs
+// MAX_APPS) on both boards. The Open Runtime carves as many as it is given, so
+// a phone without a spare 8 MiB untyped gets 4 MiB and seven apps instead.
 enum { OPEN_KERNEL_BITS = 23 };
-#else
-enum { OPEN_KERNEL_BITS = 22 };
-#endif
 // The supervisor's own Reply object (MCS), for answering on `life`.
 static seL4_CPtr root_reply;
 #ifdef CONFIG_KERNEL_MCS
@@ -131,6 +130,16 @@ extern unsigned package_floor_record(unsigned char *out, unsigned room, unsigned
 extern void package_trial_installed(void);
 extern void package_trial_healthy(void);
 extern bool package_trial_fault_rejects(void);
+// Full-system updates (system/package-manager/ota.rs, verify.rs): a signed
+// manifest for the image Storage wrote and read back in the inactive slot.
+extern unsigned ota_verify(const unsigned char *manifest, unsigned slot_sectors, const unsigned char *digest,
+                           unsigned *sectors, unsigned *why);
+extern unsigned ota_system_version(void);
+// When to ask Storage to mark the running slot successful (ota.rs, Mark):
+// only after a healthy period since the last (re)start, retried until it works.
+extern void ota_mark_restart(void);
+extern bool ota_mark_due(bool healthy, unsigned now);
+extern void ota_mark_result(bool ok, unsigned now, unsigned second);
 // The floor record of the catalog parse() accepted last.
 static const unsigned char *catalog_floors;
 static unsigned catalog_floor_bytes;
@@ -704,8 +713,9 @@ static void share_scanout_with_open(seL4_CPtr frame, unsigned va) {
   share_with_open_attrs(frame, va, seL4_ARM_PageCacheable | seL4_ARM_ExecuteNever);
 }
 // Kernel memory for the Open Runtime from any RAM untyped except the one the
-// other processes share, so its app objects never crowd them out.
-static seL4_CPtr spare_ram(unsigned type, unsigned bits) {
+// other processes share, so its app objects never crowd them out; with
+// `shared`, the shared untyped last.
+static seL4_CPtr spare_ram_in(unsigned type, unsigned bits, bool shared) {
   for (unsigned i = 0; i < boot->untyped.end - boot->untyped.start; i++) {
     seL4_CPtr u = boot->untyped.start + i;
     if (boot->untypedList[i].isDevice || u == ram || boot->untypedList[i].sizeBits < bits) continue;
@@ -714,9 +724,12 @@ static seL4_CPtr spare_ram(unsigned type, unsigned bits) {
       return next_slot++;
   }
   // Last, the shared untyped, but never at the cost of booting: 0 means none.
-  if (!seL4_Untyped_Retype(ram, type, bits, seL4_CapInitThreadCNode, 0, 0, next_slot, 1))
+  if (shared && !seL4_Untyped_Retype(ram, type, bits, seL4_CapInitThreadCNode, 0, 0, next_slot, 1))
     return next_slot++;
   return 0;
+}
+static seL4_CPtr spare_ram(unsigned type, unsigned bits) {
+  return spare_ram_in(type, bits, true);
 }
 // How far Open Runtime setup got, and the root CNode's use, for the boot harness.
 volatile unsigned open_setup[4], open_fault[6];
@@ -797,7 +810,16 @@ static void open_runtime(void) {
     }
   }
 #endif
+#ifdef VIOLET_QEMU
   seL4_CPtr kernel_memory = spare_ram(seL4_UntypedObject, OPEN_KERNEL_BITS);
+  if (!kernel_memory) kernel_memory = spare_ram(seL4_UntypedObject, OPEN_KERNEL_BITS - 1);
+#else
+  // The handset: 8 MiB only from a spare untyped, never out of the shared one
+  // the supervisor keeps allocating from (frames, restarts); otherwise the
+  // 4 MiB it always had, spare first, then shared.
+  seL4_CPtr kernel_memory = spare_ram_in(seL4_UntypedObject, OPEN_KERNEL_BITS, false);
+  if (!kernel_memory) kernel_memory = spare_ram(seL4_UntypedObject, OPEN_KERNEL_BITS - 1);
+#endif
   if (kernel_memory) give_open(OPEN_SLOT_KERNEL, kernel_memory);
 #ifdef VIOLET_QEMU
   // The image QEMU loads at 0x4a000000, read-only at 0x10000000, then the pool.
@@ -1657,6 +1679,44 @@ static unsigned camera_platform(unsigned val, bool change, unsigned survey[10]) 
   return done;
 }
 #endif
+// Full-system updates. Storage (services/storage/slotwrite.rs) writes the
+// inactive boot slot for Settings or the Agent and hashes what it reads
+// back; only the supervisor may make that slot the next one booted, after
+// checking the manifest's signature, target and version and that Storage's
+// digest is the signed one. "OTA1" checks the manifest alone (before the
+// image is sent), "OTA2" checks everything and switches.
+enum { OTA_CHECK = 0x3141544f, OTA_APPLY = 0x3241544f };
+static bool ota_storage(unsigned op, unsigned value, const unsigned in[8], unsigned out[12]) {
+  for (unsigned i = 0; i < 14; i++) seL4_SetMR(i, 0);
+  seL4_SetMR(0, op);
+  seL4_SetMR(2, value);
+  for (unsigned i = 0; in && i < 8; i++) seL4_SetMR(4 + i, in[i]);
+  seL4_MessageInfo_t reply = seL4_Call(procs[STORAGE].ep, seL4_MessageInfo_new(0, 0, 0, 14));
+  if (seL4_MessageInfo_get_length(reply) != 14 || seL4_GetMR(0) != 0) return false;
+  // out: value, arg, then the 40 bytes of data and tail.
+  for (unsigned i = 0; out && i < 12; i++) out[i] = seL4_GetMR(2 + i);
+  return true;
+}
+// The update's version, or 0 with *why set (ota.rs; 8: Storage refused or
+// has no inactive slot, 9: the switch itself failed).
+static unsigned ota_request(bool apply, unsigned *why) {
+  unsigned info[12], words[12], manifest[32], sectors = 0, digest[8];
+  *why = 8;
+  if (!procs[STORAGE].package || !ota_storage(0x4f544149, 0, 0, info) || info[0] < 2) return 0;
+  for (unsigned at = 0; at < 128; at += 40) {
+    if (!ota_storage(0x4f54414d, at, 0, words)) return 0;
+    for (unsigned i = 0; i < 10 && at / 4 + i < 32; i++) manifest[at / 4 + i] = words[2 + i];
+  }
+  unsigned version = ota_verify((const unsigned char *)manifest, info[0], 0, &sectors, why);
+  if (!version || !apply) return version;
+  *why = 8;
+  if (!ota_storage(0x4f544144, sectors, 0, words) || words[0] != sectors) return 0;
+  for (unsigned i = 0; i < 8; i++) digest[i] = words[2 + i];
+  version = ota_verify((const unsigned char *)manifest, info[0], (const unsigned char *)digest, &sectors, why);
+  if (!version) return 0;
+  *why = 9;
+  return ota_storage(0x4f544153, sectors, digest, 0) ? version : 0;
+}
 void root_main(seL4_BootInfo *bi) {
   unsigned freq;
   __asm__ volatile("mrc p15,0,%0,c14,c0,0" : "=r"(freq));
@@ -1695,6 +1755,7 @@ void root_main(seL4_BootInfo *bi) {
     volatile unsigned *health = (void *)LANE_BASE;
     unsigned healthy_since = ticks();
     bool settled = false;
+    ota_mark_restart();
     health[1021] = healthy_since;
     unsigned limit = freq * (report[5] == 1 ? 2 : 20);
     check(seL4_TCB_SetPriority(seL4_CapInitThreadTCB, seL4_CapInitThreadTCB,
@@ -1738,6 +1799,11 @@ void root_main(seL4_BootInfo *bi) {
               settled = true;
               package_trial_healthy();
             }
+            // And the boot slot: the bootloader stops spending its tries on
+            // it (Storage writes nothing if it is already marked). A request
+            // Storage could not carry out is sent again a little later.
+            if (procs[STORAGE].package && ota_mark_due(settled, ticks()))
+              ota_mark_result(ota_storage(0x4f54414b, 0, 0, 0), ticks(), freq);
           }
           seL4_Yield();
           continue;
@@ -2044,6 +2110,15 @@ void root_main(seL4_BootInfo *bi) {
         error = 0;
       } else
 #endif
+      if (badge == PACKAGES && op == EXECUTE && key == 17 && (val == OTA_CHECK || val == OTA_APPLY)) {
+        // A full-system update (ota_request): the version, or the refusal in its place.
+        unsigned why = 0;
+        result = ota_request(val == OTA_APPLY, &why);
+        error = result ? 0 : 2;
+        if (!result) result = why;
+        for (unsigned i = 0; i < 14; i++) seL4_SetMR(i, 0);
+        seL4_SetMR(3, ota_system_version());
+      } else
       if (badge == PACKAGES && op == EXECUTE && (key == 17 || key == 18)) {
         if (val != USB_DIAG && update_catalog(val, key == 18))
           break;

@@ -68,7 +68,8 @@ for n in range(len(PROBES) + 1):
         log = everything()
         for key, pattern in [("checks", rf"wx {n}: checks ok"),
                              ("layout", rf"wx {n}: layout main=(\S+) stack=(\S+) heap=(\S+) mmap=(\S+) random=([0-9a-f]{{32}})"),
-                             ("probe", rf"wx {n}: probe (\S+)"),
+                             # A runtime line may land before the probe's newline.
+                             ("probe", rf"wx {n}: probe ([a-z-]+)"),
                              ("done", rf"wx {n}: all probes done")]:
             found = re.findall(pattern, log)
             if found:

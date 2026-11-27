@@ -321,10 +321,11 @@ impl Wifi {
         self.auto.next_ns = now + backoff_ns(self.auto.tries);
     }
 
-    /// Answer one "wifi ..." command from `path`.
-    pub fn command(&mut self, path: &str, words: &mut core::str::SplitWhitespace) -> String {
+    /// Answer one "wifi ..." command; `admin`: from an app with the
+    /// wifi-admin capability (policy.rs; Settings).
+    pub fn command(&mut self, admin: bool, words: &mut core::str::SplitWhitespace) -> String {
         let sub = words.next();
-        if matches!(sub, Some("join" | "leave")) && path != SETTINGS_APP {
+        if matches!(sub, Some("join" | "leave")) && !admin {
             return String::from("error denied: only Settings changes the network\n");
         }
         match sub {
@@ -445,11 +446,12 @@ impl Wifi {
     ///   relay on CODE      host the network for a 12-character pairing code
     ///   relay off          stop hosting
     ///
-    /// Only Settings may turn it on or off; Settings saves the choice in
-    /// /data/relay, and the runtime turns it back on after a restart.
-    pub fn relay(&mut self, path: &str, words: &mut core::str::SplitWhitespace) -> String {
+    /// Only an app with wifi-admin (`admin`; Settings) may turn it on or off;
+    /// Settings saves the choice in /data/relay, and the runtime turns it
+    /// back on after a restart.
+    pub fn relay(&mut self, admin: bool, words: &mut core::str::SplitWhitespace) -> String {
         let sub = words.next();
-        if sub.is_some() && path != SETTINGS_APP {
+        if sub.is_some() && !admin {
             return String::from("error denied: only Settings changes Phone Internet\n");
         }
         self.poll();

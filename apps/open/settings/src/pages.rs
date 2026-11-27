@@ -11,17 +11,22 @@ pub enum Section {
     PhoneLink,
     Time,
     AgentApps,
+    Passcode,
     About,
+    /// Settings › Updates (updates.rs), drawn by its own module like Wi-Fi.
+    Updates,
 }
 
-/// The menu, in order.
-pub const MENU: [(Section, &str); 6] = [
+/// The menu, in order (Passcode last but one, so the rows above keep their places).
+pub const MENU: [(Section, &str); 8] = [
     (Section::Wifi, "Wi-Fi"),
     (Section::Bluetooth, "Bluetooth"),
     (Section::PhoneLink, "Phone Link"),
     (Section::Time, "Date & Time"),
     (Section::AgentApps, "Agent Apps"),
+    (Section::Passcode, "Passcode"),
     (Section::About, "About"),
+    (Section::Updates, "Updates"),
 ];
 
 /// Something under the finger, drawn pressed.
@@ -34,6 +39,9 @@ pub enum Hit {
     City(usize),
     Delete(usize),
     DeleteAll,
+    /// Set or change the passcode, or turn it off: the runtime's own keypad asks.
+    PassSet,
+    PassOff,
 }
 
 /// An app Violet Agent installed.
@@ -79,6 +87,8 @@ pub struct Status {
     /// The system clock in minutes since 1970, so the page redraws as it turns.
     pub minute: i64,
     pub installed: Vec<Installed>,
+    /// A passcode is set ("passcode" in /dev/violet/sys).
+    pub passcode: bool,
 }
 
 pub struct View<'a> {
@@ -122,6 +132,8 @@ pub fn delete_rect(i: usize) -> Rect {
     Rect::new(r.x1 - 196, r.y0 + 20, r.x1 - 20, r.y1 - 20)
 }
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
+pub const PASS_SET: Rect = Rect::new(40, 1010, W as i32 - 40, 1110);
+pub const PASS_OFF: Rect = Rect::new(40, 1140, W as i32 - 40, 1240);
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -146,6 +158,8 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
             }
             (0..n).find(|&i| delete_rect(i).contains(x, y)).map(Hit::Delete)
         }
+        Section::Passcode if PASS_SET.contains(x, y) => Some(Hit::PassSet),
+        Section::Passcode if v.status.passcode && PASS_OFF.contains(x, y) => Some(Hit::PassOff),
         _ => None,
     }
 }
@@ -216,6 +230,7 @@ pub fn menu_value(s: &Status, section: Section) -> (String, bool) {
             let n = s.installed.len();
             (if n == 0 { "None".into() } else { format!("{n} installed") }, false)
         }
+        Section::Passcode => ((if s.passcode { "On" } else { "Off" }).into(), s.passcode),
         _ => (String::new(), false),
     }
 }
@@ -238,7 +253,7 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
                 chevron(c, (r.x1 - 34) as f32, (r.y0 + r.height() / 2) as f32);
             }
         }
-        Section::Wifi => {}
+        Section::Wifi | Section::Updates => {}
         Section::Bluetooth => {
             header(c, f, v, "‹ Settings", "Bluetooth");
             let card = Rect::new(40, 230, W as i32 - 40, 390);
@@ -350,6 +365,24 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             }
             if !v.note.is_empty() {
                 f.regular(26.0).centered(c, v.note, 0, W as i32, 1460, ALERT);
+            }
+        }
+        Section::Passcode => {
+            header(c, f, v, "‹ Settings", "Passcode");
+            let card = Rect::new(40, 230, W as i32 - 40, 400);
+            slab(c, card, 30.0, PAPER_RAISED);
+            f.medium(36.0).draw(c, if s.passcode { "On" } else { "Off" }, 80, 300, if s.passcode { VIOLET } else { CREAM });
+            let line = if s.passcode { "Asked for at start and when the screen wakes" } else { "Anyone holding the phone can use it" };
+            f.regular(27.0).draw(c, line, 80, 346, MUTED);
+            paragraph(c, &f.regular(28.0), "You type the passcode on the phone's own keypad, drawn by the system with the band at the top saying VIOLET SYSTEM: no app, Settings included, sees the digits. Five wrong tries in a row and the phone makes you wait, longer each time. There is no fingerprint or face unlock.", 44, 470, W as i32 - 88, MUTED);
+            let bg = if v.pressed == Some(Hit::PassSet) { PAPER_PRESSED } else { VIOLET };
+            violet::button(c, &f.medium(34.0), PASS_SET, if s.passcode { "Change passcode" } else { "Set passcode" }, bg, PAPER);
+            if s.passcode {
+                let bg = if v.pressed == Some(Hit::PassOff) { PAPER_PRESSED } else { PAPER_RAISED };
+                violet::button(c, &f.medium(30.0), PASS_OFF, "Turn off", bg, ALERT);
+            }
+            if !v.note.is_empty() {
+                f.regular(26.0).centered(c, v.note, 0, W as i32, 1290, ALERT);
             }
         }
         Section::About => {

@@ -122,7 +122,23 @@ def main():
     assert int(lwip["LWIP_DNS_SECURE"]) & 2 and 1 <= int(lwip["DNS_MAX_SOURCE_PORTS"]) <= int(lwip["DNS_TABLE_SIZE"])
     assert int(lwip["MEMP_NUM_UDP_PCB"]) >= count + int(lwip["DNS_MAX_SOURCE_PORTS"]) + 1
     assert int(lwip["MEMP_NUM_TCP_SEG"]) >= count
+    # Commands are numbered alike; a listener's connections waiting to be
+    # accepted have lwIP connections of their own, and lwIP counts them
+    # against the backlog (which drops SYNs past it).
+    cmds = rust("runtime/open/net.rs", "CMD_CONNECT", "CMD_CLOSE", "CMD_UDP", "CMD_LISTEN", "CMD_ACCEPT")
+    for name, value in cmds.items():
+        assert radio[name] == value == getattr(net_relay, name), f"{name} differs"
+    assert int(lwip["MEMP_NUM_TCP_PCB"]) >= count + radio["PARKED"] + 2
+    assert lwip["TCP_LISTEN_BACKLOG"] == "1" and lwip["SO_REUSE"] == "1"
+    loop = rust("runtime/open/loopback.rs", "MAX_BACKLOG")
+    assert radio["LISTEN_BACKLOG"] == net_relay.LISTEN_BACKLOG <= loop["MAX_BACKLOG"] and radio["LISTEN_BACKLOG"] <= radio["PARKED"]
+    assert 1 <= int(lwip["MEMP_NUM_TCP_PCB_LISTEN"]) <= count
     assert lwip["TCP_WND"] == "(4*TCP_MSS)" and 4 * int(lwip["TCP_MSS"]) <= net["RX"]
+    # lwIP's own local ports and the Open Runtime's port 0 picks never meet.
+    eph = rust("runtime/open/loopback.rs", "EPHEMERAL")["EPHEMERAL"]
+    for proto in ("TCP", "UDP"):
+        lo, hi = int(lwip[f"{proto}_LOCAL_PORT_RANGE_START"], 0), int(lwip[f"{proto}_LOCAL_PORT_RANGE_END"], 0)
+        assert 1024 <= lo <= hi < eph, f"lwIP's {proto} local ports {lo}-{hi} overlap the runtime's from {eph}"
 
     # The quotas add up: every app its floor, the system its reserve.
     runtime = (ROOT / "runtime/open/mod.rs").read_text()

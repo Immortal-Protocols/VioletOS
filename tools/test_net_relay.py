@@ -266,6 +266,70 @@ def main():
             app.send(6, datagram(0, where, b"2130706433", b"to an address") + datagram(loopback, where, b"", b"after it"))
             data, _ = udp.recvfrom(2048)
             assert data == b"after it"
+
+            # Listening: a Mac listener on loopback for the app's port, where
+            # connections wait (word 15) until an accept of the same owner takes
+            # the oldest, with its peer in words 12 and 13.
+            def as_owner(slot, owner, command, ip=0, port=0):
+                app.start(slot, 2)
+                until(f"slot {slot} closes", lambda: app.state(slot) == net_relay.IDLE)
+                app.put(slot, 14, owner)
+                app.start(slot, command, ip=ip, port=port)
+
+            as_owner(20, 7, net_relay.CMD_LISTEN, ip=2, port=8080)
+            until("the listener opens", lambda: app.state(20) == net_relay.OPEN)
+            assert app.word(20, 12) == 8080
+            mac = relay.forwarded[("tcp", 8080)][0]
+            first = socket.create_connection(("127.0.0.1", mac), timeout=5)
+            second = socket.create_connection(("127.0.0.1", mac), timeout=5)
+            until("two connections wait", lambda: app.word(20, 15) == 2)
+            first.sendall(b"from the mac")
+            as_owner(21, 8, net_relay.CMD_ACCEPT, ip=20)
+            until("another owner's accept fails", lambda: app.state(21) == net_relay.FAILED)
+            assert app.word(21, 4) == 22 and app.word(20, 15) == 2
+            as_owner(21, 7, net_relay.CMD_ACCEPT, ip=20)
+            until("the accept opens", lambda: app.state(21) == net_relay.OPEN)
+            assert app.word(21, 12) == first.getsockname()[1] and app.word(21, 13) == loopback
+            until("the bytes come", lambda: app.read(21) == b"from the mac")
+            app.send(21, b"back")
+            assert first.recv(16) == b"back"
+            as_owner(22, 7, net_relay.CMD_ACCEPT, ip=20)
+            until("the second is taken", lambda: app.state(22) == net_relay.OPEN)
+            assert app.word(22, 12) == second.getsockname()[1] and app.word(20, 15) == 0
+            as_owner(23, 7, net_relay.CMD_ACCEPT, ip=20)
+            until("none waits", lambda: app.state(23) == net_relay.FAILED)
+            assert app.word(23, 4) == 11
+            as_owner(24, 7, net_relay.CMD_LISTEN, ip=1, port=8080)
+            until("the port is taken", lambda: app.state(24) == net_relay.FAILED)
+            assert app.word(24, 4) == 98
+            # Closing the listener closes what waits, not what was accepted, and frees the port.
+            third = socket.create_connection(("127.0.0.1", mac), timeout=5)
+            until("one waits", lambda: app.word(20, 15) == 1)
+            app.start(20, 2)
+            until("the listener closes", lambda: app.state(20) == net_relay.IDLE)
+            assert third.recv(16) == b"" and ("tcp", 8080) not in relay.forwarded
+            app.send(22, b"still")
+            assert second.recv(16) == b"still"
+            for conn in (first, second, third):
+                conn.close()
+            # A UDP slot is told the port the app bound; datagrams to it come in.
+            as_owner(24, 7, net_relay.CMD_UDP, port=5353)
+            until("the bound UDP slot opens", lambda: app.state(24) == net_relay.OPEN)
+            assert app.word(24, 12) == 5353
+            udp.sendto(b"to the bound port", ("127.0.0.1", relay.forwarded[("udp", 5353)][0]))
+            until("the datagram arrives", lambda: app.word(24, 9) != 0)
+            frame = app.read(24)
+            assert struct.unpack_from("<HIHB", frame)[1:3] == (loopback, udp.getsockname()[1]) and frame[9:] == b"to the bound port"
+            # A port a slot holds is refused to another, as lwIP refuses it.
+            as_owner(26, 8, net_relay.CMD_UDP, port=5353)
+            until("the second bind fails", lambda: app.state(26) == net_relay.FAILED)
+            assert app.word(26, 4) == 98
+            # Through a SOCKS relay (the phone's), listening is refused.
+            relay.socks_proxy = ("127.0.0.1", 9)
+            as_owner(25, 7, net_relay.CMD_LISTEN, ip=1, port=9090)
+            until("listening through the relay fails", lambda: app.state(25) == net_relay.FAILED)
+            assert app.word(25, 4) == 95
+            relay.socks_proxy = None
         finally:
             release.set()
             relay.stop()

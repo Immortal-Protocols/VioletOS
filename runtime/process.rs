@@ -153,6 +153,11 @@ impl Runtime {
             (GET, CATALOG | INBOX) | (EXECUTE, INSTALL | REMOVE) if who == LAUNCHER => {
                 self.forward(who, 9, m)
             }
+            // A full-system update's check or switch ("OTA1"/"OTA2"), for the
+            // Open Runtime's `update` commands; the supervisor decides.
+            (EXECUTE, INSTALL) if who == OPEN_APPS && (m.value == 0x3141_544f || m.value == 0x3241_544f) => {
+                self.forward(who, 9, m)
+            }
             // The Open Runtime is always running, so focus moves without a launch.
             (EXECUTE, OPEN)
                 if who == LAUNCHER && m.value == OPEN_APPS

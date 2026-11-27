@@ -93,7 +93,17 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *data, u16_t len, unsigned char 
 }
 err_t tcp_output(struct tcp_pcb *pcb) { return ERR_OK; }
 static unsigned peers_never_close;
+// Listeners lwIP holds (see tcp_bind below).
+static unsigned live_listen, time_wait_port;
+static struct tcp_pcb *listeners[64];
 err_t tcp_close(struct tcp_pcb *pcb) {
+  if (pcb->listening) {
+    for (unsigned k = 0; k < 64; k++)
+      if (listeners[k] == pcb) listeners[k] = NULL;
+    live_listen--;
+    pcb->closed = 1;
+    return ERR_OK;
+  }
   pcb->closed = 1;
   live_tcp--;
   if (peers_never_close) {
@@ -116,6 +126,57 @@ void tcp_recved(struct tcp_pcb *pcb, u16_t len) {
 }
 unsigned tcp_sndbuf(struct tcp_pcb *pcb) { return pcb->snd_buf; }
 
+// Listening, as lwIP does it: tcp_bind refuses a port a listener (or, without
+// SOF_REUSEADDR, a connection in TIME_WAIT, `time_wait_port`) holds; a listen
+// frees the pcb it was given and returns one from its own pool.
+err_t tcp_bind(struct tcp_pcb *pcb, const ip_addr_t *addr, u16_t port) {
+  for (unsigned k = 0; k < 64; k++)
+    if (listeners[k] && listeners[k]->local_port == port) return ERR_USE;
+  if (port == time_wait_port && !(pcb->reuse & SOF_REUSEADDR)) return ERR_USE;
+  pcb->local_port = port;
+  return ERR_OK;
+}
+struct tcp_pcb *tcp_listen_with_backlog_and_err(struct tcp_pcb *pcb, unsigned char backlog, err_t *err) {
+  if (live_listen >= MEMP_NUM_TCP_PCB_LISTEN) {
+    *err = ERR_MEM;
+    return NULL;
+  }
+  struct tcp_pcb *l = calloc(1, sizeof *l);
+  l->listening = 1;
+  l->local_port = pcb->local_port;
+  l->backlog = backlog;
+  l->prio = pcb->prio;
+  for (unsigned k = 0; k < 64; k++)
+    if (!listeners[k]) {
+      listeners[k] = l;
+      break;
+    }
+  live_listen++;
+  pcb->closed = 1;
+  live_tcp--;
+  *err = ERR_OK;
+  return l;
+}
+void tcp_accept(struct tcp_pcb *pcb, tcp_accept_fn fn) { pcb->accept = fn; }
+void tcp_backlog_delayed(struct tcp_pcb *pcb) { pcb->delayed = 1; }
+void tcp_backlog_accepted(struct tcp_pcb *pcb) { pcb->delayed = 0; }
+// A connection from the network to listener `l` (lwIP's tcp_listen_input,
+// then the accept callback; lwIP resets the connection when it is refused).
+static struct tcp_pcb *net_incoming(struct tcp_pcb *l, unsigned ip, unsigned port) {
+  struct tcp_pcb *pcb = tcp_new();
+  assert(pcb && l->listening && l->accept);
+  pcb->prio = l->prio;
+  pcb->remote_ip.addr = __builtin_bswap32(ip);
+  pcb->remote_port = port;
+  pcb->arg = l->arg;
+  if (l->accept(l->arg, pcb, ERR_OK) != ERR_OK) {
+    pcb->aborted = 1;
+    live_tcp--;
+    return NULL;
+  }
+  return pcb;
+}
+
 static struct {
   ip_addr_t to;
   unsigned port, len, count;
@@ -126,8 +187,11 @@ struct udp_pcb *udp_new(void) {
   live_udp++;
   return calloc(1, sizeof(struct udp_pcb));
 }
+static unsigned char udp_bound[65536];
 err_t udp_bind(struct udp_pcb *pcb, const ip_addr_t *addr, u16_t port) {
-  pcb->local_port = next_port++;
+  if (port && udp_bound[port]) return ERR_USE;
+  pcb->local_port = port ? port : next_port++;
+  udp_bound[pcb->local_port] = 1;
   return ERR_OK;
 }
 void udp_recv(struct udp_pcb *pcb, udp_recv_fn fn, void *arg) {
@@ -143,6 +207,7 @@ err_t udp_sendto(struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16
   return ERR_OK;
 }
 void udp_remove(struct udp_pcb *pcb) {
+  udp_bound[pcb->local_port] = 0;
   live_udp--;
   free(pcb);
 }
@@ -210,6 +275,9 @@ static void poll(void) { open_sockets_poll(region, online); }
 static void fresh(void) {
   for (int i = 0; i < SLOTS; i++) drop(i);
   memset(s, 0, sizeof s);
+  memset(parked, 0, sizeof parked);
+  arrivals = time_wait_port = 0;
+  assert(live_listen == 0);
   memset(asks, 0, sizeof asks);
   count = 0;
   free(region);
@@ -288,6 +356,189 @@ static void open_tcp(int i) {
 }
 
 #define RUN(test) (test(), printf("ok   %s\n", #test))
+
+// ---- Listening slots ---------------------------------------------------------
+static void listen_on(int i, unsigned port, unsigned backlog) {
+  start(i, CMD_LISTEN, backlog, port, NULL);
+  poll();
+}
+static void accept_on(int i, int listener) {
+  start(i, CMD_ACCEPT, listener, 0, NULL);
+  poll();
+}
+
+static void a_listener_parks_connections_until_accepted(void) {
+  fresh();
+  as_owner = 5;
+  listen_on(4, 8080, 2);
+  assert(state(4) == OPEN && slot(4)->local_port == 8080 && slot(4)->waiting == 0);
+  struct tcp_pcb *l = s[4].listener;
+  assert(l && l->listening && l->prio == PARKED_PRIO && l->backlog == 2);
+  struct tcp_pcb *a = net_incoming(l, ip4(192, 168, 1, 9), 50001);
+  struct tcp_pcb *b = net_incoming(l, ip4(192, 168, 1, 10), 50002);
+  assert(a && b && slot(4)->waiting == 2);
+  // Waiting connections are lwIP's, counted against the backlog, the window
+  // shut at once (advertised with an ACK now), so lwIP keeps none of a peer's
+  // bytes for an app that does not accept.
+  assert(a->delayed && a->prio == PARKED_PRIO && PARKED_PRIO > TCP_PRIO_MIN);
+  assert(a->rcv_wnd == 0 && a->rcv_ann_wnd == 0 && a->ack_now);
+  assert(net_deliver(a, "early", 5) == ERR_MEM);
+  // Past the backlog lwIP resets the connection.
+  assert(!net_incoming(l, ip4(192, 168, 1, 11), 50003) && slot(4)->waiting == 2);
+  // The oldest first, with its peer.
+  accept_on(6, 4);
+  assert(state(6) == OPEN && s[6].pcb == a && !a->delayed && a->prio == TCP_PRIO_NORMAL);
+  // Accepted: the window opens again.
+  assert(a->rcv_wnd == TCP_WND);
+  assert(slot(6)->local_port == 50001 && slot(6)->local_ip == ip4(192, 168, 1, 9));
+  assert(slot(4)->waiting == 1);
+  // Now its bytes come (lwIP offers what it kept again) and go out.
+  assert(net_deliver(a, "early", 5) == ERR_OK);
+  unsigned char got[16];
+  assert(app_read(6, got, sizeof got) == 5 && !memcmp(got, "early", 5));
+  app_send(6, "reply", 5);
+  poll();
+  assert(a->out_len == 5 && !memcmp(a->out, "reply", 5));
+  accept_on(7, 4);
+  assert(state(7) == OPEN && s[7].pcb == b && slot(4)->waiting == 0);
+  // None waiting: EAGAIN, and the listener is untouched.
+  accept_on(8, 4);
+  assert(state(8) == FAILED && slot(8)->error == E_AGAIN && state(4) == OPEN);
+  assert(live_pbufs == 0);
+}
+
+static void an_accept_takes_only_its_owners_listener(void) {
+  fresh();
+  as_owner = 5;
+  listen_on(4, 8080, 4);
+  assert(net_incoming(s[4].listener, ip4(10, 0, 0, 7), 40000));
+  as_owner = 6;
+  accept_on(9, 4);
+  assert(state(9) == FAILED && slot(9)->error == E_INVALID && slot(4)->waiting == 1);
+  // Nor a slot that is not listening, nor one past the slots served.
+  open_tcp(10);
+  accept_on(11, 10);
+  assert(state(11) == FAILED && slot(11)->error == E_INVALID);
+  accept_on(12, 200);
+  assert(state(12) == FAILED && slot(12)->error == E_INVALID);
+  as_owner = 5;
+  accept_on(9, 4);
+  assert(state(9) == OPEN);
+}
+
+static void a_closed_listener_resets_what_waits(void) {
+  fresh();
+  listen_on(2, 9000, 4);
+  struct tcp_pcb *a = net_incoming(s[2].listener, ip4(10, 0, 0, 7), 40000);
+  struct tcp_pcb *b = net_incoming(s[2].listener, ip4(10, 0, 0, 8), 40001);
+  assert(a && b && live_listen == 1);
+  start(2, CMD_CLOSE, 0, 0, NULL);
+  poll();
+  assert(a->aborted && b->aborted && live_listen == 0 && slot(2)->waiting == 0);
+  for (int k = 0; k < PARKED; k++) assert(!parked[k].used);
+  // The port is free again, even with connections of the last one in TIME_WAIT.
+  time_wait_port = 9000;
+  listen_on(2, 9000, 4);
+  assert(state(2) == OPEN);
+  // A connection that goes while it waits is forgotten.
+  struct tcp_pcb *c = net_incoming(s[2].listener, ip4(10, 0, 0, 9), 40002);
+  assert(slot(2)->waiting == 1);
+  c->err(c->arg, ERR_RST);
+  assert(slot(2)->waiting == 0);
+  accept_on(3, 2);
+  assert(state(3) == FAILED && slot(3)->error == E_AGAIN);
+  // One that closed before it was taken is taken at its end.
+  struct tcp_pcb *d = net_incoming(s[2].listener, ip4(10, 0, 0, 9), 40003);
+  d->recv(d->arg, d, NULL, ERR_OK);
+  accept_on(3, 2);
+  assert(state(3) == PEER_CLOSED && s[3].pcb == d);
+}
+
+static void listening_is_bounded(void) {
+  fresh();
+  // Ports in use, through the relay, and port 0 are refused.
+  listen_on(0, 7000, 1);
+  listen_on(1, 7000, 1);
+  assert(state(0) == OPEN && state(1) == FAILED && slot(1)->error == E_ADDRINUSE);
+  listen_on(1, 0, 1);
+  assert(state(1) == FAILED && slot(1)->error == E_INVALID);
+  online = 2;
+  listen_on(1, 7001, 1);
+  assert(state(1) == FAILED && slot(1)->error == E_OPNOTSUPP);
+  online = 1;
+  // The backlog is at most LISTEN_BACKLOG, and PARKED wait on the whole phone.
+  listen_on(1, 7001, 100);
+  assert(s[1].listener->backlog == LISTEN_BACKLOG);
+  unsigned in = 0;
+  for (int l = 0; l < 4; l++) {
+    // Four apps' listeners (one app alone gets PARKED_EACH: parked_connections_are_bounded_per_app).
+    as_owner = 20 + l;
+    if (l) listen_on(l + 1, 7001 + l, LISTEN_BACKLOG);
+    for (int k = 0; k < LISTEN_BACKLOG + 1; k++) in += net_incoming(s[l + 1].listener, ip4(10, 0, 0, 7), 41000 + k) != NULL;
+  }
+  as_owner = 0;
+  assert(in == PARKED);
+  unsigned waiting = 0;
+  for (int i = 0; i < SLOTS; i++) waiting += slot(i)->waiting;
+  assert(waiting == PARKED);
+  // The listeners lwIP has room for, and no more.
+  for (int i = 5; i < 5 + MEMP_NUM_TCP_PCB_LISTEN; i++) listen_on(i, 7100 + i, 1);
+  assert(state(5) == OPEN && state(7) == OPEN && state(8) == FAILED);
+  assert(live_listen == MEMP_NUM_TCP_PCB_LISTEN);
+  unsigned refused = 0;
+  for (int i = 5; i < 5 + MEMP_NUM_TCP_PCB_LISTEN; i++) refused += state(i) == FAILED && slot(i)->error == E_NOBUFS;
+  assert(refused == 5);
+}
+
+static void parked_connections_are_bounded_per_app_and_in_time(void) {
+  fresh();
+  // One app with two listeners and a peer that dials in again and again
+  // holds at most PARKED_EACH of the phone's waiting connections...
+  as_owner = 5;
+  listen_on(1, 7001, LISTEN_BACKLOG);
+  listen_on(2, 7002, LISTEN_BACKLOG);
+  unsigned in = 0;
+  for (int l = 1; l <= 2; l++)
+    for (int k = 0; k < LISTEN_BACKLOG; k++) in += net_incoming(s[l].listener, ip4(10, 0, 0, 7), 41000 + 10 * l + k) != NULL;
+  assert(in == PARKED_EACH && PARKED_EACH < PARKED);
+  // ... so another app's listener still takes connections.
+  as_owner = 6;
+  listen_on(3, 7003, LISTEN_BACKLOG);
+  struct tcp_pcb *other = net_incoming(s[3].listener, ip4(10, 0, 0, 8), 42000);
+  assert(other && slot(3)->waiting == 1);
+  // A connection nobody accepts is reset after PARK_MS; one accepted in time is not.
+  as_owner = 5;
+  struct tcp_pcb *first = NULL;
+  for (int k = 0; k < PARKED; k++)
+    if (parked[k].used && parked[k].listener == 1) first = first ? first : parked[k].pcb;
+  now_ms += PARK_MS - 1;
+  poll();
+  assert(slot(1)->waiting + slot(2)->waiting == PARKED_EACH && !first->aborted);
+  as_owner = 6;
+  accept_on(9, 3);
+  assert(state(9) == OPEN && s[9].pcb == other);
+  now_ms += 1;
+  poll();
+  assert(slot(1)->waiting == 0 && slot(2)->waiting == 0 && first->aborted);
+  assert(state(9) == OPEN && !other->aborted);
+  for (int k = 0; k < PARKED; k++) assert(!parked[k].used);
+  // The app may be dialled again.
+  assert(net_incoming(s[1].listener, ip4(10, 0, 0, 7), 43000) && slot(1)->waiting == 1);
+  as_owner = 0;
+}
+
+static void udp_binds_the_port_it_was_given(void) {
+  fresh();
+  start(3, CMD_UDP, 0, 5353, NULL);
+  poll();
+  assert(state(3) == OPEN && slot(3)->local_port == 5353);
+  start(4, CMD_UDP, 0, 5353, NULL);
+  poll();
+  assert(state(4) == FAILED && slot(4)->error == E_ADDRINUSE);
+  start(4, CMD_UDP, 0, 0, NULL);
+  poll();
+  assert(state(4) == OPEN && slot(4)->local_port >= 40000);
+}
 
 static void layout_is_net2_and_keeps_out_of_the_hole(void) {
   fresh();
@@ -956,7 +1207,7 @@ static void one_app_cannot_fill_the_name_table(void) {
   as_owner = 0;
   start(31, CMD_CONNECT, 0, 7001, "sentinel.example");
   poll();
-  assert(asked_count == ASKS_EACH + 2 && !strcmp(asked[4].name, "peer.example") && !strcmp(asked[5].name, "sentinel.example"));
+  assert(asked_count == ASKS_EACH + 2 && !strcmp(asked[ASKS_EACH].name, "peer.example") && !strcmp(asked[ASKS_EACH + 1].name, "sentinel.example"));
   assert(dns_answer("peer.example", 10, 3, 3, 3) == 1 && dns_answer("sentinel.example", 10, 4, 4, 4) == 1);
   poll();
   assert(remote(pcb_of(20)) == ip4(10, 3, 3, 3) && remote(pcb_of(31)) == ip4(10, 4, 4, 4));
@@ -979,7 +1230,7 @@ static void one_app_cannot_fill_the_name_table(void) {
   assert(own_questions(7) == ASKS_EACH - 1);
   start(0, CMD_CONNECT, 0, 80, "again.hog.example");
   poll();
-  assert(own_questions(7) == ASKS_EACH && asked_count == ASKS_EACH + 3 && !strcmp(asked[6].name, "again.hog.example"));
+  assert(own_questions(7) == ASKS_EACH && asked_count == ASKS_EACH + 3 && !strcmp(asked[ASKS_EACH + 2].name, "again.hog.example"));
   // An answer for a question whose slot has moved on is counted off and goes nowhere.
   start(0, CMD_CLOSE, 0, 0, NULL);
   poll();
@@ -1087,6 +1338,12 @@ int main(void) {
   RUN(closing_connections_give_way_to_new_ones);
   RUN(one_app_cannot_fill_the_name_table);
   RUN(an_old_supervisor_gets_the_slots_it_mapped);
+  RUN(a_listener_parks_connections_until_accepted);
+  RUN(an_accept_takes_only_its_owners_listener);
+  RUN(a_closed_listener_resets_what_waits);
+  RUN(listening_is_bounded);
+  RUN(parked_connections_are_bounded_per_app_and_in_time);
+  RUN(udp_binds_the_port_it_was_given);
   puts("sockets.c: all tests passed");
   return 0;
 }

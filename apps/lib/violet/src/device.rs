@@ -100,6 +100,9 @@ pub const LIFECYCLE: u16 = 7;
 /// Lifecycle values.
 pub const FOCUS_GAINED: i32 = 1;
 pub const FOCUS_LOST: i32 = 2;
+pub const QUIT: i32 = 3;
+/// Memory is low: free caches and buffers (sent once to apps behind the front one).
+pub const LOW_MEMORY: i32 = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Event {
@@ -113,6 +116,9 @@ pub struct Event {
 impl Event {
     pub fn focus_gained(&self) -> bool {
         self.kind == LIFECYCLE && self.value == FOCUS_GAINED
+    }
+    pub fn low_memory(&self) -> bool {
+        self.kind == LIFECYCLE && self.value == LOW_MEMORY
     }
 }
 

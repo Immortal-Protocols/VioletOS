@@ -186,6 +186,8 @@ impl Runtime {
             }
             ShieldVerdict::KillApp { shield_id } => {
                 crate::log!("shield {}: ended pid {} at {}", shield_id, who.app.0, describe(action));
+                // Forked processes of the same app do not outlive the verdict.
+                self.end_family(i, 137);
                 let app = self.apps[i].as_mut().unwrap();
                 app.exit_code = Some(137);
                 self.reap(i);
@@ -257,7 +259,11 @@ impl Runtime {
     pub fn thaw(&mut self, i: usize) {
         let Some(app) = self.apps[i].as_mut() else { return };
         let Some(f) = app.frozen.take() else { return };
+        // Threads the lifecycle parked stay parked until it thaws the app (mod.rs `unpark`).
         for slot in f.suspended {
+            if !super::lifecycle::shield_may_resume(&app.life, slot) {
+                continue;
+            }
             if let Some(t) = app.threads.get(slot) {
                 if t.alive {
                     sys::tcb_resume(t.tcb);

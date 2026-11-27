@@ -25,7 +25,11 @@ objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
 # Cores the kernel boots (kernel/sel4/build.py); the loader starts the others.
-defines = ["-DNDEBUG", "-DROOT_BYTES=0x100000", "-DVIOLET_CORES=" + os.environ.get("VIOLET_CORES", "1")]
+# The root task's window: its image (the supervisor and, on the handset, the
+# built-in catalog) with its stack above. 1.5 MiB at 0x40200000 physical; the
+# loader proves 0x40000000-0x44000000 holds no firmware reservation.
+ROOT_BYTES = 0x180000
+defines = ["-DNDEBUG", f"-DROOT_BYTES={ROOT_BYTES:#x}", "-DVIOLET_CORES=" + os.environ.get("VIOLET_CORES", "1")]
 if probe: defines.append("-DVIOLET_TEST_ISOLATION")
 defines.append("-DVIOLET_QEMU" if variant=="qemu" else "-DVIOLET_MOTO")
 sys.path.insert(0,str(repo / "services/touch"))
@@ -98,12 +102,12 @@ else:
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
-# The root task's stack is what is left of its 1 MiB window (root.S), and
+# The root task's stack is what is left of its window (root.S), and
 # package signatures are checked on it (SHA-256 and P-256: a few KiB).
 root_bytes = (out/"root.bin").stat().st_size
-print(f"root.bin: {root_bytes} bytes, {0x100000 - root_bytes} left for the root stack (at least {0x100000 - 0xfe000} required)")
-if root_bytes >= 0xfe000:
-    sys.exit(f"root.bin is {root_bytes} bytes: under {0x100000 - 0xfe000} bytes would be left for the root task's stack")
+print(f"root.bin: {root_bytes} bytes, {ROOT_BYTES - root_bytes} left for the root stack (at least 8192 required)")
+if root_bytes > ROOT_BYTES - 8192:
+    sys.exit(f"root.bin is {root_bytes} bytes: under 8192 bytes would be left for the root task's stack")
 # Say which keys this image trusts: a developer image must never pass for a release.
 print(sign_summary(package_signer))
 elf = (abi/"kernel.elf").read_bytes()

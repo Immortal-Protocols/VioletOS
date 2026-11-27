@@ -95,12 +95,28 @@ fn send(op: u32, key: u32, name: &str, offset: u32, data: &[u8], flags: u32) -> 
     }
 }
 
-/// Put every stored file into /data.
-pub fn load(fs: &mut Fs) {
+/// Put every stored file into /data. True if every file Storage keeps was
+/// read (or Storage has no disk at all): only then does a missing file mean
+/// it is not stored, which the passcode depends on (trusted_ui.rs `boot`).
+pub fn load(fs: &mut Fs) -> bool {
     let _ = fs.mkdir(DIR);
     let mut count = 0;
+    let (mut failed, mut offline) = (0, 0);
     for slot in 0..FILES {
-        let entry = file(GET, FILE_LIST, "", slot, &[]);
+        let mut entry = file(GET, FILE_LIST, "", slot, &[]);
+        // An error is tried again, unless every slot so far was OFFLINE (no disk).
+        for _ in 0..2 {
+            if entry.op == OK || entry.op == INVALID || (slot > 0 && offline == slot) {
+                break;
+            }
+            super::sys::pause();
+            entry = file(GET, FILE_LIST, "", slot, &[]);
+        }
+        // INVALID: no such slot (a small disk holds fewer files).
+        if entry.op != OK && entry.op != INVALID {
+            failed += 1;
+            offline += (entry.op == OFFLINE) as u32;
+        }
         if entry.op != OK || entry.value == 0 {
             continue;
         }
@@ -113,6 +129,7 @@ pub fn load(fs: &mut Fs) {
         while data.len() < len {
             let r = file(GET, FILE_READ, &name, data.len() as u32, &[]);
             if r.op != OK || r.value == 0 {
+                failed += 1; // kept short: a short passcode record keeps the phone locked
                 break;
             }
             data.extend_from_slice(&r.text()[..r.value as usize]);
@@ -125,7 +142,8 @@ pub fn load(fs: &mut Fs) {
         }
     }
     fs.changed.clear();
-    log!("/data: {} saved files", count);
+    log!("/data: {} saved files, {} unreadable", count, failed);
+    super::sysui::listing_complete(failed, offline, FILES)
 }
 
 /// Write back every changed file now, however long it takes (the runtime's

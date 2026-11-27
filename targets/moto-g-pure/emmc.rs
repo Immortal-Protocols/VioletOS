@@ -129,6 +129,9 @@ pub struct Disk {
     /// The installed apps' extent: the end of boot_b, or userdata once claimed.
     apps_first: u32,
     apps_count: usize,
+    /// The slot geometry once looked up (slot_geometry), for `slot_ota` builds.
+    #[cfg(slot_ota)]
+    slots: Option<Option<(u32, [u32; 2], u32)>>,
 }
 impl Disk {
     pub fn open_checked() -> Result<Self, &'static [u8]> {
@@ -154,6 +157,8 @@ impl Disk {
             userdata,
             apps_first: volume::APPS,
             apps_count: volume::APP_SECTORS,
+            #[cfg(slot_ota)]
+            slots: None,
         })
     }
     fn finish<T>(&mut self, r: Result<T, ()>) -> Result<T, ()> {
@@ -251,6 +256,64 @@ impl Disk {
         }
         let lba = self.app_lba(i)?;
         self.finish(transfer(24, lba, s))
+    }
+}
+
+// Full-system updates into boot_a / boot_b and the A/B metadata in misc
+// (services/storage/slotwrite.rs, slot.rs). NOT ENABLED: no build sets
+// `slot_ota`, because what Motorola's bootloader does with the record has
+// not been seen on a handset and the running slot is not passed by the
+// loader yet (slot.rs lists what is unknown). When enabled, every address
+// comes from the live CRC-checked GPT and only these sectors can be reached:
+// misc + 4 and the first 16 MiB of boot_a and boot_b (in boot_b that ends
+// exactly at the storage marker). Nothing is offered while Android may still
+// be on slot A: only once `moto-flash --take-userdata` has claimed userdata.
+#[cfg(slot_ota)]
+#[path = "slot.rs"]
+mod slot;
+#[cfg(slot_ota)]
+impl Disk {
+    pub const SLOT_SECTORS: u32 = 16 * 1024 * 1024 / 512;
+    /// (bootloader_control sector, first sector of boot_a and boot_b, sectors per slot).
+    pub fn slot_geometry(&mut self) -> Option<(u32, [u32; 2], u32)> {
+        if self.retired || self.apps_first == volume::APPS {
+            return None;
+        }
+        if let Some(known) = self.slots {
+            return known;
+        }
+        let found = self.find_slots();
+        self.slots = Some(found);
+        found
+    }
+    fn find_slots(&mut self) -> Option<(u32, [u32; 2], u32)> {
+        let ext = read_card(8, 0).ok()?;
+        let capacity = u32::from_le_bytes(ext[212..216].try_into().ok()?);
+        let mut found = [None; 3];
+        slot::gpt_find(|lba| read_card(17, lba), capacity, &[b"misc", b"boot_a", b"boot_b"], &mut found).ok()?;
+        let (misc, a, b) = (found[0]?, found[1]?, found[2]?);
+        if b.0 != volume::BOOT_B || volume::MARKER != b.0 + Self::SLOT_SECTORS
+            || a.1 - a.0 + 1 < Self::SLOT_SECTORS || misc.1 - misc.0 < slot::MISC_SECTOR
+        {
+            return None;
+        }
+        Some((misc.0 + slot::MISC_SECTOR, [a.0, b.0], Self::SLOT_SECTORS))
+    }
+    fn slot_lba(&mut self, lba: u32) -> Result<u32, ()> {
+        let (control, first, sectors) = self.slot_geometry().ok_or(())?;
+        if lba == control || first.iter().any(|&f| (f..f + sectors).contains(&lba)) {
+            Ok(lba)
+        } else {
+            Err(())
+        }
+    }
+    pub fn slot_read(&mut self, lba: u32) -> Result<Sector, ()> {
+        let at = self.slot_lba(lba)?;
+        self.finish(read_card(17, at))
+    }
+    pub fn slot_write(&mut self, lba: u32, s: &mut Sector) -> Result<(), ()> {
+        let at = self.slot_lba(lba)?;
+        self.finish(transfer(24, at, s))
     }
 }
 

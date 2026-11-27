@@ -37,7 +37,7 @@ def inspect(blob, keys=None, target=None):
     ):
         raise ValueError("unsupported package or ABI")
     # The Open Runtime (24) keeps its stack elsewhere, so its image may be larger.
-    window = 0x60000 if identity == 24 else 0x3E000
+    window = 0x80000 if identity == 24 else 0x3E000
     if not 0 < code <= size <= window or code % 4096 or len(blob) != HEADER + size + TRAILER:
         raise ValueError("invalid segment sizes")
     image = blob[HEADER : HEADER + size]

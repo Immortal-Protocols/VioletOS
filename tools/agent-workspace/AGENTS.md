@@ -6,7 +6,7 @@ An app is either **Rust** (native, fastest) or **Python** (a single script, no c
 
 ## Rust recipe
 
-1. Make `apps/NAME/` (NAME: lowercase letters, digits, `-`; not `example`). Copy `apps/example` (a working Stopwatch) as the starting point: `Cargo.toml` (rename the package to NAME), `app.txt` (the title shown on the phone, e.g. `Scorekeeper`) and `src/main.rs`.
+1. Make `apps/NAME/` (NAME: up to 12 lowercase letters, digits, `-`; not `example`). Copy `apps/example` (a working Stopwatch) as the starting point: `Cargo.toml` (rename the package to NAME), `app.txt` (the title shown on the phone, e.g. `Scorekeeper`) and `src/main.rs`.
 2. Write `src/main.rs`. Use only `std` and the `violet` crate; nothing else is available (builds are offline).
 3. Run `./build NAME`. It prints one JSON line with `path`, `bytes` and `seconds`, or the compiler errors. Fix errors and rebuild.
 4. Call `install_app` with `name`, `title` and `path`. It sends the program to the phone and returns when it is installed.
@@ -14,12 +14,22 @@ An app is either **Rust** (native, fastest) or **Python** (a single script, no c
 ### The phone, from Rust
 
 - Screen 720 × 1600 pixels, touch only. Draw into `Screen::canvas()`, then `screen.show_all(&c)` (or `screen.show(&c, rect)` for a part).
-- `violet::events()` gives touch and lifecycle events: `e.kind == violet::device::TOUCH_DOWN` with `e.x`, `e.y`; `e.focus_gained()` means redraw everything.
+- `violet::events()` gives touch and lifecycle events: `e.kind == violet::device::TOUCH_DOWN` with `e.x`, `e.y`; `e.focus_gained()` means redraw everything; `e.low_memory()` means free caches (sent once to apps behind the front one).
 - Every app draws the shared header: `violet::header(c, &fonts, "Title")`, and goes home when `violet::HOME_BOX.contains(x, y)` is tapped: `violet::home()`.
 - Colours in `violet::colors` (`BACKGROUND`, `PANEL`, `INK`, `MUTED`, `ACCENT`); `violet::rgb(r, g, b)` for others.
 - Text: `let fonts = Fonts::load(); let face = fonts.bold(40.0);` then `face.draw(c, text, x, baseline_y, color)`, `face.centered(c, text, x0, x1, baseline_y, color)`, `face.width(text)`.
 - Shapes: `c.fill(Rect::new(x0, y0, x1, y1), color)`, `c.round_rect(rect, radius, color)`, `c.circle(cx, cy, r, color)`, `c.line(x0, y0, x1, y1, width, color)`. Buttons: `violet::button(c, &face, rect, label, bg, ink)`.
-- State that should survive a restart goes in a small file directly in `/data` (name up to 16 characters, up to 4 KiB): `std::fs::write("/data/NAME", …)`.
+- State that should survive a restart goes in a small file directly in `/data` named after the app: `/data/NAME` or `/data/NAME.something` (NAME is the app's name; up to 16 characters in all, up to 4 KiB): `std::fs::write("/data/NAME", …)`. An app cannot see or write any other name in `/data`; `std::env::args().next()` is `/apps/NAME`.
+
+## What the app may use (both recipes)
+
+An app gets only its own `/data`, the screen and touch unless it says what else it needs in a `manifest.txt` next to its `app.txt`, one line:
+
+```
+caps: net audio-out
+```
+
+The words: `net` (the internet: sockets, HTTP, name lookups), `audio-out` (`/dev/violet/audio`, sounds), `mic` (`/dev/violet/mic`), `camera` (`/dev/violet/camera`), `hci` (Bluetooth). List only what the app uses; an unknown word fails the build. The phone asks the user the first time the app uses `net`, `mic`, `camera` or `hci`; until the user allows it the call fails at once (a permission error, it does not wait), so ask first and wait for the answer (Python: `violet.ask("net")`, True if allowed; Rust: write `consent net` to `/dev/violet/sys` and read `allow`, `deny` or `pending` until it is not `pending`), and handle a no on screen instead of crashing. A new install of the same name is asked again. `./build` adds the manifest to the end of the program it writes.
 
 ## Python recipe
 
@@ -46,13 +56,14 @@ violet.text_width("Hi", size=48, bold=True)
 s.button(x, y, w, h, "Start", bg=PANEL, ink=INK, size=40)
 s.show()                                # put the drawing on the panel; s.show(y, h) for some rows
 
-for e in violet.events():               # e.kind: "down", "move", "up", "focus", "blur"
+for e in violet.events():               # e.kind: "down", "move", "up", "focus", "blur", "lowmemory" (free caches)
     if e.focus: redraw()                # back in front: draw everything again
     elif e.down and e.inside(x, y, w, h): ...
 for e in violet.events(timeout=1.0):    # e is None once a second with no touch: for clocks, timers, animation
     ...
 
-violet.save("name", value)              # JSON, kept across restarts (up to 4 KiB)
+violet.save("name", value)              # JSON, kept across restarts (up to 4 KiB; /data/APP.name, a long name hashed)
+ok = violet.ask("net")                  # wait for the user's answer to a manifest power; True if allowed
 value = violet.load("name", default)
 violet.beep(880, 120)                   # a tone; violet.play(pcm) for 48 kHz stereo 16-bit
 ```
