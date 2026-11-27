@@ -137,6 +137,26 @@ build/moto-debug: services/usb-diagnostics/host/moto_debug.c
 	@mkdir -p build
 	$(CC) -Wall -Wextra -Werror -std=c11 $< $$(pkg-config --cflags --libs libusb-1.0) -o $@
 
+# Which mode the connected handset is in. adb and fastboot come from PATH, or
+# from the Android SDK's platform-tools when they are not on it.
+.PHONY: showphone
+PLATFORM_TOOLS ?= $(HOME)/Library/Android/sdk/platform-tools
+showphone: build/moto-debug
+	@export PATH="$$PATH:$(PLATFORM_TOOLS)"; \
+	fastboot=$$(fastboot devices 2>/dev/null | awk 'NF>=2 {print $$1}'); \
+	android=$$(adb devices 2>/dev/null | awk 'NF==2 {print $$1" ("$$2")"}'); \
+	violet=$$($< 2>/dev/null >/dev/null && echo answering); \
+	echo "Bootloader (fastboot): $${fastboot:-not found}"; \
+	echo "Android (adb):         $${android:-not found}"; \
+	echo "VioletOS (USB):        $${violet:-not found}"
+
+# Build the handset image, install it on the connected handset and join the
+# saved Wi-Fi network (moto-wifi-profile --save).
+.PHONY: flashphone
+flashphone: moto build/moto-package
+	@export PATH="$$PATH:$(PLATFORM_TOOLS)"; \
+	services/usb-diagnostics/host/moto-flash && build/moto-package join-wifi
+
 .PHONY: test-moto-radio
 MOTO_WIFI_STOCK ?= build/xt2163dl/S3RHS32.20-42-13-2-3-2/stock/wifi
 HOST_RUSTC ?= $(or $(shell command -v rustc),build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc)
@@ -152,6 +172,12 @@ test-moto-radio: moto
 .PHONY: test-moto-ip-live
 test-moto-ip-live: moto
 	$(PYTHON) targets/moto-g-pure/test_ip_live.py
+
+# moto-wifi-profile on the Mac alone, with a stand-in for build/moto-package:
+# what it sends the handset and saves for each setting. Needs no phone.
+.PHONY: test-moto-wifi-profile
+test-moto-wifi-profile:
+	$(PYTHON) services/usb-diagnostics/host/test_wifi_profile.py
 
 # A Mac bitchat peer for over-the-air tests of apps/open/bitchat. macOS keeps
 # its Bluetooth grant across rebuilds while it is signed with one identity:

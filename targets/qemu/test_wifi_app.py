@@ -4,8 +4,9 @@ First boot: Settings › Wi-Fi (apps/open/settings) opens, which scans and lists
 emulator's three networks (tools/run.py: two open, VIOLET HOME with WPA2).
 Choosing VIOLET HOME asks for its password; a wrong one is refused by Radio,
 the right one ("violet-home", typed on the on-screen keyboard, symbols page
-included) joins it. Then an open network is chosen, which leaves VIOLET HOME
-and joins that one. Second boot on the same disk: the runtime rejoins that
+included) joins it and moves it to the top of the list, and its page then
+shows the link's addresses. Then an open
+network is chosen, which leaves VIOLET HOME and joins that one. Second boot on the same disk: the runtime rejoins that
 open network by itself (the most recently joined saved network), and VIOLET
 HOME then joins with one tap, from the key saved in the app's /data.
 """
@@ -158,7 +159,18 @@ tap(*CONNECT)
 until("VIOLET HOME joins", lambda: "wifi: joined VIOLET HOME" in everything(), 20)
 print("wifi: joined VIOLET HOME with its password", file=sys.stderr)
 time.sleep(1)
-tap(360, ROW(0))  # VIOLET LAB (open): leave VIOLET HOME, scan, join
+# The joined network's page: besides its status, security and password, the
+# link Radio reports through "wifi info" (in the emulator its address and
+# router, no host name sent, and the radio's address, kind and name).
+tap(360, ROW(0))  # the connected network leads the list now
+until("VIOLET HOME's page shows the link", lambda: "wifi: showing VIOLET HOME (9 details)" in everything(), 10)
+if os.environ.get("WIFI_DETAILS_SHOT"):
+    time.sleep(.5)
+    open(os.environ["WIFI_DETAILS_SHOT"], "wb").write(bytes(screen[:]))
+print("wifi: the joined network's page shows its link", file=sys.stderr)
+tap(108, 63)  # Back
+time.sleep(.5)
+tap(360, ROW(1))  # VIOLET LAB (open), below the connected network: leave VIOLET HOME, scan, join
 until("VIOLET LAB joins", lambda: "wifi: joined VIOLET LAB" in everything(), 30)
 print("wifi: switched to the open network VIOLET LAB", file=sys.stderr)
 time.sleep(1.5)  # the runtime writes /data back on its next pass
@@ -186,4 +198,4 @@ with TemporaryDirectory() as tmp:
         status = run.main(str(viewer))
         if status != 0:
             raise SystemExit(f"Wi-Fi app test failed in the {stage} boot (viewer status {status})")
-    print("Wi-Fi app verified: scan, wrong and right WPA2 password, switching networks, rejoining by itself, the saved key after a restart and after a handshake timeout")
+    print("Wi-Fi app verified: scan, wrong and right WPA2 password, the joined link's details, switching networks, rejoining by itself, the saved key after a restart and after a handshake timeout")

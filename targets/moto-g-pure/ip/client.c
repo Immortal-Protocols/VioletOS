@@ -26,6 +26,8 @@ static unsigned request_start;
 static int established, failed, eof, initialized, attached, dns_state;
 static ip_addr_t destination;
 static unsigned char frame[1518];
+// The name sent with DHCP requests. Empty by default: no name is sent.
+static char hostname[33];
 u32_t sys_now(void) { return radio_monotonic_ms(); }
 unsigned radio_ip_random(void) {
   unsigned v = 0;
@@ -170,6 +172,12 @@ void station_net_close(void) {
   }
   hosting = leased = 0;
 }
+void station_net_hostname(const unsigned char *name, unsigned n) {
+  if (n >= sizeof(hostname))
+    n = 0;
+  memcpy(hostname, name, n);
+  hostname[n] = 0;
+}
 void station_net_relay_password(const unsigned char *p, unsigned n) {
   if (n > sizeof(relay_password))
     n = sizeof(relay_password);
@@ -223,6 +231,7 @@ int station_net_join(const unsigned char *mac) {
     return 0;
   attached = 1;
   memcpy(iface.hwaddr, mac, 6);
+  netif_set_hostname(&iface, hostname[0] ? hostname : NULL);
   netif_set_default(&iface);
   netif_set_up(&iface);
   netif_set_link_up(&iface);
@@ -237,6 +246,32 @@ int station_net_join(const unsigned char *mac) {
   }
   station_net_close();
   return 0;
+}
+// The joined network's IPv4 settings for Settings' network page (LINK_IP in
+// runtime/protocol.rs): this station's address, the subnet mask, the router,
+// two DNS servers and the DHCP server, four bytes each, then the lease and
+// what is left of it in seconds, little endian. Zero where there is none.
+// Returns 0 without an address from DHCP.
+int station_net_info(unsigned char out[32]) {
+  memset(out, 0, 32);
+  if (!attached || hosting || failed || !dhcp_supplied_address(&iface))
+    return 0;
+  const struct dhcp *lease = netif_dhcp_data(&iface);
+  const ip4_addr_t *list[] = {
+      netif_ip4_addr(&iface), netif_ip4_netmask(&iface), netif_ip4_gw(&iface),
+      ip_2_ip4(dns_getserver(0)), ip_2_ip4(dns_getserver(1)),
+      ip_2_ip4(&lease->server_ip_addr)};
+  for (unsigned i = 0; i < 6; i++)
+    memcpy(out + 4 * i, &list[i]->addr, 4); // lwIP keeps addresses in network order
+  // lease_used counts minutes (DHCP_COARSE_TIMER_SECS) since the last acknowledgement.
+  unsigned total = lease->offered_t0_lease;
+  unsigned used = (unsigned)lease->lease_used * DHCP_COARSE_TIMER_SECS;
+  unsigned left = used < total ? total - used : 0;
+  for (unsigned i = 0; i < 4; i++) {
+    out[24 + i] = total >> (8 * i);
+    out[28 + i] = left >> (8 * i);
+  }
+  return 1;
 }
 static err_t connected(void *arg, struct tcp_pcb *pcb, err_t err) {
   established = err == ERR_OK;

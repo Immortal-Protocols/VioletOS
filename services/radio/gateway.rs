@@ -5,9 +5,9 @@ use core::ptr::{read_volatile, write_volatile};
 const DEVICE: usize = 0x09001000;
 const DMA: usize = 0x09002000;
 const PHYSICAL: u32 = 0x49201000;
-const MAC: [u8; 6] = [0x52, 0x54, 0, 0x56, 0, 1];
-const GUEST: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY: [u8; 4] = [10, 0, 2, 2];
+pub(super) const MAC: [u8; 6] = [0x52, 0x54, 0, 0x56, 0, 1];
+pub(super) const GUEST: [u8; 4] = [10, 0, 2, 15];
+pub(super) const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 fn reg(n: usize) -> u32 {
     unsafe { read_volatile((DEVICE + n) as *const u32) }
 }

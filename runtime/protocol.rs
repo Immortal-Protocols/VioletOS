@@ -195,6 +195,33 @@ pub fn valid_relay_code(code: &[u8]) -> bool {
         && code[..RELAY_CODE_LEN].iter().all(|c| matches!(c, b'0'..=b'9' | b'A'..=b'F'))
 }
 
+/// GET LINK n: record n about the joined network, for Settings' network page.
+/// Only the Open Runtime may ask, and it answers only Settings: the addresses
+/// here identify the phone and the place. OFFLINE when no network is joined
+/// or Radio has no such record.
+pub const LINK: u32 = 34;
+/// data: this phone's Wi-Fi address (6 bytes), the access point's (6) and the
+/// channel (1). arg: where the phone's address came from, LINK_ADDRESS_*.
+pub const LINK_STATION: u32 = 0;
+/// The address is the chip's own.
+pub const LINK_ADDRESS_CHIP: u32 = 1;
+/// The chip has none: a random one, new each time Wi-Fi starts.
+pub const LINK_ADDRESS_RANDOM: u32 = 2;
+/// The one provisioned over USB (VIOLET_FIXED_MAC).
+pub const LINK_ADDRESS_FIXED: u32 = 3;
+/// data: IPv4 addresses of four bytes each (this phone's, the subnet mask, the
+/// router, two DNS servers, the DHCP server), then the lease and what is left
+/// of it in seconds (little endian). Zero where there is none.
+pub const LINK_IP: u32 = 1;
+/// The host name sent with DHCP requests, as text; value is its length (0: none is sent).
+pub const LINK_NAME: u32 = 2;
+/// The radio's name, as text.
+pub const LINK_RADIO: u32 = 3;
+/// What the Wi-Fi firmware reported of itself when it started: the text is its
+/// build date; value is its version (major in the high byte of the low 16
+/// bits, then minor) and arg its build number.
+pub const LINK_FIRMWARE: u32 = 4;
+
 pub const STORAGE_DIAGNOSTIC: u32 = 0x300;
 
 // Audio. VOLUME and PLAYBACK can be subscribed to, read with GET and changed

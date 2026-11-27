@@ -30,6 +30,27 @@ fn desc(r: usize, i: usize) -> usize {
 fn payload(r: usize, i: usize) -> usize {
     0x10000 + (r * SLOTS + i) * BUF
 }
+/// Where the station address came from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AddressFrom {
+    /// The chip's own.
+    Chip,
+    /// The chip gave none: a random one for this session.
+    Random,
+    /// The one provisioned over USB.
+    Fixed,
+}
+/// What the firmware said of itself when it started, in the answer that also
+/// carries the station address (EVENT_NIC_CAPABILITY in MediaTek's gen4m
+/// driver: u2FwVersion, ucFwBuildNumber and aucDateCode).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Firmware {
+    /// Major version in the high byte, minor in the low.
+    pub version: u16,
+    pub build: u8,
+    /// The build date in ASCII, zero-padded.
+    pub date: [u8; 16],
+}
 pub struct Axi {
     cursor: [usize; 4],
     rx: [u8; BUF],
@@ -39,6 +60,10 @@ pub struct Axi {
     threshold: u32,
     owned: bool,
     pub station: [u8; 6],
+    /// Set with `station`, when the firmware starts.
+    pub station_from: Option<AddressFrom>,
+    /// None when the firmware left its version and build date empty.
+    pub firmware: Option<Firmware>,
     peer: [u8; 6],
     basic_rate: u8,
     pairwise_ready: bool,
@@ -66,6 +91,8 @@ impl Axi {
             threshold: 0,
             owned: false,
             station: [0; 6],
+            station_from: None,
+            firmware: None,
             peer: [0; 6],
             basic_rate: 0,
             pairwise_ready: false,
@@ -270,6 +297,18 @@ impl Axi {
                 return Err(45);
             }
             let mut mac: [u8; 6] = event[20..26].try_into().unwrap();
+            // The capability body follows the 12-byte event header.
+            let firmware = Firmware {
+                version: u16::from_le_bytes([event[14], event[15]]),
+                build: event[68],
+                date: event[32..48].try_into().unwrap(),
+            };
+            self.firmware = (firmware.version != 0 || firmware.date[0] != 0).then_some(firmware);
+            if let Some(fixed) = super::radio_io::fixed_address() {
+                self.station_from = Some(AddressFrom::Fixed);
+                return Ok(fixed);
+            }
+            self.station_from = Some(AddressFrom::Chip);
             if mac == [0; 6] || mac[0] & 1 != 0 {
                 // Ellis can provide the permanent address outside the NIC.
                 // Configure a locally administered unicast address for this session.
@@ -277,6 +316,7 @@ impl Axi {
                     return Err(45);
                 }
                 mac[0] = (mac[0] & !3) | 2;
+                self.station_from = Some(AddressFrom::Random);
             }
             return Ok(mac);
         }

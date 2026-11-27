@@ -136,7 +136,9 @@ CHECKS = {
         "exited with status 0",
     ],
     "chello": ["pthreads summed 15005000", "libm: 1.190020", "slept at least 20 ms: yes",
-               "file round trip: written by c", "16 MiB malloc ok: 1", "c done"],
+               "file round trip: written by c", "16 MiB malloc ok: 1",
+               # Only Settings is told the Wi-Fi link's addresses (runtime/open/wifi.rs).
+               "wifi info: error denied: only Settings reads the link's addresses", "c done"],
     "gohello": ["goroutines summed: 102018000", "gc cycles at least 1: true",
                 "timer fired after at least 30ms: true ticks>0: true", "file round trip: written by go <nil>", "go done"],
     # TCP through the host relay to the test's web server, which stands in for example.com.
