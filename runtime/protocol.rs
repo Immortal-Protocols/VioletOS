@@ -94,6 +94,10 @@ pub const RADIO_RELEASE_POWER:u32=0x405f;
 pub const RADIO_RETAIN_POWER:u32=0x4053;
 pub const RADIO_DIAGNOSTIC: u32 = 1 << 31;
 pub const POWER_MILLIVOLTS: u32 = 1 << 31;
+/// The power key, for the Open Runtime (runtime/open/power.rs). GET: value bit 0
+/// is set while the key is held; arg counts presses where the board latches them
+/// (QEMU), so a press shorter than a poll is still seen.
+pub const POWER_KEY: u32 = 34;
 pub const CATALOG: u32 = 9;
 pub const QUIT: u32 = 10;
 pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {

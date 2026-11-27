@@ -95,6 +95,8 @@ pub const TOUCH_DOWN: u16 = 1;
 pub const TOUCH_MOVE: u16 = 2;
 pub const TOUCH_UP: u16 = 3;
 pub const KEY_DOWN: u16 = 4;
+/// KEY_DOWN's code when the power key is held (sent to Home, for its power sheet).
+pub const KEY_POWER: u16 = 4;
 pub const JACK: u16 = 6;
 pub const LIFECYCLE: u16 = 7;
 /// Lifecycle values.

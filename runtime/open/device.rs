@@ -134,7 +134,7 @@ pub const ACCENT: u32 = 0xffd1b0fe;
 pub const ALERT: u32 = 0xffff5a5f;
 pub const OK_GREEN: u32 = 0xff6ee7a8;
 
-fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
+pub(super) fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
     // Scanout is mapped cached, so plain stores (written back by the clean
     // below or by the caller) are as visible as volatile ones, and a row is
     // one fill instead of a store per pixel: the app list used to take long
@@ -418,6 +418,10 @@ impl Runtime {
     }
 
     fn shell_tap(&mut self, x: i32, y: i32) {
+        // Locked, the list starts nothing (power.rs brings Home back).
+        if self.power.locked {
+            return;
+        }
         let y = y as usize;
         if (HOME_Y..HOME_Y + 150).contains(&y) {
             if self.home.is_some() {
@@ -1089,6 +1093,8 @@ impl Runtime {
                 String::from("ok\n")
             }
             // The list of every program in /apps.
+            Some("apps" | "open") if self.power.locked => String::from("error locked\n"),
+            Some(verb @ ("lock" | "unlock" | "passcode" | "power")) => self.power_command(i, verb, &mut words),
             Some("apps") => {
                 self.set_foreground(None);
                 self.shell.dirty = true;

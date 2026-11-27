@@ -103,6 +103,18 @@ pub fn read() -> Message {
     }
     reply
 }
+/// The power key: MT6357 TOPSTATUS bit 1 (PWRKEY_DEB), 0 while pressed, as in
+/// Linux's mtk-pmic-keys. One wrapper read, so the Open Runtime can poll it.
+const TOPSTATUS: u16 = 0x0024;
+pub fn key() -> Message {
+    if read_reg(0xa0) & 1 == 0 || read_reg(STATUS) & (1 << 22) == 0 {
+        return Message::error(OFFLINE);
+    }
+    match pmic_read(TOPSTATUS) {
+        Some(top) => Message::result(u32::from(top & (1 << 1) == 0)),
+        None => Message::error(OFFLINE),
+    }
+}
 pub fn command(value: u32) -> Message {
     match value {
         // Runtime blanks scanout and consumes the first touch on wake.

@@ -22,7 +22,7 @@ fn service(key: u32) -> u32 {
         SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         PRESENT => 5,
         SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | RELAY => 7,
-        POWER => 8,
+        POWER | POWER_KEY => 8,
         CATALOG | INBOX | INSTALL | REMOVE => 9,
         _ => 0,
     }
@@ -36,7 +36,7 @@ const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK, MI
 fn component(key: u32) -> u32 {
     match key {
         RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | RELAY => 7,
-        POWER => 8,
+        POWER | POWER_KEY => 8,
         SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         VOLUME | PLAYBACK | MICROPHONE => AUDIO_COMPONENT,
         _ => 0,
@@ -207,7 +207,10 @@ impl Runtime {
             // Volume is shared. Only the app on screen may change it, make sound
             // or listen.
             (EXECUTE, VOLUME | PLAYBACK | MICROPHONE) if who == self.focus && !self.asleep => audio(m),
-            (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
+            (GET, POWER_KEY) if who == OPEN_APPS => self.forward(who, 8, m),
+            // Sleep (1), wake (0) and power off (2). The Open Runtime asks when
+            // the power key is pressed or Home's power sheet is confirmed.
+            (EXECUTE, POWER) if (who == LAUNCHER || who == OPEN_APPS) && m.value <= 2 => {
                 self.asleep = m.value == 1;
                 if self.asleep {
                     self.mic_off();

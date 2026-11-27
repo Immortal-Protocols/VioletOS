@@ -14,7 +14,7 @@ For hardware acceptance, check for **DISK READY**, then start and pause Stopwatc
 
 ## Handset power and Wi-Fi bring-up
 
-The Power package owns the MT6765 PMIC wrapper. It checks the MT6357 chip identity, requests a battery ADC conversion and reports millivolts. Screen blanking keeps touch running. The confirmed Off action requests shutdown by releasing the PMIC power-hold bit. Verify the voltage, tap-to-wake and shutdown on the handset. The QEMU power test exercises the virtual power backend.
+The Power package owns the MT6765 PMIC wrapper. It checks the MT6357 chip identity, requests a battery ADC conversion and reports millivolts. It reads the power key (MT6357 TOPSTATUS bit 1) for the Open Runtime, which turns the screen off and on, locks, and offers Power off; power off releases the PMIC power-hold bit. A screen that is off is a black frame with touch ignored; the backlight stays lit. Verify the voltage, the power key and power off on the handset. `make test-lock` exercises the virtual power backend. See [Power](../../services/power/README.md).
 
 ## Round one on slot B
 
