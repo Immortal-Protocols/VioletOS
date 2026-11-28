@@ -405,7 +405,7 @@ final class AgentModel: ObservableObject {
                 return done(["success": false, "contentItems": [["type": "inputText", "text": "Unknown tool \(tool)"]]])
             }
             if let b = self.building { self.rose.buildProgress(b.task, "Installing \(args["title"] ?? "the app") on the phone.") }
-            self.install(args) { ok, text in done(["success": ok, "contentItems": [["type": "inputText", "text": text]]]) }
+            self.install(args, fromBuilder: true) { ok, text in done(["success": ok, "contentItems": [["type": "inputText", "text": text]]]) }
         }
         builder.onTurnEnd = { [weak self] ok in self?.buildEnded(ok) }
         builder.start(login: login, account: { [weak self] signedIn in
@@ -889,13 +889,25 @@ final class AgentModel: ObservableObject {
         link.send(["t": "state", "state": state])
     }
 
-    private func install(_ args: [String: Any], _ done: @escaping (Bool, String) -> Void) {
+    private func install(_ args: [String: Any], fromBuilder: Bool = false, _ done: @escaping (Bool, String) -> Void) {
         let name = args["name"] as? String ?? ""
         let title = args["title"] as? String ?? name
         let path = URL(fileURLWithPath: args["path"] as? String ?? "").standardizedFileURL
         guard path.path.hasPrefix(workspace.appendingPathComponent("target").path) || pendingInstallAllowed(path),
               let data = try? Data(contentsOf: path), !data.isEmpty else {
             return done(false, "That program is not in the workspace's build output.")
+        }
+        if fromBuilder {
+            guard name.range(of: #"^[a-z0-9_-]{1,12}$"#, options: .regularExpression) != nil else {
+                return done(false, "Use the app folder name printed by ./build.")
+            }
+            let language = data.starts(with: Data("#!".utf8)) ? "python" : "apps"
+            let source = workspace.appendingPathComponent(language).appendingPathComponent(name)
+            do {
+                try AppManifest.check(program: data, source: source)
+            } catch {
+                return done(false, "The install file does not match the app's manifest.txt. Rebuild with a manifest-aware builder and install the path printed by ./build.")
+            }
         }
         guard online else {
             // The link can drop for a moment (a network change, a relay hiccup): wait for it before giving up.
@@ -904,7 +916,7 @@ final class AgentModel: ObservableObject {
             log("install of \(name) waits for the phone to come back")
             var retry = args
             retry["_wait_until"] = deadline
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.install(retry, done) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.install(retry, fromBuilder: fromBuilder, done) }
             return
         }
         let started = Date()
@@ -933,7 +945,7 @@ final class AgentModel: ObservableObject {
             // Not known yet (the phone's hello may still be on its way): ask it.
             appLists.append { [weak self] o in
                 self?.phonePython = o["python"] as? Bool
-                self?.install(args, done)
+                self?.install(args, fromBuilder: fromBuilder, done)
             }
             link.send(["t": "apps"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
