@@ -33,11 +33,23 @@ def install_radio(package, before):
     expected = f"{struct.unpack_from('<I', data, 20)[0]:08x}"
     if expected == before[0][0]:
         raise SystemExit("Choose a Radio package different from the active build")
+    # The ABI word's top byte names the architecture (package_format.py ARCH_ABI).
+    # An image older than USB request 0x59 reports no word size and is 32-bit;
+    # one from before signed packages (slot A's fallback, say) refuses any VPK2
+    # only at the last chunk, so say which image answered before uploading.
+    bits = json.loads(read("moto-debug")).get("word_bits", 32)
+    arch = 64 if struct.unpack_from("<I", data, 4)[0] >> 24 == 0x64 else 32
+    if bits != arch:
+        raise SystemExit(f"The handset runs a {bits}-bit VioletOS; this Radio package is for the {arch}-bit image")
     with tempfile.TemporaryDirectory() as directory:
         sig = Path(directory) / "radio.sig"
         subprocess.run(["openssl", "dgst", "-sha256", "-sign", BUILD/"sel4/moto/developer-signing.pem",
                         "-out", sig, package], check=True)
-        print(read("moto-package", package, timeout=30 + len(data) // 500), flush=True)
+        try:
+            print(read("moto-package", package, timeout=30 + len(data) // 500), flush=True)
+        except subprocess.CalledProcessError as error:
+            raise SystemExit((error.stderr or "").strip() + "\nThe handset refused the package: is it running an image"
+                             " built from this tree (not slot A's fallback), which trusts build/sel4/moto's key?")
         read("moto-package", "activate-radio", sig)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -74,6 +86,11 @@ def run(package=None):
                     and new["counter_ms"] + 1000 < boot["counter_ms"] + elapsed_ms):
                 after = snapshot()
                 print("After reboot:", *after)
+                if new.get("word_bits", 32) != boot.get("word_bits", 32):
+                    # Slot B is never marked successful, so each boot spends one of
+                    # its tries; with one left LK starts slot A (moto-flash select_b).
+                    raise SystemExit("A different VioletOS answered after the reboot: the bootloader probably "
+                                     "started slot A. Restore B's tries from fastboot (set_active a, set_active b).")
                 if after != before:
                     raise SystemExit("Radio or stopwatch changed across reboot")
                 print("Physical reboot verified; Radio and stopwatch match.")

@@ -318,6 +318,20 @@ class PageRights(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertGreaterEqual(own, 1)
 
+    def test_link_4_the_composed_catalog_is_cached_where_it_is_shared(self):
+        # The handset's installed catalog is composed by the supervisor in two
+        # RAM sections and written to disk by Storage. Both must map them with
+        # the same (cacheable) attributes: Storage reading them uncached saw
+        # stale RAM, so the bank's checksum did not match its sectors and the
+        # loader refused the catalog at the next boot (catalog_volume.rs).
+        text = (ROOT / "system/supervisor/supervisor.c").read_text()
+        maps = [(line, args) for name in ("seL4_ARM_Page_Map", "map_section") for line, args in calls(text, name)
+                if re.search(r"\b(catalog_candidate_frame|copy_catalog)\b", args[0])]
+        self.assertGreaterEqual(len(maps), 4, "the supervisor's and Storage's mappings of the composed catalog")
+        self.assertTrue(any("procs[STORAGE]" in args[1] for _, args in maps), "Storage's mapping was not found")
+        for line, args in maps:
+            self.assertIn("seL4_ARM_Default_VMAttributes", args[4], f"supervisor.c:{line}: an uncached view of the catalog")
+
     def test_link_4_finds_what_it_must(self):
         # The audit itself: a share_with_open_attrs caller without ExecuteNever
         # and a plain cacheable mapping are what it reports.

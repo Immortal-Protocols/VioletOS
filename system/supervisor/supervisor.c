@@ -1352,16 +1352,22 @@ static void wire(void) {
     }
 #else
   boot_stage(1);
+  // Cacheable, as the supervisor maps the same frames while it composes the
+  // catalog there. Storage once read them uncached: it saw RAM the
+  // supervisor's dirty cache lines had not reached yet, and lines written
+  // back while it worked changed the data under it, so the bank's checksum
+  // (taken at the end) did not match the sectors written before, and the
+  // loader refused the installed catalog at the next boot.
   for (unsigned i = 0; i < 2; i++) {
 #if VM_AARCH64
     map_section(catalog_candidate_frame[i], &procs[STORAGE].task, 0x0d100000 + i * 0x100000, seL4_CanRead,
-                seL4_ARM_ExecuteNever, true);
+                seL4_ARM_Default_VMAttributes | seL4_ARM_ExecuteNever, true);
 #else
     unsigned copy_catalog=next_slot++;
     check(seL4_CNode_Copy(seL4_CapInitThreadCNode,copy_catalog,SEL4_DEPTH,seL4_CapInitThreadCNode,
                           catalog_candidate_frame[i],SEL4_DEPTH,seL4_CanRead));
     check(seL4_ARM_Page_Map(copy_catalog,procs[STORAGE].task.pd,0x0d100000 + i * 0x100000,seL4_CanRead,
-                            seL4_ARM_ExecuteNever));
+                            seL4_ARM_Default_VMAttributes | seL4_ARM_ExecuteNever));
 #endif
   }
   if (usb_factory_only) procs[USB_DIAG].package = factory_usb;
