@@ -1,10 +1,11 @@
-"""Cross-build the open apps' C library and Python for ARMv7 Linux (musl, hard float),
-or for AArch64 Linux with VIOLET_ARCH=aarch64.
+"""Cross-build the open apps' C library and Python for the build's architecture
+(VIOLET_ARCH, aarch64 unless set): AArch64 Linux, or ARMv7 Linux (musl, hard
+float) with VIOLET_ARCH=aarch32.
 
-    python3 tools/build_python.py musl      # build/open-toolchain/sysroot
-    python3 tools/build_python.py python    # build/open-toolchain/python-root
+    VIOLET_ARCH=aarch32 python3 tools/build_python.py musl      # build/open-toolchain/sysroot
+    VIOLET_ARCH=aarch32 python3 tools/build_python.py python    # build/open-toolchain/python-root
 
-With VIOLET_ARCH=aarch64 everything goes under build/open-toolchain/aarch64
+For AArch64 everything goes under build/open-toolchain/aarch64
 instead (its own sources, sysroot, python-build and python-root), built for the
 ARMv8.0 baseline of the handset's Cortex-A53: no LSE atomics, as
 targets/qemu64/musl.py does. The AArch32 paths and flags are unchanged.
@@ -55,7 +56,7 @@ TARGETS = {
 
 
 def target(arch=None):
-    """The Target for `arch`, or for VIOLET_ARCH (aarch32 unless set)."""
+    """The Target for `arch`, or for VIOLET_ARCH (aarch64 unless set)."""
     if arch is None:
         sys.path.insert(0, str(ROOT / "image/packages"))
         import violet_arch

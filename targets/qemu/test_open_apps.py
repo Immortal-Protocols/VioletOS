@@ -103,7 +103,8 @@ time.sleep(2)  # the runtime writes /data back on its next pass
 '''
 
 
-ARCH = sys.argv[2] if sys.argv[1:2] == ["--arch"] else "aarch32"
+# AArch64 unless --arch aarch32 (the 32-bit image, make qemu32-image).
+ARCH = sys.argv[2] if sys.argv[1:2] == ["--arch"] else "aarch64"
 # What boots each architecture's image (tools/run.py boot_devices).
 FILES = {"aarch32": ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"),
          "aarch64": ("qemu64.bin", "qemu64.json", "initfs.cpio")}
@@ -114,7 +115,7 @@ with TemporaryDirectory() as tmp:
     viewer.chmod(0o755)
     original = run.IMAGES[ARCH]
     if not (original / "initfs.cpio").exists():
-        raise SystemExit("Build the QEMU image first (make qemu-image" + (" or make qemu64-image QEMU64_STACK=1)." if ARCH == "aarch64" else ")."))
+        raise SystemExit("Build the QEMU image first (make " + ("qemu-image)." if ARCH == "aarch64" else "qemu32-image)."))
     image = Path(tmp) / "image"
     image.mkdir()
     for name in FILES[ARCH]:

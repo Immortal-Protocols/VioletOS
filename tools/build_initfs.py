@@ -47,7 +47,7 @@ ARCHES = {
 
 
 def arch_of(arch=None):
-    """`arch`, or VIOLET_ARCH (aarch32 unless set)."""
+    """`arch`, or VIOLET_ARCH (aarch64 unless set)."""
     if arch is None:
         sys.path.insert(0, str(ROOT / "image/packages"))
         import violet_arch
@@ -275,7 +275,7 @@ def c_toolchain(arch="aarch32"):
     sysroot = t.sysroot
     builtins = next(ndk.glob(f"toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/{t.builtins}"))
     if not (sysroot / "lib/libc.a").exists():
-        raise SystemExit("Build the musl sysroot first: " + ("" if arch == "aarch32" else f"VIOLET_ARCH={arch} ")
+        raise SystemExit("Build the musl sysroot first: " + f"VIOLET_ARCH={arch} "
                          + "python3 tools/build_python.py musl")
     flags = [*ARCHES[arch]["c_flags"], f"--sysroot={sysroot}", "-isystem", str(sysroot / "include")]
     link = ["-static", "-fuse-ld=lld", "-nostdlib", str(sysroot / "lib/crt1.o"), str(sysroot / "lib/crti.o")]
@@ -477,7 +477,7 @@ HANDSET_SKIP = {"gonet", "pyhello", "pynet", "pypaint", "pytone"}
 def main(out, python=True, compress=False, skip=(), arch=None):
     """compress=True writes "VGZ1", the gzip length, then the gzip of the
     archive (the handset carries it compressed in its boot image's ramdisk).
-    `arch` is the programs' architecture: VIOLET_ARCH (aarch32) unless given."""
+    `arch` is the programs' architecture: VIOLET_ARCH (aarch64) unless given."""
     arch = arch_of(arch)
     sys.path.insert(0, str(ROOT / "tools"))
     import build_python

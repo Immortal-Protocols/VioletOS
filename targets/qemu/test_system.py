@@ -438,9 +438,11 @@ def image_files(path):
 
 
 def main():
+    # The 32-bit system (make test-system32): its image and machine.
+    os.environ["VIOLET_ARCH"] = "aarch32"
     original = ROOT / "build/sel4/qemu"
     if not (original / "initfs.cpio").exists():
-        fail("build the test image first (make test-system)")
+        fail("build the test image first (make test-system32)")
     cpio = (original / "initfs.cpio").read_bytes()
     files = image_files(original / "initfs.cpio")
     on_home = home_grid.apps(cpio)
@@ -725,7 +727,7 @@ def aarch64_verified_boot(original):
 def aarch64_layers():
     original = run.IMAGES["aarch64"]
     if not (original / "qemu64.json").exists():
-        fail(f"build the AArch64 system first: make qemu64-image QEMU64_STACK=1 ({original})")
+        fail(f"build the AArch64 system first: make qemu-image ({original})")
     # What this image gives up against AArch32 (targets/qemu64/stack.py
     # differences.json): printed as layers that are absent, never as passes,
     # and checked against the boot below.
@@ -767,9 +769,13 @@ def aarch64_layers():
 
 
 if __name__ == "__main__":
+    # AArch64 by default (make test-system); --arch aarch32 is the 32-bit
+    # system's test (make test-system32), --prepare its update test root.
     if sys.argv[1:] == ["--prepare"]:
         prepare()
-    elif sys.argv[1:] == ["--arch", "aarch64"]:
+    elif sys.argv[1:] in ([], ["--arch", "aarch64"]):
         aarch64_layers()
-    else:
+    elif sys.argv[1:] == ["--arch", "aarch32"]:
         main()
+    else:
+        sys.exit("usage: test_system.py [--arch aarch64|aarch32] | --prepare")

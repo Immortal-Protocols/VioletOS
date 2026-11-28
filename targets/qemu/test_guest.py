@@ -9,11 +9,17 @@ parser.add_argument("--watchdog-enabled", action="store_true")
 modes = ["normal","delayed","drop-before","drop-after","stuck","setup","reset1","reset2"]
 parser.add_argument("--spi", choices=modes, default="normal")
 parser.add_argument("--probe",choices=["touch","storage","dma","scanout","peer","radio","radio-dma"])
+# The AArch64 image (make qemu-image) unless --arch aarch32 (make qemu32-image).
+# The isolation probes are built into the 32-bit image only (make test-isolation).
+parser.add_argument("--arch",choices=["aarch64","aarch32"],default=None)
 args=parser.parse_args()
+arch=args.arch or ("aarch32" if args.probe else "aarch64")
 enabled=args.watchdog_enabled
 repo=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(repo/"tools"))
-from run import IMAGE, machine
+os.environ["VIOLET_ARCH"]=arch
+from run import IMAGES, machine
+IMAGE=IMAGES[arch]
 scratch=tempfile.TemporaryDirectory()
 out=Path(scratch.name)
 image=IMAGE/"isolation-test" if args.probe else IMAGE

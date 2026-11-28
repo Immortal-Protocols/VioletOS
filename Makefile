@@ -1,30 +1,35 @@
 .DEFAULT_GOAL := moto
-.PHONY: build moto emulator qemu-image test-emulator sim setup
+.PHONY: build moto moto32 emulator emulator32 qemu-image qemu32-image test-emulator sim setup
 PYTHON ?= python3
 VENV := build/sel4/venv
+# AArch64 is the default architecture (image/packages/violet_arch.py). The
+# handset (targets/moto-g-pure/build64.py, README "AArch64 boot path"):
+# build/sel4/moto-aarch64/boot.img for boot_b. Local only.
 build: moto
 moto: setup
 	$(PYTHON) tools/build_sel4.py moto
-qemu-image: setup
-	$(PYTHON) tools/build_sel4.py qemu
-# The handset in AArch64 (targets/moto-g-pure/build64.py, README "AArch64 boot
-# path"): build/sel4/moto-aarch64/boot.img for boot_b. Local only, like moto.
 .PHONY: moto64
-moto64: setup
-	$(PYTHON) tools/build_sel4.py moto-aarch64
-# The AArch64 bring-up image (targets/qemu64/README.md). Local only: CI neither builds nor boots it.
-# QEMU64_STACK=1 also builds the VioletOS system for AArch64 (targets/qemu64/stack.py,
-# build/sel4/qemu-aarch64) and `make qemu64` then checks the layers it reaches
-# (targets/qemu/test_system.py --arch aarch64) and drives Home, Settings and a
-# setting kept across a restart (test_open_apps.py --arch aarch64, two boots).
+moto64: moto
+# The 32-bit (AArch32) handset image, build/sel4/moto/boot.img.
+moto32: setup
+	$(PYTHON) tools/build_sel4.py moto32
+# The open apps' C library for AArch64 (the c64 test app and C programs).
+MUSL64 := build/open-toolchain/aarch64/sysroot/lib/libc.a
+$(MUSL64):
+	VIOLET_ARCH=aarch64 $(PYTHON) tools/build_python.py musl
+# The VioletOS system for AArch64 QEMU (targets/qemu64/stack.py): its kernel,
+# supervisor, services and apps, with verified boot, in build/sel4/qemu-aarch64.
+qemu-image: setup $(MUSL64)
+	$(PYTHON) tools/build_sel4.py qemu
+# The 32-bit (AArch32) QEMU system, build/sel4/qemu.
+qemu32-image: setup
+	$(PYTHON) tools/build_sel4.py qemu32
+# The AArch64 bring-up image alone (targets/qemu64/README.md): kernel and entry stub.
 .PHONY: qemu64-image qemu64
 qemu64-image: setup
 	$(PYTHON) tools/build_sel4.py qemu64
-	$(if $(QEMU64_STACK),$(PYTHON) tools/build_sel4.py qemu-aarch64)
 qemu64: qemu64-image
 	$(PYTHON) targets/qemu64/run.py --expect
-	$(if $(QEMU64_STACK),$(PYTHON) targets/qemu/test_system.py --arch aarch64)
-	$(if $(QEMU64_STACK),OPEN_FORCE_OFFLINE=1 $(PYTHON) targets/qemu/test_open_apps.py --arch aarch64)
 setup: $(VENV)/.deps
 $(VENV)/.deps: tools/requirements-sel4.txt
 	$(PYTHON) -m venv $(VENV)
@@ -46,6 +51,8 @@ $(VIEWER): build/sel4/viewer tools/emulator/Info.plist tools/emulator/VioletOS.i
 endif
 emulator: qemu-image $(VIEWER)
 	$(PYTHON) tools/run.py $(VIEWER)
+emulator32: qemu32-image $(VIEWER)
+	VIOLET_ARCH=aarch32 $(PYTHON) tools/run.py $(VIEWER)
 test-emulator: qemu-image
 	@set -e; for mode in normal delayed drop-before drop-after stuck setup reset1 reset2; do \
 	  $(PYTHON) targets/qemu/test_guest.py --spi $$mode --watchdog-enabled; \
@@ -58,30 +65,30 @@ sim: build/simulator
 
 .PHONY: test-isolation component
 test-isolation: setup
-	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu
+	VIOLET_TEST_ISOLATION=1 $(PYTHON) tools/build_sel4.py qemu32
 	@set -e; for region in touch storage dma scanout peer radio radio-dma; do \
 	  $(PYTHON) targets/qemu/test_guest.py --probe $$region; \
 	done
 
 component: setup
 	@test -n "$(NAME)" || (echo "Set NAME to the component name"; exit 1)
-	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py qemu
+	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py qemu32
 
 .PHONY: test-audio
 test-audio: setup
-	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu32
 	$(PYTHON) targets/qemu/test_audio.py
 
 # The test programs (Rust, C, Go, Python) live in targets/qemu/open-test-apps
 # and go into this image only; they show up on Home as extra icons.
 .PHONY: test-open
 test-open: setup
-	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/open-test-apps) $(PYTHON) tools/build_sel4.py qemu32
 	$(PYTHON) targets/qemu/test_open.py
 
 .PHONY: test-memory
 test-memory: setup
-	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/memory-test-apps) $(PYTHON) tools/build_sel4.py qemu
+	VIOLET_OPEN_EXTRA_APPS=$(abspath targets/qemu/memory-test-apps) $(PYTHON) tools/build_sel4.py qemu32
 	$(PYTHON) targets/qemu/test_memory.py
 
 # Radio's socket code against lwIP itself, on the host (local, not in CI: it
@@ -105,25 +112,25 @@ test-ladybird: qemu-image
 	$(PYTHON) targets/qemu/test_ladybird.py
 
 .PHONY: test-wifi-app
-test-wifi-app: qemu-image
+test-wifi-app: qemu32-image
 	$(PYTHON) targets/qemu/test_wifi_app.py
 
 # The voice agent: QR pairing, an encrypted install that survives a restart, reconnect
 # and unpair, with the real Mac app (companion/mac) and a local relay.
 test-agent:
-	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu32-image
 	$(PYTHON) targets/qemu/test_agent.py
 
 # Rose as the agent, end to end (needs Codex signed in and companion/mac/violet_rose/setup.sh).
 test-rose:
-	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu32-image
 	$(PYTHON) targets/qemu/test_rose.py
 
 # Uses the downloaded Mac app and its installed models. Runs locally only.
 LOCOMO_APP ?= /Applications/Locomo Music.app
 .PHONY: test-locomo
 test-locomo:
-	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=off VIOLET_OPEN_SKIP=ladybird VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=off VIOLET_OPEN_SKIP=ladybird VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu32-image
 	$(PYTHON) targets/qemu/test_locomo.py "$(LOCOMO_APP)"
 
 .PHONY: test-open-apps
@@ -254,7 +261,7 @@ test-storage-long:
 # Package signatures at boot (local, not in CI): staged catalogs with a
 # patched, unsigned or foreign-signed Radio must not boot.
 .PHONY: test-packages
-test-packages: qemu-image
+test-packages: qemu32-image
 	$(PYTHON) system/package-manager/test_signed_boot.py
 
 # The boot image's version floor only shows with a component above version 1
@@ -262,8 +269,8 @@ test-packages: qemu-image
 # suite against it, then build the normal image again.
 .PHONY: test-packages-floor
 test-packages-floor: setup
-	VIOLET_PACKAGE_VERSIONS=radio=2 $(PYTHON) tools/build_sel4.py qemu
-	$(PYTHON) system/package-manager/test_signed_boot.py; status=$$?; $(PYTHON) tools/build_sel4.py qemu && exit $$status
+	VIOLET_PACKAGE_VERSIONS=radio=2 $(PYTHON) tools/build_sel4.py qemu32
+	$(PYTHON) system/package-manager/test_signed_boot.py; status=$$?; $(PYTHON) tools/build_sel4.py qemu32 && exit $$status
 
 # The one QEMU end-to-end test of the local loop (not in CI): what needs the
 # real kernel, MMU or boot path. One image (system version 2, a test CA for
@@ -275,17 +282,25 @@ test-packages-floor: setup
 # docs/test-map.md.
 SYSTEM_TEST_APPS = $(abspath targets/qemu/abi-test-apps):$(abspath targets/qemu/wx-test-apps):$(abspath targets/qemu/policy-test-apps)
 SYSTEM_TEST_ENV = VIOLET_SYSTEM_VERSION=2 VIOLET_UPDATE_URL=https://updates.violet.test/latest.vota VIOLET_OPEN_LDSO=1 VIOLET_OPEN_EXTRA_APPS=$(SYSTEM_TEST_APPS)
-.PHONY: test-system
-test-system: setup
+# The AArch64 system (the default; test_system.py): verified boot refusing a
+# changed kernel, a changed root task and an old version (four short boots),
+# then one boot through the kernel, supervisor, services, /data, the Open
+# Runtime and its policy, Home, and 64-bit programs (signals, posix_spawn,
+# fork, the 47-bit layout, the timekeeper's timer).
+.PHONY: test-system test-system32
+test-system: qemu-image
+	$(PYTHON) targets/qemu/test_system.py
+# The 32-bit system's test, as below.
+test-system32: setup
 	@mkdir -p build/tests/abi
 	# One shell line: whatever step fails (the image build, the loader check
 	# or QEMU), the normal image is built again, so no later run boots the
 	# image that trusts the test update CA.
-	$(SYSTEM_TEST_ENV) VIOLET_UPDATE_TEST_ROOT=$$($(PYTHON) targets/qemu/test_system.py --prepare) $(PYTHON) tools/build_sel4.py qemu \
+	$(SYSTEM_TEST_ENV) VIOLET_UPDATE_TEST_ROOT=$$($(PYTHON) targets/qemu/test_system.py --prepare) $(PYTHON) tools/build_sel4.py qemu32 \
 	  && "$(HOST_RUSTC)" --edition=2021 --test -O runtime/open/tests/abi_host.rs -o build/tests/abi/host \
 	  && VIOLET_ABI_REQUIRE_LIBC=1 build/tests/abi/host the_shipped_loader \
-	  && $(PYTHON) targets/qemu/test_system.py; \
-	  status=$$?; $(PYTHON) tools/build_sel4.py qemu && exit $$status
+	  && $(PYTHON) targets/qemu/test_system.py --arch aarch32; \
+	  status=$$?; $(PYTHON) tools/build_sel4.py qemu32 && exit $$status
 
 # Host integration tests (seconds; also run by test-unit, so by CI): the
 # shipped sources of the Open Runtime, Storage, Power and the package
@@ -314,13 +329,13 @@ test-ci: qemu-image
 	OPEN_FORCE_OFFLINE=1 $(PYTHON) targets/qemu/test_open_apps.py
 
 .PHONY: test-moto-diagnostics
-test-moto-diagnostics: moto qemu-image
+test-moto-diagnostics: moto32 qemu32-image
 	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial confirm
 	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial fault
 	python3 targets/moto-g-pure/test_boot.py --diagnostics-trial timeout
 
 .PHONY: test-moto-ui
-test-moto-ui: moto qemu-image
+test-moto-ui: moto32 qemu32-image
 	$(PYTHON) targets/moto-g-pure/test_boot.py
 	$(PYTHON) targets/moto-g-pure/test_boot.py --stall-services
 	$(PYTHON) targets/moto-g-pure/test_ui.py
@@ -336,7 +351,7 @@ build/moto-debug: services/usb-diagnostics/host/moto_debug.c
 .PHONY: test-moto-radio
 MOTO_WIFI_STOCK ?= build/xt2163dl/S3RHS32.20-42-13-2-3-2/stock/wifi
 HOST_RUSTC ?= $(or $(shell command -v rustc),build/spike1/rustup/toolchains/1.91.1-aarch64-apple-darwin/bin/rustc)
-test-moto-radio: moto
+test-moto-radio: moto32
 	HOST_RUSTC="$(HOST_RUSTC)" $(PYTHON) targets/moto-g-pure/test_supplicant.py
 	"$(HOST_RUSTC)" --edition=2021 --test targets/moto-g-pure/test_history.rs -o build/sel4/moto/test-history
 	build/sel4/moto/test-history
@@ -376,7 +391,7 @@ test-sae: build/sel4/$(HOSTAP)/src/rsn_supp/wpa.c
 	build/tests/bt-wifi/sae-hostap/sae
 
 .PHONY: test-moto-ip-live
-test-moto-ip-live: moto
+test-moto-ip-live: moto32
 	$(PYTHON) targets/moto-g-pure/test_ip_live.py
 
 # A Mac bitchat peer for over-the-air tests of apps/open/bitchat. macOS keeps
@@ -397,7 +412,7 @@ build/moto-package: services/usb-diagnostics/host/moto_package.c
 .PHONY: moto-component
 moto-component: setup
 	@test -n "$(NAME)" || (echo "Set NAME to the Moto component (e.g. radio)"; exit 1)
-	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py moto
+	VIOLET_COMPONENT_ONLY="$(NAME)" $(PYTHON) tools/build_sel4.py moto32
 
 # Violet Shield (docs/violet-shield-poc.md).
 SHIELD_PY := build/shield/venv/bin/python
@@ -410,14 +425,14 @@ shield-train: $(SHIELD_PY)
 	$(SHIELD_PY) tools/shield-trainer/train.py
 test-shield-unit: $(SHIELD_PY)
 	SHIELD_PYTHON=$(SHIELD_PY) HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_unit.sh
-test-shield: qemu-image $(SHIELD_PY)
+test-shield: qemu32-image $(SHIELD_PY)
 	$(SHIELD_PY) targets/qemu/test_shield.py
 SHIELD_PROXY ?= Mac
-test-shield-proxy: qemu-image
+test-shield-proxy: qemu32-image
 	$(PYTHON) targets/qemu/test_shield_proxy.py "$(SHIELD_PROXY)"
 # Moto image with the demo apps for use with the Mac companion.
 moto-shield: setup
-	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto
+	VIOLET_OPEN_EXTRA_APPS=$(abspath apps/shield-demo) $(PYTHON) tools/build_sel4.py moto32
 # The phone's own enforcement (docs/violet-shield-poc.md): host tests, all run by
 # `make test-unit` (targets/qemu/test_shield_host.sh, tests/integration/scenarios/shield.rs).
 .PHONY: shield-train-tiny shield-fp-report

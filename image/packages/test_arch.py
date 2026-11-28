@@ -37,18 +37,20 @@ def elf(wide, sections):
 
 
 class Arch(unittest.TestCase):
-    def test_default_is_the_32_bit_build_unchanged(self):
-        self.assertEqual(violet_arch.selected({}), "aarch32")
-        self.assertEqual(violet_arch.selected({"VIOLET_ARCH": ""}), "aarch32")
-        self.assertEqual(violet_arch.rust_target({}), "armv7a-none-eabi")
-        self.assertEqual(violet_arch.require_components({}), "aarch32")
+    def test_the_default_is_aarch64_and_the_32_bit_build_is_unchanged(self):
+        self.assertEqual(violet_arch.selected({}), "aarch64")
+        self.assertEqual(violet_arch.selected({"VIOLET_ARCH": ""}), "aarch64")
+        self.assertEqual(violet_arch.rust_target({}), "aarch64-unknown-none")
+        a32 = {"VIOLET_ARCH": "aarch32"}
+        self.assertEqual(violet_arch.rust_target(a32), "armv7a-none-eabi")
+        self.assertEqual(violet_arch.require_components(a32), "aarch32")
         # The package builder takes its Rust target and its ELF reader from
         # here (below). clang_flags() is not called by the AArch32 build:
         # these lines check only that clang_flags({}) states the flags
         # platform/sel4/loader/build.py passes today, in its order, so wiring
         # it in later cannot change the 32-bit build.
         loader = (HERE.parents[1] / "platform/sel4/loader/build.py").read_text()
-        self.assertIn('"' + '","'.join(violet_arch.clang_flags({})[:4]) + '"', loader)
+        self.assertIn('"' + '","'.join(violet_arch.clang_flags(a32)[:4]) + '"', loader)
         self.assertIn('"-mno-unaligned-access"', loader)
         # And the builder takes its Rust target from here, with no second literal.
         builder = (HERE / "build.py").read_text()

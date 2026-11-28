@@ -128,6 +128,8 @@ def layout(board):
 if args.arch == "aarch64":
     run_aarch64()
     sys.exit(0)
+# The 32-bit handset build (make moto32) on the 32-bit QEMU kernel (make qemu32-image).
+os.environ["VIOLET_ARCH"] = "aarch32"
 assert layout(moto) == layout(qemu), "kernel memory reservations differ"
 
 

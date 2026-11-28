@@ -17,9 +17,10 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = ROOT / "build/sel4/qemu"
-# The same machine with an AArch64 kernel and system (VIOLET_ARCH=aarch64,
-# targets/qemu64/stack.py): its image directory, and the board whose
-# emulator, CPU and memory it boots with (targets/board/qemu64.json).
+# IMAGE is the 32-bit (AArch32) system (VIOLET_ARCH=aarch32, make qemu32-image).
+# The default, AArch64 (targets/qemu64/stack.py, make qemu-image), has its image
+# directory here, and the board whose emulator, CPU and memory it boots with
+# (targets/board/qemu64.json).
 IMAGES = {"aarch32": IMAGE, "aarch64": ROOT / "build/sel4/qemu-aarch64"}
 sys.path.insert(0,str(ROOT/"system/package-manager"))
 sys.path.insert(0,str(ROOT/"image/packages"))
@@ -28,7 +29,7 @@ from manage import launch_catalogs, acknowledge_rollback
 
 
 def arch_of(arch=None):
-    """`arch`, or VIOLET_ARCH (aarch32 unless set)."""
+    """`arch`, or VIOLET_ARCH (aarch64 unless set; image/packages/violet_arch.py)."""
     import violet_arch
     return arch or violet_arch.selected()
 

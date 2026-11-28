@@ -1,10 +1,12 @@
-"""The CPU architecture a package build targets: VIOLET_ARCH, default aarch32.
+"""The CPU architecture a package build targets: VIOLET_ARCH, default aarch64.
 
 One table (targets/board/board.py ARCHES) says what an architecture means for
-the compilers. The default, aarch32, gives exactly the flags the build has
-always used. aarch64 builds the same components for the 64-bit supervisor
-(targets/qemu64/stack.py); require_components() names what is not complete
-there and stops while anything in UNPORTED is left.
+the compilers. The default, aarch64, is the system VioletOS ships (QEMU:
+targets/qemu64/stack.py, the handset: targets/moto-g-pure/build64.py);
+require_components() names what is not complete there and stops while
+anything in UNPORTED is left. aarch32 (VIOLET_ARCH=aarch32; tools/build_sel4.py
+sets it for qemu32 and moto32) gives exactly the flags the 32-bit build has
+always used.
 
 What is wired in today: the package builder takes its Rust target from
 rust_target(), reads its linked components with sections() (either ELF
@@ -20,7 +22,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "targets/board"))
 from board import ARCHES  # noqa: E402
 
-DEFAULT = "aarch32"
+DEFAULT = "aarch64"
 
 # What still ties a layer to AArch32 (runtime/arch/README.md has the method).
 # The supervisor, memory.h, transport.c and the services are ported: they
@@ -59,7 +61,7 @@ def require_components(environ=None):
     """Stop a component build for an architecture whose components cannot run yet;
     name what runs but is not complete."""
     arch = selected(environ)
-    if arch != DEFAULT:
+    if arch == "aarch64":
         if UNPORTED:
             raise SystemExit(f"VIOLET_ARCH={arch}: the components are not ported to {arch} yet:\n  " + "\n  ".join(UNPORTED)
                              + "\nBuild the 64-bit bring-up image with: make qemu64-image")

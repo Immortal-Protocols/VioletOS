@@ -17,6 +17,8 @@ KERNEL = ("seL4-17.0.0", "https://codeload.github.com/seL4/seL4/tar.gz/refs/tags
           "cda7844ba516ba8920ba1f24ec8ab98302f0527007c1ec0cfe294aa46443b0fe")
 DTC = ("dtc-1.7.2", "https://codeload.github.com/dgibson/dtc/tar.gz/refs/tags/v1.7.2",
        "8f1486962f093f28a2f79f01c1fd82f144ef640ceabe555536d43362212ceb7c")
+BEARSSL = ("bearssl-0.6", "https://bearssl.org/bearssl-0.6.tar.gz",
+           "6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14")
 
 def source(package, destination):
     name,url,digest = package
@@ -36,6 +38,13 @@ def source(package, destination):
             sys.exit("Invalid cached archive: "+str(archive))
         subprocess.run(["tar","xf",archive,"-C",tmp],check=True)
         (Path(tmp)/name).rename(destination)
+
+def fetch_shared():
+    """The pinned sources every target compiles against (dtc's libfdt, BearSSL),
+    for the AArch64 builds, which do not run build_target."""
+    BUILD.mkdir(parents=True,exist_ok=True)
+    source(DTC,BUILD/DTC[0])
+    source(BEARSSL,BUILD/BEARSSL[0])
 
 def update(path, data):
     if not path.exists() or path.read_bytes()!=data:
@@ -75,7 +84,7 @@ def build_target(target,out):
     src=out/"upstream"
     source(KERNEL,src)
     source(DTC,BUILD/DTC[0])
-    bear=("bearssl-0.6","https://bearssl.org/bearssl-0.6.tar.gz","6705bba1714961b41a728dfc5debbe348d2966c117649392f8c8139efc83ff14")
+    bear=BEARSSL
     source(bear,BUILD/bear[0])
     if target == "moto":
         supplicant = ("wpa_supplicant-2.11", "https://w1.fi/releases/wpa_supplicant-2.11.tar.gz",

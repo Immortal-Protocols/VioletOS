@@ -7,6 +7,7 @@
 """
 
 import binascii
+import os
 import json
 from pathlib import Path
 import struct
@@ -17,6 +18,8 @@ import unittest
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+# The fixtures are AArch32 packages; the arch test below sets VIOLET_ARCH itself.
+os.environ["VIOLET_ARCH"] = "aarch32"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "system/package-manager"))
 import package_format
@@ -279,10 +282,12 @@ class Format(unittest.TestCase):
             unpack(pack(wide.values(), arch="aarch64"), arch="aarch32")
         with self.assertRaises(ValueError):
             pack([*list(narrow.values())[:4], wide[7]], arch="aarch32")
-        # With no arch given, the build's own (VIOLET_ARCH) decides; unset, it is AArch32.
+        # With no arch given, the build's own (VIOLET_ARCH) decides; unset, it is AArch64.
         from unittest import mock
         with mock.patch.dict("os.environ", {"VIOLET_ARCH": ""}):
-            self.assertEqual(package_format.selected_arch(), "aarch32")
+            self.assertEqual(package_format.selected_arch(), "aarch64")
+            self.assertEqual(inspect(wide[5]), 5)
+        with mock.patch.dict("os.environ", {"VIOLET_ARCH": "aarch32"}):
             self.assertEqual(inspect(narrow[5]), 5)
         with mock.patch.dict("os.environ", {"VIOLET_ARCH": "aarch64"}):
             self.assertEqual(inspect(wide[5]), 5)
