@@ -47,7 +47,8 @@
       "KernelArmExportVCNTUser": "ON",
       "KernelArmExportPTMRUser": "OFF",
       "KernelIsMCS": "OFF",
-      "KernelDebugBuild": "OFF"
+      "KernelDebugBuild": "OFF",
+      "KernelRootCNodeSizeBits": "16"
     }
   },
   "changed": {
@@ -152,6 +153,10 @@
     "KernelArmHypervisorSupport": {
       "value": "OFF",
       "why": "The kernel runs at EL1; QEMU virt without virtualization starts there."
+    },
+    "KernelRootCNodeSizeBits": {
+      "value": "16",
+      "why": "The supervisor's root CNode: on AArch64 its device windows, scanout and camera are mapped as 4 KiB frames (no 64 KiB or 1 MiB pages), about 6000 capabilities on QEMU, beyond the default 4096 slots."
     }
   }
 }

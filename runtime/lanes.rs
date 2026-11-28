@@ -15,6 +15,8 @@ struct Cell {
     owner: UnsafeCell<u32>,
     message: UnsafeCell<Message>,
 }
+// 32 cells and the mark at 4080 share one 4 KiB page per lane, on either word size.
+const _: () = assert!(core::mem::size_of::<Cell>() == 64 && 32 * 64 <= 4080);
 fn cell(lane: u32, index: u32) -> &'static Cell {
     assert!((4..=9).contains(&lane) && index < 32);
     unsafe { &*((BASE + (lane - 4) as usize * 4096) as *const Cell).add(index as usize) }

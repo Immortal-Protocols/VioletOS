@@ -1,11 +1,15 @@
-// The C portion of the AArch32 ABI is limited to libsel4 and the virtual
-// counter.
+// The C portion of the component ABI is limited to libsel4 and the virtual
+// counter. It builds for AArch32 and AArch64: the message words stay 32-bit
+// values in seL4_Word registers, and only the counter reads and the badge
+// width differ.
 #include "tasks.h"
 #include "mcs.h"
 #include "timekeeper.h"
 seL4_IPCBuffer *__sel4_ipc_buffer;
 char __sel4_print_error;
 enum { WORDS = 14 };
+// A message word is 32 bits on both architectures (runtime/protocol.rs).
+_Static_assert(sizeof(unsigned) == 4, "message words are 32-bit");
 extern void component_main(unsigned);
 // Whether the supervisor's timekeeper serves this process: it says so in the
 // second argument at start (TK_LIVE), and then the page at TK_PAGE and the
@@ -36,13 +40,15 @@ static void read_words(unsigned *words, seL4_MessageInfo_t tag) {
 void ipc_call(unsigned ep, unsigned *words) {
   read_words(words, seL4_Call(ep, send_words(words)));
 }
+// The kernel stores a whole seL4_Word badge: 8 bytes on AArch64. Badges are
+// the supervisor's small numbers, so the low 32 bits are the badge.
 unsigned ipc_receive(unsigned ep, unsigned *words) {
-  unsigned badge = 0;
+  seL4_Word badge = 0;
   read_words(words, IPC_RECV(ep, &badge, REPLY_SLOT));
-  return badge;
+  return (unsigned)badge;
 }
 unsigned ipc_try_receive(unsigned ep,unsigned *words) {
-  unsigned badge=0;
+  seL4_Word badge=0;
   seL4_MessageInfo_t tag=IPC_NBRECV(ep,&badge,REPLY_SLOT);
   if (seL4_MessageInfo_get_length(tag)!=WORDS) return 0;
   read_words(words,tag);
@@ -50,15 +56,30 @@ unsigned ipc_try_receive(unsigned ep,unsigned *words) {
 }
 void ipc_reply(unsigned *words) { IPC_REPLY(REPLY_SLOT, send_words(words)); }
 unsigned ticks_per_ms;
+// The generic timer's virtual counter (CNTVCT) and its frequency (CNTFRQ):
+// CP15 on AArch32, system registers on AArch64 (as runtime/arch/mod.rs).
+// ticks() is the counter's low 32 bits on both.
 uint32_t ticks(void) {
+#if defined(__aarch64__)
+  uint64_t count;
+  __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(count));
+  return (uint32_t)count;
+#else
   uint32_t lo, hi;
   __asm__ volatile("isb; mrrc p15,1,%0,%1,c14" : "=r"(lo), "=r"(hi));
   return lo;
+#endif
 }
 void clock_init(void) {
+#if defined(__aarch64__)
+  uint64_t freq;
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+  ticks_per_ms = (unsigned)(freq / 1000);
+#else
   unsigned freq;
   __asm__ volatile("mrc p15,0,%0,c14,c0,0" : "=r"(freq));
   ticks_per_ms = freq / 1000;
+#endif
 }
 // The timekeeper, for this process (platform/sel4/include/timekeeper.h).
 unsigned timekeeper_live(void) { return tk_on; }

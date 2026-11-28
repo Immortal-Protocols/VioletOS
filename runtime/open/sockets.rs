@@ -911,12 +911,22 @@ impl Runtime {
 
     /// sendmsg and recvmsg: the address and the first buffer of the vector.
     fn message_call(&mut self, i: usize, fd: i32, msg: u32, flags: u32, send: bool) -> Outcome {
-        let Some(h) = self.rd_words(i, msg, 7) else { return Done(EFAULT) };
-        let (name, namelen, iov, iovlen) = (h[0], h[1], h[2], h[3]);
-        if iovlen == 0 {
+        // struct msghdr and struct iovec in the app's ABI (../arch/compat.rs):
+        // an AArch64 app's are 64-bit, its addresses below 4 GiB.
+        use super::arch::compat;
+        let abi = super::arch::NATIVE;
+        let mut hb = alloc::vec![0u8; compat::msghdr_bytes(abi)];
+        let Some(h) = self.app_bytes(i, msg, &mut hb).then(|| compat::msghdr(abi, &hb)).flatten() else { return Done(EFAULT) };
+        let (Ok(name), Ok(iov)) = (u32::try_from(h.name), u32::try_from(h.iov)) else { return Done(EFAULT) };
+        let namelen = h.namelen;
+        if h.iovlen == 0 {
             return Done(0);
         }
-        let Some(v) = self.rd_words(i, iov, 2) else { return Done(EFAULT) };
+        let mut vb = alloc::vec![0u8; compat::iovec_bytes(abi)];
+        let Some((base, len)) = self.app_bytes(i, iov, &mut vb).then(|| compat::iovec(abi, &vb, 0)).flatten() else { return Done(EFAULT) };
+        let (Ok(base), len) = (u32::try_from(base), len.min(u64::from(u32::MAX)) as u32) else { return Done(EFAULT) };
+        let v = [base, len];
+        let w = abi.word_bytes() as u32;
         if send {
             let to = if name != 0 {
                 match self.read_sockaddr(i, fd, name, namelen) {
@@ -928,21 +938,25 @@ impl Runtime {
             };
             self.send_call(i, fd, v[0], v[1], flags, to)
         } else {
-            let r = self.recv_call(i, fd, v[0], v[1], flags, name, if name != 0 { msg + 4 } else { 0 });
+            // msg_namelen follows msg_name (a word); msg_controllen and
+            // msg_flags are words 5 and 6 (AArch32), or at 40 and 48 (AArch64).
+            let r = self.recv_call(i, fd, v[0], v[1], flags, name, if name != 0 { msg + w } else { 0 });
             if let Done(k) = r {
                 if k >= 0 {
                     // No control data; flags cleared.
+                    let (controllen, msg_flags) = if w == 8 { (40, 48) } else { (20, 24) };
                     let app = self.apps[i].as_mut().unwrap();
-                    app.space.write_u32(&mut self.k, &mut self.pool, msg + 20, 0);
-                    app.space.write_u32(&mut self.k, &mut self.pool, msg + 24, 0);
+                    app.space.write(&mut self.k, &mut self.pool, msg + controllen, &[0u8; 8][..w as usize]);
+                    app.space.write_u32(&mut self.k, &mut self.pool, msg + msg_flags, 0);
                 }
             }
             r
         }
     }
-    fn rd_words(&mut self, i: usize, at: u32, n: usize) -> Option<Vec<u32>> {
-        let app = self.apps[i].as_mut()?;
-        (0..n).map(|k| app.space.read_u32(&mut self.k, &mut self.pool, at + 4 * k as u32)).collect()
+
+    fn app_bytes(&mut self, i: usize, at: u32, out: &mut [u8]) -> bool {
+        let Some(app) = self.apps[i].as_mut() else { return false };
+        app.space.read(&mut self.k, &mut self.pool, at, out)
     }
 
     fn getsockopt(&mut self, i: usize, fd: i32, level: u32, name: u32, val: u32, len_ptr: u32) -> Outcome {

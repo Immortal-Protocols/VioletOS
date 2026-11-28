@@ -204,6 +204,9 @@ impl Space {
     }
 
     fn table(&mut self, k: &mut Kernel, va: u32) -> Result<(), i32> {
+        if vma::WIDE {
+            return self.tables64(k, va);
+        }
         let mib = va >> 20;
         if self.tables.contains_key(&mib) {
             return Ok(());
@@ -211,6 +214,20 @@ impl Space {
         let pt = self.object(k, Object::PageTable, 0)?;
         sys::pt_map(pt, self.pd, mib << 20)?;
         self.tables.insert(mib, pt);
+        Ok(())
+    }
+    /// AArch64 (4 KiB granule, 48-bit address space): below the root, one
+    /// table for the first 512 GiB, one per GiB and one per 2 MiB. Made top
+    /// down, each lands at the level the kernel's walk stops at. Keys: the
+    /// last level by 2 MiB, the middle by GiB with bit 28, the first bit 29.
+    fn tables64(&mut self, k: &mut Kernel, va: u32) -> Result<(), i32> {
+        for key in [1 << 29, 1 << 28 | va >> 30, va >> 21] {
+            if !self.tables.contains_key(&key) {
+                let pt = self.object(k, Object::PageTable, 0)?;
+                sys::pt_map(pt, self.pd, va)?;
+                self.tables.insert(key, pt);
+            }
+        }
         Ok(())
     }
 
@@ -671,8 +688,12 @@ const AT_SECURE: u32 = 23;
 const AT_RANDOM: u32 = 25;
 const AT_HWCAP2: u32 = 26;
 const AT_EXECFN: u32 = 31;
-/// half, thumb, fast mult, VFP, EDSP, NEON, VFPv3, TLS, VFPv4, IDIVA, IDIVT, VFPD32.
-const HWCAP: u32 = 2 | 4 | 16 | 64 | 128 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | 524288;
+/// half, thumb, fast mult, VFP, EDSP, NEON, VFPv3, TLS, VFPv4, IDIVA, IDIVT, VFPD32;
+/// on AArch64 (vma::WIDE) FP and ASIMD, all an ARMv8.0 core is sure to have.
+const HWCAP: u32 = if vma::WIDE { 1 | 2 } else { 2 | 4 | 16 | 64 | 128 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | 524288 };
+/// AT_PLATFORM, and the bytes of one word of the initial stack.
+const PLATFORM: &[u8] = if vma::WIDE { b"aarch64\0" } else { b"v7l\0" };
+const WORD: u32 = if vma::WIDE { 8 } else { 4 };
 
 /// The dynamic loader a program needs, if it is dynamically linked: only
 /// elf::LOADER is ever named (a program naming another is refused by `load`).
@@ -732,10 +753,10 @@ pub fn load(
     let main_entry = base.wrapping_add(plan.entry);
     let (mut entry, mut ld_base) = (main_entry, 0);
     if plan.interp {
-        let ld_image = interp.ok_or("its dynamic loader /lib/ld-musl-armhf.so.1 is not in the system image")?;
+        let ld_image = interp.ok_or(elf::NO_LOADER)?;
         let ld = elf::plan(ld_image)?;
         if !ld.loader_ok() {
-            return Err("/lib/ld-musl-armhf.so.1 is not a dynamic loader");
+            return Err(elf::NOT_LOADER);
         }
         let (lo, hi) = ld.span();
         let lo = align_down(lo, WINDOW);
@@ -767,7 +788,7 @@ pub fn load(
         }
         Ok(sp)
     };
-    let platform = push_bytes(space, b"v7l\0")?;
+    let platform = push_bytes(space, PLATFORM)?;
     let rand = push_bytes(space, &random)?;
     let mut arg_ptrs = Vec::new();
     for a in argv {
@@ -813,10 +834,11 @@ pub fn load(
         words.push(key);
         words.push(value);
     }
-    sp = (sp - words.len() as u32 * 4) & !15;
-    let mut bytes = Vec::with_capacity(words.len() * 4);
+    // Words of the app's ABI: AArch64's are 8 bytes (addresses below 4 GiB, zero above).
+    sp = (sp - words.len() as u32 * WORD) & !15;
+    let mut bytes = Vec::with_capacity(words.len() * WORD as usize);
     for w in &words {
-        bytes.extend_from_slice(&w.to_le_bytes());
+        bytes.extend_from_slice(&u64::from(*w).to_le_bytes()[..WORD as usize]);
     }
     if !space.write(k, pool, sp, &bytes) {
         return Err("out of memory building the stack");

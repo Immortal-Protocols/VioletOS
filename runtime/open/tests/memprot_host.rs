@@ -413,6 +413,41 @@ fn random_layouts_stay_apart_and_vary() {
     assert_eq!(Layout::random(&[]), Layout::fixed());
 }
 
+#[test]
+fn aarch64_layouts_are_sparse_wide_and_random() {
+    use vma::*;
+    let mut seed = 0x2545f4914f6cdd1du64;
+    let (mut pies, mut mmaps, mut stacks) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    let (mut min_mmap, mut max_pie, mut max_stack) = (u64::MAX, 0, 0);
+    for _ in 0..100_000 {
+        let l = Layout64::random(&random_bytes(&mut seed));
+        for a in [l.pie_base, l.brk_gap, l.mmap_top, l.stack_top, l.stubs] {
+            assert_eq!(a & 0xffff, 0, "64 KiB windows, as AArch32");
+        }
+        assert!(l.stack_pad % 16 == 0 && l.stack_pad < 4096);
+        // Nothing in the low 4 GiB: an address cut to 32 bits faults.
+        assert!(l.pie_base >= 1 << 32);
+        // A 4 GiB program and its 256 MiB heap gap still end below mmap.
+        assert!(l.pie_base + (4 << 30) + l.brk_gap <= MMAP_BASE64);
+        // Room for TiB-scale PROT_NONE reservations below every mmap top.
+        assert!(l.mmap_top - MMAP_BASE64 >= 40 << 40);
+        assert!(l.stack_top - (8 << 20) >= MMAP_TOP64 && l.stack_top <= STACK_TOP64);
+        assert!(l.stubs >= STACK_TOP64 + 0x10000 && l.stubs + 0x10000 <= USER_TOP64);
+        min_mmap = min_mmap.min(l.mmap_top);
+        max_pie = max_pie.max(l.pie_base);
+        max_stack = max_stack.max(l.stack_top);
+        pies.insert(l.pie_base);
+        mmaps.insert(l.mmap_top);
+        stacks.insert(l.stack_top);
+    }
+    // Far more distinct placements than AArch32's 4096: about every draw differs.
+    assert!(pies.len() > 99_000 && mmaps.len() > 99_000 && stacks.len() > 98_000, "{} {} {}", pies.len(), mmaps.len(), stacks.len());
+    assert!(max_pie > PIE_BASE64 + (1 << 39) && min_mmap < MMAP_TOP64 - (1 << 43) && max_stack < STACK_TOP64);
+    assert_eq!(USER_TOP64, 0x8000_0000_0000, "runtime/arch AARCH64.user_top");
+    assert_eq!(Layout64::random(&[0; 24]), Layout64::fixed());
+    assert_eq!(Layout64::random(&[]), Layout64::fixed());
+}
+
 // ---- procmgr.rs: the loader ----
 
 #[test]

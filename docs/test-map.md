@@ -169,3 +169,17 @@ Main's app-drawn lock was replaced by the trusted UI's when the branches merged;
 These came before the waves, or are host-only, and stay as separate local targets outside the loop: `test-emulator`, `test-isolation`, `test-audio`, `test-open`, `test-memory`, `test-ladybird`, `test-wifi-app`, `test-agent`, `test-locomo`, `test-open-apps`, `test-shield`, `test-shield-proxy`, `test-shield-unit`, the handset targets, and from wave 1 the host-only `test-net-lwip`, `test-radio-tls`, `test-storage-long`, `test-wpa`, `test-sae`.
 
 `test-packages` and `test-packages-floor` (wave 1, QEMU: a patched, unsigned or foreign-signed Radio must not boot; one below the rollback floor must not boot) are boot-path tests, each with its own staged catalog and image build. They stay local targets **outside the loop**: folding them into test_system.py would add an image build each. What the loop does cover: the refusals themselves, decided by `system/package-manager/verify.rs`, which `make test-unit` tests with the real BearSSL (`test_verify.sh`). What it does not: that supervisor.c's `valid_package` calls the verifier when it starts a component, acts on its answer and passes the floor. Run `make test-packages test-packages-floor` after changing supervisor.c's package path.
+
+## The AArch64 build (`--arch aarch64`)
+
+No QEMU assertion moved or was dropped for the AArch64 port: the AArch32 rows above are unchanged, and `make test-system`, `make test-ci` and `make test-local` still boot only the AArch32 image. The AArch64 system has its checks in the same scripts, run by `make qemu64 QEMU64_STACK=1` and by hand, outside the loop and CI ([targets/qemu64](../targets/qemu64/README.md#the-violetos-system-on-aarch64)): `test_system.py --arch aarch64` (one boot: the layers in order, then a 64-bit program's signal handlers and posix_spawn), `test_open_apps.py --arch aarch64` and `test_ladybird.py --arch aarch64`. The host side is in `make test-unit`: `runtime/arch/tests/host.rs` (`enter64`, `widen`, `memory_args`, `signal64`, `compat`), `runtime/open/tests/abi_host.rs` (AArch64 programs below 4 GiB or refused, sigreturn's alternate stack) and the integration scenario `an_aarch64_program_meets_the_same_policy_through_its_own_numbers` (through the shipped `enter64::translate` and `widen`).
+
+What `test_system.py` checks on AArch32 and has **no AArch64 counterpart yet**:
+
+| AArch32 check | On AArch64 |
+| --- | --- |
+| Linux ABI apps (cdyn, cfault, charden, cproc, csig, goabi, rsig) | Not built: they need an AArch64 musl C toolchain. A 64-bit Rust program (`targets/qemu64/test-apps/abi64`) covers signals, siginfo, a fault's handler and posix_spawn. fork without `CLONE_VM` answers ENOSYS. |
+| W^X and layout randomization on real page tables (wxprobe) | Not probed end to end. The same `sel4.c` `open_page_map` sets ExecuteNever; host `memory::*` covers the decisions. |
+| The policy probe (boot 1) | Not run. Host `policy::*` and the integration scenario above cover the decisions. |
+| Verified boot, the timekeeper | Absent on AArch64. Printed as absent layers from `differences.json`, never as passes. |
+| The trusted UI's lock kept across a restart (boot 2) | Not run on AArch64. |

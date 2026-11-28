@@ -27,6 +27,11 @@ Boot 2, from slot B as a trial: the phone is locked from the start (the
   comes up healthy and the supervisor has Storage mark the slot successful,
   read here from the disk.
 
+`--arch aarch64` checks the AArch64 build of the same system instead
+(targets/qemu64/stack.py; `make qemu64 QEMU64_STACK=1`, not in the loop):
+one boot, the layers it reaches in order (AARCH64_LAYERS below), then a
+64-bit program's signals and posix_spawn (targets/qemu64/test-apps/abi64).
+
 The image must be the one `make test-system` builds: VIOLET_SYSTEM_VERSION=2,
 VIOLET_UPDATE_URL=https://updates.violet.test/latest.vota, the test CA of
 `--prepare` as VIOLET_UPDATE_TEST_ROOT, VIOLET_OPEN_LDSO=1 and the three test
@@ -516,8 +521,152 @@ def main():
           "a signed update staged in slot B, booted as a trial and marked successful, the passcode lock kept across the restart")
 
 
+# --arch aarch64: the same system built for AArch64 (targets/qemu64/stack.py,
+# `make qemu64 QEMU64_STACK=1`; not in test-local or CI). One boot, checked
+# layer by layer in the order the system comes up: the supervisor creates the
+# services, Storage serves /data, the Open Runtime unpacks /apps and draws on
+# the 720 x 1600 screen, and Home, a 64-bit program the Open Runtime loads and
+# serves through its one dispatcher (runtime/arch/enter64.rs), shows. Then
+# Home opens targets/qemu64/test-apps/abi64, which needs the real kernel:
+# signal handlers through the A64 gate (a fault's handler returning to the
+# faulting write, the SIMD registers intact), the 64-bit siginfo, and
+# posix_spawn (clone with CLONE_VM|CLONE_VFORK, execve, pipes, wait4).
+# targets/qemu/test_open_apps.py --arch aarch64 then drives Settings, Music
+# and a setting kept across a restart, and test_ladybird.py --arch aarch64 the browser.
+AARCH64_LAYERS = [
+    ("Storage serves /data to the Open Runtime", "[open] /data: "),
+    ("the Open Runtime reads the installed apps", "[open] installed apps: "),
+    ("the policy reads the app manifests", "[open] policy: "),
+    ("the Open Runtime unpacks /apps", "[open] ready: "),
+    ("the Open Runtime starts Home, an AArch64 program", "[open] started /apps/home as pid "),
+    ("Home is ready", "home: ready"),
+    ("Home shows", "home: shown"),
+]
+AARCH64_ABI = [
+    "abi64: usr1 handler ran 2",
+    "abi64: siginfo signo 12 code -6",
+    "abi64: fault at page+0x8, then wrote 0x5eed, fp 3",
+    "abi64: child exit Some(7)",
+    'abi64: child said "from the child"',
+    "abi64: missing program refused true",
+    "abi64 done",
+]
+AARCH64_SCRIPT = r"""#!/usr/bin/env python3
+import json, mmap, os, struct, sys, time
+ram = open(sys.argv[1], "r+b")
+log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
+screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000, prot=mmap.PROT_READ)
+LAYERS = json.loads(os.environ["AARCH64_LAYERS"])
+ABI = json.loads(os.environ["AARCH64_ABI"])
+
+def text():
+    n = struct.unpack_from("<I", log, 4)[0]
+    data = bytes(log[8:4096])
+    if n <= len(data):
+        return data[:n].decode(errors="replace")
+    s = n % len(data)
+    return (data[s:] + data[:s]).decode(errors="replace")
+seen = ""
+def everything():
+    global seen
+    t = text()
+    for k in range(min(len(seen), len(t)), 0, -1):
+        if seen.endswith(t[:k]):
+            seen += t[k:]
+            return seen
+    seen += t
+    return seen
+def fail(why):
+    print("AArch64 system test failed:", why, "\n--- log ---\n" + everything()[-3000:], file=sys.stderr)
+    sys.exit(1)
+def until(what, check, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.05)
+    fail(what)
+def tap(x, y):
+    os.write(1, bytes([9, x >> 4, y >> 4, ((x & 15) << 4) | (y & 15), 1, 1]))
+    time.sleep(.15); os.write(1, bytes(6)); time.sleep(.5)
+
+until("Home shows", lambda: "home: shown" in everything(), 120)
+at = 0
+for what, line in LAYERS:
+    found = everything().find(line, at)
+    if found < 0:
+        fail(f"{what}: no line starting {line!r} after the ones before it")
+    print(f"AArch64 layer: {what}: ok", file=sys.stderr)
+    at = found
+frame = screen[:]
+drawn = sum(1 for i in range(0, len(frame), 4 * 101) if frame[i:i + 3] != b"\0\0\0")
+if drawn < (len(frame) // (4 * 101)) // 2:
+    fail(f"the screen is not drawn ({drawn} of {len(frame) // (4 * 101)} sampled pixels are not black)")
+print("AArch64 layer: Home draws the 720 x 1600 screen: ok", file=sys.stderr)
+# The timer this image was built with is the one the Open Runtime runs with.
+polling = "no timer: polling at priority" in everything()
+if polling != (os.environ["AARCH64_USER_TIMER"] == "0"):
+    fail("the Open Runtime's timer is not what differences.json says (user timer %s, polling %s)" % (os.environ["AARCH64_USER_TIMER"], polling))
+until("the Sentinel answers", lambda: "[open] shield: mode enforce" in everything(), 30)
+print("AArch64 layer: the Sentinel answers (Violet Shield): ok", file=sys.stderr)
+time.sleep(1)
+start = len(everything())
+open_icon("abi64")
+until("abi64 finishes", lambda: "abi64 done" in everything()[start:], 60)
+out = everything()[start:]
+for line in ABI:
+    if line not in out:
+        fail(f"abi64 did not print {line!r}")
+until("abi64 exits", lambda: "exited with status 0" in everything()[start:], 15)
+print("AArch64 layer: signals (handler, siginfo, a fault's handler) and posix_spawn in a 64-bit program: ok", file=sys.stderr)
+notes = sorted({l.strip() for l in everything().splitlines() if "unsupported AArch64 system call" in l})
+if notes:
+    print("AArch64: note: " + "; ".join(notes), file=sys.stderr)
+"""
+
+
+def aarch64_layers():
+    original = run.IMAGES["aarch64"]
+    if not (original / "qemu64.json").exists():
+        fail(f"build the AArch64 system first: make qemu64-image QEMU64_STACK=1 ({original})")
+    # What this image gives up against AArch32 (targets/qemu64/stack.py
+    # differences.json): printed as layers that are absent, never as passes,
+    # and checked against the boot below.
+    known = original / "differences.json"
+    if not known.exists():
+        fail(f"the AArch64 image has no differences.json: rebuild it with targets/qemu64/stack.py ({original})")
+    differences = json.loads(known.read_text())
+    if differences.get("verified_boot") is not False or not differences.get("differences"):
+        fail(f"{known} does not record the AArch64 image's verified boot as absent: rebuild it")
+    for d in differences["differences"]:
+        print(f"AArch64 layer ABSENT (security difference from AArch32): {d}", file=sys.stderr)
+    os.environ["AARCH64_USER_TIMER"] = "1" if differences["user_timer"] else "0"
+    cpio = (original / "initfs.cpio").read_bytes()
+    if "abi64" not in home_grid.apps(cpio):
+        fail("the AArch64 image has no abi64 (targets/qemu64/test-apps): rebuild it with targets/qemu64/stack.py")
+    with TemporaryDirectory() as tmp:
+        image = Path(tmp) / "image"
+        image.mkdir()
+        for name in ("qemu64.bin", "qemu64.json", "initfs.cpio"):
+            (image / name).symlink_to(original / name)
+        os.environ["VIOLET_ARCH"] = "aarch64"
+        run.IMAGES["aarch64"] = image
+        os.environ["AARCH64_LAYERS"] = json.dumps(AARCH64_LAYERS)
+        os.environ["AARCH64_ABI"] = json.dumps(AARCH64_ABI)
+        viewer = Path(tmp) / "input.py"
+        viewer.write_text(home_grid.viewer(AARCH64_SCRIPT, cpio))
+        viewer.chmod(0o755)
+        if run.main(str(viewer)) != 0:
+            fail("the AArch64 system test failed (above)")
+    print("AArch64 system checked: kernel, supervisor and services, /data, the Open Runtime with its policy and "
+          "Sentinel, the 720 x 1600 screen, Home as a 64-bit program, and a 64-bit program's signal handlers and posix_spawn. "
+          "Absent on AArch64: " + "; ".join(differences["differences"]))
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--prepare"]:
         prepare()
+    elif sys.argv[1:] == ["--arch", "aarch64"]:
+        aarch64_layers()
     else:
         main()

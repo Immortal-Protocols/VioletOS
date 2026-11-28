@@ -427,6 +427,23 @@ fn relro_range_is_the_segment_at_the_load_bias_in_whole_pages() {
     assert_eq!(relro_seal::relro_range(&[phdr(6, 0, 0), phdr(0x6474_e552, 0xffff_f000, 0x2000)], 0x1000), None);
 }
 
+fn phdr64(kind: u32, vaddr: u64, memsz: u64) -> [u64; 7] {
+    [kind as u64 | 4 << 32, vaddr, vaddr, vaddr, memsz, memsz, 8]
+}
+
+#[test]
+fn relro_range64_reads_elf64_headers_the_same_way() {
+    // An AArch64 PIE: PHDR at 0x40, loaded far above 4 GiB.
+    let headers = [phdr64(6, 0x40, 0x230), phdr64(1, 0, 0x9d194), phdr64(0x6474_e552, 0x1e_5640, 0x79c0)];
+    for base in [0x40_0000u64, 0x1000_0000_0000, 0] {
+        assert_eq!(relro_seal::relro_range64(&headers, base + 0x40), Some((base + 0x1e_5000, base + 0x1ed_000)), "{base:#x}");
+    }
+    // p_flags in the high half of the first word does not hide the type.
+    assert_eq!(relro_seal::relro_range64(&[phdr64(6, 0x40, 0x40)], 0x40_0040), None);
+    assert_eq!(relro_seal::relro_range64(&[], 0x40_0040), None);
+    assert_eq!(relro_seal::relro_range64(&[phdr64(6, 0, 0), phdr64(0x6474_e552, u64::MAX - 0xfff, 0x2000)], 0x1000), None);
+}
+
 #[test]
 fn the_policy_lets_relro_drop_write_and_never_regain_execute() {
     // A loaded static PIE (home's segments at base 0x400000, 4 KiB rounded):

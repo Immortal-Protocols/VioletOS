@@ -56,6 +56,61 @@ pub fn relro_range(phdrs: &[[u32; 8]], at: u32) -> Option<(u32, u32)> {
     Some((start & !(PAGE - 1), end & !(PAGE - 1)))
 }
 
+/// `relro_range` for ELF64 program headers (AArch64): each row is the 56-byte
+/// header as seven words, the first holding p_type in its low half and
+/// p_flags in its high half. None if either header is missing or the range wraps.
+pub fn relro_range64(phdrs: &[[u64; 7]], at: u64) -> Option<(u64, u64)> {
+    let (mut bias, mut relro) = (None, None);
+    for p in phdrs {
+        let kind = p[0] as u32;
+        if kind == PT_PHDR {
+            bias = Some(at.wrapping_sub(p[2]));
+        } else if kind == PT_GNU_RELRO {
+            relro = Some((p[2], p[5]));
+        }
+    }
+    let (bias, (va, size)) = (bias?, relro?);
+    let start = bias.checked_add(va)?;
+    let end = start.checked_add(size)?;
+    let page = PAGE as u64;
+    Some((start & !(page - 1), end & !(page - 1)))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod start64 {
+    extern "C" {
+        fn getauxval(kind: u64) -> u64;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+        fn abort() -> !;
+    }
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const PROT_READ: i32 = 1;
+
+    unsafe extern "C" fn seal() {
+        let _ = core::ptr::read_volatile(super::VIOLET_RELRO_SEAL.as_ptr());
+        let (at, entry, count) = (getauxval(AT_PHDR), getauxval(AT_PHENT), getauxval(AT_PHNUM) as usize);
+        if at == 0 || entry != 56 || at % 8 != 0 {
+            abort();
+        }
+        let phdrs = core::slice::from_raw_parts(at as *const [u64; 7], count);
+        match super::relro_range64(phdrs, at) {
+            Some((start, end)) if end > start => {
+                if mprotect(start as *mut u8, (end - start) as usize, PROT_READ) != 0 {
+                    abort();
+                }
+            }
+            Some(_) => {}
+            None => abort(),
+        }
+    }
+
+    #[used]
+    #[link_section = ".init_array"]
+    static SEAL: unsafe extern "C" fn() = seal;
+}
+
 #[cfg(all(target_os = "linux", target_arch = "arm"))]
 mod start {
     extern "C" {

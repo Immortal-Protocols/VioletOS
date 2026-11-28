@@ -96,6 +96,33 @@ impl AltStack {
     }
 }
 
+/// The alternate stack a thread at `sp` with `current` gets from a stack_t
+/// of (ss_sp, flags, size), by sigaltstack's rules (Linux do_sigaltstack):
+/// EPERM while on the current one, EINVAL for unknown flags, ENOMEM for a
+/// stack under MINSIGSTKSZ, EFAULT for one no 32-bit app address can hold.
+/// sigaltstack answers the error; rt_sigreturn (restore_altstack) leaves the
+/// stack as it was.
+pub fn alt_change(current: AltStack, sp: u32, ss_sp: u64, flags: u32, size: u64) -> Result<AltStack, i32> {
+    const EPERM: i32 = -1;
+    const EFAULT: i32 = -14;
+    const ENOMEM: i32 = -12;
+    const EINVAL: i32 = -22;
+    let (Ok(ss_sp), Ok(size)) = (u32::try_from(ss_sp), u32::try_from(size.min(u64::from(u32::MAX)))) else { return Err(EFAULT) };
+    if current.on(sp) {
+        return Err(EPERM);
+    }
+    if flags & !(SS_DISABLE | SS_ONSTACK | 0x8000_0000) != 0 {
+        return Err(EINVAL);
+    }
+    if flags & SS_DISABLE != 0 {
+        Ok(AltStack::default())
+    } else if size < MINSIGSTKSZ {
+        Err(ENOMEM)
+    } else {
+        Ok(AltStack { sp: ss_sp, size, flags: 0 })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Disposition {
     Ignore,

@@ -93,5 +93,130 @@ class Console(unittest.TestCase):
         self.assertEqual(run.missing([]), run.EXPECTED[0])
 
 
+class Emulator(unittest.TestCase):
+    """tools/run.py boots either architecture's image on the same machine and fixtures."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("violet_run", HERE.parents[1] / "tools/run.py")
+        sys.path.insert(0, str(HERE.parents[1] / "tools"))
+        cls.launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.launcher)
+
+    def test_aarch64_boots_its_plan_on_qemu_system_aarch64(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "qemu64.json").write_text(json.dumps({"board": "qemu64", "image": "qemu64.bin", "load": 0x48000000, "entry": 0x48000000}))
+            wide = self.launcher.machine(folder, arch="aarch64")
+            narrow = self.launcher.machine(folder, arch="aarch32")
+        self.assertEqual(wide[:5], ["qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "cortex-a53"])
+        self.assertIn(f"loader,file={folder / 'qemu64.bin'},addr=0x48000000,force-raw=on", wide)
+        self.assertIn("loader,addr=0x48000000,cpu-num=0", wide)
+        self.assertFalse(any("zImage" in a or "entry.bin" in a for a in wide))
+        self.assertEqual(narrow[:5], ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on", "-cpu", "max"])
+        self.assertTrue(any(a.endswith("zImage,addr=0x45000000,force-raw=on") for a in narrow))
+        # Everything after the boot loaders is the same machine: devices, fixtures, Wi-Fi records.
+        boot_end = lambda cmd: max(i for i, a in enumerate(cmd) if "cpu-num=0" in a) + 1
+        self.assertEqual(wide[5:wide.index("-device", 5)], narrow[5:narrow.index("-device", 5)])
+        self.assertEqual(wide[boot_end(wide):], narrow[boot_end(narrow):])
+
+    def test_an_image_of_the_other_architecture_is_refused(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "qemu64.json").write_text(json.dumps({"board": "qemu", "image": "x", "load": 0, "entry": 0}))
+            with self.assertRaises(SystemExit):
+                self.launcher.machine(folder, arch="aarch64")
+        self.assertEqual(self.launcher.image_for("aarch64"), HERE.parents[1] / "build/sel4/qemu-aarch64")
+
+
+class AppBuild(unittest.TestCase):
+    """The open apps' build for each architecture (tools/build_initfs.py, tools/build_python.py)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE.parents[1] / "tools"))
+        import build_initfs
+        import build_python
+        cls.initfs, cls.python = build_initfs, build_python
+
+    def test_aarch32_keeps_the_original_choices(self):
+        a = self.initfs.ARCHES["aarch32"]
+        self.assertEqual(a["target"], "armv7-unknown-linux-musleabihf")
+        self.assertEqual(a["cpu"], ["-C", "target-cpu=cortex-a53", "-C", "target-feature=+neon"])
+        self.assertEqual(a["go"], {"GOARCH": "arm", "GOARM": "7"})
+        self.assertEqual(a["loader"], self.initfs.LOADER)
+        t = self.python.TARGETS["aarch32"]
+        self.assertEqual((t.flags, t.triple, t.sysroot, t.pyroot), (self.python.FLAGS, "arm-linux-musleabihf",
+                                                                     self.python.SYSROOT, self.python.PYROOT))
+        self.assertEqual(t.wrapper, self.python.WORK / "bin/arm-linux-musleabihf-cc")
+        self.assertEqual(a["c_flags"], self.python.FLAGS.split())
+
+    def test_aarch64_is_armv8_0_in_its_own_directories(self):
+        sys.path.insert(0, str(HERE.parents[0] / "board"))
+        import board
+        a, t = self.initfs.ARCHES["aarch64"], self.python.TARGETS["aarch64"]
+        self.assertEqual(a["target"], board.ARCHES["aarch64"]["app_rust_target"])
+        self.assertEqual(self.initfs.ARCHES["aarch32"]["target"], board.ARCHES["aarch32"]["app_rust_target"])
+        self.assertIn("-mno-outline-atomics", t.flags)
+        self.assertIn("-mno-outline-atomics", a["cflags"])
+        self.assertIn("target-feature=-outline-atomics", a["cpu"])
+        self.assertEqual(a["c_flags"], t.flags.split())
+        self.assertEqual(a["go"], {"GOARCH": "arm64"})
+        self.assertEqual(a["loader"], "lib/ld-musl-aarch64.so.1")
+        self.assertTrue(str(t.sysroot).startswith(str(self.python.WORK / "aarch64")))
+        self.assertNotEqual(a["seal"], self.initfs.ARCHES["aarch32"]["seal"])
+
+    def test_the_release_gate_refuses_what_it_cannot_check(self):
+        def program(elf_class, machine):
+            head = bytearray(64)
+            head[:6] = b"\x7fELF" + bytes([elf_class, 1])
+            struct.pack_into("<HH", head, 16, 3, machine)
+            return bytes(head)
+        files = {"apps/a": program(2, 183), "apps/b": program(1, 40), "apps/c": program(2, 62)}
+        out = self.initfs.refused_by_class(files, "aarch64", lambda data, arch=None: None)
+        self.assertEqual([line.split(":")[0] for line in out], ["apps/a", "apps/b", "apps/c"])
+        self.assertIn("does not read it", out[0])
+        self.assertIn("not a little-endian aarch64", out[1])
+        self.assertEqual(self.initfs.refused_by_class({"apps/a": files["apps/a"]}, "aarch64", lambda data, arch=None: {}), [])
+        # The AArch32 gate is the one it always was: unread files are elf_check's to skip.
+        with self.assertRaises(SystemExit):
+            self.initfs.release_gate({"apps/a": (files["apps/a"], 0o100755)}, set(), False, "aarch64")
+
+    def test_a_seal_object_must_have_an_init_array_entry(self):
+        sys.path.insert(0, str(HERE.parents[1] / "image/packages"))
+        from test_arch import elf
+        with_entry = elf(True, [(".text", 1, 6, 0, b"code"), (".init_array", 14, 3, 0, bytes(8))])
+        empty = elf(True, [(".text", 1, 6, 0, b"code"), (".init_array", 14, 3, 0, b"")])
+        none = elf(False, [(".text", 1, 6, 0, b"code")])
+        self.assertTrue(self.initfs.seals(with_entry))
+        self.assertFalse(self.initfs.seals(empty))
+        self.assertFalse(self.initfs.seals(none))
+
+
+
+class Differences(unittest.TestCase):
+    def test_the_supervisor_compiles_against_the_kernels_timer_setting(self):
+        off, on = "KernelArmExportPTMRUser:BOOL=OFF\n", "x\nKernelArmExportPTMRUser:BOOL=ON\n"
+        disabled, enabled = "/* disabled: CONFIG_EXPORT_PTMR_USER */\n", "#define CONFIG_EXPORT_PTMR_USER  1\n"
+        self.assertFalse(image.user_timer(off, [disabled, "#define CONFIG_OTHER 1\n"]))
+        self.assertTrue(image.user_timer(on, [enabled]))
+        # A stale tree's headers against this kernel: refused either way.
+        with self.assertRaises(ValueError):
+            image.user_timer(off, [enabled])
+        with self.assertRaises(ValueError):
+            image.user_timer(on, [disabled])
+        with self.assertRaises(ValueError):
+            image.user_timer("", [])
+
+    def test_the_lost_protections_are_named(self):
+        self.assertEqual(image.differences(True), [image.NO_VERIFIED_BOOT])
+        self.assertEqual(image.differences(False), [image.NO_VERIFIED_BOOT, image.NO_USER_TIMER])
+
+
 if __name__ == "__main__":
     unittest.main()

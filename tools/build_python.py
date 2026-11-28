@@ -1,7 +1,13 @@
-"""Cross-build the open apps' C library and Python for ARMv7 Linux (musl, hard float).
+"""Cross-build the open apps' C library and Python for ARMv7 Linux (musl, hard float),
+or for AArch64 Linux with VIOLET_ARCH=aarch64.
 
     python3 tools/build_python.py musl      # build/open-toolchain/sysroot
     python3 tools/build_python.py python    # build/open-toolchain/python-root
+
+With VIOLET_ARCH=aarch64 everything goes under build/open-toolchain/aarch64
+instead (its own sources, sysroot, python-build and python-root), built for the
+ARMv8.0 baseline of the handset's Cortex-A53: no LSE atomics, as
+targets/qemu64/musl.py does. The AArch32 paths and flags are unchanged.
 
 The second step produces a tree for the /apps image: a static /bin/python3 and
 the standard library under /lib/python3.12. Point VIOLET_INITFS_EXTRA at it
@@ -29,12 +35,46 @@ ZLIB = ("zlib-1.3.1", "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
 FLAGS = "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
 
 
+class Target:
+    """What one architecture means for the apps' C library and Python."""
+
+    def __init__(self, arch, flags, triple, builtins, work):
+        self.arch, self.flags, self.triple, self.work = arch, flags, triple, work
+        self.builtins = f"libclang_rt.builtins-{builtins}.a"   # the NDK's compiler runtime
+        self.sysroot = work / "sysroot"
+        self.pyroot = work / "python-root"
+        self.python_build = work / "python-build"
+        self.wrapper = work / "bin" / f"{triple}-cc"
+
+
+TARGETS = {
+    "aarch32": Target("aarch32", FLAGS, "arm-linux-musleabihf", "arm-android", WORK),
+    "aarch64": Target("aarch64", "--target=aarch64-linux-musl -march=armv8-a -mcpu=cortex-a53 -mno-outline-atomics",
+                      "aarch64-linux-musl", "aarch64-android", WORK / "aarch64"),
+}
+
+
+def target(arch=None):
+    """The Target for `arch`, or for VIOLET_ARCH (aarch32 unless set)."""
+    if arch is None:
+        sys.path.insert(0, str(ROOT / "image/packages"))
+        import violet_arch
+        arch = violet_arch.selected()
+    return TARGETS[arch]
+
+
+def builtins_for(t, b=None):
+    b = b or ndk_bin()
+    return next(b.parent.glob(f"lib/clang/*/lib/linux/{t.builtins}"))
+
+
 def ndk_bin():
     ndk = Path(os.environ.get("ANDROID_NDK_HOME", Path.home() / "Library/Android/sdk/ndk/28.2.13676358"))
     return next(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
 
 
-def fetch(package):
+def fetch(package, work=WORK):
+    """The unpacked source of `package` under `work` (each architecture has its own: musl and zlib build in tree)."""
     name, url, digest = package
     archive = ROOT / "build/downloads" / Path(url).name
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -43,47 +83,50 @@ def fetch(package):
     if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
         archive.unlink()
         sys.exit(f"Unexpected download checksum for {name}")
-    source = WORK / name
+    source = work / name
     if not source.is_dir():
-        WORK.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["tar", "xf", archive, "-C", WORK], check=True)
+        work.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["tar", "xf", archive, "-C", work], check=True)
     return source
 
 
-def build_musl():
-    source = fetch(MUSL)
+def build_musl(t=None):
+    t = t or target()
+    source = fetch(MUSL, t.work)
     b = ndk_bin()
-    env = dict(os.environ, CC=f"{b / 'clang'} {FLAGS}", AR=str(b / "llvm-ar"), RANLIB=str(b / "llvm-ranlib"))
-    subprocess.run(["./configure", "--prefix=/", "--target=arm-linux-musleabihf", "--disable-shared"],
+    env = dict(os.environ, CC=f"{b / 'clang'} {t.flags}", AR=str(b / "llvm-ar"), RANLIB=str(b / "llvm-ranlib"))
+    subprocess.run(["./configure", "--prefix=/", f"--target={t.triple}", "--disable-shared"],
                    cwd=source, env=env, check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["make", f"-j{os.cpu_count()}", f"AR={env['AR']}", f"RANLIB={env['RANLIB']}"],
                    cwd=source, check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(["make", f"DESTDIR={SYSROOT}", "install"], cwd=source, check=True, stdout=subprocess.DEVNULL)
-    print("musl sysroot:", SYSROOT)
+    subprocess.run(["make", f"DESTDIR={t.sysroot}", "install"], cwd=source, check=True, stdout=subprocess.DEVNULL)
+    print("musl sysroot:", t.sysroot)
 
 
-def compiler_wrapper():
+def compiler_wrapper(t=None):
     """A cc that compiles for the target and links fully static against musl:
     a static position-independent executable (musl's self-relocating rcrt1.o,
     no text relocations), which the Open Runtime loads at a random address,
     with its RELRO sealed read-only before main (tools/relro_seal.rs).
     VIOLET_OPEN_PIE=0 links at a fixed address instead, as tools/build_initfs.py
     does (a development build only)."""
+    t = t or target()
     b = ndk_bin()
-    builtins = next(b.parent.glob("lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
-    wrapper = WORK / "bin/arm-linux-musleabihf-cc"
+    builtins = builtins_for(t, b)
+    wrapper = t.wrapper
     wrapper.parent.mkdir(parents=True, exist_ok=True)
-    lib = SYSROOT / "lib"
+    lib = t.sysroot / "lib"
     pie = not fixed_allowed()
     if pie:
         sys.path.insert(0, str(ROOT / "tools"))
         import build_initfs
-        compile_flags, link_flags, start = "-fPIE", f"-static-pie -Wl,-z,text -Wl,-z,relro {build_initfs.relro_seal()}", "rcrt1.o"
+        compile_flags, link_flags, start = "-fPIE", f"-static-pie -Wl,-z,text -Wl,-z,relro {build_initfs.relro_seal(arch=t.arch)}", "rcrt1.o"
     else:
         compile_flags, link_flags, start = "", "-static", "crt1.o"
+    what = "ARMv7" if t.arch == "aarch32" else "AArch64"
     text = f"""#!/bin/sh
-# Compile for ARMv7 Linux (musl); link statically with musl's start files.
-cc="{b / 'clang'} {FLAGS} {compile_flags} --sysroot={SYSROOT} -isystem {SYSROOT / 'include'}"
+# Compile for {what} Linux (musl); link statically with musl's start files.
+cc="{b / 'clang'} {t.flags} {compile_flags} --sysroot={t.sysroot} -isystem {t.sysroot / 'include'}"
 for a in "$@"; do
   case "$a" in -c|-E|-S|-M|-MM) exec $cc "$@";; esac
 done
@@ -120,25 +163,28 @@ def host_python():
     sys.exit("Install Python 3.12 on the Mac (brew install python@3.12) to cross-build Python 3.12")
 
 
-def build_zlib():
-    source = fetch(ZLIB)
+def build_zlib(t=None):
+    t = t or target()
+    source = fetch(ZLIB, t.work)
     b = ndk_bin()
-    env = dict(os.environ, CC=f"{b / 'clang'} {FLAGS} --sysroot={SYSROOT} -isystem {SYSROOT / 'include'}",
-               AR=str(b / "llvm-ar"), RANLIB=str(b / "llvm-ranlib"), CHOST="arm-linux-musleabihf")
+    env = dict(os.environ, CC=f"{b / 'clang'} {t.flags} --sysroot={t.sysroot} -isystem {t.sysroot / 'include'}",
+               AR=str(b / "llvm-ar"), RANLIB=str(b / "llvm-ranlib"), CHOST=t.triple)
     subprocess.run(["./configure", "--prefix=/", "--static"], cwd=source, env=env, check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["make", f"-j{os.cpu_count()}", "libz.a"], cwd=source, env=env, check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(["make", f"DESTDIR={SYSROOT}", "install"], cwd=source, env=env, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["make", f"DESTDIR={t.sysroot}", "install"], cwd=source, env=env, check=True, stdout=subprocess.DEVNULL)
 
 
-def build_python():
+def build_python(t=None):
+    t = t or target()
+    SYSROOT, PYROOT = t.sysroot, t.pyroot
     if not (SYSROOT / "lib/libc.a").exists():
-        build_musl()
+        build_musl(t)
     if not (SYSROOT / "lib/libz.a").exists():
-        build_zlib()
-    source = fetch(PYTHON)
-    cc = compiler_wrapper()
+        build_zlib(t)
+    source = fetch(PYTHON, t.work)
+    cc = compiler_wrapper(t)
     b = ndk_bin()
-    build = WORK / "python-build"
+    build = t.python_build
     build.mkdir(exist_ok=True)
     site = build / "config.site"
     # Answers configure cannot find out by running target programs.
@@ -161,7 +207,7 @@ def build_python():
                PKG_CONFIG_LIBDIR=str(SYSROOT / "lib/pkgconfig"), PKG_CONFIG_PATH="",
                PKG_CONFIG_SYSROOT_DIR=str(SYSROOT))
     if not (build / "Makefile").exists():
-        subprocess.run([source / "configure", "--host=arm-linux-musleabihf", "--build=aarch64-apple-darwin",
+        subprocess.run([source / "configure", f"--host={t.triple}", "--build=aarch64-apple-darwin",
                         "--prefix=/", f"--with-build-python={host_python()}", "--disable-shared",
                         "--without-ensurepip", "--disable-test-modules", "--with-pymalloc",
                         "MODULE_BUILDTYPE=static"], cwd=build, env=env, check=True)

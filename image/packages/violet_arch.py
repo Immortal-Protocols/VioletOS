@@ -2,15 +2,15 @@
 
 One table (targets/board/board.py ARCHES) says what an architecture means for
 the compilers. The default, aarch32, gives exactly the flags the build has
-always used. aarch64 is accepted as a name and stops the component build with
-the list of what is not ported yet, rather than producing packages a 64-bit
-supervisor could not load; the 64-bit bring-up image is built by
-targets/qemu64/build.py instead.
+always used. aarch64 builds the same components for the 64-bit supervisor
+(targets/qemu64/stack.py); require_components() names what is not complete
+there and stops while anything in UNPORTED is left.
 
 What is wired in today: the package builder takes its Rust target from
-rust_target() and stops on require_components(). clang_flags() and
-sections() are the 64-bit-ready forms of what the loader build and the
-builder's ELF32 section reader do now; no build calls them yet.
+rust_target(), reads its linked components with sections() (either ELF
+class), records the architecture in each package's ABI word
+(package_format.py) and stops on require_components(). clang_flags() is the
+64-bit-ready form of the loader build's flags; targets/qemu64/stack.py calls it.
 """
 import os
 from pathlib import Path
@@ -22,13 +22,20 @@ from board import ARCHES  # noqa: E402
 
 DEFAULT = "aarch32"
 
-# What still ties each layer to AArch32, measured by compiling the current
-# sources for aarch64 (runtime/arch/README.md has the method and the numbers).
-UNPORTED = [
-    "system/supervisor/supervisor.c and platform/sel4/board/memory.h: one page-table level, 64 KiB and 1 MiB frames, AArch32 registers",
-    "runtime/transport.c, services/power/process.rs, runtime/open/sys.rs: CP15 counter reads (runtime/arch has the 64-bit ones)",
-    "runtime/open: ELF32 loader, 64 KiB pool pages, AArch32 system call numbers and structure layouts",
-    "this builder: ELF32 section parsing and the VPK header carry no architecture",
+# What still ties a layer to AArch32 (runtime/arch/README.md has the method).
+# The supervisor, memory.h, transport.c and the services are ported: they
+# compile and link for aarch64 (services/check_aarch64.py, in make test-unit).
+# What is left does not stop the component build: the Open Runtime builds and
+# starts, but its loader takes ELF32 programs only, so it refuses every AArch64
+# app (elf.rs plan) until its dispatch is widened; the build says so.
+UNPORTED = []
+APP_ABI_UNPORTED = [
+    "runtime/open: AArch64 programs run below 4 GiB with the AArch32 layout's randomization (vma.rs Layout; "
+    "Layout64's 47-bit layout is not used yet)",
+    "runtime/open: fork (a new process with a copy of the caller's memory) answers ENOSYS for AArch64 programs "
+    "(the fork gate is A32 code; vfork and posix_spawn work)",
+    "runtime/arch/enter64.rs: AArch64 calls whose structures are not converted answer ENOSYS "
+    "(recvmmsg, sendmmsg, timer_create, waitid, itimers, sigqueueinfo, preadv/pwritev, pselect6, execveat, clone3...)",
 ]
 
 
@@ -53,11 +60,15 @@ def clang_flags(environ=None):
 
 
 def require_components(environ=None):
-    """Stop a component build for an architecture whose components cannot run yet."""
+    """Stop a component build for an architecture whose components cannot run yet;
+    name what runs but is not complete."""
     arch = selected(environ)
     if arch != DEFAULT:
-        raise SystemExit(f"VIOLET_ARCH={arch}: the components are not ported to {arch} yet:\n  " + "\n  ".join(UNPORTED)
-                         + "\nBuild the 64-bit bring-up image with: make qemu64-image")
+        if UNPORTED:
+            raise SystemExit(f"VIOLET_ARCH={arch}: the components are not ported to {arch} yet:\n  " + "\n  ".join(UNPORTED)
+                             + "\nBuild the 64-bit bring-up image with: make qemu64-image")
+        for line in APP_ABI_UNPORTED:
+            print(f"VIOLET_ARCH={arch}: not ported yet: {line}", file=sys.stderr)
     return arch
 
 

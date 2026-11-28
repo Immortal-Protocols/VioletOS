@@ -13,6 +13,12 @@
 
 #[path = "linux.rs"]
 pub mod linux;
+#[path = "signal64.rs"]
+pub mod signal64;
+#[path = "compat.rs"]
+pub mod compat;
+#[path = "enter64.rs"]
+pub mod enter64;
 
 /// A machine word of the *described* architecture, wide enough for both.
 pub type Word = u64;
@@ -231,6 +237,29 @@ pub fn syscall_return(abi: &Abi, mrs: &mut [Word; SYSCALL_WORDS], value: i64) {
     mrs[0] = value as Word & mask;
     let short = abi.status_short_instruction != 0 && mrs[MR_STATUS] & abi.status_short_instruction != 0;
     mrs[MR_IP] = mrs[MR_IP].wrapping_add(if short { 2 } else { 4 }) & mask;
+}
+
+/// The Open Runtime's AArch32 fork-helper call (signal.rs FORK_NR), which
+/// the AArch64 helper's own number (signal64::FORK_NR) stands for.
+pub const FORK_NR32: u32 = 0xf_0000;
+
+/// The call a thread of `abi` made, in the one numbering the Open Runtime's
+/// dispatcher, policy and Shield hooks know (AArch32's), and whether its
+/// arguments need the other ABI's structure layouts (compat.rs).
+///
+/// AArch32 numbers pass unchanged. An AArch64 number is translated through
+/// linux.rs, never passed on raw: 63 is AArch64's read but AArch32's dup2.
+/// An AArch64 number the table lacks is None (ENOSYS), and so is every
+/// AArch32-only call (open, fork, the 0xf0000 private range) made by number
+/// from an AArch64 program.
+pub fn internal_call(abi: &Abi, number: Word) -> Option<(u32, linux::Layout)> {
+    if abi.word_bits == 32 {
+        return u32::try_from(number).ok().map(|n| (n, linux::Layout::Same));
+    }
+    if number == signal64::FORK_NR {
+        return Some((FORK_NR32, linux::Layout::Same));
+    }
+    linux::aarch64(number).map(|call| (u32::from(call.aarch32), call.layout))
 }
 
 /// A virtual-memory fault: where, at which instruction, and what the thread was doing.

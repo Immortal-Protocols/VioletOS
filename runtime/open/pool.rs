@@ -118,6 +118,11 @@ impl Pool {
             for _ in 0..1u32 << (bits - PAGE_BITS) {
                 retype(SLOT_POOL + u as u32, PAGE_OBJECT, PAGE_BITS, first_slot + index)?;
                 let va = (POOL_VA + index as usize * PAGE) as u32;
+                // AArch32: one second-level table per 1 MiB, made before its
+                // first page. AArch64 has up to three levels below the root and
+                // a last-level table covers 2 MiB, so the page's mapping says
+                // which level is missing (FailedLookup) and one is made there.
+                #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
                 if va & 0xf_ffff == 0 {
                     let pt = k.object(SLOT_KERNEL, Object::PageTable, 0)?;
                     pt_map(pt, SLOT_PD, va)?;
@@ -125,7 +130,23 @@ impl Pool {
                 }
                 // Writable, never executable: this is app-controlled data (and
                 // the runtime's heap) inside the runtime's own address space.
+                #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
                 page_map(first_slot + index, SLOT_PD, va, true, false)?;
+                #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+                {
+                    let mut levels = 0;
+                    loop {
+                        match page_map(first_slot + index, SLOT_PD, va, true, false) {
+                            Err(e) if e == FAILED_LOOKUP && levels < 3 => {
+                                let pt = k.object(SLOT_KERNEL, Object::PageTable, 0)?;
+                                pt_map(pt, SLOT_PD, va)?;
+                                mapped_tables += 1;
+                                levels += 1;
+                            }
+                            result => break result?,
+                        }
+                    }
+                }
                 index += 1;
             }
         }

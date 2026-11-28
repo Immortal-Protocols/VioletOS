@@ -107,3 +107,37 @@ def assemble(regions, base):
         image.extend(bytes(at - len(image)))
         image.extend(data)
     return bytes(image)
+
+
+# What this image gives up against the AArch32 one, as test_system.py --arch
+# aarch64 prints and checks it (stack.py writes it to differences.json), so a
+# boot that passes every layer cannot read as one with these protections.
+NO_VERIFIED_BOOT = ("verified boot: absent (the qemu64 entry stub checks no signed manifest; the kernel and the "
+                    "supervisor load unverified, packages are still signature-checked by the supervisor)")
+NO_USER_TIMER = ("no user timer (KernelArmExportPTMRUser=OFF): the supervisor's timekeeper and its stuck-WFI guard are "
+                 "compiled out, and the Open Runtime polls at a fixed priority instead of taking IRQ 30")
+
+
+def user_timer(cache, headers):
+    """Whether the kernel exports the EL0 physical timer, from its CMakeCache.txt text, checked against every
+    gen_config.h text the supervisor compiles against (`headers`): those decide vm.h VM_USER_TIMER, and one
+    that says otherwise (a stale build tree) would build a supervisor whose timer writes trap. Raises
+    ValueError on a mismatch or a cache that does not say."""
+    import re
+    found = re.search(r"^KernelArmExportPTMRUser:BOOL=(\w+)$", cache, re.M)
+    if not found:
+        raise ValueError("the kernel's CMakeCache.txt does not set KernelArmExportPTMRUser")
+    kernel = found.group(1).upper() in ("ON", "1", "TRUE", "YES")
+    for text in headers:
+        if "CONFIG_EXPORT_PTMR_USER" not in text:
+            continue
+        compiled = re.search(r"^#define CONFIG_EXPORT_PTMR_USER\s+1", text, re.M) is not None
+        if compiled != kernel:
+            raise ValueError(f"the supervisor's headers say CONFIG_EXPORT_PTMR_USER={int(compiled)}, the kernel "
+                             f"KernelArmExportPTMRUser={'ON' if kernel else 'OFF'}: a stale build tree")
+    return kernel
+
+
+def differences(timer):
+    """The AArch64 image's security differences from AArch32, for differences.json."""
+    return [NO_VERIFIED_BOOT] + ([] if timer else [NO_USER_TIMER])

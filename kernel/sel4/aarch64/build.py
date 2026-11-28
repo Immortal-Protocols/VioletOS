@@ -178,6 +178,10 @@ def build(out):
             # threads, so any app could cancel or move another's wake-up.
             "-DKernelArmExportVCNTUser=ON", "-DKernelArmExportPTMRUser=OFF",
             "-DKernelMaxNumNodes=1",
+            # The VioletOS supervisor maps every device window in 4 KiB or
+            # 2 MiB frames (AArch64 has no 64 KiB or 1 MiB pages), about 6000
+            # capabilities on QEMU: a 2^16-slot root CNode (2 MiB) holds them.
+            "-DKernelRootCNodeSizeBits=16",
             # EL1 kernel: QEMU virt without virtualization starts there.
             "-DKernelArmHypervisorSupport=OFF"], env=env, check=True)
         # The effective configuration, defaults included, differs from the

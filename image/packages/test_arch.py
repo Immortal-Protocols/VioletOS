@@ -42,8 +42,8 @@ class Arch(unittest.TestCase):
         self.assertEqual(violet_arch.selected({"VIOLET_ARCH": ""}), "aarch32")
         self.assertEqual(violet_arch.rust_target({}), "armv7a-none-eabi")
         self.assertEqual(violet_arch.require_components({}), "aarch32")
-        # Only the Rust target is wired into a build today (the package builder,
-        # below). clang_flags() and sections() are not called by any build yet:
+        # The package builder takes its Rust target and its ELF reader from
+        # here (below). clang_flags() is not called by the AArch32 build:
         # these lines check only that clang_flags({}) states the flags
         # platform/sel4/loader/build.py passes today, in its order, so wiring
         # it in later cannot change the 32-bit build.
@@ -55,20 +55,26 @@ class Arch(unittest.TestCase):
         self.assertIn('"--target=" + violet_arch.rust_target()', builder)
         self.assertNotIn("armv7a-none-eabi", builder)
         self.assertIn("violet_arch.require_components()", builder)
+        self.assertIn("violet_arch.sections(data)", builder)
 
-    def test_aarch64_is_known_but_components_stop_with_reasons(self):
+    def test_aarch64_components_build_and_the_open_runtime_gap_is_named(self):
         env = {"VIOLET_ARCH": "aarch64"}
         self.assertEqual(violet_arch.rust_target(env), "aarch64-unknown-none")
         self.assertIn("--target=aarch64-none-elf", violet_arch.clang_flags(env))
         self.assertNotIn("-marm", violet_arch.clang_flags(env))
-        with self.assertRaises(SystemExit) as stop:
-            violet_arch.require_components(env)
-        message = str(stop.exception)
-        self.assertIn("not ported", message)
-        self.assertIn("supervisor.c", message)
-        self.assertIn("make qemu64-image", message)
-        for path in ("system/supervisor/supervisor.c", "runtime/transport.c", "services/power/process.rs", "runtime/open/sys.rs"):
-            self.assertTrue((HERE.parents[1] / path).is_file(), path)
+        self.assertEqual(violet_arch.UNPORTED, [])
+        self.assertEqual(violet_arch.require_components(env), "aarch64")
+        self.assertTrue(any("runtime/open" in line for line in violet_arch.APP_ABI_UNPORTED))
+        # Anything left in UNPORTED stops the build again, naming it.
+        saved = violet_arch.UNPORTED
+        try:
+            violet_arch.UNPORTED = ["system/supervisor/supervisor.c: example"]
+            with self.assertRaises(SystemExit) as stop:
+                violet_arch.require_components(env)
+            self.assertIn("not ported", str(stop.exception))
+            self.assertIn("supervisor.c", str(stop.exception))
+        finally:
+            violet_arch.UNPORTED = saved
 
     def test_an_unknown_architecture_stops_the_build(self):
         for name in ("arm64", "riscv64", "AARCH64"):
@@ -89,6 +95,36 @@ class Arch(unittest.TestCase):
             violet_arch.sections(b"\x7fELF\x03\x01" + bytes(64))
         with self.assertRaises(ValueError):
             violet_arch.sections(b"not an ELF file at all")
+
+    def test_the_builder_packages_both_elf_classes_alike(self):
+        import build
+        # The AArch32 linker script and flags are the ones the build always used.
+        self.assertNotIn("eh_frame", build.component_script("aarch32"))
+        self.assertIn("*(.ARM.exidx*) *(.ARM.extab*) }", build.component_script("aarch32"))
+        self.assertEqual(build.link_flags("aarch32"), [])
+        self.assertIn("*(.eh_frame*)", build.component_script("aarch64"))
+        self.assertEqual(build.link_flags("aarch64"), ["-z", "max-page-size=4096"])
+        code = bytes(range(256)) * 16
+        layout = [(".text", 1, 6, 0x100000, code), (".data", 1, 3, 0x101000, b"data"),
+                  (".bss", 8, 3, 0x101004, b"\xff" * 12), (".comment", 1, 0, 0, b"not loaded")]
+        images = []
+        for wide in (False, True):
+            size, image = build.package_image(elf(wide, layout))
+            self.assertEqual(size, 4096)
+            self.assertEqual(bytes(image[:4096]), code)
+            # .data, then .bss as zeroes (its file bytes are never copied).
+            self.assertEqual(bytes(image[4096:]), b"data" + bytes(12))
+            images.append(image)
+        self.assertEqual(images[0], images[1])
+        # The handset Radio's private RAM (NOBITS at 0x02800000) is left out of its image.
+        radio = layout + [(".bss.private", 8, 3, 0x02800000, b"\xff" * 64)]
+        self.assertEqual(len(build.package_image(elf(False, radio))[1]), 0x02800000 + 64 - 0x100000)
+        for wide in (False, True):
+            self.assertEqual(build.package_image(elf(wide, radio), 0x02800000)[1], images[0])
+        for bad in ([(".text", 1, 6, 0x101000, code)], [(".text", 1, 6, 0x100000, code[:100])]):
+            for wide in (False, True):
+                with self.assertRaises(ValueError):
+                    build.package_image(elf(wide, bad))
 
 
 if __name__ == "__main__":

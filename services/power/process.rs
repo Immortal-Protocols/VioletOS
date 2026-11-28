@@ -16,12 +16,26 @@ const RADIO_BADGE: u32 = 7;
 /// Milliseconds since boot from the 64-bit virtual counter (`ticks()` is its
 /// low half, which wraps in about a minute in QEMU).
 pub fn now_ms() -> u64 {
+    counter() / u64::from(unsafe { ticks_per_ms }.max(1))
+}
+
+/// The 64-bit virtual counter: CP15 on AArch32, CNTVCT_EL0 on AArch64.
+#[cfg(target_arch = "arm")]
+fn counter() -> u64 {
     let (lo, hi): (u32, u32);
     unsafe {
         core::arch::asm!("isb", "mrrc p15, 1, {lo}, {hi}, c14", lo = out(reg) lo, hi = out(reg) hi,
             options(nomem, nostack, preserves_flags));
-        (u64::from(hi) << 32 | u64::from(lo)) / u64::from(ticks_per_ms.max(1))
     }
+    u64::from(hi) << 32 | u64::from(lo)
+}
+#[cfg(target_arch = "aarch64")]
+fn counter() -> u64 {
+    let count: u64;
+    unsafe {
+        core::arch::asm!("isb", "mrs {c}, cntvct_el0", c = out(reg) count, options(nomem, nostack, preserves_flags));
+    }
+    count
 }
 
 fn put(m: &mut Message, at: usize, value: u32) {

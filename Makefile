@@ -8,11 +8,18 @@ moto: setup
 qemu-image: setup
 	$(PYTHON) tools/build_sel4.py qemu
 # The AArch64 bring-up image (targets/qemu64/README.md). Local only: CI neither builds nor boots it.
+# QEMU64_STACK=1 also builds the VioletOS system for AArch64 (targets/qemu64/stack.py,
+# build/sel4/qemu-aarch64) and `make qemu64` then checks the layers it reaches
+# (targets/qemu/test_system.py --arch aarch64) and drives Home, Settings and a
+# setting kept across a restart (test_open_apps.py --arch aarch64, two boots).
 .PHONY: qemu64-image qemu64
 qemu64-image: setup
 	$(PYTHON) tools/build_sel4.py qemu64
+	$(if $(QEMU64_STACK),$(PYTHON) tools/build_sel4.py qemu-aarch64)
 qemu64: qemu64-image
 	$(PYTHON) targets/qemu64/run.py --expect
+	$(if $(QEMU64_STACK),$(PYTHON) targets/qemu/test_system.py --arch aarch64)
+	$(if $(QEMU64_STACK),OPEN_FORCE_OFFLINE=1 $(PYTHON) targets/qemu/test_open_apps.py --arch aarch64)
 setup: $(VENV)/.deps
 $(VENV)/.deps: tools/requirements-sel4.txt
 	$(PYTHON) -m venv $(VENV)
@@ -141,6 +148,10 @@ test-unit:
 	@mkdir -p build/tests/power2
 	cc -std=gnu11 -O1 -Wall -Wextra -I platform/sel4/include system/supervisor/tests/timekeeper_test.c -o build/tests/power2/timekeeper_test
 	build/tests/power2/timekeeper_test
+	@# The supervisor's AArch64 allocator (memory.h), against a model kernel.
+	@mkdir -p build/tests/aarch64-supervisor
+	cc -std=gnu11 -O1 -Wall -Wextra -I system/supervisor/tests/model -I platform/sel4/include system/supervisor/tests/memory_test.c -o build/tests/aarch64-supervisor/memory_test
+	build/tests/aarch64-supervisor/memory_test
 	"$(HOST_RUSTC)" --edition=2021 --test -O targets/moto-g-pure/test_power_tables.rs -o build/tests/power2/power_tables_test
 	build/tests/power2/power_tables_test
 	python3 tools/test_power_tables.py
@@ -199,6 +210,8 @@ test-unit:
 	HOST_RUSTC="$(HOST_RUSTC)" system/package-manager/test_ota.sh
 	python3 kernel/sel4/test_delta.py
 	HOST_RUSTC="$(HOST_RUSTC)" runtime/arch/test_host.sh
+	@# Every service package compiles and links for AArch64 (3 s; skipped without the target).
+	HOST_RUSTC="$(HOST_RUSTC)" python3 services/check_aarch64.py --if-available
 	@mkdir -p build/tests/bootchain
 	HOST_RUSTC="$(HOST_RUSTC)" boot/loader/test_verified.sh
 	python3 tools/test_phone_image.py

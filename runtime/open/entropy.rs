@@ -186,29 +186,5 @@ pub fn gather(drbg: &mut Drbg, next: &mut dyn FnMut() -> u32) -> (u32, u32) {
     (jitter.samples, jitter.bits())
 }
 
-/// Seed the runtime's generator from timer jitter: the counter read after
-/// each yield to the other processes (how long a round of them takes varies
-/// with their work, interrupts, caches and the other cores). False, with a
-/// log line, if the jitter found is not enough; then no app starts and
-/// getrandom fails. Starting an app tries again.
-#[cfg(target_arch = "arm")]
-pub fn collect(drbg: &mut Drbg) -> bool {
-    use super::sys;
-    let (samples, bits) = gather(drbg, &mut || {
-        sys::yield_now();
-        sys::counter() as u32
-    });
-    // "entropy: seeded from timer jitter" (no hardware source reaches this
-    // process), or "entropy: too little timer jitter": no app will start.
-    let how = if drbg.seeded { "seeded from" } else { "too little" };
-    crate::log!("entropy: {} timer jitter ({} bits credited to {} samples)", how, bits, samples);
-    drbg.seeded
-}
-
-/// The runtime's generator, seeded if `collect` could.
-#[cfg(target_arch = "arm")]
-pub fn boot() -> Drbg {
-    let mut drbg = Drbg::new(super::sentinel::sha256);
-    collect(&mut drbg);
-    drbg
-}
+// `collect` and `boot`, which read this process's timer, are in sys.rs:
+// this file is also built into the 64-bit bootstrap task (targets/qemu64).

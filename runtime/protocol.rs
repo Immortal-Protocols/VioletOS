@@ -9,6 +9,10 @@ pub struct Message {
     pub data: [u8; 32],
     pub tail: [u8; 8],
 }
+// The wire is the same on AArch32 and AArch64: transport.c moves a Message as
+// 14 32-bit words (WORDS), one per message register, and the shared pages
+// (lanes.rs, process.rs) hold it as is. No field may take the word size.
+const _: () = assert!(core::mem::size_of::<Message>() == 14 * 4 && core::mem::align_of::<Message>() == 4);
 impl Message {
     pub fn new(op: u32, key: u32, value: u32) -> Self {
         Self {

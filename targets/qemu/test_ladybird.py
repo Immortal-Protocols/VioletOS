@@ -13,6 +13,9 @@ its output from the guest's screen and the Open Runtime's log:
   5. The address bar and on-screen keyboard load a typed URL.
   6. With the Mac online, example.com loads over HTTPS with a verified certificate.
   7. Home returns to the Home app.
+
+`--arch aarch64` runs it on the AArch64 build of the system
+(targets/qemu64/stack.py, `make qemu64 QEMU64_STACK=1`).
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -249,11 +252,16 @@ def online():
         return False
 
 
+ARCH = sys.argv[2] if sys.argv[1:2] == ["--arch"] else "aarch32"
+# What boots each architecture's image (tools/run.py boot_devices).
+FILES = {"aarch32": ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"),
+         "aarch64": ("qemu64.bin", "qemu64.json", "initfs.cpio")}
+
 with TemporaryDirectory() as tmp:
     viewer = Path(tmp) / "input.py"
     viewer.write_text(SCRIPT)
     viewer.chmod(0o755)
-    original = run.ROOT / "build/sel4/qemu"
+    original = run.IMAGES[ARCH]
     if not (original / "initfs.cpio").exists():
         raise SystemExit("Build the QEMU image first (make qemu-image).")
     server = ThreadingHTTPServer(("127.0.0.1", 0), Site)
@@ -261,9 +269,13 @@ with TemporaryDirectory() as tmp:
     port = server.server_address[1]
     image = Path(tmp) / "image"
     image.mkdir()
-    for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):
+    for name in FILES[ARCH]:
         (image / name).symlink_to(original / name)
-    run.IMAGE = image
+    os.environ["VIOLET_ARCH"] = ARCH
+    if ARCH == "aarch32":
+        run.IMAGE = image
+    else:
+        run.IMAGES[ARCH] = image
     viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
     os.environ.update(
         OPEN_ONLINE="1" if online() else "0",
@@ -278,5 +290,5 @@ with TemporaryDirectory() as tmp:
     missing = expected - set(Site.requests)
     if missing:
         raise SystemExit(f"the browser never requested {sorted(missing)}; it asked for {Site.requests}")
-    print("Ladybird verified: start page, HTTP links, a linked style sheet, a relative link, back, scrolling, typed address"
+    print(("AArch64: " if ARCH == "aarch64" else "") + "Ladybird verified: start page, HTTP links, a linked style sheet, a relative link, back, scrolling, typed address"
           + (", HTTPS" if os.environ["OPEN_ONLINE"] == "1" else ""))

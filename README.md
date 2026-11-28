@@ -121,7 +121,7 @@ apps/                 Built-in apps (no_std Rust) and open apps
   examples/           Sketches from the open app model RFC
 runtime/              Runtime: protocol.rs (wire format and keys), process.rs, lanes.rs (workers), sdk.rs (app side)
   open/               Open Runtime: syscalls, devices, sockets, file system, memory pool
-  arch/               What differs between AArch32 and AArch64 (used by targets/qemu64 only, so far)
+  arch/               What differs between AArch32 and AArch64 (the qemu64 bootstrap task and the Open Runtime's AArch64 calls)
 services/             One folder per service: touch, display, storage, radio, power, audio, camera, usb-diagnostics
 system/
   supervisor/         The first task (supervisor.c) and the open apps' process manager (procmgr.rs)
@@ -135,7 +135,7 @@ targets/
   qemu/               QEMU backends (audio, power, touch fixture) and the QEMU test suites
   moto-g-pure/        Handset backends: Wi-Fi driver, lwIP and WPA2, audio, eMMC, power; handset tests
   board/              Board descriptions (handset, QEMU, QEMU AArch64): memory map and device windows as data
-  qemu64/             The AArch64 bring-up target: a 64-bit kernel, a bootstrap task and two Linux test programs
+  qemu64/             The AArch64 target: a 64-bit kernel, a bootstrap task, and stack.py, the whole system for AArch64 QEMU
   mac-simulator/      The native SDL simulator
 tests/integration/    Host integration tests: the shipped sources joined by in-memory fakes of the kernel and hardware
 tools/                Build and run on the Mac: run.py, the emulator viewer, image builders, network and USB helpers
@@ -181,9 +181,13 @@ For example, change a label in `apps/open/settings/src/pages.rs` to update both 
 
 Open apps keep files in `/data`, which the Open Runtime writes back to Storage and loads on the next boot: Settings' saved networks and Phone Internet code, the shared settings, and so on. QEMU keeps them on a 1 MiB raw disk in `build/sel4/qemu`; the handset uses the same code with an MSDC0 block driver (see the [handset storage layout](targets/moto-g-pure/README.md#handset-storage)). Apps Violet Agent installs live in their own extent of the disk and survive restarts too.
 
-### AArch64 (bring-up only)
+### AArch64 (QEMU only, not the default)
 
-Everything above is AArch32. `make qemu64` builds and boots the first step of the AArch64 port ([targets/qemu64](targets/qemu64/README.md)): the same pinned seL4 as a 64-bit kernel, a bootstrap task, and two static AArch64 Linux programs (one linked against musl) whose system calls it answers. The Supervisor, the services and the Open Runtime do not run there yet; [runtime/arch](runtime/arch/README.md) holds the shared architecture code and measures what remains. CI does not build it.
+Everything above is AArch32, and AArch32 stays the default for every build and test. On QEMU `virt` (Cortex-A53) the real system also runs as AArch64: the same pinned seL4 built as a 64-bit kernel, the Supervisor, the Rust and C services, Storage's `/data`, the Sentinel and the Open Runtime with its policy and Shield, and Home, Settings, Music and Ladybird as 64-bit Linux programs. Build and check it with `make qemu64 QEMU64_STACK=1` (see [targets/qemu64](targets/qemu64/README.md) for the layer table and each check); `python3 targets/qemu/test_ladybird.py --arch aarch64` drives the browser. CI and `make test-local` do not build or boot it.
+
+What is not there on AArch64: verified boot (the entry stub checks no manifest; package signatures are still checked), a user timer (the kernel does not export the EL0 physical timer, so the timekeeper is off and the Open Runtime polls), fork without `CLONE_VM` (vfork, posix_spawn and threads work), the 47-bit address layout (apps are placed below 4 GiB with the AArch32 layout's randomization), a few calls whose structures are not converted, an end-to-end check of the trusted UI's lock, and the W^X, policy and C/Go ABI probes `make test-system` runs on AArch32. `test_system.py --arch aarch64` prints the first two as absent layers, never as passes.
+
+The handset stays AArch32: its bootloader starts every kernel in AArch32, an arm64 Image included ([measured](targets/moto-g-pure/README.md#aarch64-boot-path)), and the Supervisor's handset build stops at an `#error` on AArch64.
 
 ## Handset
 

@@ -21,7 +21,8 @@ static TOTAL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize:
 pub const LOW_BYTES: usize = 4 << 20;
 
 const ALIGN: usize = 8;
-const HEADER: usize = 8;
+// Two words: the block's start and its size (8 bytes on AArch32, 16 on AArch64).
+const HEADER: usize = 2 * core::mem::size_of::<usize>();
 fn round(n: usize) -> usize {
     (n + ALIGN - 1) & !(ALIGN - 1)
 }
@@ -89,7 +90,7 @@ unsafe impl GlobalAlloc for Heap {
         while !cur.is_null() {
             let start = cur as usize;
             let end = start + (*cur).size;
-            // The user pointer follows an 8-byte header that records the block.
+            // The user pointer follows a two-word header that records the block.
             let user = (start + HEADER + align - 1) & !(align - 1);
             let block_start = user - HEADER;
             let block_end = round(user + layout.size().max(1));

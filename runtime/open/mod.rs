@@ -5,6 +5,11 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+#[cfg(target_arch = "aarch64")]
+pub mod abi64;
+/// What differs between AArch32 and AArch64 (runtime/arch), pure code.
+#[path = "../arch/mod.rs"]
+pub mod arch;
 pub mod contain;
 pub mod appstore;
 pub mod data;
@@ -382,7 +387,7 @@ impl Runtime {
             foreground: None,
             shell: device::Shell::default(),
             next_pid: 100,
-            entropy: entropy::boot(),
+            entropy: sys::entropy_boot(),
             contact: None,
             last_poll: 0,
             stats: Stats::default(),
@@ -479,7 +484,7 @@ impl Runtime {
         // AT_RANDOM and a random address-space layout; without a seeded
         // generator nothing starts, rather than start predictably.
         let mut drawn = [0u8; 40];
-        if !self.entropy.fill(&mut drawn) && !(entropy::collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
+        if !self.entropy.fill(&mut drawn) && !(sys::entropy_collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
             return Err(String::from("no entropy to start an app"));
         }
         let mut random = [0u8; 16];
@@ -530,7 +535,12 @@ impl Runtime {
         // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
         // The app has the page read-execute; the runtime writes it through its own mapping.
         space.add(layout.stubs, layout.stubs + procmgr::WINDOW, procmgr::PROT_READ | procmgr::PROT_EXEC);
-        let Some(_) = space.resolve(k, &mut self.pool, layout.stubs) else {
+        // AArch64: the A64 signal gate, at the end of the same page (abi64.rs).
+        #[cfg(target_arch = "aarch64")]
+        let gate = abi64::install_gate(&mut space, k, &mut self.pool);
+        #[cfg(not(target_arch = "aarch64"))]
+        let gate = true;
+        let Some(_) = space.resolve(k, &mut self.pool, layout.stubs).filter(|_| gate) else {
             space.destroy(k, &mut self.pool);
             self.release_objects(index, core::mem::take(&mut space.object_slots));
             return Err(String::from("out of memory"));
@@ -560,9 +570,12 @@ impl Runtime {
         for _ in 0..3 {
             app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
         }
-        let regs = sys::Regs { sp: loaded.sp, ..Default::default() };
         self.apps[index] = Some(app);
-        if let Err(e) = self.spawn(index, pid, regs, loaded.entry) {
+        #[cfg(not(target_arch = "aarch64"))]
+        let started = self.spawn(index, pid, sys::Regs { sp: loaded.sp, ..Default::default() }, loaded.entry);
+        #[cfg(target_arch = "aarch64")]
+        let started = self.spawn64(index, pid, arch::NATIVE.start_context(loaded.entry.into(), loaded.sp.into(), 0, 0));
+        if let Err(e) = started {
             self.reap(index);
             return Err(alloc::format!("thread: {}", e));
         }
@@ -588,6 +601,9 @@ impl Runtime {
     /// Thumb) with `regs`. seL4 clears the Thumb bit in a written CPSR, so the
     /// thread starts at its ARM-mode trampoline, which jumps there.
     pub fn spawn(&mut self, index: usize, tid: u32, mut regs: sys::Regs, target: u32) -> Result<usize, i32> {
+        if vma::WIDE {
+            return Err(-22); // the AArch32 register form: spawn64
+        }
         let app = self.apps[index].as_mut().unwrap();
         // A thread that ended (exit, a vfork child after execve) leaves its
         // slot, TCB and fault endpoint for the next: posix_spawn makes and
@@ -653,6 +669,60 @@ impl Runtime {
             sig: signal::Thread::new(0),
         });
         sys::tcb_write(tcb, true, &regs)?;
+        Ok(slot)
+    }
+
+    /// AArch64: create a thread in app `index` that starts with context `c`
+    /// (its pc, sp, x0 and tpidr_el0 set). A64 code needs no trampoline: the
+    /// kernel starts it where the context says. The slot, kernel objects and
+    /// scheduling are `spawn`'s.
+    #[cfg(target_arch = "aarch64")]
+    pub fn spawn64(&mut self, index: usize, tid: u32, c: arch::Context) -> Result<usize, i32> {
+        let app = self.apps[index].as_mut().unwrap();
+        let reuse = app.threads.iter().position(|t| !t.alive && t.reply.is_none());
+        let slot = reuse.unwrap_or(app.threads.len());
+        if slot >= (1 << APP_CNODE_BITS) - 2 {
+            return Err(-11);
+        }
+        let k = &mut self.k;
+        let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
+        let tcb = if let Some(s) = reuse {
+            let tcb = app.threads[s].tcb;
+            if sys::cores() > 1 {
+                sys::tcb_schedule(tcb, 0, 0, tier)?;
+            }
+            let t = &mut app.threads[s];
+            (t.tid, t.wait, t.deadline, t.saved, t.clear_tid, t.alive) = (tid, None, None, [0; 9], 0, true);
+            t.sig = signal::Thread::new(0);
+            tcb
+        } else {
+            let tcb = app.space.object(k, Object::Tcb, 0)?;
+            let ep_slot = slot as u32 + 1;
+            sys::mint_into(app.cnode, ep_slot, APP_CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
+            sys::tcb_configure(tcb, ep_slot, app.cnode, APP_CNODE_BITS, app.space.pd)?;
+            // (The AArch64 kernel is built without MCS: kernel/sel4/aarch64.)
+            if sys::cores() > 1 {
+                sys::tcb_schedule(tcb, 0, 0, tier)?;
+            }
+            app.threads.push(Thread {
+                tid,
+                tcb,
+                reply: None,
+                wait: None,
+                deadline: None,
+                saved: [0; 9],
+                clear_tid: 0,
+                alive: true,
+                slot: slot as u32,
+                sc: 0,
+                sig: signal::Thread::new(0),
+            });
+            tcb
+        };
+        if let Err(e) = sys::tcb_write_context(tcb, true, &c) {
+            app.threads[slot].alive = false;
+            return Err(e);
+        }
         Ok(slot)
     }
 
@@ -765,8 +835,18 @@ impl Runtime {
             unsafe { ((r.mrs[0] & 0xffc) as usize as *mut u32).write_volatile(0) };
         }
         match r.label {
+            #[cfg(target_arch = "aarch64")]
+            sys::FAULT_UNKNOWN_SYSCALL => {
+                if let Some(mrs) = self.enter64(index, &r) {
+                    self.syscall(index, slot, &mrs);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
+                #[cfg(target_arch = "aarch64")]
+                let (pc, addr) = (r.mrs[0], arch::enter64::fault_address(sys::wide()[1]));
+                #[cfg(not(target_arch = "aarch64"))]
                 let (pc, addr) = (r.mrs[0], r.mrs[1]);
                 // Read, write or instruction fetch: the region must allow it (vma.rs).
                 let access = vma::access(r.mrs[2], r.mrs[3]);

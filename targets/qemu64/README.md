@@ -1,6 +1,6 @@
 # qemu64: the AArch64 bring-up target
 
-VioletOS is an AArch32 system today. This target is the first step of moving it to AArch64, built beside the default one and changing nothing in it. `make qemu64` builds the image and boots it in `qemu-system-aarch64`; CI neither builds nor boots it.
+VioletOS ships as an AArch32 system. This target moves it to AArch64 on QEMU `virt`, built beside the default one and changing nothing in it. It has two images: the bring-up image (a bootstrap task and two test programs, the first sections below), and the whole VioletOS system ([The VioletOS system on AArch64](#the-violetos-system-on-aarch64)). `make qemu64` builds the first and boots it in `qemu-system-aarch64`; `make qemu64 QEMU64_STACK=1` also builds, boots and checks the second. CI and `make test-local` neither build nor boot either.
 
 ```sh
 make qemu64-image     # build/sel4/qemu64/qemu64.bin
@@ -9,7 +9,7 @@ make qemu64           # build, boot, and check the console lines below
 
 It needs what `make qemu-image` needs, plus the Rust target `aarch64-unknown-none` (`rustup target add aarch64-unknown-none`).
 
-## What runs
+## What runs in the bring-up image
 
 | Layer | On qemu64 |
 | --- | --- |
@@ -50,6 +50,32 @@ no file system: fopen fails with ENOSYS: ok
 qemu64: pid 3 exited with status 0
 qemu64: done
 ```
+
+## The VioletOS system on AArch64
+
+[stack.py](stack.py) builds the real system for this machine, beside the bring-up image: `make qemu64-image QEMU64_STACK=1` (or `python3 tools/build_sel4.py qemu-aarch64`) writes `build/sel4/qemu-aarch64`, and `VIOLET_ARCH=aarch64 python3 tools/run.py VIEWER` boots it with the AArch32 emulator's devices, fixtures and blobs (the same addresses: both kernels use the same device trees). It is the QEMU half of `platform/sel4/loader/build.py` with `VIOLET_ARCH=aarch64`:
+
+- the same delta-checked kernel and entry stub as above ([build.py](build.py) `build_kernel`, `boot_image`), with the supervisor as the root task, entered at [root64.S](../../platform/sel4/loader/root64.S) with x0 = BootInfo and its stack at the top of its 1.5 MiB window;
+- the services, Open Runtime and Sentinel from [image/packages/build.py](../../image/packages/build.py) for `aarch64-unknown-none`, linked with 4 KiB pages, each package's signed ABI word marked AArch64 so neither supervisor loads the other's;
+- C built with `-mgeneral-regs-only -mstrict-align` (the supervisor reads catalogs and keys in windows mapped as device memory);
+- the open apps from [tools/build_initfs.py](../../tools/build_initfs.py) for `aarch64-unknown-linux-musl`, Go `linux/arm64` and an AArch64 musl and Python from [tools/build_python.py](../../tools/build_python.py) (`build/open-toolchain/aarch64`), all ARMv8.0 (no LSE atomics).
+
+`make qemu64 QEMU64_STACK=1` then boots it and checks it layer by layer (`python3 targets/qemu/test_system.py --arch aarch64`, about 5 s): the supervisor starts every service, Storage serves `/data`, the Open Runtime reads the installed apps and the policy manifests, unpacks `/apps`, seeds its random generator, starts Home as a 64-bit program, Home shows, the screen is drawn and the Sentinel answers; then Home opens [test-apps/abi64](test-apps/abi64/main.rs), a 64-bit Rust program whose signal handlers run through the A64 gate (a handler by `signal`, an `SA_SIGINFO` handler's 64-bit siginfo, a SIGSEGV handler that makes the page writable and returns to the faulting write with the SIMD registers intact) and which starts itself with `std::process::Command` (posix_spawn: clone with `CLONE_VM|CLONE_VFORK`, execve, pipes, wait4). stack.py puts that test program in this development image, as the AArch32 test image has its own. It then runs `targets/qemu/test_open_apps.py --arch aarch64` (two boots, about 20 s): Home's Settings icon opens Settings, Date & Time picks Tokyo, the Wi-Fi page scans, Agent Apps opens, Music starts, and after a restart Settings still has Tokyo. `targets/qemu/test_ladybird.py --arch aarch64` (about 40 s) drives the browser: HTTP links, a linked style sheet, back, scrolling, a typed address and HTTPS. What it reaches today:
+
+| Layer | AArch64 |
+| --- | --- |
+| Kernel, supervisor, services, Sentinel | run; every package carries the AArch64 ABI word and the supervisor takes only those |
+| Open Runtime | starts, unpacks `/apps`, draws its screen; **polls** instead of sleeping on its timer (the AArch64 kernel does not export the EL0 physical timer: kernel/sel4/aarch64 `KernelArmExportPTMRUser=OFF`, so the timekeeper is off too) |
+| Home, Settings, Music, Ladybird | built for `aarch64-unknown-linux-musl` (Rust 1.98), sealed (tools/relro_seal.rs `start64`), checked by the release gate (tools/elf_check.py reads ELF64), loaded by the Open Runtime below 4 GiB (elf.rs `narrow`) and served by its one dispatcher, policy and Shield: each AArch64 call is translated to the AArch32 call of the same meaning ([runtime/arch/enter64.rs](../../runtime/arch/enter64.rs), [runtime/open/abi64.rs](../../runtime/open/abi64.rs)), and the thread gets its own 64-bit registers back (runtime/open/sys.rs `calls`) |
+
+Not yet on AArch64 (named in `violet_arch.APP_ABI_UNPORTED`): programs are placed by the AArch32 layout below 4 GiB (16 to 24 bits of randomization per area, not `vma::Layout64`'s 47-bit layout); fork (not vfork) answers ENOSYS; calls whose structures are not converted (recvmmsg, timer_create, itimers...) answer ENOSYS and are logged by number.
+
+The build stops, naming the layer, while one is not ported (`violet_arch.UNPORTED`, now empty), and refuses any AArch64 program the release gate cannot read. The image has **no verified boot**: the entry stub checks no manifest.
+
+Security differences from AArch32, written by `stack.py` to `differences.json` and printed by `test_system.py --arch aarch64` as absent layers (never as passes; the test refuses an image without the file, and checks the Open Runtime's timer line against it):
+
+- **Verified boot: absent.** The kernel and the supervisor load unverified (`boot/loader/verified_lib.rs` is not built for AArch64); the supervisor still checks every package signature. The handset keeps its `#error` until a 64-bit loader verifies the manifest.
+- **No user timer.** The kernel keeps `KernelArmExportPTMRUser=OFF` (one EL0 physical timer that it does not switch between threads would let any app move another's wake-up), so `vm.h` `VM_USER_TIMER` is 0: the supervisor's timekeeper and its stuck-WFI guard are compiled out, and the Open Runtime gets no IRQ 30 and polls at a fixed priority. A weaker denial-of-service posture than AArch32's until a per-thread timer or the kernel's timeout API replaces it. `stack.py` stops if the `gen_config.h` the supervisor compiles against disagrees with the kernel's `CMakeCache.txt` (a stale tree with the timer on would build a supervisor whose `cntp_*` writes trap). [toolchain.py](toolchain.py) `--check` says which Rust targets are missing; without `--check` it adds them to a copy of the pinned toolchain under `build/rust-aarch64` (and, with `--ladybird`, to Ladybird's).
 
 ## Limits
 

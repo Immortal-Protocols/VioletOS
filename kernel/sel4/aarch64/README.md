@@ -6,7 +6,7 @@ Like the 32-bit kernels, this is seL4's code and **not a verified seL4 configura
 
 ## Every difference from upstream, checked by the build
 
-[delta.json](delta.json) lists them and `build.py` enforces the list on every build with the same code as the 32-bit kernels ([../delta.py](../delta.py)): the prepared tree is compared file by file with the pinned archive, each changed file must be exactly upstream plus its patch or script, and each added file must be its source here. After CMake runs, the build's `CMakeCache.txt` (defaults included, not only the `-D` options) is compared with the nearest verified configuration, `AARCH64_imx8mm_verified`: it must differ in exactly the options `nearest_verified` lists (platform, verification build, EL1 instead of EL2, no SMC forwarding, the boot untyped array, one domain) and have the `beyond` values (virtual counter exported, physical timer not, no MCS, no debug build). `make test-unit` ([test_delta64.py](test_delta64.py)) checks the manifest against the repository without building. The board device trees enter both kernels; their reviewed hashes are recorded once, in the 32-bit manifest.
+[delta.json](delta.json) lists them and `build.py` enforces the list on every build with the same code as the 32-bit kernels ([../delta.py](../delta.py)): the prepared tree is compared file by file with the pinned archive, each changed file must be exactly upstream plus its patch or script, and each added file must be its source here. After CMake runs, the build's `CMakeCache.txt` (defaults included, not only the `-D` options) is compared with the nearest verified configuration, `AARCH64_imx8mm_verified`: it must differ in exactly the options `nearest_verified` lists (platform, verification build, EL1 instead of EL2, no SMC forwarding, the boot untyped array, one domain) and have the `beyond` values (virtual counter exported, physical timer not, no MCS, no debug build, a 2^16-slot root CNode). `make test-unit` ([test_delta64.py](test_delta64.py)) checks the manifest against the repository without building. The board device trees enter both kernels; their reviewed hashes are recorded once, in the 32-bit manifest.
 
 ### Upstream files changed
 
@@ -44,6 +44,7 @@ Like the 32-bit kernels, this is seL4's code and **not a verified seL4 configura
 | `KernelArmExportVCNTUser` | ON | User level reads the virtual counter. |
 | `KernelArmExportPTMRUser` | OFF | No user thread may program the EL0 physical timer (it is not switched between threads). |
 | `KernelArmHypervisorSupport` | OFF | The kernel runs at EL1. |
+| `KernelRootCNodeSizeBits` | 16 | The supervisor's root CNode: 65536 slots, for its device windows in 4 KiB frames (AArch64 has no 64 KiB or 1 MiB pages). |
 
 ## Why the system call entry is patched
 

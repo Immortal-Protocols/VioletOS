@@ -443,6 +443,40 @@ impl AppHandle<'_> {
         self.w.settle();
         r
     }
+    /// A raw Linux AArch64 system call: number (x8) and x0..x5, entering the
+    /// same dispatch through the shipped translation (runtime/arch/enter64.rs
+    /// `translate`), as the 64-bit runtime does (runtime/open/abi64.rs): an
+    /// AArch64 number the table lacks is ENOSYS and never reaches the
+    /// dispatch raw, an address or size of 4 GiB or more (sign-extended
+    /// included) and any other word that is not a sign-extended int names no
+    /// app memory (enter64 NOWHERE) rather than a low address, and register
+    /// pairs (lseek, pread64, mmap's byte offset...) are rewritten. The x0
+    /// returned is the one the thread gets back (enter64 `widen`, as
+    /// runtime/open/sys.rs `calls` sends it). Structures the 64-bit runtime
+    /// converts after the call (`After`) are not in this stand-in.
+    pub fn syscall64(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        use crate::open::arch::enter64::{translate, widen, After, Entry};
+        const SVC: u32 = 0x1_0000;
+        let mut wide = [0u64; 16];
+        wide[..6].copy_from_slice(&a);
+        (wide[8], wide[12]) = (u64::from(SVC), n);
+        let mut shown: [u32; 16] = core::array::from_fn(|k| wide[k] as u32);
+        let r = match translate(n, a) {
+            Entry::Answer(e) => e,
+            Entry::Call { number, args, after: After::None } => {
+                shown[..6].copy_from_slice(&args);
+                shown[7] = number;
+                self.syscall(number, args)
+            }
+            Entry::Call { after, .. } => panic!("AArch64 call {n} needs {after:?} after it, not in this stand-in"),
+        };
+        let mut answer = [0u32; 9];
+        answer[..8].copy_from_slice(&shown[..8]);
+        (answer[0], answer[8]) = (r as u32, SVC + 4);
+        let mut out = [0u64; 16];
+        widen(true, &wide, &shown, &answer, &mut out);
+        out[0] as i64
+    }
     /// Put a NUL-terminated string in the app's memory; its address.
     pub fn string(&mut self, at: u32, s: &str) -> u32 {
         let rt = &mut self.w.rt;
