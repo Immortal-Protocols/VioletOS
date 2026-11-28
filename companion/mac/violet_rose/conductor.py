@@ -31,8 +31,8 @@ def _named(tool_name, description):
 
 
 VIOLET_TOOLS = [
-    tool('build_app', 'Build an app for the owner\'s VioletOS phone, or change one built before, and install it. '
-         'Runs in the background as a task; its result is announced when it is installed.', request='string'),
+    tool('build_app', 'Build or change a VioletOS app and install it, or publish its source to GitHub with gh '
+         'when the owner explicitly asks. Runs in the background and announces its result.', request='string'),
     _named('open_app', 'Open an installed app on the VioletOS phone\'s screen.'),
     tool('list_apps', 'The apps installed on the VioletOS phone and the room left.'),
     _named('remove_app', 'Remove an installed app from the VioletOS phone. Only after the owner agreed to remove that app.'),
@@ -43,8 +43,10 @@ have their own on-screen keys: there is no typing into fields from outside and n
 You live on the owner's VioletOS phone (a Moto G Pure running VioletOS), and run on their Mac.
 When the owner asks for an app or a change to one, call build_app at once with what they asked for, in their words
 (say "in Python" when they asked for Python), then say one short line. The build runs as a task: keep talking with the
-owner meanwhile, report it with list_tasks if asked, amend it with update_task, stop it with cancel_task. A build is
-done only when its task says installed.
+owner meanwhile, report it with list_tasks if asked, amend it with update_task, stop it with cancel_task.
+When the owner explicitly asks to publish a VioletOS app's source on GitHub, use build_app with the app name and
+the GitHub destination, including any requested settings. Clarify the app or destination if it is ambiguous.
+Report installation or publication only after the builder reports it succeeded.
 open_app opens an installed app; list_apps lists them with the room left. When an install fails for lack of room,
 offer to remove apps the owner no longer wants, and call remove_app only for apps the owner agreed to remove.
 """
@@ -67,6 +69,9 @@ class VioletConductor(CodexConductor):
     def _policy(self):
         # The instructions for withheld tools go with them: Rose must not offer what this phone cannot do.
         policy = super()._policy()
+        policy = policy.replace('Never send messages, pay, publish, delete data or change credentials.',
+                                'Never send messages, pay, delete data or change credentials. '
+                                'Only publish VioletOS app source as described below.')
         for line in (customization.POLICY_LINE, builder_voice.POLICY_LINE, composer.POLICY_LINE):
             policy = policy.replace(line.strip() + '\n', '')
         hidden = ANDROID_ONLY | (set() if self.phone_control else PHONE_CONTROL | {'update_task', 'cancel_task'})

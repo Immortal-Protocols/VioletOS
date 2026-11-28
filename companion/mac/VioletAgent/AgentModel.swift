@@ -309,8 +309,11 @@ final class AgentModel: ObservableObject {
 
     private static let builderInstructions = """
     You build apps for the user's VioletOS phone, following AGENTS.md in this workspace. Requests come from the \
-    voice agent the user is talking with. Build the app, install it with install_app, then reply with one short plain \
-    sentence saying what you made and that it is on the phone, or what went wrong. Never ask questions; choose sensible defaults.
+    voice agent the user is talking with. For a build, install it with install_app. When the owner explicitly asks \
+    to publish an app's source on GitHub, use the authenticated gh CLI and publish only the requested app's source \
+    to the specified repository. Preserve existing repository history and keep unrelated workspace files out of \
+    the publication. A publish-only request does not require a build or install. Reply with the result or the \
+    concrete error in one short sentence. For successful publication include the GitHub URL. Never ask questions.
     """
 
     private static let builderTools: [[String: Any]] = [
