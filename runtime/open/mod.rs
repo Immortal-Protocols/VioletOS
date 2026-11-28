@@ -122,21 +122,23 @@ macro_rules! log {
 }
 
 #[derive(Clone)]
+/// (Every app address a wait keeps is whole: vma::Va.)
 pub enum Wait {
-    Futex { app: usize, addr: u32 },
+    Futex { app: usize, addr: vma::Va },
     Sleep,
-    Poll { fds: Vec<(i32, i16)>, ptr: u32, time64: bool },
-    Epoll { epfd: i32, events: u32, max: u32 },
-    Read { fd: i32, buf: u32, len: u32 },
-    /// recvfrom/recvmsg: a read whose source address goes to `name`.
-    RecvFrom { fd: i32, buf: u32, len: u32, name: u32, name_len: u32 },
+    Poll { fds: Vec<(i32, i16)>, ptr: vma::Va, time64: bool },
+    Epoll { epfd: i32, events: vma::Va, max: u32 },
+    Read { fd: i32, buf: vma::Va, len: u32 },
+    /// recvfrom/recvmsg: a read whose source address goes to `name`
+    /// (`name_len`: the address of its length).
+    RecvFrom { fd: i32, buf: vma::Va, len: u32, name: vma::Va, name_len: vma::Va },
     /// A blocking accept/accept4 on a listening socket (sockets.rs).
-    Accept { fd: i32, addr: u32, len: u32, flags: u32 },
+    Accept { fd: i32, addr: vma::Va, len: vma::Va, flags: u32 },
     /// A blocking write to /dev/violet/audio waiting for room in the ring.
-    Audio { fd: i32, buf: u32, len: u32 },
+    Audio { fd: i32, buf: vma::Va, len: u32 },
     /// A blocking connect, or a send waiting for room in the socket's ring.
     Connect { fd: i32 },
-    Send { fd: i32, buf: u32, len: u32 },
+    Send { fd: i32, buf: vma::Va, len: u32 },
     /// Held by a Violet Shield freeze; answered with EACCES when the app thaws.
     Frozen,
     /// A call that finished while its app was frozen (lifecycle or Shield):
@@ -146,7 +148,7 @@ pub enum Wait {
     /// answers the write with `result`.
     Present { result: i32 },
     /// SCREEN_IOC_WAIT_VSYNC: until a frame after `after` starts; VsyncInfo to `ptr`.
-    Vsync { after: u64, ptr: u32 },
+    Vsync { after: u64, ptr: vma::Va },
     /// An open or socket that needs the user's answer to the consent prompt
     /// up for it (trusted_ui.rs `pending`): run again once it is answered
     /// or withdrawn, when policy has the answer.
@@ -194,7 +196,8 @@ pub struct Thread {
     pub deadline: Option<u64>,
     /// The fault message to answer with when it wakes: r0..r7 and FaultIP.
     pub saved: [u32; 9],
-    pub clear_tid: u32,
+    /// set_tid_address / CLONE_CHILD_CLEARTID: an app address, or 0.
+    pub clear_tid: vma::Va,
     pub alive: bool,
     pub slot: u32,
     /// Its scheduling context (MCS), or 0.
@@ -489,7 +492,8 @@ impl Runtime {
         }
         let mut random = [0u8; 16];
         random.copy_from_slice(&drawn[..16]);
-        let layout = procmgr::Layout::random(&drawn[16..]);
+        // AArch64 apps: vma::Layout64, the 47-bit layout above 4 GiB.
+        let layout = procmgr::Layout::native_random(&drawn[16..]);
         let untyped = self.untypeds[index];
         let k = &mut self.k;
         let mut space = Space::new(k, untyped).map_err(|e| alloc::format!("address space: {}", e))?;
@@ -572,9 +576,12 @@ impl Runtime {
         }
         self.apps[index] = Some(app);
         #[cfg(not(target_arch = "aarch64"))]
-        let started = self.spawn(index, pid, sys::Regs { sp: loaded.sp, ..Default::default() }, loaded.entry);
+        let started = match (u32::try_from(loaded.sp), u32::try_from(loaded.entry)) {
+            (Ok(sp), Ok(entry)) => self.spawn(index, pid, sys::Regs { sp, ..Default::default() }, entry),
+            _ => Err(-22),
+        };
         #[cfg(target_arch = "aarch64")]
-        let started = self.spawn64(index, pid, arch::NATIVE.start_context(loaded.entry.into(), loaded.sp.into(), 0, 0));
+        let started = self.spawn64(index, pid, arch::NATIVE.start_context(loaded.entry, loaded.sp, 0, 0));
         if let Err(e) = started {
             self.reap(index);
             return Err(alloc::format!("thread: {}", e));
@@ -621,7 +628,7 @@ impl Runtime {
                 let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
                 sys::tcb_schedule(tcb, sc, 0, tier)?;
             }
-            let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
+            let stub = app.space.stub(k, &mut self.pool, slot, target).and_then(|s| u32::try_from(s).ok()).ok_or(-12)?;
             (regs.pc, regs.cpsr) = (stub, 0x10);
             let t = &mut app.threads[s];
             (t.tid, t.wait, t.deadline, t.saved, t.clear_tid, t.alive) = (tid, None, None, [0; 9], 0, true);
@@ -652,7 +659,7 @@ impl Runtime {
         }
         // The trampoline page is looked up each time, never through a kept
         // address: no thread starts if the runtime's page is not there.
-        let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
+        let stub = app.space.stub(k, &mut self.pool, slot, target).and_then(|s| u32::try_from(s).ok()).ok_or(-12)?;
         regs.pc = stub;
         regs.cpsr = 0x10;
         app.threads.push(Thread {
@@ -845,9 +852,9 @@ impl Runtime {
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
                 #[cfg(target_arch = "aarch64")]
-                let (pc, addr) = (r.mrs[0], arch::enter64::fault_address(sys::wide()[1]));
+                let (pc, addr) = (sys::wide()[0], arch::enter64::fault_address(sys::wide()[1]));
                 #[cfg(not(target_arch = "aarch64"))]
-                let (pc, addr) = (r.mrs[0], r.mrs[1]);
+                let (pc, addr) = (r.mrs[0], vma::Va::from(r.mrs[1]));
                 // Read, write or instruction fetch: the region must allow it (vma.rs).
                 let access = vma::access(r.mrs[2], r.mrs[3]);
                 let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
@@ -890,7 +897,7 @@ impl Runtime {
                 }
             }
             // An undefined instruction: SIGILL, to a handler if there is one.
-            sys::FAULT_USER_EXCEPTION if self.fault_signal(index, slot, r.label, r.mrs[0], None, 0) => {}
+            sys::FAULT_USER_EXCEPTION if self.fault_signal(index, slot, r.label, vma::Va::from(r.mrs[0]), None, 0) => {}
             _ => {
                 let app = self.apps[index].as_mut().unwrap();
                 log!("{} (pid {}): fault {} at pc {:#x}", app.name, app.pid, r.label, r.mrs[0]);

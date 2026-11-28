@@ -8,7 +8,7 @@
 //! against musl: its PT_INTERP must name exactly LOADER, the one dynamic
 //! loader the system image ships (musl's libc.so). Any other interpreter is
 //! refused.
-use super::vma::{self, Layout, Vma, MMAP_BASE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use super::vma::{self, Layout, Va, Vma, PROT_EXEC, PROT_READ, PROT_WRITE};
 use alloc::vec::Vec;
 
 /// The one dynamic loader a program may name: musl's for the ABI this
@@ -16,12 +16,13 @@ use alloc::vec::Vec;
 pub const LOADER: &str = if vma::WIDE { LOADER64 } else { LOADER32 };
 pub const LOADER32: &str = "/lib/ld-musl-armhf.so.1";
 
+/// One PT_LOAD segment, of an ELF32 or ELF64 program, in whole addresses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Seg {
-    pub vaddr: u32,
-    pub offset: u32,
-    pub filesz: u32,
-    pub memsz: u32,
+    pub vaddr: Va,
+    pub offset: Va,
+    pub filesz: Va,
+    pub memsz: Va,
     /// PF_X 1, PF_W 2, PF_R 4.
     pub flags: u32,
 }
@@ -30,12 +31,12 @@ pub struct Seg {
 pub struct Plan {
     /// ET_DYN: loaded at a base the loader picks.
     pub pie: bool,
-    pub entry: u32,
-    pub phoff: u32,
+    pub entry: Va,
+    pub phoff: Va,
     pub phentsize: u32,
     pub phnum: u32,
     /// PT_PHDR's address, if there is one.
-    pub phdr: Option<u32>,
+    pub phdr: Option<Va>,
     /// PT_LOAD segments with memory.
     pub segs: Vec<Seg>,
     /// It has PT_INTERP (which names LOADER).
@@ -51,27 +52,14 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
 }
 
 /// The program headers of a program for the ABI this runtime serves: a
-/// 32-bit ARM executable, or (vma::WIDE) a 64-bit AArch64 one, checked by
-/// `plan64` and placed below 4 GiB like any other (`narrow`).
+/// 32-bit ARM executable, or (vma::WIDE) a 64-bit AArch64 one checked by
+/// `plan64`, with its 64-bit addresses whole (vma::Layout64 places it).
 pub fn plan(image: &[u8]) -> Result<Plan, &'static str> {
     if vma::WIDE {
-        narrow(plan64(image, u64::from(vma::USER_TOP))?)
+        plan64(image, vma::USER_TOP64)
     } else {
         plan32(image)
     }
-}
-
-/// An AArch64 program's headers in the runtime's 32-bit form: every app's
-/// address space is below 4 GiB (vma.rs), so a program whose addresses,
-/// sizes or offsets do not fit 32 bits is refused, never cut.
-pub fn narrow(p: Plan64) -> Result<Plan, &'static str> {
-    let fit = |v: u64| u32::try_from(v).map_err(|_| "an address or size above 4 GiB");
-    let mut segs = Vec::with_capacity(p.segs.len());
-    for s in &p.segs {
-        segs.push(Seg { vaddr: fit(s.vaddr)?, offset: fit(s.offset)?, filesz: fit(s.filesz)?, memsz: fit(s.memsz)?, flags: s.flags });
-    }
-    let phdr = match p.phdr { Some(v) => Some(fit(v)?), None => None };
-    Ok(Plan { pie: p.pie, entry: fit(p.entry)?, phoff: fit(p.phoff)?, phentsize: p.phentsize, phnum: p.phnum, phdr, segs, interp: p.interp })
 }
 
 /// The program headers of a 32-bit little-endian ARM executable.
@@ -94,7 +82,7 @@ pub fn plan32(image: &[u8]) -> Result<Plan, &'static str> {
     if phentsize < 32 || headers_end.map_or(true, |e| e > image.len()) {
         return Err("bad program headers");
     }
-    let mut p = Plan { pie, entry: field(24)?, phoff, phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
+    let mut p = Plan { pie, entry: field(24)?.into(), phoff: phoff.into(), phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
     for i in 0..phnum as usize {
         let h = phoff as usize + i * phentsize as usize;
         let w = |k: usize| u32_at(image, h + 4 * k).ok_or("bad program headers");
@@ -114,7 +102,7 @@ pub fn plan32(image: &[u8]) -> Result<Plan, &'static str> {
                 if p.segs.len() >= 16 {
                     return Err("too many segments");
                 }
-                p.segs.push(Seg { vaddr, offset, filesz, memsz, flags });
+                p.segs.push(Seg { vaddr: vaddr.into(), offset: offset.into(), filesz: filesz.into(), memsz: memsz.into(), flags });
             }
             3 => {
                 let path = (offset as usize).checked_add(filesz as usize).and_then(|e| image.get(offset as usize..e));
@@ -124,7 +112,7 @@ pub fn plan32(image: &[u8]) -> Result<Plan, &'static str> {
                 }
                 p.interp = true;
             }
-            6 => p.phdr = Some(vaddr),
+            6 => p.phdr = Some(vaddr.into()),
             _ => {}
         }
     }
@@ -132,31 +120,6 @@ pub fn plan32(image: &[u8]) -> Result<Plan, &'static str> {
         return Err("no loadable segments");
     }
     Ok(p)
-}
-
-impl Plan {
-    /// The lowest and highest address the segments use, rounded out to 4 KiB.
-    pub fn span(&self) -> (u32, u32) {
-        let lo = self.segs.iter().map(|s| s.vaddr).min().unwrap_or(0) & !0xfff;
-        let hi = self.segs.iter().map(|s| s.vaddr.saturating_add(s.memsz)).max().unwrap_or(0);
-        (lo, hi.saturating_add(0xfff) & !0xfff)
-    }
-    /// Where the program headers are once loaded at `base`: PT_PHDR, else
-    /// the segment that holds them in the file.
-    pub fn phdr_at(&self, base: u32) -> u32 {
-        if let Some(v) = self.phdr {
-            return base.wrapping_add(v);
-        }
-        self.segs
-            .iter()
-            .find(|s| s.offset <= self.phoff && self.phoff - s.offset < s.filesz)
-            .map_or(0, |s| base.wrapping_add(s.vaddr).wrapping_add(self.phoff - s.offset))
-    }
-    /// Whether this can be the dynamic loader: position-independent, with no
-    /// interpreter of its own.
-    pub fn loader_ok(&self) -> bool {
-        self.pie && !self.interp
-    }
 }
 
 // ---- AArch64 programs (ELF64) ----
@@ -174,28 +137,9 @@ pub const LOADER64: &str = "/lib/ld-musl-aarch64.so.1";
 /// e_machine EM_AARCH64.
 pub const EM_AARCH64: u32 = 183;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Seg64 {
-    pub vaddr: u64,
-    pub offset: u64,
-    pub filesz: u64,
-    pub memsz: u64,
-    /// PF_X 1, PF_W 2, PF_R 4.
-    pub flags: u32,
-}
-
-/// `Plan` for a 64-bit program: the same facts with 64-bit addresses.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Plan64 {
-    pub pie: bool,
-    pub entry: u64,
-    pub phoff: u64,
-    pub phentsize: u32,
-    pub phnum: u32,
-    pub phdr: Option<u64>,
-    pub segs: Vec<Seg64>,
-    pub interp: bool,
-}
+/// A 64-bit program's segments and plan are the same types (whole addresses).
+pub type Seg64 = Seg;
+pub type Plan64 = Plan;
 
 fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     let s = b.get(at..at.checked_add(8)?)?;
@@ -209,7 +153,7 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 /// both writable and executable, at most 16, PT_INTERP naming exactly
 /// LOADER64. A fixed-address (ET_EXEC) program must also lie below
 /// `user_top`; a PIE's segments are checked again where they are placed.
-pub fn plan64(image: &[u8], user_top: u64) -> Result<Plan64, &'static str> {
+pub fn plan64(image: &[u8], user_top: Va) -> Result<Plan, &'static str> {
     if image.len() < 64 || &image[..4] != b"\x7fELF" || image[4] != 2 || image[5] != 1 {
         return Err("not a 64-bit little-endian ELF file");
     }
@@ -228,7 +172,7 @@ pub fn plan64(image: &[u8], user_top: u64) -> Result<Plan64, &'static str> {
     if phentsize < 56 || headers_end.map_or(true, |e| e > image.len()) {
         return Err("bad program headers");
     }
-    let mut p = Plan64 { pie, entry: long(24)?, phoff, phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
+    let mut p = Plan { pie, entry: long(24)?, phoff, phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
     for i in 0..phnum as usize {
         let h = phoff as usize + i * phentsize as usize;
         let w32 = |at: usize| u32_at(image, h + at).ok_or("bad program headers");
@@ -250,7 +194,7 @@ pub fn plan64(image: &[u8], user_top: u64) -> Result<Plan64, &'static str> {
                 if p.segs.len() >= 16 {
                     return Err("too many segments");
                 }
-                p.segs.push(Seg64 { vaddr, offset, filesz, memsz, flags });
+                p.segs.push(Seg { vaddr, offset, filesz, memsz, flags });
             }
             3 => {
                 let path = usize::try_from(offset).ok().and_then(|o| image.get(o..o.checked_add(usize::try_from(filesz).ok()?)?));
@@ -270,15 +214,16 @@ pub fn plan64(image: &[u8], user_top: u64) -> Result<Plan64, &'static str> {
     Ok(p)
 }
 
-impl Plan64 {
+impl Plan {
     /// The lowest and highest address the segments use, rounded out to 4 KiB.
-    pub fn span(&self) -> (u64, u64) {
+    pub fn span(&self) -> (Va, Va) {
         let lo = self.segs.iter().map(|s| s.vaddr).min().unwrap_or(0) & !0xfff;
         let hi = self.segs.iter().map(|s| s.vaddr.saturating_add(s.memsz)).max().unwrap_or(0);
         (lo, hi.saturating_add(0xfff) & !0xfff)
     }
-    /// Where the program headers are once loaded at `base` (AT_PHDR).
-    pub fn phdr_at(&self, base: u64) -> u64 {
+    /// Where the program headers are once loaded at `base` (AT_PHDR):
+    /// PT_PHDR, else the segment that holds them in the file.
+    pub fn phdr_at(&self, base: Va) -> Va {
         if let Some(v) = self.phdr {
             return base.wrapping_add(v);
         }
@@ -287,13 +232,15 @@ impl Plan64 {
             .find(|s| s.offset <= self.phoff && self.phoff - s.offset < s.filesz)
             .map_or(0, |s| base.wrapping_add(s.vaddr).wrapping_add(self.phoff - s.offset))
     }
+    /// Whether this can be the dynamic loader: position-independent, with no
+    /// interpreter of its own.
     pub fn loader_ok(&self) -> bool {
         self.pie && !self.interp
     }
     /// Whether two segments share a 4 KiB page with different protections
     /// (code with data): refused, since a page has one protection.
     pub fn mixed_pages(&self) -> bool {
-        let pages = |s: &Seg64| (s.vaddr >> 12, (s.vaddr.saturating_add(s.memsz).saturating_add(0xfff)) >> 12);
+        let pages = |s: &Seg| (s.vaddr >> 12, (s.vaddr.saturating_add(s.memsz).saturating_add(0xfff)) >> 12);
         self.segs.iter().enumerate().any(|(i, a)| {
             self.segs[i + 1..].iter().any(|b| {
                 let ((a0, a1), (b0, b1)) = (pages(a), pages(b));
@@ -310,7 +257,7 @@ impl Plan64 {
 /// read-execute, data read-write), 4 KiB-rounded, and a data neighbour on
 /// the same 4 KiB page keeping both protections. Code sharing a page with
 /// data is refused. Returns (address, end, rounded start, rounded end).
-pub fn region(vmas: &mut Vec<Vma>, s: &Seg, base: u32, limit: u32) -> Result<(u32, u32, u32, u32), &'static str> {
+pub fn region(vmas: &mut Vec<Vma>, s: &Seg, base: Va, limit: Va) -> Result<(Va, Va, Va, Va), &'static str> {
     let va = base.checked_add(s.vaddr).ok_or("bad segment address")?;
     let end = va.checked_add(s.memsz).filter(|&e| e <= limit).ok_or("segment too high")?;
     let mut prot = PROT_READ;
@@ -330,25 +277,25 @@ pub fn region(vmas: &mut Vec<Vma>, s: &Seg, base: u32, limit: u32) -> Result<(u3
 }
 
 /// A free range of `len` bytes (rounded up to 64 KiB pages) in the mmap
-/// area below `top`, highest first (procmgr.rs `free_range`).
-pub fn free_in(vmas: &[Vma], top: u32, len: u32) -> Option<u32> {
-    let page = 1u32 << 16;
+/// area [`mmap_base`, `top`), highest first (procmgr.rs `free_range`).
+pub fn free_in(vmas: &[Vma], mmap_base: Va, top: Va, len: Va) -> Option<Va> {
+    let page: Va = 1 << 16;
     let len = len.checked_add(page - 1)? & !(page - 1);
     let mut top = top;
     for v in vmas.iter().rev() {
         if v.start >= top {
             continue;
         }
-        let floor = v.end.max(MMAP_BASE).checked_add(page - 1)? & !(page - 1);
+        let floor = v.end.max(mmap_base).checked_add(page - 1)? & !(page - 1);
         if floor <= top && top - floor >= len {
             return Some(top - len);
         }
         top = top.min(v.start & !(page - 1));
-        if top <= MMAP_BASE {
+        if top <= mmap_base {
             return None;
         }
     }
-    (top >= MMAP_BASE.checked_add(len)?).then(|| top - len)
+    (top >= mmap_base.checked_add(len)?).then(|| top - len)
 }
 
 /// Everything procmgr.rs `load` checks before it touches memory, on a fresh
@@ -361,7 +308,7 @@ pub fn check(image: &[u8], ld: Option<&[u8]>, layout: &Layout) -> Result<(), &'s
     let base = if p.pie { layout.pie_base } else { 0 };
     let mut vmas = Vec::new();
     for s in &p.segs {
-        region(&mut vmas, s, base, MMAP_BASE)?;
+        region(&mut vmas, s, base, layout.mmap_base)?;
     }
     if p.interp {
         let l = plan(ld.ok_or(NO_LOADER)?)?;
@@ -370,7 +317,7 @@ pub fn check(image: &[u8], ld: Option<&[u8]>, layout: &Layout) -> Result<(), &'s
         }
         let (lo, hi) = l.span();
         let lo = lo & !0xffff;
-        let at = free_in(&vmas, layout.mmap_top, hi - lo).ok_or("no room for the dynamic loader")?;
+        let at = free_in(&vmas, layout.mmap_base, layout.mmap_top, hi - lo).ok_or("no room for the dynamic loader")?;
         for s in &l.segs {
             region(&mut vmas, s, at.wrapping_sub(lo), layout.mmap_top)?;
         }

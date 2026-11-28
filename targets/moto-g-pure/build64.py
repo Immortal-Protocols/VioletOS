@@ -16,6 +16,10 @@ volume, the boot history and the two catalog banks. What differs:
   handoff checks, panel detection, radio profile, firmware staging, catalog
   bank and boot history (stages 21-23) as the 32-bit one, then the drop to
   EL1, the boot page tables and the kernel's elfloader-style entry;
+- verified boot: loader.c `verified()` checks the kernel and the supervisor
+  against a manifest signed for MOTO (link_loader signs it for the kernel it
+  links); a refusal is boot stage 90 + the reason. No stored floor (LK keeps
+  none). Not run on the phone;
 - the supervisor, services, Storage, Sentinel and Open Runtime are the AArch32
   build's sources for VIOLET_ARCH=aarch64 (image/packages/build.py), and the
   open apps are aarch64 Linux programs (tools/build_initfs.py).
@@ -112,11 +116,35 @@ def link_loader(out, work, kernel_elf, probe_stage=None):
         '.balign 8\nboot_tables: .incbin "boot-tables.bin"\nboot_tables_end:\n'
         f'.balign 8\n.global radio_firmware,radio_firmware_end\nradio_firmware: .incbin "{out / "wifi-firmware.bin"}"\n'
         'radio_firmware_end:\n')
+    # Verified boot (loader.c verified(), boot/loader/verified.rs): the loader
+    # starts the kernel and the supervisor only if they match a manifest
+    # signed for the handset ("MOTO") by a key the supervisor's build pins,
+    # signed here for the kernel this loader carries (test_boot.py --arch
+    # aarch64 links QEMU's). The /apps ramdisk is bound in a release or with
+    # VIOLET_BOOT_BIND_APPS=1. No stored rollback floor: LK keeps none.
+    verified = saved.get("verified")
+    manifest = None
+    if verified:
+        from sign import config as signing_config
+        from boot_manifest import build as boot_manifest, verify as check_boot_manifest, system_version
+        signer = signing_config(REPO, "moto")
+        root = (out / "root.bin").read_bytes()
+        apps = (out / "initfs.cpio").read_bytes() if signer.release or os.environ.get("VIOLET_BOOT_BIND_APPS") == "1" else None
+        try:
+            version = system_version(root, os.environ.get("VIOLET_SYSTEM_VERSION"), signer.release)
+        except ValueError as e:
+            sys.exit(f"verified boot: {e}")
+        manifest = boot_manifest(signer, version, kernel_data, root, apps)
+        check_boot_manifest(manifest, signer.keys, "moto", kernel_data, root, apps, require_apps=signer.release)
+        (work / "boot-manifest.bin").write_bytes(manifest)
+        with (work / "payload.S").open("a") as payload:
+            payload.write('.balign 8\n.global boot_manifest,boot_manifest_end\nboot_manifest: .incbin "boot-manifest.bin"\n'
+                          'boot_manifest_end:\n')
     places = {"KERNEL_PA": KERNEL_PA, "KERNEL_STAGE": KERNEL_STAGE, "KERNEL_FILE": len(kernel_data),
               "KERNEL_SPAN": kernel_span, "TABLES_PA": TABLES_PA, "TABLE_LOWER": lower, "TABLE_UPPER": upper,
               "ROOT_PA": ROOT_PA, "ROOT_PA_START": ROOT_PA, "ROOT_PA_END": ROOT_PA + ROOT_BYTES,
               "ROOT_PV_OFFSET": ROOT_PA - 0x100000, "ROOT_ENTRY": root_entry, "KERNEL_ENTRY": kernel_entry}
-    loader_defines = defines + [f"-D{k}={v:#x}" for k, v in places.items()]
+    loader_defines = defines + [f"-D{k}={v:#x}" for k, v in places.items()] + (["-DVIOLET_VERIFIED_BOOT"] if verified else [])
     if probe_stage is not None:
         loader_defines.append(f"-DVIOLET_PROBE64_STAGE={probe_stage}")
     fdt = REPO / "build/sel4/dtc-1.7.2/libfdt"
@@ -130,6 +158,7 @@ def link_loader(out, work, kernel_elf, probe_stage=None):
         run(common + loader_defines + headers + ["-c", source, "-o", obj])
         objects.append(obj)
     objects.append(out / "loader-history.a")
+    objects.extend(Path(o) for o in verified or [])
     run([ld, "--gc-sections", "-z", "max-page-size=4096", f"--defsym=ROOT_PA={ROOT_PA:#x}", "-T",
          REPO / "boot/loader/loader64.ld", *objects, "-o", "loader.elf"])
     run([objcopy, "-O", "binary", "loader.elf", "Image"])
@@ -138,6 +167,9 @@ def link_loader(out, work, kernel_elf, probe_stage=None):
     if image[0x38:0x3c] != b"ARM\x64" or struct.unpack_from("<Q", image, 16)[0] != len(image) or \
             loader_symbols["_start"] != 0x40080000:
         sys.exit("loader: the Image header or link address is not what LK's 64-bit path takes")
+    # A loader that dropped the check, or carries another manifest, fails the build.
+    if manifest is not None and (image.count(manifest) != 1 or "verified_boot" not in loader_symbols):
+        sys.exit("verified boot: the AArch64 handset loader does not carry its manifest once and the check")
     return image, places
 
 
@@ -224,7 +256,11 @@ def build(out, stock_path, probe_stage=None):
     if len(root) > ROOT_BYTES - 8192:
         sys.exit(f"root.bin is {len(root)} bytes: under 8192 bytes would be left for the root task's stack")
     print(sign_summary(signer))
-    (out / "loader.json").write_text(json.dumps({"defines": defines, "cc": str(cc)}) + "\n")
+    # The loader's verified-boot check (link_loader): verified_lib.rs with the
+    # supervisor's pinned keys, and the same BearSSL objects.
+    run(rust + ["--crate-type=staticlib", REPO / "boot/loader/verified_lib.rs", "-o", "loader-verified.a"])
+    verified = [str(out / "loader-verified.a"), str(out / "verify-crypto.o"), str(build_crypto(REPO, out, common)[1])]
+    (out / "loader.json").write_text(json.dumps({"defines": defines, "cc": str(cc), "verified": verified}) + "\n")
 
     # The open apps for aarch64 Linux (the handset's set), gzip in the ramdisk.
     from build_initfs import main as build_initfs, HANDSET_SKIP

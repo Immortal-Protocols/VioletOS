@@ -20,6 +20,11 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "targets/board"))
+sys.path.insert(0, str(REPO / "tools"))
+# The open apps' image, where tools/run.py loads it (as on AArch32), and the
+# most a bound manifest may cover there.
+APPS_PA = 0x4a000000
+APPS_ROOM = 0x06000000
 import board as boards
 import image as layout
 
@@ -68,10 +73,22 @@ def c_flags(cc, board):
             "-ffunction-sections", "-fdata-sections"]
 
 
-def boot_image(out, board, kernel, root, root_entry, common, run):
+# The verifier's place in the loader region: after the stub's page and the
+# five pages of boot page tables, with its bss and stack.
+VERIFIER_OFFSET = 0x8000
+VERIFIER_STACK = 0x8000
+
+
+def boot_image(out, board, kernel, root, root_entry, common, run, verify=None):
     """Write out/qemu64.bin and out/qemu64.json: the kernel, the root task's flat image `root`
     (linked at the board's root va, entered at `root_entry`) and the entry stub with its boot
-    page tables, behind the stage that copies them to the start of RAM."""
+    page tables, behind the stage that copies them to the start of RAM.
+
+    `verify` (the system image, stack.py): verified boot. It is called as
+    verify(kernel_image, root) and returns (the signed boot manifest for those
+    exact bytes, the objects of verified_lib.rs and its crypto); the entry stub
+    then runs verify.c with them before the kernel, and the build fails unless
+    the image carries that manifest once and the check's code."""
     regions = board["memory"]["regions"]
     address = lambda name, key="pa": boards.number(regions[name][key], name)
     cc = Path(common[0])
@@ -87,6 +104,37 @@ def boot_image(out, board, kernel, root, root_entry, common, run):
     defines = {"GICR_IGROUPR0": redistributor + 0x10080, "TABLE_LOWER": lower, "TABLE_UPPER": upper,
                "ROOT_PA_START": address("root"), "ROOT_PA_END": address("root") + len(root),
                "ROOT_PV_OFFSET": address("root") - root_va, "ROOT_ENTRY": root_entry, "KERNEL_ENTRY": kernel_entry}
+    verifier, verified = b"", None
+    if verify is not None:
+        verifier_pa = loader_pa + VERIFIER_OFFSET
+        if tables_pa + len(tables) > verifier_pa:
+            sys.exit("the boot page tables run into the verifier")
+        manifest, objects = verify(kernel_image, root)
+        (out / "boot-manifest.bin").write_bytes(manifest)
+        (out / "verify-manifest.S").write_text('.section .rodata.manifest,"a"\n.balign 8\n.global boot_manifest,boot_manifest_end\n'
+                                              'boot_manifest: .incbin "boot-manifest.bin"\nboot_manifest_end:\n')
+        run(common + ["-c", out / "verify-manifest.S", "-o", "verify-manifest.o"])
+        uart = boards.number(board["devices"]["uart"]["pa"], "uart")
+        import boot_manifest
+        places = {"UART_PA": uart, "FLOOR_PA": boot_manifest.FLOOR_ADDRESS, "KERNEL_PA": address("kernel"),
+                  "KERNEL_SIGNED": len(kernel_image), "ROOT_PA": address("root"), "ROOT_SIGNED": len(root),
+                  "APPS_PA": APPS_PA, "APPS_ROOM": APPS_ROOM}
+        run(common + [f"-D{name}={value:#x}" for name, value in places.items()] + ["-c", HERE / "verify.c", "-o", "verify.o"])
+        (out / "verify.ld").write_text(f"ENTRY(verify64)\nSECTIONS {{ . = {verifier_pa:#x}; .text : {{ KEEP(*(.text.verify64)) *(.text*) }} "
+                                       ".rodata : { *(.rodata*) } .data : { *(.data*) *(.got*) } .bss : { *(.bss*) *(COMMON) } "
+                                       f". = ALIGN(16); . += {VERIFIER_STACK:#x}; verify_stack = .; verify_end = .; "
+                                       "/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) } }")
+        run([ld, "--gc-sections", "-z", "max-page-size=4096", "-T", "verify.ld", "verify.o", "verify-manifest.o",
+             "--start-group", *objects, "--end-group", "-o", "verify.elf"])
+        run([objcopy, "-O", "binary", "verify.elf", "verify.bin"])
+        marks = symbols(cc.with_name("llvm-nm"), out / "verify.elf")
+        # Its bss and stack are in the image, zeroed: nothing it reads is left from before.
+        verifier = (out / "verify.bin").read_bytes().ljust(marks["verify_end"] - verifier_pa, b"\0")
+        if verifier_pa + len(verifier) > loader_pa + address("loader", "size"):
+            sys.exit(f"the verifier ({len(verifier):#x} bytes with its stack) does not fit the loader region")
+        defines.update(VERIFY_ENTRY=marks["verify64"], VERIFY_STACK=marks["verify_stack"])
+        verified = {"manifest": manifest, "kernel": address("kernel"), "kernel_bytes": len(kernel_image),
+                    "root": address("root"), "root_bytes": len(root)}
     run(common + [f"-D{name}={value:#x}" for name, value in defines.items()] + ["-c", HERE / "entry.S", "-o", "entry.o"])
     (out / "entry.ld").write_text(f"ENTRY(_start)\nSECTIONS {{ . = {loader_pa:#x}; .text : {{ *(.text*) }} /DISCARD/ : {{ *(.comment) *(.note*) }} }}")
     run([ld, "-T", "entry.ld", "entry.o", "-o", "entry.elf"])
@@ -95,8 +143,10 @@ def boot_image(out, board, kernel, root, root_entry, common, run):
     if len(stub) > layout.PAGE or len(stub) + len(tables) > address("loader", "size"):
         sys.exit("the entry stub outgrew its page")
     base = boards.number(board["memory"]["ram"]["pa"], "ram")
-    blob = layout.assemble([(address("kernel"), kernel_image), (address("root"), root),
-                            (loader_pa, stub.ljust(layout.PAGE, b"\0") + tables)], base)
+    loader = stub.ljust(layout.PAGE, b"\0") + tables
+    if verifier:
+        loader = loader.ljust(VERIFIER_OFFSET, b"\0") + verifier
+    blob = layout.assemble([(address("kernel"), kernel_image), (address("root"), root), (loader_pa, loader)], base)
     blob += bytes(-len(blob) % 8)
     # QEMU overwrites the start of RAM at reset (stage.S): load at the staging address, copy at start.
     staging = address("staging")
@@ -106,7 +156,20 @@ def boot_image(out, board, kernel, root, root_entry, common, run):
     if len(stage) != layout.PAGE or len(stage) + len(blob) > address("staging", "size"):
         sys.exit("the staged image does not fit its region")
     (out / "qemu64.bin").write_bytes(stage + blob)
-    (out / "qemu64.json").write_text(json.dumps({"board": board["name"], "image": "qemu64.bin", "load": staging, "entry": staging}, indent=2) + "\n")
+    plan = {"board": board["name"], "image": "qemu64.bin", "load": staging, "entry": staging}
+    if verified:
+        import boot_manifest
+        try:
+            # The stub that dropped the check, or an image whose manifest is not the signed one, fails here.
+            boot_manifest.check_loader(stage + blob, verified["manifest"])
+        except ValueError as e:
+            sys.exit(f"verified boot: {e}")
+        # Where the signed images sit in qemu64.bin (test_system.py --arch aarch64 changes a byte of each).
+        at = lambda pa: len(stage) + pa - base
+        plan["verified"] = {"kernel": [at(verified["kernel"]), verified["kernel_bytes"]],
+                            "root": [at(verified["root"]), verified["root_bytes"]],
+                            "version": boot_manifest.parse(verified["manifest"]).version}
+    (out / "qemu64.json").write_text(json.dumps(plan, indent=2) + "\n")
     return len(kernel_image)
 
 

@@ -3,22 +3,25 @@
 //! words, and the structure the dispatcher writes, made into the AArch64
 //! one after it ran (`After`).
 //!
-//! Every app's address space is below 4 GiB (runtime/open/vma.rs), so an
-//! address an AArch64 program passes fits a 32-bit word. A word that cannot
-//! name the app's memory becomes NOWHERE, an address in no app's regions (so
-//! a pointer is EFAULT and a size too large), never cut to some low address
-//! that might be the app's: for an address or size argument (`MEMORY`) any
-//! value of 4 GiB or more, sign-extended ones included (0xffff_ffff_bef0_0000
-//! is a kernel-half address on Linux, not the app's stack at 0xbef0_0000);
-//! for an int argument (fd, AT_FDCWD, pid -1, flags with bit 31) a value that
-//! is neither below 4 GiB nor a sign-extended int (`narrow`). It is not
-//! refused outright: the registers a call does not use hold whatever the
-//! program left there (musl passes three for write, Linux reads three), and
-//! those must not fail the call.
+//! An AArch64 app lives above 4 GiB (runtime/open/vma.rs Layout64), so its
+//! addresses do not fit 32-bit words. The dispatcher takes them whole: every
+//! call comes with `wide`, its arguments as the 64-bit registers were (moved
+//! with them where a call is rewritten), and the dispatcher reads an address,
+//! and a length of app memory, from there (syscall.rs `vargs`). The 32-bit
+//! words are for everything else. In them a word that cannot name the app's
+//! memory becomes NOWHERE, an address in no app's regions (so a pointer read
+//! from the 32-bit words is EFAULT and a size too large), never cut to some
+//! low address: for an address or size argument (`MEMORY`) any value of
+//! 4 GiB or more; for an int argument (fd, AT_FDCWD, pid -1, flags with bit
+//! 31) a value that is neither below 4 GiB nor a sign-extended int
+//! (`narrow`). It is not refused outright: the registers a call does not use
+//! hold whatever the program left there (musl passes three for write, Linux
+//! reads three), and those must not fail the call.
 //!
 //! On the way back (`widen`), x0 of an answered call is its 32-bit result
-//! made 64-bit (an error -4095..-1 sign-extended), never the caller's x0;
-//! the other registers are the thread's own unless the runtime changed them.
+//! made 64-bit (an error -4095..-1 sign-extended), or the whole address a
+//! call answers (mmap, brk: `result`), never the caller's x0; the other
+//! registers are the thread's own unless the runtime changed them.
 //!
 //! Three kinds of call, by linux.rs `Layout`:
 //! - `Same`: the arguments narrowed, the dispatcher's handler as it is.
@@ -45,23 +48,25 @@ pub const EOVERFLOW: i32 = -75;
 pub enum After {
     None,
     /// struct stat64 (104 bytes) to struct stat (128).
-    Stat(u32),
+    Stat(Word),
     /// A time64 timespec (clock_gettime64) to struct timeval.
-    Timeval(u32),
+    Timeval(Word),
     /// struct sysinfo of 32-bit longs (64 bytes) to 64-bit ones (112).
-    Sysinfo(u32),
+    Sysinfo(Word),
     /// struct rusage (72 bytes) to 144.
-    Rusage(u32),
+    Rusage(Word),
     /// struct statfs64 (84 bytes) to AArch64's struct statfs (120).
-    Statfs(u32),
+    Statfs(Word),
     /// struct tms of 32-bit clock_t (16 bytes) to 64-bit (32).
-    Tms(u32),
+    Tms(Word),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Entry {
-    /// Dispatch AArch32 call `number` with `args`, then `after`.
-    Call { number: u32, args: [u32; 6], after: After },
+    /// Dispatch AArch32 call `number` with `args` (its 32-bit words) and
+    /// `wide` (the same arguments as the 64-bit registers held them: an
+    /// address or a length of app memory is read from here), then `after`.
+    Call { number: u32, args: [u32; 6], wide: [Word; 6], after: After },
     /// Answer at once with this result.
     Answer(i32),
 }
@@ -164,16 +169,26 @@ pub fn result64(r: u32) -> u64 {
 /// - Any other word, and x0 of a call made again (word 8 back on the svc,
 ///   its registers as they were), goes back as the thread had it if the
 ///   runtime left it as shown, else as the 32-bit value the runtime wrote.
-pub fn widen(syscall: bool, wide: &[u64; 16], shown: &[u32; 16], mrs: &[u32], out: &mut [u64; 16]) -> usize {
+/// - `result`: the whole value of an answered call that answers an address
+///   (mmap, brk), when its 32-bit result is still `result.0`.
+/// - The program counter (word 8, FaultIP) the runtime moved (past the svc,
+///   or back onto it) moves the whole one by the same small distance: code
+///   above 4 GiB resumes at its own address, never a 32-bit one.
+pub fn widen(syscall: bool, wide: &[u64; 16], shown: &[u32; 16], mrs: &[u32], result: Option<(u32, u64)>, out: &mut [u64; 16]) -> usize {
     let n = mrs.len().min(16);
     let answered = syscall && n > 8 && mrs[8] != shown[8];
     for k in 0..n {
         out[k] = if k == 0 && answered {
-            result64(mrs[0])
+            match result {
+                Some((low, whole)) if low == mrs[0] => whole,
+                _ => result64(mrs[0]),
+            }
         } else if mrs[k] == shown[k] {
             wide[k]
         } else if k == 0 {
             result64(mrs[0])
+        } else if k == 8 {
+            wide[8].wrapping_add(i64::from(mrs[8].wrapping_sub(shown[8]) as i32) as u64)
         } else {
             u64::from(mrs[k])
         };
@@ -198,10 +213,16 @@ pub fn unconverted(number: Word) -> bool {
     matches!(internal_call(&AARCH64, number), Some((_, Layout::Words))) && translate(number, [0; 6]) == Entry::Answer(ENOSYS)
 }
 
+/// A call's 32-bit words and its 64-bit ones, in the same places.
+fn call(number: u32, args: [u32; 6], wide: [Word; 6], after: After) -> Entry {
+    Entry::Call { number, args, wide, after }
+}
+
 /// The AArch32 call for AArch64 call `number` with arguments `a`.
 pub fn translate(number: Word, a: [Word; 6]) -> Entry {
     let Some((n32, layout)) = internal_call(&AARCH64, number) else { return Entry::Answer(ENOSYS) };
-    let call = |number: u32, args: [u32; 6], after: After| Entry::Call { number, args, after };
+    // The 32-bit words in their own places, with the registers whole beside them.
+    let same = |number: u32, w: [u32; 6], after: After| call(number, w, a, after);
     // Arguments that are 32-bit words (fds, flags, addresses).
     let mut w = [0u32; 6];
     let mut wide_args = 0u8; // bit k: argument k is a 64-bit value, split below
@@ -222,47 +243,47 @@ pub fn translate(number: Word, a: [Word; 6]) -> Entry {
     match number {
         // lseek(fd, offset, whence): the 32-bit lseek, which answers an int.
         62 => match i32::try_from(a[1] as i64) {
-            Ok(off) => call(19, [w[0], off as u32, w[2], 0, 0, 0], After::None),
+            Ok(off) => call(19, [w[0], off as u32, w[2], 0, 0, 0], [a[0], off as u32 as Word, a[2], 0, 0, 0], After::None),
             Err(_) => Entry::Answer(EOVERFLOW),
         },
         // pread64/pwrite64(fd, buf, count, offset): the offset as a pair after a pad.
-        67 | 68 => call(n32, [w[0], w[1], w[2], 0, lo(a[3]), hi(a[3])], After::None),
+        67 | 68 => call(n32, [w[0], w[1], w[2], 0, lo(a[3]), hi(a[3])], [a[0], a[1], a[2], 0, lo(a[3]).into(), hi(a[3]).into()], After::None),
         // truncate(path, length), ftruncate(fd, length): truncate64's pair.
-        45 | 46 => call(n32, [w[0], 0, lo(a[1]), hi(a[1]), 0, 0], After::None),
+        45 | 46 => call(n32, [w[0], 0, lo(a[1]), hi(a[1]), 0, 0], [a[0], 0, lo(a[1]).into(), hi(a[1]).into(), 0, 0], After::None),
         // fallocate(fd, mode, offset, length).
-        47 => call(n32, [w[0], w[1], lo(a[2]), hi(a[2]), lo(a[3]), hi(a[3])], After::None),
+        47 => same(n32, [w[0], w[1], lo(a[2]), hi(a[2]), lo(a[3]), hi(a[3])], After::None),
         // fadvise64(fd, offset, length, advice): ARM's puts advice second.
-        223 => call(n32, [w[0], w[3], lo(a[1]), hi(a[1]), lo(a[2]), hi(a[2])], After::None),
+        223 => call(n32, [w[0], w[3], lo(a[1]), hi(a[1]), lo(a[2]), hi(a[2])], [a[0], a[3], 0, 0, 0, 0], After::None),
         // mmap(addr, length, prot, flags, fd, offset in bytes): mmap2's pages.
         222 => match compat::mmap_pages(&AARCH64, a[5]).and_then(|p| u32::try_from(p).ok()) {
-            Some(pages) => call(n32, [w[0], w[1], w[2], w[3], w[4], pages], After::None),
+            Some(pages) => call(n32, [w[0], w[1], w[2], w[3], w[4], pages], [a[0], a[1], a[2], a[3], a[4], pages.into()], After::None),
             None => Entry::Answer(EINVAL),
         },
         // nanosleep(req, rem): CLOCK_MONOTONIC, relative, with 64-bit timespecs.
-        101 => call(407, [1, 0, w[0], w[1], 0, 0], After::None),
+        101 => call(407, [1, 0, w[0], w[1], 0, 0], [1, 0, a[0], a[1], 0, 0], After::None),
         // getrlimit/setrlimit(resource, rlim): prlimit64's 64-bit rlimit is AArch64's.
-        163 => call(369, [0, w[0], 0, w[1], 0, 0], After::None),
-        164 => call(369, [0, w[0], w[1], 0, 0, 0], After::None),
+        163 => call(369, [0, w[0], 0, w[1], 0, 0], [0, a[0], 0, a[1], 0, 0], After::None),
+        164 => call(369, [0, w[0], w[1], 0, 0, 0], [0, a[0], a[1], 0, 0, 0], After::None),
         // gettimeofday(tv, tz): clock_gettime64 of the wall clock, then microseconds.
-        169 if w[0] == 0 => Entry::Answer(0),
-        169 => call(403, [0, w[0], 0, 0, 0, 0], After::Timeval(w[0])),
-        79 => call(n32, w, After::Stat(w[2])),
-        80 => call(n32, w, After::Stat(w[1])),
-        179 => call(n32, w, After::Sysinfo(w[0])),
-        165 => call(n32, w, After::Rusage(w[1])),
-        260 => call(n32, w, if w[3] != 0 { After::Rusage(w[3]) } else { After::None }),
-        153 => call(n32, w, if w[0] != 0 { After::Tms(w[0]) } else { After::None }),
+        169 if a[0] == 0 => Entry::Answer(0),
+        169 => call(403, [0, w[0], 0, 0, 0, 0], [0, a[0], 0, 0, 0, 0], After::Timeval(a[0])),
+        79 => same(n32, w, After::Stat(a[2])),
+        80 => same(n32, w, After::Stat(a[1])),
+        179 => same(n32, w, After::Sysinfo(a[0])),
+        165 => same(n32, w, After::Rusage(a[1])),
+        260 => same(n32, w, if a[3] != 0 { After::Rusage(a[3]) } else { After::None }),
+        153 => same(n32, w, if a[0] != 0 { After::Tms(a[0]) } else { After::None }),
         // statfs(path, buf), fstatfs(fd, buf): statfs64's size argument.
-        43 | 44 => call(n32, [w[0], 84, w[1], 0, 0, 0], After::Statfs(w[1])),
+        43 | 44 => call(n32, [w[0], 84, w[1], 0, 0, 0], [a[0], 84, a[1], 0, 0, 0], After::Statfs(a[1])),
         // fcntl: AArch64's struct flock is AArch32's struct flock64 (fcntl64).
         // sendfile: its offset is a pointer to a 64-bit value on both.
         // set_robust_list, mremap and rt_sigtimedwait take nothing the
         // dispatcher reads differently (it never reads the robust list;
         // siginfo is 128 bytes on both, the timespec 64-bit).
-        25 | 71 | 99 | 216 | 137 => call(n32, w, After::None),
-        n if WIDE_IN_DISPATCH.contains(&n) => call(n32, w, After::None),
+        25 | 71 | 99 | 216 | 137 => same(n32, w, After::None),
+        n if WIDE_IN_DISPATCH.contains(&n) => same(n32, w, After::None),
         _ if layout == Layout::Words => Entry::Answer(ENOSYS),
-        _ => call(n32, w, After::None),
+        _ => same(n32, w, After::None),
     }
 }
 
@@ -273,7 +294,7 @@ pub fn converts(result: i32) -> bool {
 }
 
 /// Bytes the dispatcher writes for `after`, and the AArch64 structure's.
-pub fn sizes(after: After) -> Option<(u32, usize, usize)> {
+pub fn sizes(after: After) -> Option<(Word, usize, usize)> {
     Some(match after {
         After::None => return None,
         After::Stat(p) => (p, compat::STAT32, compat::STAT64),
@@ -345,9 +366,9 @@ pub fn convert(after: After, s: &[u8]) -> [u8; MAX_AFTER] {
     out
 }
 
-/// A VM fault's address as the runtime's 32-bit regions see it: one above
-/// 4 GiB is in no region of any app, so it becomes an address that is not
-/// either (the top page), never a low one it might alias.
-pub fn fault_address(address: Word) -> u32 {
-    u32::try_from(address).unwrap_or(NOWHERE)
+/// A VM fault's address as the runtime's regions see it: whole (vma::Va is
+/// 64 bits), so an address above 4 GiB is looked up as itself, never cut to
+/// a low one it might alias.
+pub fn fault_address(address: Word) -> Word {
+    address
 }

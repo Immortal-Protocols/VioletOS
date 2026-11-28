@@ -18,17 +18,17 @@ const SLICE: u32 = 1 << 20;
 /// An app's iovec array, and a descriptor that takes `room` bytes a call
 /// (u32::MAX: everything, as /dev/null or a file) or answers `error`.
 struct App {
-    iov: Vec<(u32, u32)>,
+    iov: Vec<(u64, u32)>,
     room: u32,
     error: Option<i32>,
     moved: u64,
     calls: u32,
 }
 impl Vectored for App {
-    fn entry(&mut self, k: u32) -> Option<(u32, u32)> {
+    fn entry(&mut self, k: u32) -> Option<(u64, u32)> {
         self.iov.get(k as usize).copied()
     }
-    fn io(&mut self, _base: u32, len: u32) -> i32 {
+    fn io(&mut self, _base: u64, len: u32) -> i32 {
         self.calls += 1;
         if let Some(e) = self.error {
             return e;
@@ -39,7 +39,7 @@ impl Vectored for App {
         n as i32
     }
 }
-fn app(iov: Vec<(u32, u32)>) -> App {
+fn app(iov: Vec<(u64, u32)>) -> App {
     App { iov, room: u32::MAX, error: None, moved: 0, calls: 0 }
 }
 fn done(o: Outcome) -> i32 {

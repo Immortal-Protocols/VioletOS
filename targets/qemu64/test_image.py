@@ -222,8 +222,9 @@ class Differences(unittest.TestCase):
             image.user_timer(off, [disabled + ellis + "#define CONFIG_ELLIS_TIMER_GRANT  1\n"])
 
     def test_the_lost_protections_are_named(self):
-        self.assertEqual(image.differences("granted"), [image.NO_VERIFIED_BOOT])
-        self.assertEqual(image.differences(""), [image.NO_VERIFIED_BOOT, image.NO_USER_TIMER])
+        self.assertEqual(image.differences("granted"), [])
+        self.assertEqual(image.differences("exported"), [])
+        self.assertEqual(image.differences(""), [image.NO_USER_TIMER])
 
 
 if __name__ == "__main__":

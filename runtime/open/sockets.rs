@@ -16,6 +16,7 @@ use super::names;
 use super::net;
 use super::sockaddr::{self, AF_INET, AF_INET6, AF_UNIX, LOOPBACK};
 use super::syscall::{Outcome, EAGAIN, EBADF, EFAULT, EINVAL, ENOSYS};
+use super::vma::Va;
 use super::{Runtime, Wait};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -126,24 +127,26 @@ impl Runtime {
         }
     }
 
-    pub fn socket_call(&mut self, i: usize, n: u32, a: [u32; 7]) -> Outcome {
+    /// `a`: the arguments as 32-bit words; `v`: as whole app addresses
+    /// (syscall.rs `vargs`), which every pointer is read from.
+    pub fn socket_call(&mut self, i: usize, n: u32, a: [u32; 7], v: [Va; 7]) -> Outcome {
         match n {
             281 => Done(self.socket(i, a[0], a[1])),
-            282 => self.bind(i, a[0] as i32, a[1], a[2]),
-            283 => self.connect(i, a[0] as i32, a[1], a[2]),
+            282 => self.bind(i, a[0] as i32, v[1], a[2]),
+            283 => self.connect(i, a[0] as i32, v[1], a[2]),
             284 => self.listen(i, a[0] as i32, a[1] as i32),
-            285 | 366 => self.accept(i, a[0] as i32, a[1], a[2], if n == 366 { a[3] } else { 0 }),
-            286 | 287 => self.socket_name(i, a[0] as i32, a[1], a[2], n == 287),
+            285 | 366 => self.accept(i, a[0] as i32, v[1], v[2], if n == 366 { a[3] } else { 0 }),
+            286 | 287 => self.socket_name(i, a[0] as i32, v[1], v[2], n == 287),
             289 | 290 => {
-                let to = if n == 290 && a[4] != 0 { Some(self.read_sockaddr(i, a[0] as i32, a[4], a[5])) } else { None };
+                let to = if n == 290 && v[4] != 0 { Some(self.read_sockaddr(i, a[0] as i32, v[4], a[5])) } else { None };
                 match to {
                     Some(Err(e)) => Done(e),
-                    to => self.send_call(i, a[0] as i32, a[1], a[2], a[3], to.and_then(|t| t.ok())),
+                    to => self.send_call(i, a[0] as i32, v[1], a[2], a[3], to.and_then(|t| t.ok())),
                 }
             }
             291 | 292 => {
-                let (name, name_len) = if n == 292 { (a[4], a[5]) } else { (0, 0) };
-                self.recv_call(i, a[0] as i32, a[1], a[2], a[3], name, name_len)
+                let (name, name_len) = if n == 292 { (v[4], v[5]) } else { (0, 0) };
+                self.recv_call(i, a[0] as i32, v[1], a[2], a[3], name, name_len)
             }
             293 => {
                 let Some(f) = self.socket_file(i, a[0] as i32) else { return Done(EBADF) };
@@ -163,7 +166,7 @@ impl Runtime {
                     let mut tv = [0u8; 16];
                     let n = if wide { 16 } else { 8 };
                     let app = self.apps[i].as_mut().unwrap();
-                    if !app.space.read(&mut self.k, &mut self.pool, a[3], &mut tv[..n]) {
+                    if !app.space.read(&mut self.k, &mut self.pool, v[3], &mut tv[..n]) {
                         return Done(EFAULT);
                     }
                     let (sec, usec) = if wide {
@@ -175,9 +178,9 @@ impl Runtime {
                 }
                 Done(0)
             }
-            295 => self.getsockopt(i, a[0] as i32, a[1], a[2], a[3], a[4]),
-            296 | 297 => self.message_call(i, a[0] as i32, a[1], a[2], n == 296),
-            288 => Done(self.socketpair(i, a[0], a[1], a[3])),
+            295 => self.getsockopt(i, a[0] as i32, a[1], a[2], v[3], v[4]),
+            296 | 297 => self.message_call(i, a[0] as i32, v[1], a[2], n == 296),
+            288 => Done(self.socketpair(i, a[0], a[1], v[3])),
             _ => Done(ENOSYS),
         }
     }
@@ -204,7 +207,7 @@ impl Runtime {
         }
     }
     /// The address an app gave for socket `fd`, as IPv4.
-    fn read_sockaddr(&mut self, i: usize, fd: i32, ptr: u32, len: u32) -> Result<(u32, u16), i32> {
+    fn read_sockaddr(&mut self, i: usize, fd: i32, ptr: Va, len: u32) -> Result<(u32, u16), i32> {
         let v6 = self.is_v6(i, fd);
         let n = (len as usize).min(sockaddr::MAX);
         let app = self.apps[i].as_mut().ok_or(EBADF)?;
@@ -217,7 +220,7 @@ impl Runtime {
         }
         sockaddr::parse(&b[..n], v6)
     }
-    fn put_sockaddr(&mut self, i: usize, ptr: u32, len_ptr: u32, addr: (u32, u16), v6: bool) {
+    fn put_sockaddr(&mut self, i: usize, ptr: Va, len_ptr: Va, addr: (u32, u16), v6: bool) {
         let app = self.apps[i].as_mut().unwrap();
         let (b, n) = sockaddr::encode(addr, v6);
         let room = if len_ptr != 0 { app.space.read_u32(&mut self.k, &mut self.pool, len_ptr).unwrap_or(0) } else { n as u32 };
@@ -255,7 +258,7 @@ impl Runtime {
     }
 
     /// socketpair(2): AF_UNIX stream sockets, as a loopback connection.
-    fn socketpair(&mut self, i: usize, domain: u32, kind: u32, sv: u32) -> i32 {
+    fn socketpair(&mut self, i: usize, domain: u32, kind: u32, sv: Va) -> i32 {
         if domain != AF_UNIX || kind & 0xf != SOCK_STREAM {
             return EOPNOTSUPP;
         }
@@ -318,7 +321,7 @@ impl Runtime {
     /// bind(2): the wildcard or a loopback address; another of the phone's
     /// addresses is not offered (EADDRNOTAVAIL). A UDP socket bound to the
     /// wildcard also takes its port on the network when the phone is online.
-    fn bind(&mut self, i: usize, fd: i32, addr: u32, len: u32) -> Outcome {
+    fn bind(&mut self, i: usize, fd: i32, addr: Va, len: u32) -> Outcome {
         let Some(f) = self.socket_file(i, fd) else { return Done(EBADF) };
         let (udp, bound) = match &f.borrow().kind {
             Kind::Tcp { local, slot, lo, .. } => (false, local.1 != 0 || slot.is_some() || lo.is_some()),
@@ -434,7 +437,7 @@ impl Runtime {
         Done(0)
     }
 
-    fn accept(&mut self, i: usize, fd: i32, addr: u32, len: u32, flags: u32) -> Outcome {
+    fn accept(&mut self, i: usize, fd: i32, addr: Va, len: Va, flags: u32) -> Outcome {
         let r = self.accept_now(i, fd, addr, len, flags);
         if self.apps[i].is_none() {
             return Outcome::Gone; // the Shield ended it over the connection
@@ -448,7 +451,7 @@ impl Runtime {
 
     /// One accept: a loopback connection waiting, else one Radio has; EAGAIN
     /// when there is none yet (a network one may then be on its way).
-    pub fn accept_now(&mut self, i: usize, fd: i32, addr: u32, len: u32, flags: u32) -> i32 {
+    pub fn accept_now(&mut self, i: usize, fd: i32, addr: Va, len: Va, flags: u32) -> i32 {
         let Some(f) = self.socket_file(i, fd) else { return EBADF };
         let pid = self.pid_of(i);
         let quarantined = self.quarantined(i);
@@ -562,7 +565,7 @@ impl Runtime {
         Some(0)
     }
 
-    fn connect(&mut self, i: usize, fd: i32, addr: u32, len: u32) -> Outcome {
+    fn connect(&mut self, i: usize, fd: i32, addr: Va, len: u32) -> Outcome {
         let Some(f) = self.socket_file(i, fd) else { return Done(EBADF) };
         let (ip, port) = match self.read_sockaddr(i, fd, addr, len) {
             Ok(a) => a,
@@ -682,7 +685,7 @@ impl Runtime {
         Some(r)
     }
 
-    pub fn socket_send(&mut self, i: usize, fd: i32, buf: u32, len: u32, to: Option<(u32, u16)>) -> i32 {
+    pub fn socket_send(&mut self, i: usize, fd: i32, buf: Va, len: u32, to: Option<(u32, u16)>) -> i32 {
         let r = self.socket_send_now(i, fd, buf, len, to);
         if r == EAGAIN {
             self.epoll_rearm(i, fd);
@@ -733,7 +736,7 @@ impl Runtime {
         Some(data.len() as i32)
     }
 
-    fn socket_send_now(&mut self, i: usize, fd: i32, buf: u32, len: u32, to: Option<(u32, u16)>) -> i32 {
+    fn socket_send_now(&mut self, i: usize, fd: i32, buf: Va, len: u32, to: Option<(u32, u16)>) -> i32 {
         let Some(f) = self.socket_file(i, fd) else { return EBADF };
         let data = {
             let app = self.apps[i].as_mut().unwrap();
@@ -860,7 +863,7 @@ impl Runtime {
         None
     }
 
-    fn send_call(&mut self, i: usize, fd: i32, buf: u32, len: u32, flags: u32, to: Option<(u32, u16)>) -> Outcome {
+    fn send_call(&mut self, i: usize, fd: i32, buf: Va, len: u32, flags: u32, to: Option<(u32, u16)>) -> Outcome {
         // A quarantine cuts send and sendto as it cuts write (syscall.rs).
         if self.quarantined(i) {
             return Done(-13);
@@ -881,7 +884,7 @@ impl Runtime {
 
     /// recv, recvfrom and recvmsg: `name` and `name_len` (pointers) take the
     /// source address when given.
-    fn recv_call(&mut self, i: usize, fd: i32, buf: u32, len: u32, flags: u32, name: u32, name_len: u32) -> Outcome {
+    fn recv_call(&mut self, i: usize, fd: i32, buf: Va, len: u32, flags: u32, name: Va, name_len: Va) -> Outcome {
         if !self.is_socket(i, fd) {
             return Done(EBADF);
         }
@@ -895,7 +898,7 @@ impl Runtime {
     }
 
     /// One read, and the sender's address to `name` when something came.
-    pub fn recv_from(&mut self, i: usize, fd: i32, buf: u32, len: u32, name: u32, name_len: u32) -> i32 {
+    pub fn recv_from(&mut self, i: usize, fd: i32, buf: Va, len: u32, name: Va, name_len: Va) -> i32 {
         self.net.last_from = (0, 0);
         let r = self.read_now(i, fd, buf, len);
         if r >= 0 && name != 0 {
@@ -910,23 +913,22 @@ impl Runtime {
     }
 
     /// sendmsg and recvmsg: the address and the first buffer of the vector.
-    fn message_call(&mut self, i: usize, fd: i32, msg: u32, flags: u32, send: bool) -> Outcome {
+    fn message_call(&mut self, i: usize, fd: i32, msg: Va, flags: u32, send: bool) -> Outcome {
         // struct msghdr and struct iovec in the app's ABI (../arch/compat.rs):
-        // an AArch64 app's are 64-bit, its addresses below 4 GiB.
+        // an AArch64 app's are 64-bit, their addresses whole.
         use super::arch::compat;
         let abi = super::arch::NATIVE;
         let mut hb = alloc::vec![0u8; compat::msghdr_bytes(abi)];
         let Some(h) = self.app_bytes(i, msg, &mut hb).then(|| compat::msghdr(abi, &hb)).flatten() else { return Done(EFAULT) };
-        let (Ok(name), Ok(iov)) = (u32::try_from(h.name), u32::try_from(h.iov)) else { return Done(EFAULT) };
+        let (name, iov) = (h.name, h.iov);
         let namelen = h.namelen;
         if h.iovlen == 0 {
             return Done(0);
         }
         let mut vb = alloc::vec![0u8; compat::iovec_bytes(abi)];
         let Some((base, len)) = self.app_bytes(i, iov, &mut vb).then(|| compat::iovec(abi, &vb, 0)).flatten() else { return Done(EFAULT) };
-        let (Ok(base), len) = (u32::try_from(base), len.min(u64::from(u32::MAX)) as u32) else { return Done(EFAULT) };
-        let v = [base, len];
-        let w = abi.word_bytes() as u32;
+        let len = len.min(u64::from(u32::MAX)) as u32;
+        let w = abi.word_bytes() as Va;
         if send {
             let to = if name != 0 {
                 match self.read_sockaddr(i, fd, name, namelen) {
@@ -936,11 +938,11 @@ impl Runtime {
             } else {
                 None
             };
-            self.send_call(i, fd, v[0], v[1], flags, to)
+            self.send_call(i, fd, base, len, flags, to)
         } else {
             // msg_namelen follows msg_name (a word); msg_controllen and
             // msg_flags are words 5 and 6 (AArch32), or at 40 and 48 (AArch64).
-            let r = self.recv_call(i, fd, v[0], v[1], flags, name, if name != 0 { msg + w } else { 0 });
+            let r = self.recv_call(i, fd, base, len, flags, name, if name != 0 { msg + w } else { 0 });
             if let Done(k) = r {
                 if k >= 0 {
                     // No control data; flags cleared.
@@ -954,12 +956,12 @@ impl Runtime {
         }
     }
 
-    fn app_bytes(&mut self, i: usize, at: u32, out: &mut [u8]) -> bool {
+    fn app_bytes(&mut self, i: usize, at: Va, out: &mut [u8]) -> bool {
         let Some(app) = self.apps[i].as_mut() else { return false };
         app.space.read(&mut self.k, &mut self.pool, at, out)
     }
 
-    fn getsockopt(&mut self, i: usize, fd: i32, level: u32, name: u32, val: u32, len_ptr: u32) -> Outcome {
+    fn getsockopt(&mut self, i: usize, fd: i32, level: u32, name: u32, val: Va, len_ptr: Va) -> Outcome {
         let Some(f) = self.socket_file(i, fd) else { return Done(EBADF) };
         let value = match (level, name) {
             // SO_ERROR: the outcome of a non-blocking connect.
@@ -1001,7 +1003,7 @@ impl Runtime {
         Some((if ip == 0 { 0x0a00_0002 } else { ip }, port))
     }
 
-    fn socket_name(&mut self, i: usize, fd: i32, ptr: u32, len_ptr: u32, peer: bool) -> Outcome {
+    fn socket_name(&mut self, i: usize, fd: i32, ptr: Va, len_ptr: Va, peer: bool) -> Outcome {
         let Some(f) = self.socket_file(i, fd) else { return Done(EBADF) };
         let (bound, v6) = match &f.borrow().kind {
             Kind::Tcp { local, v6, .. } | Kind::Udp { local, v6, .. } => (*local, *v6),

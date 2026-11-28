@@ -64,7 +64,7 @@ class Arch(unittest.TestCase):
         self.assertNotIn("-marm", violet_arch.clang_flags(env))
         self.assertEqual(violet_arch.UNPORTED, [])
         self.assertEqual(violet_arch.require_components(env), "aarch64")
-        self.assertTrue(any("runtime/open" in line for line in violet_arch.APP_ABI_UNPORTED))
+        self.assertTrue(any("runtime/arch/enter64.rs" in line for line in violet_arch.APP_ABI_UNPORTED))
         # Anything left in UNPORTED stops the build again, naming it.
         saved = violet_arch.UNPORTED
         try:

@@ -244,6 +244,16 @@ struct images {
 };
 extern unsigned verified_boot(const struct images *images, unsigned *version);
 extern char boot_manifest[], boot_manifest_end[];
+#ifdef VIOLET_MOTO
+// The AArch64 handset (loader64.S, targets/moto-g-pure/build64.py; the
+// AArch32 handset loader carries no manifest). No console: a refusal is the
+// red band and boot stage 90 + its reason (prepare()). LK keeps and hands over
+// no rollback floor, so the handset's check has none (version 0 is still
+// refused). The /apps image is the ramdisk where LK put it (layout_ok()).
+static unsigned verified_refused;
+static void say(const char *s) { (void)s; }
+static void say_number(unsigned v) { (void)v; }
+#else
 static void say(const char *s) {
     volatile uint32_t *uart = (void *)0x09000000;  // QEMU's PL011
     while (*s) *uart = (unsigned char)*s++;
@@ -254,13 +264,28 @@ static void say_number(unsigned v) {
     do *--p = '0' + v % 10; while (v /= 10);
     say(p);
 }
+#endif
 static int verified(void) {
+#ifdef VIOLET_MOTO
+    const unsigned floor[3] = {0, 0, 0};
+    const void *apps = (const void *)(uintptr_t)initrd_start;
+    size_t apps_room = initrd_end > initrd_start ? initrd_end - initrd_start : 0;
+    // Hashing with the data cache off, under the inherited watchdog.
+    boot_progress();
+#else
     // The bootloader's stored rollback floor (tools/boot_manifest.py FLOOR_ADDRESS).
     const volatile unsigned *floor = (void *)0x47870000;
+    const void *apps = (void *)0x4a000000;
+    size_t apps_room = 0x06000000;
+#endif
     const struct images images = {
         boot_manifest, boot_manifest_end - boot_manifest, kernel, kernel_end - kernel,
-        root, root_end - root, (void *)0x4a000000, 0x06000000, {floor[0], floor[1], floor[2]}};
+        root, root_end - root, apps, apps_room, {floor[0], floor[1], floor[2]}};
     unsigned version = 0, why = verified_boot(&images, &version);
+#ifdef VIOLET_MOTO
+    boot_progress();
+    verified_refused = why;
+#endif
     if (!why) {
         say("VioletOS loader: verified boot, system version ");
         say_number(version);
@@ -306,7 +331,16 @@ void prepare(const void *dt)
     if (!layout_ok(dt)) return;
 #endif
 #ifdef VIOLET_VERIFIED_BOOT
-    if (!verified()) return;
+    if (!verified()) {
+#ifdef VIOLET_MOTO
+        // As a refused handoff: the eMMC clock on, then the stage.
+        *(volatile uint32_t *)0x1000108c = 1u << 2;
+        *(volatile uint32_t *)0x100010c4 = 1u << 9;
+        __asm__ volatile("dsb sy" ::: "memory");
+        record_boot_stage(90 + verified_refused);
+#endif
+        return;
+    }
 #endif
 #ifdef VIOLET_MOTO
 #ifdef __aarch64__

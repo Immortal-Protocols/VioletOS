@@ -463,7 +463,7 @@ impl AppHandle<'_> {
         let mut shown: [u32; 16] = core::array::from_fn(|k| wide[k] as u32);
         let r = match translate(n, a) {
             Entry::Answer(e) => e,
-            Entry::Call { number, args, after: After::None } => {
+            Entry::Call { number, args, after: After::None, .. } => {
                 shown[..6].copy_from_slice(&args);
                 shown[7] = number;
                 self.syscall(number, args)
@@ -474,7 +474,7 @@ impl AppHandle<'_> {
         answer[..8].copy_from_slice(&shown[..8]);
         (answer[0], answer[8]) = (r as u32, SVC + 4);
         let mut out = [0u64; 16];
-        widen(true, &wide, &shown, &answer, &mut out);
+        widen(true, &wide, &shown, &answer, None, &mut out);
         out[0] as i64
     }
     /// Put a NUL-terminated string in the app's memory; its address.
@@ -484,7 +484,7 @@ impl AppHandle<'_> {
         let va = app.scratch + at;
         let mut bytes = s.as_bytes().to_vec();
         bytes.push(0);
-        assert!(app.space.write(&mut rt.k, &mut rt.pool, va, &bytes), "the app's stack takes the string");
+        assert!(app.space.write(&mut rt.k, &mut rt.pool, va.into(), &bytes), "the app's stack takes the string");
         va
     }
     pub fn open(&mut self, path: &str, flags: u32) -> Result<i32, i32> {
@@ -527,7 +527,7 @@ impl AppHandle<'_> {
         let rt = &mut self.w.rt;
         let app = rt.apps[self.i].as_mut().unwrap();
         let va = app.scratch + 0x1000;
-        assert!(app.space.write(&mut rt.k, &mut rt.pool, va, data));
+        assert!(app.space.write(&mut rt.k, &mut rt.pool, va.into(), data));
         result(self.syscall(4, [fd as u32, va, data.len() as u32, 0, 0, 0]))
     }
     /// ftruncate(fd, len) (93) or ftruncate64 (194, the length in r2:r3 as EABI passes it).
@@ -545,7 +545,7 @@ impl AppHandle<'_> {
         let rt = &mut self.w.rt;
         let mut out = vec![0u8; n];
         let app = rt.apps[self.i].as_mut().unwrap();
-        assert!(app.space.read(&mut rt.k, &mut rt.pool, va, &mut out));
+        assert!(app.space.read(&mut rt.k, &mut rt.pool, va.into(), &mut out));
         Ok(out)
     }
     /// The names open() + getdents show for a directory.
@@ -594,7 +594,7 @@ impl AppHandle<'_> {
         let mut b = [0u8; 20];
         b[..4].copy_from_slice(&handler.to_le_bytes());
         b[4..8].copy_from_slice(&flags.to_le_bytes());
-        assert!(app.space.write(&mut rt.k, &mut rt.pool, va, &b));
+        assert!(app.space.write(&mut rt.k, &mut rt.pool, va.into(), &b));
         result(self.syscall(174, [sig, va, 0, 8, 0, 0]))
     }
     pub fn kill(&mut self, pid: i32, sig: u32) -> Result<i32, i32> {
@@ -628,7 +628,7 @@ impl AppHandle<'_> {
     }
     /// The hardware mapping of the page at `va`: (writable, executable).
     pub fn mapping(&self, va: u32) -> Option<(bool, bool)> {
-        kernel::sys::at(self.w.rt.apps[self.i].as_ref().unwrap().space.pd, va)
+        kernel::sys::at(self.w.rt.apps[self.i].as_ref().unwrap().space.pd, va.into())
     }
 }
 

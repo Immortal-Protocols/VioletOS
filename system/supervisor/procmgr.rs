@@ -34,7 +34,7 @@ use super::sys::{self, Object, PAGE, PAGE_BITS};
 use super::syscall::{EACCES, EEXIST, ENOMEM};
 use super::vma::{self, HW_NONE, HW_RW, HW_RX};
 #[allow(unused_imports)]
-pub use super::vma::{Access, Layout, Vma, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_READ, PROT_WRITE, STACK_SIZE, USER_TOP};
+pub use super::vma::{Access, Layout, Va, Vma, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_READ, PROT_WRITE, STACK_SIZE, USER_TOP};
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -50,18 +50,21 @@ struct Page {
     hw: u8,
 }
 
+/// Addresses are whole (vma::Va, 64 bits for either ABI); pages are keyed by
+/// page number (address >> PAGE_BITS), page tables by level and index.
 pub struct Space {
     pub pd: u32,
     pub untyped: u32,
-    tables: BTreeMap<u32, u32>,
-    pages: BTreeMap<u32, Page>,
+    tables: BTreeMap<u64, u32>,
+    pages: BTreeMap<u64, Page>,
     pub vmas: Vec<Vma>,
-    pub brk_start: u32,
-    pub brk: u32,
-    /// Where this program's parts are (random per start; set by `load`).
+    pub brk_start: Va,
+    pub brk: Va,
+    /// Where this program's parts are (random per start; set by `load`),
+    /// and the bounds of its ABI's address space.
     pub layout: Layout,
     /// The last fault that changed nothing, and how often it repeated.
-    spin: (u32, u32),
+    spin: (u64, u32),
     /// Capability slots holding this app's kernel objects (freed by revoking `untyped`).
     pub object_slots: Vec<u32>,
     /// Pool pages it owns now, and the most it may (the runtime sets it from
@@ -77,17 +80,17 @@ pub struct Space {
 /// The 64 KiB unit of app address-space layout: mmap placement, the
 /// trampoline region, and the windows the W^X policy keeps code alone in
 /// (vma.rs). It was also the hardware page; pages are sys::PAGE now.
-pub const WINDOW: u32 = 0x1_0000;
+pub const WINDOW: Va = 0x1_0000;
 
 pub struct Loaded {
-    pub entry: u32,
-    pub sp: u32,
+    pub entry: Va,
+    pub sp: Va,
 }
 
 /// Pages a fault brings in when first touches come in a row (4 KiB pages
 /// only: one 64 KiB page was already sixteen of them), and the free pool
 /// (8 MiB) below which a fault brings in just its own page.
-const AHEAD: u32 = if PAGE_BITS == 12 { 4 } else { 1 };
+const AHEAD: u64 = if PAGE_BITS == 12 { 4 } else { 1 };
 const AHEAD_FLOOR: usize = (8 << 20) / PAGE;
 
 /// A fault that leaves the mapping as it was may be a stale TLB entry or a
@@ -138,27 +141,27 @@ fn give(pool: &mut Pool, index: u32) {
     }
 }
 
-fn page_of(va: u32) -> u32 {
+fn page_of(va: Va) -> u64 {
     va >> PAGE_BITS
 }
-fn align_down(v: u32, a: u32) -> u32 {
+fn align_down(v: Va, a: Va) -> Va {
     v & !(a - 1)
 }
-fn align_up(v: u32, a: u32) -> u32 {
+fn align_up(v: Va, a: Va) -> Va {
     v.wrapping_add(a - 1) & !(a - 1)
 }
 
 /// The hardware mapping the regions in page `p` call for.
-fn want(vmas: &[Vma], p: u32) -> u8 {
+fn want(vmas: &[Vma], p: u64) -> u8 {
     let start = p << PAGE_BITS;
-    vma::hardware(vma::union(vmas, start, start.saturating_add(PAGE as u32)))
+    vma::hardware(vma::union(vmas, start, start.saturating_add(PAGE as Va)))
 }
 
 /// Give the app's mapping of page `p` the rights `hw`: unmapped, read-only,
 /// read-write or read-execute, and Execute-Never unless it is the last.
 /// Mapping a page that is mapped changes its rights in place. If that fails
 /// the page ends up unmapped (`page.hw` says so), never with the old rights.
-fn set(pd: u32, p: u32, page: &mut Page, hw: u8) {
+fn set(pd: u32, p: u64, page: &mut Page, hw: u8) {
     if hw != HW_NONE {
         let va = p << PAGE_BITS;
         let (w, x) = (hw == HW_RW, hw == HW_RX);
@@ -188,7 +191,7 @@ impl Space {
             vmas: Vec::new(),
             brk_start: 0,
             brk: 0,
-            layout: Layout::fixed(),
+            layout: Layout::native(),
             spin: (0, 0),
             object_slots: alloc::vec![pd],
             owned: 0,
@@ -203,7 +206,7 @@ impl Space {
         Ok(slot)
     }
 
-    fn table(&mut self, k: &mut Kernel, va: u32) -> Result<(), i32> {
+    fn table(&mut self, k: &mut Kernel, va: Va) -> Result<(), i32> {
         if vma::WIDE {
             return self.tables64(k, va);
         }
@@ -217,11 +220,11 @@ impl Space {
         Ok(())
     }
     /// AArch64 (4 KiB granule, 48-bit address space): below the root, one
-    /// table for the first 512 GiB, one per GiB and one per 2 MiB. Made top
-    /// down, each lands at the level the kernel's walk stops at. Keys: the
-    /// last level by 2 MiB, the middle by GiB with bit 28, the first bit 29.
-    fn tables64(&mut self, k: &mut Kernel, va: u32) -> Result<(), i32> {
-        for key in [1 << 29, 1 << 28 | va >> 30, va >> 21] {
+    /// table per 512 GiB, one per GiB and one per 2 MiB. Made top down, each
+    /// lands at the level the kernel's walk stops at. Keys: the level in the
+    /// top bits (3, 2, 1), then the index of the range the table covers.
+    fn tables64(&mut self, k: &mut Kernel, va: Va) -> Result<(), i32> {
+        for key in [3 << 60 | va >> 39, 2 << 60 | va >> 30, 1 << 60 | va >> 21] {
             if !self.tables.contains_key(&key) {
                 let pt = self.object(k, Object::PageTable, 0)?;
                 sys::pt_map(pt, self.pd, va)?;
@@ -236,7 +239,7 @@ impl Space {
     /// Checked here whatever the caller passed: `va` is an app address, and
     /// `index` is one of the apps' pages that no other address space holds
     /// (frames.rs), so no page is ever mapped in two apps.
-    pub fn map(&mut self, k: &mut Kernel, pool: &Pool, va: u32, index: u32, owned: bool) -> Result<(), i32> {
+    pub fn map(&mut self, k: &mut Kernel, pool: &Pool, va: Va, index: u32, owned: bool) -> Result<(), i32> {
         // One mapping per page per space: a page this space holds is not
         // mapped again (the screen's pages are the only ones anyone asks
         // twice for). With the ledger's one space per page, the slots all
@@ -244,7 +247,7 @@ impl Space {
         if ledger().owner(index) == self.pd {
             return Err(ENOMEM);
         }
-        if va >= USER_TOP || ledger().claim(self.pd, index).is_err() {
+        if va >= self.layout.user_top || ledger().claim(self.pd, index).is_err() {
             return Err(EACCES);
         }
         let mapped = self.map_claimed(k, pool, va, index, owned);
@@ -253,7 +256,7 @@ impl Space {
         }
         mapped
     }
-    fn map_claimed(&mut self, k: &mut Kernel, pool: &Pool, va: u32, index: u32, owned: bool) -> Result<(), i32> {
+    fn map_claimed(&mut self, k: &mut Kernel, pool: &Pool, va: Va, index: u32, owned: bool) -> Result<(), i32> {
         let p = page_of(va);
         if self.pages.contains_key(&p) {
             return Err(EEXIST);
@@ -278,7 +281,7 @@ impl Space {
         Ok(())
     }
 
-    fn unmap_page(&mut self, k: &mut Kernel, pool: &mut Pool, p: u32) {
+    fn unmap_page(&mut self, k: &mut Kernel, pool: &mut Pool, p: u64) {
         if let Some(page) = self.pages.remove(&p) {
             sys::delete(page.cap);
             ledger().release(self.pd, page.pool);
@@ -292,7 +295,7 @@ impl Space {
     }
 
     /// Bring the mappings of the pages in [start, end) in line with the regions.
-    fn sync(&mut self, start: u32, end: u32) {
+    fn sync(&mut self, start: Va, end: Va) {
         if start >= end {
             return;
         }
@@ -320,11 +323,11 @@ impl Space {
     /// cap, kernel memory or capability slots ran out). The runtime closes
     /// the app as out of memory, not as a bad access.
     /// (mod.rs asks `holds` after checking the region itself.)
-    pub fn starved(&self, va: u32, access: Access) -> bool {
+    pub fn starved(&self, va: Va, access: Access) -> bool {
         self.find(va).is_some_and(|v| access.allowed(v.prot)) && !self.holds(va)
     }
     /// Whether a page is mapped at `va`.
-    pub fn holds(&self, va: u32) -> bool {
+    pub fn holds(&self, va: Va) -> bool {
         self.pages.contains_key(&page_of(va))
     }
     /// execve: this new space, loaded for a program `old`'s process now
@@ -334,13 +337,13 @@ impl Space {
         self.family = old.family.clone();
     }
 
-    pub fn find(&self, va: u32) -> Option<&Vma> {
+    pub fn find(&self, va: Va) -> Option<&Vma> {
         vma::find(&self.vmas, va)
     }
 
     /// The runtime's own view of the page holding `va`, taking a zeroed page
     /// from the pool if there is none yet. No protection check: callers check.
-    fn page(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32) -> Option<usize> {
+    fn page(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va) -> Option<usize> {
         let p = page_of(va);
         if !self.pages.contains_key(&p) {
             if self.capped() {
@@ -360,7 +363,7 @@ impl Space {
     /// Whether [start, end) touches the trampoline region (one WINDOW),
     /// which only the runtime may map, unmap or change (munmap, mmap and
     /// mprotect refuse).
-    pub fn pinned(&self, start: u32, end: u32) -> bool {
+    pub fn pinned(&self, start: Va, end: Va) -> bool {
         let stubs = self.layout.stubs;
         start < end && start < stubs.saturating_add(WINDOW) && end > stubs
     }
@@ -369,7 +372,7 @@ impl Space {
     /// and return its address in the app. The page is looked up on every
     /// call, and only the runtime's whole read-execute region will do: None
     /// (nothing written) if it is missing or altered, or memory ran out.
-    pub fn stub(&mut self, k: &mut Kernel, pool: &mut Pool, slot: usize, target: u32) -> Option<u32> {
+    pub fn stub(&mut self, k: &mut Kernel, pool: &mut Pool, slot: usize, target: u32) -> Option<Va> {
         let stubs = self.layout.stubs;
         let whole = Vma { start: stubs, end: stubs.checked_add(WINDOW)?, prot: PROT_READ | PROT_EXEC };
         if slot >= (GATE_OFFSET / 8) as usize || self.find(stubs) != Some(&whole) {
@@ -378,8 +381,8 @@ impl Space {
         // The region is WINDOW long; only the pages in use have memory: the
         // one with this trampoline (8 bytes, 8-aligned: never across pages)
         // and the last, with the gate.
-        let at = self.page(k, pool, stubs + 8 * slot as u32)?;
-        let gate = self.page(k, pool, stubs + GATE_OFFSET)?;
+        let at = self.page(k, pool, stubs + 8 * slot as Va)?;
+        let gate = self.page(k, pool, stubs + Va::from(GATE_OFFSET))?;
         unsafe {
             (at as *mut u32).write_volatile(0xe51f_f004);
             ((at + 4) as *mut u32).write_volatile(target);
@@ -389,12 +392,12 @@ impl Space {
             }
         }
         self.sync_code(stubs, whole.end);
-        Some(stubs + 8 * slot as u32)
+        Some(stubs + 8 * slot as Va)
     }
 
     /// Where the signal gate is in the app.
-    pub fn gate(&self) -> u32 {
-        self.layout.stubs + GATE_OFFSET
+    pub fn gate(&self) -> Va {
+        self.layout.stubs + Va::from(GATE_OFFSET)
     }
 
     /// fork(2): give `child` (a new, empty space) a copy of this one: its
@@ -415,7 +418,7 @@ impl Space {
         child.brk = self.brk;
         child.vmas = self.vmas.clone();
         for (&p, _) in self.pages.iter().filter(|(_, page)| !page.owned) {
-            vma::carve(&mut child.vmas, p << PAGE_BITS, (p << PAGE_BITS).saturating_add(PAGE as u32));
+            vma::carve(&mut child.vmas, p << PAGE_BITS, (p << PAGE_BITS).saturating_add(PAGE as Va));
         }
         for (&p, page) in self.pages.iter().filter(|(_, page)| page.owned) {
             // Checked before the copy: the parent's bytes never land in a page another space holds.
@@ -434,7 +437,7 @@ impl Space {
 
     /// The runtime's view of an app address inside a region, for the
     /// runtime's own writes (the loader's bss). Not for app-given addresses.
-    pub fn resolve(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32) -> Option<usize> {
+    pub fn resolve(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va) -> Option<usize> {
         self.find(va)?;
         self.page(k, pool, va)
     }
@@ -443,7 +446,7 @@ impl Space {
     /// the page is now mapped to serve it. False stops the app: an access the
     /// region does not allow (a write to read-only memory, running data), no
     /// region, or no memory left.
-    pub fn fault(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, access: Access) -> bool {
+    pub fn fault(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va, access: Access) -> bool {
         let Some(end) = self.find(va).filter(|v| access.allowed(v.prot)).map(|v| v.end) else { return false };
         let p = page_of(va);
         if !self.pages.contains_key(&p) {
@@ -467,7 +470,7 @@ impl Space {
         }
         let hw = want(&self.vmas, p);
         let Some(page) = self.pages.get_mut(&p) else { return false };
-        let at = p << 2 | access as u32;
+        let at = p << 2 | access as u64;
         if page.hw != hw {
             self.spin = (at, 0);
         } else if self.spin.0 != at {
@@ -483,7 +486,7 @@ impl Space {
         access.served(page.hw)
     }
 
-    fn copy(&mut self, k: &mut Kernel, pool: &mut Pool, mut va: u32, buf: *mut u8, len: usize, to_app: bool) -> bool {
+    fn copy(&mut self, k: &mut Kernel, pool: &mut Pool, mut va: Va, buf: *mut u8, len: usize, to_app: bool) -> bool {
         let mut done = 0;
         while done < len {
             let Some(at) = self.page(k, pool, va) else { return false };
@@ -496,47 +499,47 @@ impl Space {
                 }
             }
             done += n;
-            va = va.wrapping_add(n as u32);
+            va = va.wrapping_add(n as Va);
         }
         true
     }
     /// Copy from app memory for a system call. All of it must be readable by
     /// the app (in regions with some access), or nothing is copied.
-    pub fn read(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, out: &mut [u8]) -> bool {
+    pub fn read(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va, out: &mut [u8]) -> bool {
         vma::permits(&self.vmas, va, out.len(), 7) && self.copy(k, pool, va, out.as_mut_ptr(), out.len(), false)
     }
     /// Copy to app memory for a system call. All of it must be writable by
     /// the app, or nothing is written: a system call cannot change memory the
     /// app itself may not (its code, read-only data, memory outside regions).
-    pub fn write(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, data: &[u8]) -> bool {
+    pub fn write(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va, data: &[u8]) -> bool {
         vma::permits(&self.vmas, va, data.len(), PROT_WRITE)
             && self.copy(k, pool, va, data.as_ptr() as *mut u8, data.len(), true)
     }
     /// Whether a system call may write `len` bytes at `va` (as `write` checks).
-    pub fn writable(&self, va: u32, len: usize) -> bool {
+    pub fn writable(&self, va: Va, len: usize) -> bool {
         vma::permits(&self.vmas, va, len, PROT_WRITE)
     }
     /// The loader placing a program: written with the runtime's authority,
     /// whatever the regions' protection, code included.
-    fn place(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, data: &[u8]) -> bool {
+    fn place(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va, data: &[u8]) -> bool {
         vma::permits(&self.vmas, va, data.len(), vma::ANY)
             && self.copy(k, pool, va, data.as_ptr() as *mut u8, data.len(), true)
     }
     /// File contents for mmap: written into the mapping even if it is
     /// read-only or has no access, but never into a 64 KiB page that holds
     /// code (the hardware would run them) and only inside regions.
-    pub fn poke(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, data: &[u8]) -> bool {
-        let Some(end) = u32::try_from(data.len()).ok().and_then(|n| va.checked_add(n)) else { return false };
+    pub fn poke(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va, data: &[u8]) -> bool {
+        let Some(end) = Va::try_from(data.len()).ok().and_then(|n| va.checked_add(n)) else { return false };
         !vma::near_code(&self.vmas, va, end) && self.place(k, pool, va, data)
     }
-    pub fn read_u32(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32) -> Option<u32> {
+    pub fn read_u32(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va) -> Option<u32> {
         let mut b = [0u8; 4];
         self.read(k, pool, va, &mut b).then(|| u32::from_le_bytes(b))
     }
-    pub fn write_u32(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, v: u32) -> bool {
+    pub fn write_u32(&mut self, k: &mut Kernel, pool: &mut Pool, va: Va, v: u32) -> bool {
         self.write(k, pool, va, &v.to_le_bytes())
     }
-    pub fn read_string(&mut self, k: &mut Kernel, pool: &mut Pool, mut va: u32, limit: usize) -> Option<String> {
+    pub fn read_string(&mut self, k: &mut Kernel, pool: &mut Pool, mut va: Va, limit: usize) -> Option<String> {
         let mut bytes = Vec::new();
         loop {
             let mut b = [0u8];
@@ -553,18 +556,18 @@ impl Space {
 
     /// Mark [start, end) valid with `prot`, replacing whatever was there;
     /// pages already there take the new rights. No policy check: `refuses`.
-    pub fn add(&mut self, start: u32, end: u32, prot: u32) {
+    pub fn add(&mut self, start: Va, end: Va, prot: u32) {
         vma::insert(&mut self.vmas, start, end, prot);
         self.sync(start, end);
     }
     /// The W^X policy: whether an app may not map [start, end) with `prot`
     /// (also anything over the trampoline page).
-    pub fn refuses(&self, start: u32, end: u32, prot: u32) -> bool {
+    pub fn refuses(&self, start: Va, end: Va, prot: u32) -> bool {
         self.pinned(start, end) || vma::refuses(&self.vmas, start, end, prot, true)
     }
     /// Remove a range and free pages no region covers any more. The
     /// trampoline page stays, whatever the range (callers refuse first).
-    pub fn remove(&mut self, k: &mut Kernel, pool: &mut Pool, start: u32, end: u32) {
+    pub fn remove(&mut self, k: &mut Kernel, pool: &mut Pool, start: Va, end: Va) {
         if start >= end {
             return;
         }
@@ -574,17 +577,17 @@ impl Space {
             return self.remove(k, pool, stubs.saturating_add(WINDOW), end);
         }
         vma::carve(&mut self.vmas, start, end);
-        let inside: Vec<u32> = self.pages.range(page_of(start)..=page_of(end - 1)).map(|(&p, _)| p).collect();
+        let inside: Vec<u64> = self.pages.range(page_of(start)..=page_of(end - 1)).map(|(&p, _)| p).collect();
         for p in inside {
             let at = p << PAGE_BITS;
-            if vma::union(&self.vmas, at, at.saturating_add(PAGE as u32)) == 0 {
+            if vma::union(&self.vmas, at, at.saturating_add(PAGE as Va)) == 0 {
                 self.unmap_page(k, pool, p);
             }
         }
         self.sync(start, end);
     }
     /// mprotect: only addresses that are already valid change protection.
-    pub fn protect(&mut self, start: u32, end: u32, prot: u32) -> Result<(), i32> {
+    pub fn protect(&mut self, start: Va, end: Va, prot: u32) -> Result<(), i32> {
         let mut pieces = Vec::new();
         for v in self.vmas.iter() {
             if v.end > start && v.start < end {
@@ -605,16 +608,16 @@ impl Space {
     }
     /// A free range of `len` bytes for mmap, highest first, below the
     /// layout's mmap top.
-    pub fn free_range(&self, len: u32) -> Option<u32> {
+    pub fn free_range(&self, len: Va) -> Option<Va> {
         // Mappings start on a 64 KiB WINDOW (the W^X policy's unit, vma.rs).
-        elf::free_in(&self.vmas, self.layout.mmap_top, len)
+        elf::free_in(&self.vmas, self.layout.mmap_base, self.layout.mmap_top, len)
     }
-    pub fn overlaps(&self, start: u32, end: u32) -> bool {
+    pub fn overlaps(&self, start: Va, end: Va) -> bool {
         vma::union(&self.vmas, start, end) != 0
     }
     /// Move the break, as brk(2) does. Returns the new break.
-    pub fn set_brk(&mut self, k: &mut Kernel, pool: &mut Pool, want: u32) -> u32 {
-        if want < self.brk_start || want > MMAP_BASE {
+    pub fn set_brk(&mut self, k: &mut Kernel, pool: &mut Pool, want: Va) -> Va {
+        if want < self.brk_start || want > self.layout.mmap_base {
             return self.brk;
         }
         let old_end = align_up(self.brk, 4096);
@@ -648,7 +651,7 @@ impl Space {
 
     /// Release every page. Kernel objects go when the caller revokes `untyped`.
     pub fn destroy(&mut self, k: &mut Kernel, pool: &mut Pool) {
-        let pages: Vec<u32> = self.pages.keys().copied().collect();
+        let pages: Vec<u64> = self.pages.keys().copied().collect();
         for p in pages {
             self.unmap_page(k, pool, p);
         }
@@ -657,7 +660,7 @@ impl Space {
 
     /// Instructions were written through the runtime's mapping: make them
     /// visible to the app's fetches from the pages it has mapped.
-    pub fn sync_code(&self, start: u32, end: u32) {
+    pub fn sync_code(&self, start: Va, end: Va) {
         if start >= end {
             return;
         }
@@ -693,7 +696,7 @@ const AT_EXECFN: u32 = 31;
 const HWCAP: u32 = if vma::WIDE { 1 | 2 } else { 2 | 4 | 16 | 64 | 128 | 4096 | 8192 | 32768 | 65536 | 131072 | 262144 | 524288 };
 /// AT_PLATFORM, and the bytes of one word of the initial stack.
 const PLATFORM: &[u8] = if vma::WIDE { b"aarch64\0" } else { b"v7l\0" };
-const WORD: u32 = if vma::WIDE { 8 } else { 4 };
+const WORD: Va = if vma::WIDE { 8 } else { 4 };
 
 /// The dynamic loader a program needs, if it is dynamically linked: only
 /// elf::LOADER is ever named (a program naming another is refused by `load`).
@@ -705,14 +708,17 @@ pub fn interp(image: &[u8]) -> Option<&'static str> {
 /// segment gets the protection its header asks for (text read-execute,
 /// constants read-only, data read-write); code sharing a 64 KiB page with
 /// anything else is refused. Returns the end of the highest segment.
-fn segments(space: &mut Space, k: &mut Kernel, pool: &mut Pool, image: &[u8], plan: &elf::Plan, base: u32, limit: u32, code: &mut Vec<(u32, u32)>) -> Result<u32, &'static str> {
-    let mut end = 0u32;
+fn segments(space: &mut Space, k: &mut Kernel, pool: &mut Pool, image: &[u8], plan: &elf::Plan, base: Va, limit: Va, code: &mut Vec<(Va, Va)>) -> Result<Va, &'static str> {
+    let mut end: Va = 0;
     for s in &plan.segs {
         // The regions by the W^X rules (elf.rs, shared with execve's dry run `elf::check`).
         let (va, seg_end, start, stop) = elf::region(&mut space.vmas, s, base, limit)?;
         space.sync(start, stop);
         // elf::plan checked that the file holds [offset, offset + filesz).
-        let data = image.get(s.offset as usize..(s.offset + s.filesz) as usize).ok_or("bad segment")?;
+        // (On a 32-bit runtime the file is in memory, so its offsets fit usize.)
+        let from = usize::try_from(s.offset).map_err(|_| "bad segment")?;
+        let to = usize::try_from(s.offset + s.filesz).map_err(|_| "bad segment")?;
+        let data = image.get(from..to).ok_or("bad segment")?;
         if !space.place(k, pool, va, data) {
             return Err("out of memory loading the program");
         }
@@ -748,8 +754,8 @@ pub fn load(
     let plan = elf::plan(image)?;
     let base = if plan.pie { layout.pie_base } else { 0 };
     space.layout = layout;
-    let mut code: Vec<(u32, u32)> = Vec::new();
-    let end = segments(space, k, pool, image, &plan, base, MMAP_BASE, &mut code)?;
+    let mut code: Vec<(Va, Va)> = Vec::new();
+    let end = segments(space, k, pool, image, &plan, base, layout.mmap_base, &mut code)?;
     let main_entry = base.wrapping_add(plan.entry);
     let (mut entry, mut ld_base) = (main_entry, 0);
     if plan.interp {
@@ -775,14 +781,14 @@ pub fn load(
     let (phentsize, phnum) = (plan.phentsize, plan.phnum);
     // The heap starts a random distance past the program.
     let heap = align_up(end, 4096);
-    space.brk_start = heap.checked_add(layout.brk_gap).filter(|&b| b <= MMAP_BASE).unwrap_or(heap);
+    space.brk_start = heap.checked_add(layout.brk_gap).filter(|&b| b <= layout.mmap_base).unwrap_or(heap);
     space.brk = space.brk_start;
 
     // The stack: strings at the top, then the vectors the C runtime reads.
     space.add(layout.stack_top - STACK_SIZE, layout.stack_top, PROT_READ | PROT_WRITE);
     let mut sp = layout.stack_top - 16 - layout.stack_pad;
-    let mut push_bytes = |space: &mut Space, bytes: &[u8]| -> Result<u32, &'static str> {
-        sp -= bytes.len() as u32;
+    let mut push_bytes = |space: &mut Space, bytes: &[u8]| -> Result<Va, &'static str> {
+        sp -= bytes.len() as Va;
         if !space.write(k, pool, sp, bytes) {
             return Err("out of memory building the stack");
         }
@@ -803,10 +809,10 @@ pub fn load(
         env_ptrs.push(push_bytes(space, &s)?);
     }
     let execfn = arg_ptrs.first().copied().unwrap_or(0);
-    let aux = [
+    let aux: [(u32, Va); 19] = [
         (AT_PHDR, phdr_va),
-        (AT_PHENT, phentsize),
-        (AT_PHNUM, phnum),
+        (AT_PHENT, phentsize.into()),
+        (AT_PHNUM, phnum.into()),
         (AT_PAGESZ, 4096),
         (AT_BASE, ld_base),
         (AT_FLAGS, 0),
@@ -816,7 +822,7 @@ pub fn load(
         (AT_GID, 0),
         (AT_EGID, 0),
         (AT_PLATFORM, platform),
-        (AT_HWCAP, HWCAP),
+        (AT_HWCAP, HWCAP.into()),
         (AT_HWCAP2, 0),
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
@@ -824,21 +830,22 @@ pub fn load(
         (AT_EXECFN, execfn),
         (AT_NULL, 0),
     ];
-    let mut words: Vec<u32> = Vec::new();
-    words.push(argv.len() as u32);
+    let mut words: Vec<Va> = Vec::new();
+    words.push(argv.len() as Va);
     words.extend(&arg_ptrs);
     words.push(0);
     words.extend(&env_ptrs);
     words.push(0);
     for (key, value) in aux {
-        words.push(key);
+        words.push(key.into());
         words.push(value);
     }
-    // Words of the app's ABI: AArch64's are 8 bytes (addresses below 4 GiB, zero above).
-    sp = (sp - words.len() as u32 * WORD) & !15;
+    // Words of the app's ABI: AArch64's are 8 bytes, AArch32's 4 (its
+    // addresses are below 4 GiB, so the low word is the whole value).
+    sp = (sp - words.len() as Va * WORD) & !15;
     let mut bytes = Vec::with_capacity(words.len() * WORD as usize);
     for w in &words {
-        bytes.extend_from_slice(&u64::from(*w).to_le_bytes()[..WORD as usize]);
+        bytes.extend_from_slice(&w.to_le_bytes()[..WORD as usize]);
     }
     if !space.write(k, pool, sp, &bytes) {
         return Err("out of memory building the stack");

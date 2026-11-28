@@ -97,7 +97,7 @@ mod sys {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Mapping {
         pub pd: u32,
-        pub va: u32,
+        pub va: u64,
         pub writable: bool,
         pub exec: bool,
     }
@@ -112,9 +112,9 @@ mod sys {
         caps: BTreeMap<u32, Cap>,
         /// Bytes carved from each pool untyped.
         carved: Vec<usize>,
-        tables: BTreeSet<(u32, u32)>,
+        tables: BTreeSet<(u32, u64)>,
         /// (pd, va) -> the slot of the capability mapped there.
-        mapped: BTreeMap<(u32, u32), u32>,
+        mapped: BTreeMap<(u32, u64), u32>,
         memory: Vec<u8>,
         /// Kernel invocations made, by kind.
         pub retypes: u64,
@@ -199,13 +199,13 @@ mod sys {
             Ok(())
         })
     }
-    pub fn pt_map(_pt: u32, pd: u32, va: u32) -> Result<(), i32> {
+    pub fn pt_map(_pt: u32, pd: u32, va: u64) -> Result<(), i32> {
         with(|m| if m.tables.insert((pd, va >> 20)) { Ok(()) } else { Err(8) })
     }
     pub fn asid_assign(_pd: u32) -> Result<(), i32> {
         Ok(())
     }
-    pub fn page_map(frame: u32, pd: u32, va: u32, writable: bool, exec: bool) -> Result<(), i32> {
+    pub fn page_map(frame: u32, pd: u32, va: u64, writable: bool, exec: bool) -> Result<(), i32> {
         assert!(!(writable && exec), "a page mapped writable and executable at {va:#x}");
         with(|m| {
             let Some(Cap::Frame { phys, bytes, at }) = m.caps.get(&frame).copied() else { return Err(3) };
@@ -259,10 +259,10 @@ mod sys {
 
     /// The MMU: where an access by code running in `pd` lands, if the
     /// mapping there allows it. None is a fault.
-    pub fn touch(pd: u32, va: u32, access: super::vma::Access) -> Option<*mut u8> {
+    pub fn touch(pd: u32, va: u64, access: super::vma::Access) -> Option<*mut u8> {
         use super::vma::Access::*;
         with(|m| {
-            let page = va & !(PAGE as u32 - 1);
+            let page = va & !(PAGE as u64 - 1);
             let slot = *m.mapped.get(&(pd, page))?;
             let Some(Cap::Frame { phys, at: Some(at), .. }) = m.caps.get(&slot).copied() else { return None };
             let ok = match access {
@@ -308,7 +308,7 @@ use vma::{Access, Layout};
 const R: u32 = PROT_READ;
 const RW: u32 = PROT_READ | PROT_WRITE;
 const RX: u32 = PROT_READ | PROT_EXEC;
-const PAGE: u32 = sys::PAGE as u32;
+const PAGE: u64 = sys::PAGE as u64;
 const KIB: usize = sys::PAGE_KIB;
 /// The runtime's heap in these tests: 1 MiB of the pool.
 const HEAP_PAGES: usize = (1 << 20) / sys::PAGE;
@@ -341,7 +341,7 @@ impl World {
     /// What the app's code does on an access: the MMU, a fault to the
     /// runtime if the mapping does not allow it, and the access again.
     /// None: the runtime refused the fault (the app would be stopped).
-    fn access(&mut self, app: &mut App, va: u32, access: Access) -> Option<*mut u8> {
+    fn access(&mut self, app: &mut App, va: u64, access: Access) -> Option<*mut u8> {
         for _ in 0..3 {
             if let Some(p) = sys::touch(app.space.pd, va, access) {
                 return Some(p);
@@ -353,21 +353,21 @@ impl World {
         }
         panic!("the fault at {va:#x} was resolved but the access still faults");
     }
-    fn store(&mut self, app: &mut App, va: u32, byte: u8) -> bool {
+    fn store(&mut self, app: &mut App, va: u64, byte: u8) -> bool {
         self.access(app, va, Access::Write).map(|p| unsafe { p.write(byte) }).is_some()
     }
-    fn fetch(&mut self, app: &mut App, va: u32) -> Option<u8> {
+    fn fetch(&mut self, app: &mut App, va: u64) -> Option<u8> {
         self.access(app, va, Access::Read).map(|p| unsafe { p.read() })
     }
     /// mmap(len, prot) as syscall.rs does it: a free range, the policy, the region.
-    fn mmap(&mut self, app: &mut App, len: u32, prot: u32) -> u32 {
+    fn mmap(&mut self, app: &mut App, len: u64, prot: u32) -> u64 {
         let len = (len + 4095) & !4095;
         let at = app.space.free_range(len).unwrap();
         assert!(!app.space.refuses(at, at + len, prot));
         app.space.add(at, at + len, prot);
         at
     }
-    fn munmap(&mut self, app: &mut App, start: u32, len: u32) {
+    fn munmap(&mut self, app: &mut App, start: u64, len: u64) {
         app.space.remove(&mut self.k, &mut self.pool, start, start + len);
     }
     fn end(&mut self, mut app: App) {
@@ -442,7 +442,7 @@ fn started(w: &mut World, untyped: u32, image: &[u8]) -> (App, procmgr::Loaded) 
     let loaded = load(&mut app.space, &mut w.k, &mut w.pool, image, None, &args, &[], [7; 16], layout).unwrap();
     // As mod.rs `launch` does: the trampoline region, then the first thread's trampoline.
     app.space.add(layout.stubs, layout.stubs + WINDOW, RX);
-    app.space.stub(&mut w.k, &mut w.pool, 0, loaded.entry).unwrap();
+    app.space.stub(&mut w.k, &mut w.pool, 0, loaded.entry as u32).unwrap();
     (app, loaded)
 }
 
@@ -712,22 +712,22 @@ fn trampolines_and_the_gate_live_on_their_own_pages_of_a_pinned_region() {
     let mut w = world();
     let (mut a, loaded) = started(&mut w, 900, &program());
     let stubs = Layout::fixed().stubs;
-    let word = |w: &mut World, a: &mut App, va: u32| -> u32 {
+    let word = |w: &mut World, a: &mut App, va: u64| -> u32 {
         let mut b = [0u8; 4];
         assert!(a.space.read(&mut w.k, &mut w.pool, va, &mut b));
         u32::from_le_bytes(b)
     };
     assert_eq!(word(&mut w, &mut a, stubs), 0xe51f_f004);
-    assert_eq!(word(&mut w, &mut a, stubs + 4), loaded.entry);
+    assert_eq!(word(&mut w, &mut a, stubs + 4), loaded.entry as u32);
     // Thread 600's trampoline is 4800 bytes in: on the second 4 KiB page.
     let far = a.space.stub(&mut w.k, &mut w.pool, 600, 0x1234_5678).unwrap();
     assert_eq!(far, stubs + 4800);
     assert_eq!(word(&mut w, &mut a, far + 4), 0x1234_5678);
     // The signal gate, at the end of the region.
     let gate = a.space.gate();
-    assert_eq!(gate, stubs + signal::GATE_OFFSET);
+    assert_eq!(gate, stubs + u64::from(signal::GATE_OFFSET));
     assert_eq!(word(&mut w, &mut a, gate), signal::GATE[0]);
-    assert_eq!(word(&mut w, &mut a, stubs + signal::FORK_HELPER), signal::GATE[18]);
+    assert_eq!(word(&mut w, &mut a, stubs + u64::from(signal::FORK_HELPER)), signal::GATE[18]);
     // The app runs them and cannot write them.
     for va in [stubs, far, gate] {
         assert!(sys::touch(a.space.pd, va, Access::Exec).is_some(), "{va:#x} must be executable");
@@ -874,7 +874,7 @@ fn a_screen_page_is_mapped_once_per_app_so_remapping_cannot_use_slots_up() {
     let screen: Vec<u32> = (0..16).map(|_| w.pool.take().unwrap()).collect();
     let first = w.mmap(&mut a, 16 * PAGE, RW);
     for (n, &p) in screen.iter().enumerate() {
-        a.space.map(&mut w.k, &w.pool, first + n as u32 * PAGE, p, false).unwrap();
+        a.space.map(&mut w.k, &w.pool, first + n as u64 * PAGE, p, false).unwrap();
     }
     assert_eq!(a.space.usage().0, 0, "the screen's pages are not the app's");
     // The attack: map the screen again and again. Every attempt is refused
@@ -883,7 +883,7 @@ fn a_screen_page_is_mapped_once_per_app_so_remapping_cannot_use_slots_up() {
     let again = w.mmap(&mut a, 16 * PAGE, RW);
     for _ in 0..1000 {
         for (n, &p) in screen.iter().enumerate() {
-            assert_eq!(a.space.map(&mut w.k, &w.pool, again + n as u32 * PAGE, p, false), Err(syscall::ENOMEM));
+            assert_eq!(a.space.map(&mut w.k, &w.pool, again + n as u64 * PAGE, p, false), Err(syscall::ENOMEM));
         }
     }
     assert_eq!(sys::caps(), caps, "no capability slot spent on a refused mapping");
@@ -926,7 +926,7 @@ fn a_family_of_forked_processes_shares_one_cap() {
     let mut a = w.app(900);
     a.space.cap = 16;
     let at = w.mmap(&mut a, 0x200000, RW);
-    let touch = |w: &mut World, x: &mut App, n: u32| w.store(x, at + n * WINDOW, 1);
+    let touch = |w: &mut World, x: &mut App, n: u64| w.store(x, at + n * WINDOW as u64, 1);
     for n in 0..6 {
         assert!(touch(&mut w, &mut a, n));
     }
@@ -1017,13 +1017,13 @@ fn fork_copies_every_page_and_shares_none() {
 
 struct Rng(u64);
 impl Rng {
-    fn next(&mut self) -> u32 {
+    fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
-        (self.0 >> 16) as u32
+        (self.0 >> 16) as u32 as u64
     }
-    fn below(&mut self, n: u32) -> u32 {
+    fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 }
@@ -1037,9 +1037,9 @@ fn random_maps_protects_unmaps_and_touches_keep_every_invariant() {
         let mut b = w.app(901);
         a.space.cap = 400;
         // A model of what the app stored: address -> byte.
-        let mut model: std::collections::BTreeMap<u32, u8> = Default::default();
-        let base = 0x6000_0000u32;
-        let span = 96u32; // 4 KiB slots the test plays in
+        let mut model: std::collections::BTreeMap<u64, u8> = Default::default();
+        let base = 0x6000_0000u64;
+        let span = 96u64; // 4 KiB slots the test plays in
         for step in 0..1500 {
             let s = rng.below(span);
             let n = 1 + rng.below(12).min(span - s - 1).min(11);

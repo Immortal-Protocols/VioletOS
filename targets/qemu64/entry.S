@@ -5,6 +5,9 @@
 // (image.py builds them): an identity map of the first 4 GiB for this stub,
 // and the kernel's window. The kernel replaces both with its own tables.
 //
+// In the system image (stack.py) the stub then runs the verified-boot check
+// (verify.c, VERIFY_ENTRY) and stops if it refuses.
+//
 // On entry to the kernel: x0, x1 the bootstrap task image's physical range,
 // x2 its physical minus virtual offset, x3 its entry point, x4 and x5 the
 // device tree (none is passed).
@@ -45,6 +48,21 @@ _start:
     orr     x9, x9, #(1 << 12)      // instruction cache
     msr     sctlr_el1, x9
     isb
+#ifdef VERIFY_ENTRY
+    // Verified boot (verify.c, the system image only): the kernel and the
+    // root task, where stage.S put them, against the signed boot manifest.
+    // Refused, nothing starts. The check's Rust may use FP/SIMD registers.
+    mov     x9, #(3 << 20)          // CPACR_EL1.FPEN: no FP/SIMD trap at EL1
+    msr     cpacr_el1, x9
+    isb
+    ldr     x9, =VERIFY_STACK
+    mov     sp, x9
+    ldr     x9, =VERIFY_ENTRY
+    blr     x9
+    msr     cpacr_el1, xzr          // as it was: the kernel sets its own
+    isb
+    cbz     x0, stop
+#endif
     ldr     x0, =ROOT_PA_START
     ldr     x1, =ROOT_PA_END
     ldr     x2, =ROOT_PV_OFFSET
