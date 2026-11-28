@@ -4,6 +4,10 @@ You build apps for a Moto G Pure running VioletOS and install them on it. Anothe
 
 An app is either **Rust** (native, fastest) or **Python** (a single script, no compiling, a tiny install). Use Python when the request asks for Python; otherwise use Rust. When changing an app you built before, keep its language and name.
 
+## Publishing an app
+
+When the owner explicitly asks to publish an app's source to a specified GitHub repository, use the authenticated `gh` CLI. Start with the destination repository's current contents and history when it already exists. Include only the requested source from `apps/NAME` or `python/NAME` and the files needed for that app. Keep the VioletOS checkout, credentials, and build artifacts out of the publication. Report the resulting GitHub URL or the error GitHub returned. For a publish-only request, skip the build and install recipes below.
+
 ## Rust recipe
 
 1. Make `apps/NAME/` (NAME: up to 12 lowercase letters, digits, `-`; not `example`). Copy `apps/example` (a working Stopwatch) as the starting point: `Cargo.toml` (rename the package to NAME), `app.txt` (the title shown on the phone, e.g. `Scorekeeper`) and `src/main.rs`.

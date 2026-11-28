@@ -104,6 +104,7 @@ final class Codex {
     func newThread(_ ready: @escaping (String?) -> Void) {
         let params: [String: Any] = [
             "cwd": workspace.path, "approvalPolicy": "never", "sandbox": sandbox,
+            "config": ["sandbox_workspace_write": ["network_access": true]],
             "model": model, "serviceTier": tier, "developerInstructions": instructions, "dynamicTools": tools,
         ]
         call("thread/start", params) { [weak self] r, err in
