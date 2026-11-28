@@ -1,7 +1,6 @@
 // The signed-in Codex app server (`codex app-server`, JSON-RPC over stdio), one
-// thread per run of the app, in the app workspace. Violet Agent runs two: the
-// talker (the conversation, read-only) and the builder (writes and builds apps
-// in the workspace, sandboxed to it with workspace-write and no approvals).
+// thread per run of the app, in the app workspace. The builder writes and
+// builds apps there with the workspace-write sandbox and no approvals.
 import Foundation
 
 final class Codex {
@@ -42,34 +41,37 @@ final class Codex {
 
     static func binary() -> String? {
         let fm = FileManager.default
-        for p in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", NSHomeDirectory() + "/.local/bin/codex"] where fm.isExecutableFile(atPath: p) {
-            return p
-        }
-        return nil
+        let environment = ProcessInfo.processInfo.environment
+        let installed = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", NSHomeDirectory() + "/.local/bin/codex"]
+        let onPath = (environment["PATH"] ?? "").split(separator: ":").map { "\($0)/codex" }
+        let override = environment["PIXEL_CODEX_BIN"].map { [$0] } ?? []
+        return (override + installed + onPath).first { $0.hasPrefix("/") && fm.isExecutableFile(atPath: $0) }
     }
 
-    func start(_ ready: @escaping (String?) -> Void) {
-        guard let bin = Codex.binary() else { return ready("Codex is not installed (brew install codex)") }
+    func start(login: CodexLogin, account: @escaping (Bool) -> Void, ready: @escaping (String?) -> Void) {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
+        p.executableURL = URL(fileURLWithPath: login.binary)
         p.arguments = ["app-server"]
         p.currentDirectoryURL = workspace
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (env["PATH"] ?? "")
-        p.environment = env
+        p.environment = login.environment
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
         p.standardError = FileHandle.nullDevice
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; return }
             DispatchQueue.main.async { self?.received(d) }
         }
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
-                self?.onLog("Codex (\(self?.label ?? "")) stopped")
-                self?.thread = nil
-                self?.activeTurn = nil
+                guard let self else { return }
+                self.onLog("Codex (\(self.label)) stopped")
+                self.thread = nil
+                self.activeTurn = nil
+                let pending = self.pending
+                self.pending.removeAll()
+                for reply in pending.values { reply(nil, "Codex stopped") }
             }
         }
         do { try p.run() } catch { return ready("Could not start Codex: \(error.localizedDescription)") }
@@ -79,10 +81,14 @@ final class Codex {
             guard let self else { return }
             if let err { return ready(err) }
             self.write(["method": "initialized", "params": [String: Any]()])
-            self.call("account/read", ["refreshToken": true]) { r, _ in
-                guard let account = r?["account"] as? [String: Any], account["type"] as? String == "chatgpt" else {
-                    return ready("Sign in to Codex first: run `codex login` in Terminal")
+            self.call("account/read", ["refreshToken": true]) { r, err in
+                if let err {
+                    account(false)
+                    return ready("Could not check ChatGPT sign-in: \(err)")
                 }
+                let signedIn = (r?["account"] as? [String: Any])?["type"] as? String == "chatgpt"
+                account(signedIn)
+                guard signedIn else { return ready("Builder is waiting for ChatGPT sign-in") }
                 self.call("model/list", [:]) { r, _ in
                     let models = (r?["data"] as? [[String: Any]]) ?? []
                     let chosen = models.first { $0["id"] as? String == self.model } ?? models.first { $0["isDefault"] as? Bool == true }
@@ -216,6 +222,6 @@ final class Codex {
     }
 
     func stop() {
-        process?.terminate()
+        if let process, process.isRunning { process.terminate() }
     }
 }

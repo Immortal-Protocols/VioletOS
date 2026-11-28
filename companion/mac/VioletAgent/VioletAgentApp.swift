@@ -154,6 +154,10 @@ struct ContentView: View {
                     Link("Rose's dashboard: her life, journal, tasks and transcripts", destination: url).font(.callout)
                 }
                 Pill(ok: model.codexState.hasPrefix("Builder ready"), text: model.codexState)
+                if model.codexSignIn == .required || model.codexSignIn == .inTerminal {
+                    Button(model.codexSignIn == .inTerminal ? "Restart sign-in…" : "Sign in with ChatGPT…",
+                           action: model.signInToCodex)
+                }
                 Pill(ok: model.workspaceState.hasPrefix("App workspace ready"), text: model.workspaceState)
                 if let t = model.lastTiming { Pill(ok: true, text: t) }
             }

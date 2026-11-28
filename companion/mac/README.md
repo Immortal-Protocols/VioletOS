@@ -10,7 +10,9 @@ xcodebuild -scheme VioletAgent -configuration Release -derivedDataPath ../../bui
 cp -R "../../build/mac-agent/Build/Products/Release/Violet Agent.app" ~/Applications/   # launch it from Finder
 ```
 
-It needs Codex signed in with ChatGPT (`codex login`, with GPT 6.1 Terra Fast, as Rose requires), Node (`brew install node`, for Rose's Codex bridge), Rose's Python environment and voice models (`companion/mac/violet_rose/setup.sh`, which makes `build/rose-env`; `ROSE_ENV` points elsewhere) and the build tools of this checkout (`make moto` once, which installs the Rust target and the NDK it uses). macOS asks for the camera when you pair.
+Install Codex CLI 0.167.1 or later and Node (`brew install node`). In Violet Agent, click **Sign in with ChatGPT…** and finish `codex login` in the Terminal window that opens. Click **Restart sign-in…** to start over. Violet Agent starts Rose and the builder when sign-in completes. The companion keeps its Codex configuration and sign-in in `~/Library/Application Support/Violet Agent/Codex` and shares them across its phone profiles. Rose requires GPT 6.1 Terra Fast on the signed-in account.
+
+Set up Rose's Python environment and voice models with `companion/mac/violet_rose/setup.sh`. It creates `build/rose-env`. Set `ROSE_ENV` to use a different environment. The app builder uses the build tools of this checkout, which `make moto` uses to build the handset image. macOS asks for camera access if you scan a pairing code with the Mac.
 
 ## Rose
 

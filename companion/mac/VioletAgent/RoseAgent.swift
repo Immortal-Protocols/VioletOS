@@ -34,7 +34,7 @@ final class RoseAgent {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.appendingPathComponent("bin/python").path) }
     }
 
-    func start(repo: URL, profile: URL, name: String, voice: String?, log: URL) -> Bool {
+    func start(repo: URL, profile: URL, name: String, voice: String?, log: URL, login: CodexLogin) -> Bool {
         guard let env = RoseAgent.environment(repo: repo) else {
             onFailed("Rose's Python environment is missing: run companion/mac/violet_rose/setup.sh")
             return false
@@ -44,10 +44,11 @@ final class RoseAgent {
         var args = [repo.appendingPathComponent("companion/mac/violet_rose/host.py").path, "--profile", profile.path, "--name", name]
         if let voice { args += ["--voice", voice] }
         p.arguments = args
-        var environment = ProcessInfo.processInfo.environment
+        var environment = login.environment
+        environment["VIOLET_CODEX_BIN"] = login.binary
+        environment["PIXEL_CODEX_BIN"] = repo.appendingPathComponent("companion/mac/violet_rose/codex.sh").path
         environment["PYTHONUNBUFFERED"] = "1"
         environment["HF_HUB_OFFLINE"] = "1"
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (environment["PATH"] ?? "")
         p.environment = environment
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
