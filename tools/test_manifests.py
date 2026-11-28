@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build_initfs  # noqa: E402
+import agent_build  # noqa: E402
 
 
 def folder(base, name, manifest=None):
@@ -31,6 +32,17 @@ class Manifests(unittest.TestCase):
         text = build_initfs.pack_manifests([a for a in (ROOT / "apps/open").iterdir() if a.is_dir()])
         self.assertIn("@settings\ncaps: net wifi-admin system audio-out\ndata: networks relay\n", text)
         self.assertIn("@home\ncaps: net system\n", text)
+
+    def test_agent_build_rejects_misnamed_capabilities_before_compiling(self):
+        for language, entry, manifest in [("apps", "Cargo.toml", "manifest.yaml"), ("python", "main.py", "manifest.yml")]:
+            with self.subTest(language=language), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                app = work / language / "store"
+                app.mkdir(parents=True)
+                (app / entry).touch()
+                (app / manifest).write_text("caps: net\n")
+                with self.assertRaisesRegex(SystemExit, "manifest.txt"):
+                    agent_build.build(work, "store")
 
     def test_pack_format(self):
         with tempfile.TemporaryDirectory() as t:

@@ -180,9 +180,16 @@ def build(work, name):
     # runtime/open/appstore.rs NEW_NAME: /data/NAME.KEY must fit Storage's 16 characters.
     if not re.fullmatch(r"[a-z0-9_-]{1,12}", name):
         raise SystemExit(f"app name {name!r}: up to 12 of a-z 0-9 _ - (the phone keeps /data/NAME.KEY in 16 characters)")
-    if (work / "python" / name / "main.py").exists():
+    python_app = work / "python" / name
+    is_python = (python_app / "main.py").is_file()
+    app = python_app if is_python else work / "apps" / name
+    if not (app / build_initfs.MANIFEST).exists():
+        for filename in ("manifest.yaml", "manifest.yml"):
+            candidate = app / filename
+            if candidate.is_file() and re.search(r"^\s*caps\s*:", candidate.read_text(), re.MULTILINE):
+                raise SystemExit(f"Put the app capabilities in {app / build_initfs.MANIFEST} before building; {filename} is ignored.")
+    if is_python:
         return build_python(work, name)
-    app = work / "apps" / name
     if not (app / "Cargo.toml").exists():
         raise SystemExit(f"no app at {app} (make python/{name}/main.py, or apps/{name}/Cargo.toml and src/main.rs)")
     cargo, env = environment(work)
