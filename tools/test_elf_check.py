@@ -57,6 +57,42 @@ def static_pie(relocations, textrel=False, relr=None, relro=(0x30000, 0x1000), s
 SHIPPED = [(0x10000, 0xd8c, 4), (0x20d90, 0x8f60, 5), (0x39cf0, 0x310, 6), (0x49d30, 0x80c, 6)]
 
 
+def static_pie64(relocations, relr=None, relro=(0x20000, 0x1000), sealed=True, interp=None, wx=False, code_at=0x10000, data_at=0x20000):
+    """An AArch64 static PIE as ld.lld lays one out with its default 64 KiB
+    max-page-size: constants at 0 (RELA table at 0x400, RELR at 0x600), code
+    at `code_at`, data at `data_at` holding the dynamic section, its first
+    page RELRO. Each in its own 64 KiB window, as the loader requires."""
+    table = b"".join(struct.pack("<QQq", address, kind, 0) for address, kind in relocations)
+    packed = b"".join(struct.pack("<Q", w) for w in relr or [])
+    tags = [(7, 0x400), (8, len(table)), (9, 24)]
+    if relr:
+        tags += [(36, 0x600), (35, len(packed)), (37, 8)]
+    dynamic = b"".join(struct.pack("<QQ", *t) for t in tags + [(0, 0)])
+    # (type, flags, offset, vaddr, paddr, filesz, memsz, align)
+    headers = [(1, 4, 0, 0, 0, 0x1000, 0x1000, 0x1000), (1, 5 | (2 if wx else 0), 0x1000, code_at, code_at, 0x1000, 0x1000, 0x1000),
+               (1, 6, 0x2000, data_at, data_at, 0x1000, 0x2000, 0x1000),
+               (2, 6, 0x2000, data_at, data_at, len(dynamic), len(dynamic), 8)]
+    path = b""
+    if interp is not None:
+        path = interp.encode() + b"\0"
+        headers.append((3, 4, 0x900, 0x900, 0x900, len(path), len(path), 1))
+    if relro:
+        headers.append((elf_check.PT_GNU_RELRO, 4, 0x2000, relro[0], relro[0], relro[1], relro[1], 1))
+    headers.insert(0, (elf_check.PT_PHDR, 4, 64, 64, 64, 56 * (len(headers) + 1), 56 * (len(headers) + 1), 8))
+    ident = b"\x7fELF\x02\x01\x01" + bytes(9)
+    head = ident + struct.pack("<HHIQQQIHHHHHH", 3, 183, 1, code_at, 64, 0, 0, 64, 56, len(headers), 64, 0, 0)
+    image = bytearray(0x3000)
+    blob = head + b"".join(struct.pack("<IIQQQQQQ", *h) for h in headers)
+    image[:len(blob)] = blob
+    image[0x400:0x400 + len(table)] = table
+    image[0x600:0x600 + len(packed)] = packed
+    image[0x900:0x900 + len(path)] = path
+    image[0x2000:0x2000 + len(dynamic)] = dynamic
+    if sealed:
+        image[0xc00:0xc00 + len(elf_check.SEAL_MARK)] = elf_check.SEAL_MARK
+    return bytes(image)
+
+
 class ElfCheck(unittest.TestCase):
     def test_layout_like_the_shipped_apps_loads(self):
         info = elf_check.inspect(elf(2, SHIPPED))
@@ -228,6 +264,51 @@ class ElfCheck(unittest.TestCase):
             subprocess.run([*base, *unsealed], check=True, capture_output=True)
             self.assertIn("it does not seal its RELRO read-only after relocating (link tools/relro_seal.rs; needs PT_PHDR)",
                           elf_check.problems(elf_check.inspect(out.read_bytes())))
+
+    def test_aarch64_programs_are_checked_by_their_own_rules(self):
+        R_AARCH64_RELATIVE, R_AARCH64_ABS64 = 1027, 257
+        good = static_pie64([(0x20000, R_AARCH64_RELATIVE), (0x20008, R_AARCH64_RELATIVE)], relr=[0x20010, 0b111])
+        info = elf_check.inspect(good)
+        self.assertEqual(info["arch"], "aarch64")
+        self.assertTrue(info["pie"])
+        # RELR: 0x20010, then the bitmap's two set bits after the marker: 0x20018 and 0x20020 (8-byte words).
+        self.assertEqual(sorted(a for a, _ in info["relocations"]), [0x20000, 0x20008, 0x20010, 0x20018, 0x20020])
+        self.assertEqual(elf_check.problems(info), [])
+        self.assertEqual(elf_check.check({"apps/a": good}, arch="aarch64"), [])
+        # The AArch32 gate does not read it (an AArch32 image never carried one), nor the AArch64 gate an AArch32 one.
+        self.assertIsNone(elf_check.inspect(good, "aarch32"))
+        self.assertIsNone(elf_check.inspect(elf(3, SHIPPED), "aarch64"))
+        # The same refusals as on AArch32, by AArch64's numbers.
+        why = elf_check.problems(elf_check.inspect(static_pie64([(0x20000, R_AARCH64_ABS64)])))
+        self.assertIn("relocations its start code cannot apply (types 257; only relative ones)", why)
+        why = elf_check.problems(elf_check.inspect(static_pie64([(0x10000, R_AARCH64_RELATIVE)])))
+        self.assertIn("1 relocation(s) patch memory that is not writable (it would fault as it starts)", why)
+        # An 8-byte patch that straddles the end of the writable segment is refused too.
+        why = elf_check.problems(elf_check.inspect(static_pie64([(0x21ffc, R_AARCH64_RELATIVE)])))
+        self.assertIn("1 relocation(s) patch memory that is not writable (it would fault as it starts)", why)
+        self.assertIn("a segment is writable and executable", elf_check.problems(elf_check.inspect(static_pie64([], wx=True))))
+        self.assertIn("it does not seal its RELRO read-only after relocating (link tools/relro_seal.rs; needs PT_PHDR)",
+                      elf_check.problems(elf_check.inspect(static_pie64([], sealed=False))))
+        self.assertIn("PT_GNU_RELRO does not end on a 4 KiB page: its last page would stay writable",
+                      elf_check.problems(elf_check.inspect(static_pie64([], relro=(0x20000, 0x800)))))
+        # Code sharing a 64 KiB window with data: the Open Runtime's W^X unit
+        # (vma.rs WINDOW, procmgr.rs load's vma::mixed) on AArch64 too, though
+        # its hardware pages are 4 KiB. Code and data on different 4 KiB pages
+        # of one window (ld.lld -z max-page-size=4096) are refused, as the
+        # loader refuses them.
+        why = "code shares a 64 KiB page with data"
+        self.assertIn(why, elf_check.problems(elf_check.inspect(static_pie64([], code_at=0x800))))
+        self.assertIn(why, elf_check.problems(elf_check.inspect(static_pie64([], code_at=0x1000, data_at=0x3000, relro=(0x3000, 0x1000)))))
+        self.assertIn(why, elf_check.problems(elf_check.inspect(static_pie64([], code_at=0x10000, data_at=0x13000, relro=(0x13000, 0x1000)))))
+        self.assertNotIn(why, elf_check.problems(elf_check.inspect(static_pie64([], code_at=0x10000, data_at=0x20000))))
+        # Only musl's AArch64 loader; the armhf one is refused.
+        dynamic = static_pie64([], interp="/lib/ld-musl-aarch64.so.1")
+        self.assertEqual(elf_check.problems(elf_check.inspect(dynamic)), [])
+        armhf = static_pie64([], interp=elf_check.LOADER)
+        self.assertIn("only /lib/ld-musl-aarch64.so.1 is supported", "; ".join(elf_check.problems(elf_check.inspect(armhf))))
+        with self.assertRaises(SystemExit) as stop:
+            elf_check.check({"apps/d": dynamic}, arch="aarch64")
+        self.assertIn("the image has no /lib/ld-musl-aarch64.so.1", str(stop.exception))
 
     def test_the_image_gate_reads_every_elf_file(self):
         import build_initfs

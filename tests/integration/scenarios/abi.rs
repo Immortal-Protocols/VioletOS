@@ -163,3 +163,42 @@ fn a_hidden_interpreter_answers_like_a_missing_one() {
         assert_eq!(w.rt.path_allowed(i, interpreter, false), Err(ENOENT), "{interp}");
     }
 }
+
+#[test]
+fn an_aarch64_program_meets_the_same_policy_through_its_own_numbers() {
+    // The 64-bit runtime translates AArch64 numbers to the one numbering its
+    // dispatch, policy and Shield hooks know (runtime/arch `internal_call`):
+    // the same app gets the same answers by either ABI.
+    use crate::open::syscall::{EACCES, ENOENT, ENOSYS, O_RDWR, AT_FDCWD};
+    let mut w = World::boot(Image::new().app("probe", ""));
+    let i = w.open_app("probe");
+    let mut p = w.app(i);
+    let mic = u64::from(p.string(0, "/dev/violet/mic"));
+    let at = AT_FDCWD as i64 as u64;
+    // openat is 56 on AArch64 (322 on AArch32).
+    assert_eq!(p.syscall64(56, [at, mic, u64::from(O_RDWR), 0, 0, 0]), i64::from(EACCES), "no capability, as by AArch32 numbers");
+    let none = u64::from(p.string(64, "/dev/violet/nothing"));
+    assert_eq!(p.syscall64(56, [at, none, u64::from(O_RDWR), 0, 0, 0]), i64::from(ENOENT));
+    let screen = u64::from(p.string(128, "/dev/violet/screen"));
+    let fd = p.syscall64(56, [at, screen, u64::from(O_RDWR), 0, 0, 0]);
+    assert!(fd >= 0, "{fd}");
+    // socket is 198 on AArch64 (281 on AArch32): refused without the capability.
+    assert_eq!(p.syscall64(198, [2, 1, 0, 0, 0, 0]), i64::from(EACCES));
+    // 57 close; 63 is read on AArch64, never AArch32's dup2 (63).
+    assert_eq!(p.syscall64(57, [fd as u64, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(p.syscall64(57, [fd as u64, 0, 0, 0, 0, 0]), i64::from(crate::open::syscall::EBADF));
+    // AArch32-only calls and private numbers are not reachable by number.
+    for n in [5u64, 2, 0xf_0000, 1000] {
+        assert_eq!(p.syscall64(n, [0; 6]), i64::from(ENOSYS), "{n:#x}");
+    }
+    // A pointer above 4 GiB cannot be cut to a low address on its way in.
+    assert_eq!(p.syscall64(56, [at, 1 << 32 | mic, u64::from(O_RDWR), 0, 0, 0]), i64::from(crate::open::syscall::EFAULT));
+    // Nor can a sign-extended (kernel-half) one alias the app's own memory.
+    let kernel_half = 0xffff_ffff_0000_0000 | mic;
+    assert_eq!(p.syscall64(56, [at, kernel_half, u64::from(O_RDWR), 0, 0, 0]), i64::from(crate::open::syscall::EFAULT));
+    // An error stays an error in x0 when it equals the narrowed fd the call
+    // passed: close(0xfffffff7) is EBADF (-9), not 4294967287.
+    assert_eq!(p.syscall64(57, [0xffff_fff7, 0, 0, 0, 0, 0]), i64::from(crate::open::syscall::EBADF));
+    assert_eq!(p.syscall64(63, [0xffff_fff7, u64::from(mic), 4, 0, 0, 0]), i64::from(crate::open::syscall::EBADF));
+    assert!(w.running(i));
+}

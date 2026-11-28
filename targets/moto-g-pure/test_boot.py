@@ -25,13 +25,111 @@ parser.add_argument("--stall-services", action="store_true")
 parser.add_argument("--radio-package", type=Path, help="exercise an independently built Radio VPK against the same kernel")
 parser.add_argument("--diagnostics-trial", choices=("fault", "timeout", "confirm"),
                     help="start at the post-activation boundary with a test Diagnostics candidate")
+parser.add_argument("--arch", choices=("aarch32", "aarch64"), default="aarch32",
+                    help="aarch64: the AArch64 handset build (make moto) on QEMU's AArch64 kernel; aarch32 (the default here): make moto32")
 args = parser.parse_args()
+
+
+def run_aarch64():
+    """The AArch64 handset build (targets/moto-g-pure/build64.py, make moto64) on QEMU.
+
+    The loader (loader64.S, loader.c) is relinked around the AArch64 QEMU kernel
+    (make qemu-image: QEMU's interrupt controller and timer,
+    the Wi-Fi extension's failing stubs); the supervisor, catalog and the open
+    apps' image are the handset build's. QEMU starts the CPU at EL2 with the
+    image away from its link address, as the handset's LK may: the loader moves
+    itself, drops to EL1 and enters the kernel. Checks the level it was entered
+    at, the four supervisor stages, Home presented and Radio's memory IPC
+    through the kernel extension. Peripheral responses need the phone."""
+    import importlib.util
+    moto64 = repo / "build/sel4/moto-aarch64"
+    qemu64 = repo / "build/sel4/qemu-aarch64"
+    for need, how in ((moto64 / "loader.json", "make moto"), (qemu64 / "kernel/kernel.elf", "make qemu-image")):
+        if not need.is_file():
+            raise SystemExit(f"{need} is missing: {how}")
+    assert layout(moto64) == layout(qemu64), "kernel memory reservations differ"
+    spec = importlib.util.spec_from_file_location("violet_build64", repo / "targets/moto-g-pure/build64.py")
+    build64 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build64)
+    with TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        build64.link_loader(moto64, out, qemu64 / "kernel/kernel.elf")
+        cc = Path(json.loads((moto64 / "loader.json").read_text())["cc"])
+        # The handset's firmware routes the virtual timer's PPI to nonsecure
+        # Group 1; QEMU's does not. Then x0 is the device tree, as LK passes it.
+        (out / "entry.S").write_text(".text\n.global _start\n_start:\n  ldr x9, =0x080b0080\n  mov w10, #0xffffffff\n"
+                                     "  str w10, [x9]\n  dsb sy\n  ldr x0, =0x47880000\n  ldr x9, =0x45000000\n  br x9\n.ltorg\n")
+        subprocess.run([cc, "--target=aarch64-none-elf", "-c", out / "entry.S", "-o", out / "entry.o"], check=True)
+        subprocess.run([cc.with_name("llvm-objcopy"), "-O", "binary", "-j", ".text", out / "entry.o", out / "entry.bin"], check=True)
+        dts = (repo / "platform/sel4/board/qemu.dts").read_text()
+        start = "linux,initrd-start = <0x51b00000>;"
+        end = 0x51b00000 + (moto64 / "initfs.cpio").stat().st_size
+        (out / "handoff.dts").write_text(dts.replace(start, start + f" linux,initrd-end = <{end:#x}>;"))
+        subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", out / "handoff.dtb", out / "handoff.dts"], check=True)
+        symbols = subprocess.check_output([cc.with_name("llvm-nm"), moto64 / "root.elf"], text=True)
+        def pa(name):
+            return build64.ROOT_PA + int(next(l.split()[0] for l in symbols.splitlines() if l.endswith(" " + name)), 16) - 0x100000
+        cmd = ["qemu-system-aarch64", "-machine", "virt,gic-version=3,virtualization=on", "-cpu", "cortex-a53", "-m", "3G",
+               "-accel", "tcg", "-display", "none", "-serial", "none", "-monitor", "none", "-no-reboot",
+               "-device", f"loader,file={out}/Image,addr=0x45000000,force-raw=on",
+               "-device", f"loader,file={out}/handoff.dtb,addr=0x47880000,force-raw=on",
+               "-device", f"loader,file={moto64}/initfs.cpio,addr=0x51b00000,force-raw=on",
+               "-device", f"loader,file={out}/entry.bin,addr=0x44000000,force-raw=on,cpu-num=0", "-qmp", "stdio"]
+        guest = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            def receive():
+                with selectors.DefaultSelector() as sel:
+                    sel.register(guest.stdout, selectors.EVENT_READ)
+                    if not sel.select(5):
+                        raise TimeoutError("QEMU monitor timed out")
+                return json.loads(guest.stdout.readline())
+
+            def command(op, arguments):
+                guest.stdin.write(json.dumps({"execute": op, "arguments": arguments}) + "\n")
+                guest.stdin.flush()
+                while True:
+                    msg = receive()
+                    if "return" in msg:
+                        return msg["return"]
+                    if "error" in msg:
+                        raise RuntimeError(msg)
+
+            def word(address):
+                value = command("human-monitor-command", {"command-line": f"xp /1wx {address:#x}"})
+                return int(value.strip().rsplit(None, 1)[1], 16)
+
+            def wait(what, test, seconds=20):
+                deadline = time.monotonic() + seconds
+                while not test():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"AArch64 Moto boot: {what}")
+                    time.sleep(.05)
+
+            assert "QMP" in receive()
+            command("qmp_capabilities", {})
+            wait("the supervisor's four stages", lambda: word(pa("boot_stages")) == 15)
+            el = word(0x43ffffd0)
+            assert el == 0x454c0002, f"loader entry level word {el:#x}, not EL2"
+            for x, y, color in [(0, 0, 0xff0c0a10), (160 * 3, 55 * 4, 0xff2b2a27)]:
+                wait(f"Home at ({x}, {y})", lambda: word(0x79450000 + 4 * (720 * y + x)) == color)
+            wait("Radio's Wi-Fi memory IPC", lambda: word(pa("wifi_memory_checks")) > 0)
+            assert word(pa("check_failed")) == 0, f"a supervisor check failed at line {word(pa('check_failed'))}"
+            print("AArch64 Moto loader entered at EL2, dropped to EL1 and started seL4; the supervisor wired every "
+                  "process and the Open Runtime presented Home; Radio's memory IPC reached the kernel extension.")
+        finally:
+            finish(guest)
+
 moto = repo / "build/sel4/moto"
 qemu = repo / "build/sel4/qemu"
 layout_path = "kernel/gen_headers/plat/machine/devices_gen.h"
 def layout(board):
     return (board / layout_path).read_text().split("avail_p_regs[] = {", 1)[1].split("};", 1)[0]
 
+if args.arch == "aarch64":
+    run_aarch64()
+    sys.exit(0)
+# The 32-bit handset build (make moto32) on the 32-bit QEMU kernel (make qemu32-image).
+os.environ["VIOLET_ARCH"] = "aarch32"
 assert layout(moto) == layout(qemu), "kernel memory reservations differ"
 
 
@@ -48,7 +146,7 @@ def signed(blob):
     signer = sign.config(repo, "moto")
     target, pinned = sign.load_keys(moto / "package-keys.json")
     assert target == "moto" and pinned.get(signer.key_id) == signer.keys[signer.key_id], \
-        "build/sel4/moto was not built with this developer key: run make moto again"
+        "build/sel4/moto was not built with this developer key: run make moto32 again"
     return bytearray(sign.resign(bytes(blob), signer))
 
 

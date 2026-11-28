@@ -123,5 +123,66 @@ class Vbmeta(unittest.TestCase):
             phone_image.avb_verify((FACTORY / "vbmeta.img").read_bytes(), {"boot": b"V" + boot[1:]})
 
 
+def synthetic_v2(cmdline=b"bootopt=64S3,32S1,32S1 buildvariant=user"):
+    """A small Android v2 boot image shaped like the XT2163DL's: kernel, ramdisk, a DTB."""
+    page = 2048
+    kernel, ramdisk, dtb = b"K" * 3000, b"R" * 1000, b"D" * 500
+    header = bytearray(phone_image.V2_HEADER_SIZE)
+    header[:8] = b"ANDROID!"
+    struct.pack_into("<10I", header, 8, len(kernel), 0x40008000, len(ramdisk), 0x51b00000, 0, 0, 0x47880000, page, 2, 0)
+    header[64:64 + len(cmdline)] = cmdline
+    struct.pack_into("<I", header, 1644, phone_image.V2_HEADER_SIZE)
+    struct.pack_into("<IQ", header, 1648, len(dtb), 0x47880000)
+    body = b"".join(s + bytes(-len(s) % page) for s in (kernel, ramdisk, dtb))
+    return phone_image.rebuild_v2(bytes(header).ljust(page, b"\0") + body, ramdisk, kernel=kernel)
+
+
+class AArch64Boot(unittest.TestCase):
+    """The boot image LK starts in AArch64 (targets/moto-g-pure/build64.py)."""
+    IMAGE = b"\0" * 0x38 + b"ARM\x64" + bytes(range(256)) * 64
+
+    def test_header_asks_lk_for_a_64_bit_kernel(self):
+        import gzip
+        stock = synthetic_v2()
+        boot = phone_image.aarch64_v2(stock, b"ramdisk", self.IMAGE)
+        self.assertEqual(struct.unpack_from("<I", boot, 12)[0], 0x40080000)
+        line = boot[64:64 + 512].split(b"\0")[0]
+        self.assertEqual(line, b"bootopt=64S3,32N2,64N2 buildvariant=user")
+        page, kernel_size = struct.unpack_from("<I", boot, 36)[0], struct.unpack_from("<I", boot, 8)[0]
+        self.assertEqual(gzip.decompress(boot[page:page + kernel_size]), self.IMAGE)
+        # Everything else the stock header said stays: load addresses, page size, version.
+        for offset in (20, 32, 36, 40):
+            self.assertEqual(boot[offset:offset + 4], stock[offset:offset + 4], offset)
+        self.assertEqual(phone_image.v2_payload_length(boot) % page, 0)
+
+    def test_only_an_arm64_image_is_taken(self):
+        with self.assertRaises(ValueError):
+            phone_image.aarch64_v2(synthetic_v2(), b"ramdisk", b"\0" * 4096)
+
+    def test_a_command_line_without_bootopt_gets_one(self):
+        boot = phone_image.set_bootopt(synthetic_v2(b"buildvariant=user"), b"64S3,32N2,64N2")
+        self.assertEqual(boot[64:64 + 512].split(b"\0")[0], b"bootopt=64S3,32N2,64N2 buildvariant=user")
+
+    def test_storage_layout_is_the_32_bit_builds(self):
+        image = phone_image.handset_storage(b"boot" * 1000, 0x140000)
+        marker = 16 * 1024 ** 2
+        self.assertTrue(image[marker:marker + 512].startswith(b"VioletOS XT2163DL boot_b storage v1\n"))
+        history = marker + 512 + 1024 ** 2
+        self.assertTrue(image[history:].startswith(b"VioletOS boot history v1\n"))
+        self.assertTrue(image[history + 1536:].startswith(b"VioletOS catalog banks v1\n"))
+        # The size services/usb-diagnostics/host/moto-flash and storage_volume.rs expect.
+        self.assertEqual(len(image), 20450816)
+        with self.assertRaises(ValueError):
+            phone_image.handset_storage(bytes(16 * 1024 ** 2 + 1))
+
+    @unittest.skipUnless((FACTORY / "boot.img").is_file(), "no XT2163DL factory boot.img")
+    def test_factory_header_keeps_its_fields(self):
+        stock = (FACTORY / "boot.img").read_bytes()
+        boot = phone_image.aarch64_v2(stock, b"ramdisk", self.IMAGE)
+        self.assertEqual(boot[64:64 + 512].split(b"\0")[0], b"bootopt=64S3,32N2,64N2 buildvariant=user")
+        for offset in (20, 32, 36, 40, 44):
+            self.assertEqual(boot[offset:offset + 4], stock[offset:offset + 4], offset)
+
+
 if __name__ == "__main__":
     unittest.main()

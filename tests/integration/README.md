@@ -45,7 +45,7 @@ Stand-ins take their place: the same decisions called in the same order, each fu
 - [open/front.rs](open/front.rs): the system call dispatch. A scripted app issues real Linux ARM call numbers with pointers into its own memory (a real `procmgr::Space`).
 - [open/trusted_ui.rs](open/trusted_ui.rs) and [open/life.rs](open/life.rs): one `sysui::Ui` per phone joined to the screen, touch and `/data/.lock`; `lifecycle.rs` applied to running apps.
 
-So a host test proves the decisions and how they combine. It cannot prove that `syscall.rs` calls them. That is what the one QEMU test is for: [targets/qemu/test_system.py](../../targets/qemu/test_system.py) (`make test-system`) runs the real dispatch, real page tables, real signal delivery and one real slot switch across a reboot.
+So a host test proves the decisions and how they combine. It cannot prove that `syscall.rs` calls them. That is what the one QEMU test is for: [targets/qemu/test_system.py](../../targets/qemu/test_system.py) (`make test-system32` on the 32-bit system; `make test-system` on AArch64) runs the real dispatch, real page tables, real signal delivery and one real slot switch across a reboot.
 
 When a file leaves that list (its fixed addresses go behind a function), add it to `shipped!` in `open/mod.rs` and delete its stand-in.
 

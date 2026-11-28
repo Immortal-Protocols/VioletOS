@@ -224,3 +224,21 @@ fn gpt_damage_or_ambiguity_is_refused() {
     let short: Vec<[u8; 512]> = base[..20].to_vec();
     assert_eq!(find(&short, 64_000_000), Err(Error::Io));
 }
+
+/// The record read from the XT2163DL's misc on November 28, 2026 (VioletOS
+/// on B after a boot that spent a try: fastboot said B 6 tries before it,
+/// the record says 5) and what the handset's Storage wrote back
+/// (emmc.rs mark_running_slot): fastboot then reported
+/// slot-successful:_b yes and slot-retry-count:_b 1, unchanged across reboots.
+#[test]
+fn the_handsets_record_is_marked_as_the_phone_saw() {
+    let before = hex("5f62000042434142010200007e005f00000000000000000000000000ad2b87e2");
+    let after = hex("5f62000042434142010200007e009f00000000000000000000000000be334d20");
+    let mut c = Control::decode(&before).unwrap();
+    assert_eq!(c.slot(1), Slot { priority: 15, tries: 5, successful: false, verity_corrupted: false });
+    assert_eq!(c.slot(0), Slot { priority: 14, tries: 7, successful: false, verity_corrupted: false });
+    assert!(c.mark_successful(1).unwrap());
+    assert_eq!(c.encode().to_vec(), after);
+    let mut again = Control::decode(&after).unwrap();
+    assert!(!again.mark_successful(1).unwrap(), "a marked slot is not written again");
+}

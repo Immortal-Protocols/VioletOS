@@ -5,6 +5,9 @@ Date & Time picks Tokyo (a shared setting kept in /data), the Wi-Fi page scans
 the virtual networks, and Agent Apps opens. Back on Home, Music opens and
 starts (when the image has it). Second boot on the same disk: Settings starts
 with Tokyo still chosen.
+
+`--arch aarch64` runs the same two boots on the AArch64 build of the system
+(targets/qemu64/stack.py, `make qemu-image`).
 """
 
 from pathlib import Path
@@ -100,18 +103,29 @@ time.sleep(2)  # the runtime writes /data back on its next pass
 '''
 
 
+# AArch64 unless --arch aarch32 (the 32-bit image, make qemu32-image).
+ARCH = sys.argv[2] if sys.argv[1:2] == ["--arch"] else "aarch64"
+# What boots each architecture's image (tools/run.py boot_devices).
+FILES = {"aarch32": ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"),
+         "aarch64": ("qemu64.bin", "qemu64.json", "initfs.cpio")}
+
 with TemporaryDirectory() as tmp:
     viewer = Path(tmp) / "input.py"
     viewer.write_text(SCRIPT)
     viewer.chmod(0o755)
-    original = run.ROOT / "build/sel4/qemu"
+    original = run.IMAGES[ARCH]
     if not (original / "initfs.cpio").exists():
-        raise SystemExit("Build the QEMU image first (make qemu-image).")
+        raise SystemExit("Build the QEMU image first (make " + ("qemu-image)." if ARCH == "aarch64" else "qemu32-image)."))
     image = Path(tmp) / "image"
     image.mkdir()
-    for name in ("zImage", "handoff.dtb", "entry.bin", "initfs.cpio"):
+    for name in FILES[ARCH]:
         (image / name).symlink_to(original / name)
-    run.IMAGE = image
+    # A fresh disk in this image directory for the two boots.
+    os.environ["VIOLET_ARCH"] = ARCH
+    if ARCH == "aarch32":
+        run.IMAGE = image
+    else:
+        run.IMAGES[ARCH] = image
     apps = home_grid.apps((original / "initfs.cpio").read_bytes())
     icons = {name: home_grid.icon(i, apps) for i, name in enumerate(apps)}
     os.environ["OPEN_ICONS"] = json.dumps(icons)
@@ -120,4 +134,4 @@ with TemporaryDirectory() as tmp:
         status = run.main(str(viewer))
         if status != 0:
             raise SystemExit(f"open apps test failed in the {stage} boot (viewer status {status})")
-    print("Open apps verified: Home, Settings (a setting kept across a restart, Wi-Fi, Agent Apps)" + (", Music" if "music" in icons else ""))
+    print(("AArch64: " if ARCH == "aarch64" else "") + "Open apps verified: Home, Settings (a setting kept across a restart, Wi-Fi, Agent Apps)" + (", Music" if "music" in icons else ""))

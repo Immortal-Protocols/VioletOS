@@ -14,14 +14,20 @@
 //
 // VIOLET_TIMEKEEPER=0 at build time turns it off the same way.
 //
-// The kernel exports this timer to every user thread, open apps included,
-// so an app can stop or move it. A guard thread (timekeeper.h, tk_watch)
+// The AArch32 kernels export this timer to every user thread, open apps
+// included, so an app can stop or move it. A guard thread (timekeeper.h, tk_watch)
 // notices when the timer is overdue and kicks the timekeeper, so that costs
 // sleepers a time slice, not a hang. The timekeeper runs only with its
 // guard. What the guard cannot undo: an app that keeps re-arming the timer
 // to fire at once makes the timekeeper scan more often, within the app's own
 // share of the CPU. The fix that removes the exposure is in the kernel
 // (export the timer to the supervisor's threads only); see services/power/README.md.
+//
+// The AArch64 kernels make that change (kernel/sel4/aarch64/ellis-timer.patch,
+// vm.h VM_TIMER_EVERYONE 0): the timer is programmable only while a thread
+// with seL4_TCBFlag_ellisTimer runs, which the root thread has from boot and
+// the timekeeper is given (vm_timer_grant). No app can touch it, so there is
+// no guard; with nothing to run the kernel's idle thread waits for interrupts.
 #pragma once
 #include "timekeeper.h"
 
@@ -58,16 +64,9 @@ static volatile unsigned tk_ready;
 static char tk_stack[4096] __attribute__((aligned(16)));
 static char tk_guard_stack[1024] __attribute__((aligned(16)));
 
-static unsigned long long tk_now(void) {
-  unsigned lo, hi;
-  __asm__ volatile("isb; mrrc p15,1,%0,%1,c14" : "=r"(lo), "=r"(hi));
-  return ((unsigned long long)hi << 32) | lo;
-}
-static unsigned tk_ticks_per_ms(void) {
-  unsigned freq;
-  __asm__ volatile("mrc p15,0,%0,c14,c0,0" : "=r"(freq));
-  return freq / 1000;
-}
+// The generic timer, CP15 on AArch32 and system registers on AArch64 (vm.h).
+static unsigned long long tk_now(void) { return vm_counter(); }
+static unsigned tk_ticks_per_ms(void) { return vm_counter_frequency() / 1000; }
 // Register-only system calls for the timekeeper thread.
 static seL4_Word tk_wait(seL4_CPtr notification) {
   seL4_Word badge = 0, info, m0, m1, m2, m3;
@@ -85,11 +84,7 @@ static void tk_signal(seL4_CPtr notification) {
 static void tk_ack(seL4_CPtr handler) {
   seL4_CallWithMRs(handler, seL4_MessageInfo_new(IRQAckIRQ, 0, 0, 0), 0, 0, 0, 0);
 }
-static void tk_program(unsigned ticks) {
-  if (ticks) __asm__ volatile("mcr p15, 0, %0, c14, c2, 0" ::"r"(ticks)); // CNTP_TVAL
-  __asm__ volatile("mcr p15, 0, %0, c14, c2, 1" ::"r"(ticks ? 1u : 0u)); // CNTP_CTL
-  __asm__ volatile("isb");
-}
+static void tk_program(unsigned ticks) { vm_ptimer_program(ticks); }
 static void tk_main(void) {
   for (;;) {
     seL4_Word badge = tk_wait(tk_ntfn);
@@ -118,7 +113,7 @@ static void tk_guard_main(void) {
     seL4_Yield();
     if (tk_guard_may_wait(&tk_watch, before, tk_now(), quick)) {
       if (!tk_watch.wfi) tk_watch.wfi = 1;
-      __asm__ volatile("dsb; wfi" ::: "memory");
+      vm_wait_for_interrupt();
       if (tk_watch.wfi == 1) tk_watch.wfi = 2;
     }
   }
@@ -135,6 +130,8 @@ static seL4_CPtr tk_mint(seL4_CPtr source, seL4_CapRights_t rights, unsigned bad
 // no timekeeper (a timer any app can stop must not be the one every
 // process waits on).
 static bool tk_guard_start(void) {
+  // A timer only the supervisor's threads can program needs no guard.
+  if (!VM_TIMER_EVERYONE) return true;
   seL4_CPtr tcb = tk_make(seL4_TCBObject);
   tk_guard_kick = tk_ntfn ? tk_mint(tk_ntfn, seL4_AllRights, 0) : 0;
   if (!tcb || !tk_guard_kick) return false;
@@ -162,7 +159,7 @@ static seL4_CPtr tk_make(unsigned type) {
 }
 static seL4_CPtr tk_mint(seL4_CPtr source, seL4_CapRights_t rights, unsigned badge) {
   if (boot->empty.end - next_slot <= TK_SLOT_RESERVE) return 0;
-  if (seL4_CNode_Mint(seL4_CapInitThreadCNode, next_slot, 32, seL4_CapInitThreadCNode, source, 32, rights, badge))
+  if (seL4_CNode_Mint(seL4_CapInitThreadCNode, next_slot, SEL4_DEPTH, seL4_CapInitThreadCNode, source, SEL4_DEPTH, rights, badge))
     return 0;
   return next_slot++;
 }
@@ -183,7 +180,7 @@ static bool tk_attach(unsigned id, seL4_CPtr notify) {
   seL4_CPtr frame = tk_make(seL4_ARM_SmallPageObject);
   if (!frame || boot->empty.end - next_slot <= TK_SLOT_RESERVE) return false;
   seL4_CPtr copy = next_slot;
-  if (seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode, frame, 32, seL4_AllRights))
+  if (seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, SEL4_DEPTH, seL4_CapInitThreadCNode, frame, SEL4_DEPTH, seL4_AllRights))
     return false;
   next_slot++;
   // The process's IPC buffer shares this section, so its page table exists.
@@ -200,17 +197,17 @@ static bool tk_attach(unsigned id, seL4_CPtr notify) {
     own = tk_make(seL4_NotificationObject);
     notify = own ? tk_mint(own, seL4_AllRights, TK_BADGE) : 0;
     if (!notify) return false;
-    if (seL4_CNode_Mint(t->caps, TK_WAIT_SLOT, bits, seL4_CapInitThreadCNode, own, 32,
+    if (seL4_CNode_Mint(t->caps, TK_WAIT_SLOT, bits, seL4_CapInitThreadCNode, own, SEL4_DEPTH,
                         seL4_CapRights_new(0, 0, 1, 0), 0))
       return false;
     // Power's deadlines arrive between its requests (services/power/process.rs).
     if (id == POWER && seL4_TCB_BindNotification(t->thread, own)) return false;
   }
-  if (seL4_CNode_Mint(t->caps, TK_KICK_SLOT, bits, seL4_CapInitThreadCNode, tk_ntfn, 32,
+  if (seL4_CNode_Mint(t->caps, TK_KICK_SLOT, bits, seL4_CapInitThreadCNode, tk_ntfn, SEL4_DEPTH,
                       seL4_CapRights_new(0, 0, 0, 1), 1u << id))
     return false;
   tk_notify[id] = notify;
-  tk.c[id].page = (struct tk_page *)va;
+  tk.c[id].page = (struct tk_page *)(uintptr_t)va;
   if (id == POWER) tk.power = POWER;
   return true;
 }
@@ -225,7 +222,9 @@ static void timekeeper_start(void) {
   tk_ready = 0;
   tk_ntfn = tk_irq = tk_thread = tk_root_ntfn = tk_root_kick = tk_guard = tk_guard_kick = 0;
   tk_guard_looks = 0;
-#if VIOLET_TIMEKEEPER && !defined(VIOLET_TEST_ISOLATION)
+  // A kernel that does not export the physical timer to user level
+  // (vm.h VM_USER_TIMER) traps tk_program: the timekeeper stays off.
+#if VIOLET_TIMEKEEPER && VM_USER_TIMER && !defined(VIOLET_TEST_ISOLATION)
   tk_per_ms = tk_ticks_per_ms();
   tk.period = (unsigned long long)TK_FREEZE_MS * tk_ticks_per_ms();
   tk.hold_min = TK_HOLD_MIN_MS * tk_ticks_per_ms();
@@ -237,7 +236,7 @@ static void timekeeper_start(void) {
   tk_root_kick = tk_ntfn ? tk_mint(tk_ntfn, seL4_AllRights, 1u << 0) : 0;
   if (!tcb || !irq_badged || !root_badged || !tk_root_kick || boot->empty.end - next_slot <= TK_SLOT_RESERVE) return;
   seL4_CPtr handler = next_slot++;
-  if (seL4_IRQControl_Get(seL4_CapIRQControl, OPEN_TIMER_IRQ, seL4_CapInitThreadCNode, handler, 32)) return;
+  if (seL4_IRQControl_Get(seL4_CapIRQControl, OPEN_TIMER_IRQ, seL4_CapInitThreadCNode, handler, SEL4_DEPTH)) return;
   tk_irq = handler;
   tk_program(0);
   bool ok = !seL4_IRQHandler_SetNotification(handler, irq_badged);
@@ -248,6 +247,8 @@ static void timekeeper_start(void) {
   ok = ok && !seL4_TCB_Configure(tcb, 0, seL4_CapInitThreadCNode, 0, seL4_CapInitThreadVSpace, 0, 0, 0) &&
        !seL4_TCB_SetPriority(tcb, seL4_CapInitThreadTCB, seL4_MaxPrio);
 #endif
+  // Where only flagged threads may program the timer, the timekeeper is one.
+  ok = ok && !vm_timer_grant(tcb);
   seL4_UserContext regs = {.pc = (seL4_Word)tk_main, .sp = (seL4_Word)(tk_stack + sizeof(tk_stack))};
   tk.c[0].page = &tk_root_page;
   tk_notify[0] = root_badged;
@@ -272,7 +273,7 @@ static void timekeeper_start(void) {
     // Off: stop the thread and free the interrupt for the Open Runtime.
     seL4_TCB_Suspend(tcb);
     tk_program(0);
-    seL4_CNode_Delete(seL4_CapInitThreadCNode, handler, 32);
+    seL4_CNode_Delete(seL4_CapInitThreadCNode, handler, SEL4_DEPTH);
     tk_irq = tk_thread = 0;
     tk.c[0].page = 0;
     return;
@@ -300,9 +301,9 @@ static bool timekeeper_open(struct task *t, seL4_CPtr wake, seL4_CPtr badged) {
     return false;
   }
   seL4_CapRights_t send = seL4_CapRights_new(0, 0, 0, 1);
-  check(seL4_CNode_Mint(t->caps, OPEN_SLOT_TIMER, OPEN_BITS, seL4_CapInitThreadCNode, tk_ntfn, 32, send, 1u << OPEN_RT));
-  check(seL4_CNode_Copy(t->caps, OPEN_SLOT_WAKE, OPEN_BITS, seL4_CapInitThreadCNode, wake, 32, seL4_AllRights));
-  check(seL4_CNode_Copy(t->caps, TK_WAIT_SLOT, OPEN_BITS, seL4_CapInitThreadCNode, wake, 32, seL4_AllRights));
+  check(seL4_CNode_Mint(t->caps, OPEN_SLOT_TIMER, OPEN_BITS, seL4_CapInitThreadCNode, tk_ntfn, SEL4_DEPTH, send, 1u << OPEN_RT));
+  check(seL4_CNode_Copy(t->caps, OPEN_SLOT_WAKE, OPEN_BITS, seL4_CapInitThreadCNode, wake, SEL4_DEPTH, seL4_AllRights));
+  check(seL4_CNode_Copy(t->caps, TK_WAIT_SLOT, OPEN_BITS, seL4_CapInitThreadCNode, wake, SEL4_DEPTH, seL4_AllRights));
   check(seL4_TCB_BindNotification(t->thread, wake));
   return true;
 }
@@ -328,7 +329,7 @@ static void timekeeper_stop(void) {
   tk_ready = 0;
   if (tk_irq) {
     tk_program(0);
-    seL4_CNode_Delete(seL4_CapInitThreadCNode, tk_irq, 32);
+    seL4_CNode_Delete(seL4_CapInitThreadCNode, tk_irq, SEL4_DEPTH);
   }
   seL4_TCB_UnbindNotification(seL4_CapInitThreadTCB);
   tk_irq = tk_thread = 0;

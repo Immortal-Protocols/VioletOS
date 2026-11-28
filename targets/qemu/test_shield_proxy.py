@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "tools"), str(Path(__file__).resolve().parent)]
 import home_grid
 import net_relay
+# This suite boots the 32-bit (AArch32) image: build/sel4/qemu, make qemu32-image.
+os.environ["VIOLET_ARCH"] = "aarch32"
 import run
 
 

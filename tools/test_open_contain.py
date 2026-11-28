@@ -132,7 +132,7 @@ check(len(re.findall(r"\bpool\.cap\(", pm)) == 1 and "pool.cap(" in body(procmgr
 check(len(re.findall(r"\bmap_claimed\(", pm)) == 2, "procmgr.rs: map_claimed is called from map only")
 mapper = body(procmgr, "    pub fn map(&mut self")
 check(before(mapper, "ledger().claim(self.pd, index)", "self.map_claimed("), "procmgr.rs map: the ledger is asked first")
-check("va >= USER_TOP" in mapper and "ledger().release(self.pd, index)" in mapper, "procmgr.rs map: app addresses only; a failed mapping lets the page go")
+check("va >= self.layout.user_top" in mapper and "ledger().release(self.pd, index)" in mapper, "procmgr.rs map: app addresses only; a failed mapping lets the page go")
 check("ledger().release(self.pd, page.pool)" in body(procmgr, "    fn unmap_page("), "procmgr.rs unmap_page: releases the page in the ledger")
 check(len(re.findall(r"\bpool\.give_back\(", pm)) == 1 and "pool.give_back(" in body(procmgr, "fn give(pool"),
       "procmgr.rs: pages go back to the pool only through give(), which keeps a held page out")

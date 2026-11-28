@@ -1,7 +1,7 @@
 name: Build and test
 
-# Keep CI under 5 minutes: the seL4 build and host unit tests on Linux, and on
-# macOS two QEMU tests (`make test-ci`). The other QEMU suites (make
+# Keep CI under 5 minutes: the 32-bit seL4 build and host unit tests on Linux,
+# and on macOS the AArch64 system and two QEMU tests on it (`make test-ci`). The other QEMU suites (make
 # test-emulator, test-open, test-agent, test-ladybird, test-shield, ...) run
 # locally. Don't add QEMU suites or jobs here (README, Continuous integration).
 
@@ -33,8 +33,9 @@ jobs:
           sudo apt-get install -y device-tree-compiler libxml2-utils ninja-build python3-venv
           rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi
           rustup override set 1.91.1
-      - name: Build the QEMU image
-        run: make qemu-image
+      # The 32-bit image (AArch64, the default, is built and booted by the mac job).
+      - name: Build the 32-bit QEMU image
+        run: make qemu32-image
       - name: Unit tests
         run: make test-unit
 
@@ -60,7 +61,7 @@ jobs:
             "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk_version"
           fi
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk_version" >> "$GITHUB_ENV"
-          rustup toolchain install 1.91.1 --profile minimal --target armv7a-none-eabi --target armv7-unknown-linux-musleabihf
+          rustup toolchain install 1.91.1 --profile minimal --target aarch64-unknown-none --target aarch64-unknown-linux-musl
           rustup override set 1.91.1
       - name: Cache the Rust apps' build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -70,5 +71,5 @@ jobs:
             build/open-cargo
           key: open-apps-${{ runner.os }}-1.91.1-${{ hashFiles('apps/Cargo.lock') }}
           restore-keys: open-apps-${{ runner.os }}-1.91.1-
-      - name: QEMU tests (supervisor boot, open apps)
+      - name: QEMU tests on AArch64 (supervisor boot, open apps)
         run: make test-ci

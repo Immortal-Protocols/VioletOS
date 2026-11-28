@@ -78,7 +78,7 @@ const R: u32 = PROT_READ;
 const RW: u32 = PROT_READ | PROT_WRITE;
 const RX: u32 = PROT_READ | PROT_EXEC;
 
-fn regions(list: &[(u32, u32, u32)]) -> Vec<Vma> {
+fn regions(list: &[(u64, u64, u32)]) -> Vec<Vma> {
     let mut vmas = Vec::new();
     for &(start, end, prot) in list {
         vma::insert(&mut vmas, start, end, prot);
@@ -114,7 +114,7 @@ fn buffer_allocates_nothing_for_memory_the_app_may_not_read() {
     assert!(vma::buffer(&vmas, 0x18000, big).is_none(), "runs into PROT_NONE memory");
     assert!(vma::buffer(&vmas, 0x30000, big).is_none(), "starts in a hole");
     assert!(vma::buffer(&vmas, 0x3_f000, big).is_none(), "starts just before the region");
-    assert!(vma::buffer(&vmas, 0x400_0000 - big as u32 + 1, big).is_none(), "one byte past the end");
+    assert!(vma::buffer(&vmas, 0x400_0000 - big as u64 + 1, big).is_none(), "one byte past the end");
     assert!(vma::buffer(&[], 0, big).is_none(), "no regions at all");
     // The lengths an app can name without owning any memory: all refused
     // before the heap is asked for anything.
@@ -149,13 +149,13 @@ fn buffer_fails_the_call_when_the_heap_cannot_hold_it() {
 // ---- the page rules at 4 KiB and 64 KiB hardware pages ----
 
 /// A small deterministic generator (the tests must not depend on the host's).
-fn next(seed: &mut u64) -> u32 {
+fn next(seed: &mut u64) -> u64 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    (*seed >> 33) as u32
+    *seed >> 33
 }
 
 /// The protection of the region holding `va`, if any.
-fn at(vmas: &[Vma], va: u32) -> Option<u32> {
+fn at(vmas: &[Vma], va: u64) -> Option<u32> {
     vma::find(vmas, va).map(|v| v.prot)
 }
 
@@ -207,7 +207,7 @@ fn every_page_has_the_right_rights_at_both_page_sizes() {
         }
         assert!(!vma::mixed(&vmas), "round {round}: a window holds code and something else");
         let (lo, hi) = (vmas.first().map_or(0, |v| v.start) & !0xffff, vmas.last().map_or(0, |v| v.end + 0xffff) & !0xffff);
-        for size in [0x1000u32, 0x1_0000] {
+        for size in [0x1000u64, 0x1_0000] {
             let mut page = lo;
             while page < hi {
                 let prot = vma::union(&vmas, page, page + size);
@@ -302,7 +302,7 @@ fn random_layout_reads_its_bytes_as_six_words() {
         // Any length: words the slice does not hold are zero (no randomness
         // there, but no panic and no read past the end either).
         let len = if round < 40 { round as usize % 33 } else { 24 };
-        let word = |i: usize| bytes[..len].get(i * 4..i * 4 + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let word = |i: usize| bytes[..len].get(i * 4..i * 4 + 4).map_or(0, |b| u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])));
         let l = Layout::random(&bytes[..len]);
         assert_eq!(l.pie_base, 0x40_0000 + (word(0) & 0xfff) * 0x1_0000);
         assert_eq!(l.brk_gap, (word(1) & 0xff) * 0x1_0000);
@@ -425,6 +425,23 @@ fn relro_range_is_the_segment_at_the_load_bias_in_whole_pages() {
     assert_eq!(relro_seal::relro_range(&[], 0x40_0034), None);
     // A range that would wrap the address space.
     assert_eq!(relro_seal::relro_range(&[phdr(6, 0, 0), phdr(0x6474_e552, 0xffff_f000, 0x2000)], 0x1000), None);
+}
+
+fn phdr64(kind: u32, vaddr: u64, memsz: u64) -> [u64; 7] {
+    [kind as u64 | 4 << 32, vaddr, vaddr, vaddr, memsz, memsz, 8]
+}
+
+#[test]
+fn relro_range64_reads_elf64_headers_the_same_way() {
+    // An AArch64 PIE: PHDR at 0x40, loaded far above 4 GiB.
+    let headers = [phdr64(6, 0x40, 0x230), phdr64(1, 0, 0x9d194), phdr64(0x6474_e552, 0x1e_5640, 0x79c0)];
+    for base in [0x40_0000u64, 0x1000_0000_0000, 0] {
+        assert_eq!(relro_seal::relro_range64(&headers, base + 0x40), Some((base + 0x1e_5000, base + 0x1ed_000)), "{base:#x}");
+    }
+    // p_flags in the high half of the first word does not hide the type.
+    assert_eq!(relro_seal::relro_range64(&[phdr64(6, 0x40, 0x40)], 0x40_0040), None);
+    assert_eq!(relro_seal::relro_range64(&[], 0x40_0040), None);
+    assert_eq!(relro_seal::relro_range64(&[phdr64(6, 0, 0), phdr64(0x6474_e552, u64::MAX - 0xfff, 0x2000)], 0x1000), None);
 }
 
 #[test]

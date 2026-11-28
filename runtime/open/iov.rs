@@ -10,18 +10,19 @@ pub const IOV_MAX: u32 = 1024;
 
 /// What the walk needs of the runtime.
 pub trait Vectored {
-    /// Buffer `k` of the app's iovec array: (base, len); None if the app
+    /// Buffer `k` of the app's iovec array: (base, len), the base a whole
+    /// app address (runtime/open/vma.rs Va); None if the app
     /// cannot be read there.
-    fn entry(&mut self, k: u32) -> Option<(u32, u32)>;
+    fn entry(&mut self, k: u32) -> Option<(u64, u32)>;
     /// Move up to `len` bytes at `base`: the count, or an error.
-    fn io(&mut self, base: u32, len: u32) -> i32;
+    fn io(&mut self, base: u64, len: u32) -> i32;
 }
 
 pub enum Outcome {
     Done(i32),
     /// Nothing moved yet and the first buffer got EAGAIN: a blocking
     /// descriptor waits with this buffer, a non-blocking one answers EAGAIN.
-    Wait { base: u32, len: u32 },
+    Wait { base: u64, len: u32 },
 }
 
 pub fn run(v: &mut impl Vectored, count: u32, slice: u32) -> Outcome {

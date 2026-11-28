@@ -10,8 +10,8 @@ use super::abi::*;
 use super::device::{Kind, OpenFile, BUFFER_BYTES, HEIGHT, STRIDE, WIDTH};
 use super::fs::{self, S_IFCHR, S_IFDIR, S_IFMT};
 use super::policy::{AccessMode, Action};
-use super::procmgr::USER_TOP;
 use super::sys::{self, MR_CPSR, MR_FAULT_IP};
+use super::vma::Va;
 use super::{FileRef, Log, Runtime, Wait};
 use super::signal::{self, Info};
 use alloc::rc::Rc;
@@ -85,7 +85,54 @@ use Outcome::*;
 fn align_up(v: u32, a: u32) -> u32 {
     v.wrapping_add(a - 1) & !(a - 1)
 }
+/// `v` rounded up to `a` (a power of two), or None past the address space.
+fn round_up(v: Va, a: Va) -> Option<Va> {
+    Some(v.checked_add(a - 1)? & !(a - 1))
+}
 
+/// The call's arguments as app addresses and lengths of app memory, whole:
+/// an AArch32 call's 32-bit registers, an AArch64 call's 64-bit ones (moved
+/// with its 32-bit words where enter64 rewrites a call: abi64.rs `args`).
+/// Every address the dispatcher reads or writes app memory at comes from
+/// here, never from the 32-bit words, which hold such an argument only below
+/// 4 GiB (enter64.rs NOWHERE).
+fn vargs(m: &[u32; 16]) -> [Va; 7] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = m;
+        let w = super::abi64::args();
+        [w[0], w[1], w[2], w[3], w[4], w[5], 0]
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        [m[0].into(), m[1].into(), m[2].into(), m[3].into(), m[4].into(), m[5].into(), m[6].into()]
+    }
+}
+/// An address or length as the Shield's 32-bit telemetry field records it
+/// (system/sentinel common.rs): saturated, for the log only.
+fn telemetry(v: Va) -> u32 {
+    v.min(Va::from(u32::MAX)) as u32
+}
+/// The caller's stack pointer at its call, whole.
+fn call_sp(m: &[u32; 16]) -> Va {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = m;
+        sys::wide()[sys::MR_SP]
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        m[sys::MR_SP].into()
+    }
+}
+/// The answer of a call that answers an app address (mmap, brk): its low
+/// word in the 32-bit result, and on AArch64 the whole address for x0
+/// (sys.rs `set_result`). An AArch32 address is below 4 GiB.
+fn address_answer(va: Va) -> Outcome {
+    #[cfg(target_arch = "aarch64")]
+    sys::set_result(va as u32, va);
+    Done(va as u32 as i32)
+}
 impl Runtime {
     pub fn syscall(&mut self, i: usize, slot: usize, mrs: &[u32; 16]) {
         let mut saved = [0u32; 9];
@@ -126,6 +173,8 @@ impl Runtime {
             Done(EACCES)
         } else {
             let o = self.dispatch(i, slot, number, mrs);
+            #[cfg(target_arch = "aarch64")]
+            let o = self.after64(i, o);
             // Violet Shield: UDP bytes count toward the exfiltration limit too.
             if let Done(r) = o { self.shield_after(i, number, mrs[0] as i32, r); }
             self.note_cloexec(i, number, mrs, o)
@@ -184,25 +233,34 @@ impl Runtime {
     }
 
     // ---- app memory helpers ----
-    fn rd(&mut self, i: usize, va: u32, len: usize) -> Option<Vec<u8>> {
+    fn rd(&mut self, i: usize, va: Va, len: usize) -> Option<Vec<u8>> {
         let app = self.apps[i].as_mut()?;
         // `len` is the app's word: checked against its regions before any
         // of the runtime's heap is spent on it (vma.rs `buffer`).
         let mut v = super::vma::buffer(&app.space.vmas, va, len)?;
         app.space.read(&mut self.k, &mut self.pool, va, &mut v).then_some(v)
     }
-    fn wr(&mut self, i: usize, va: u32, data: &[u8]) -> bool {
+    fn wr(&mut self, i: usize, va: Va, data: &[u8]) -> bool {
         let app = self.apps[i].as_mut().unwrap();
         app.space.write(&mut self.k, &mut self.pool, va, data)
     }
-    fn rd32(&mut self, i: usize, va: u32) -> Option<u32> {
+    fn rd32(&mut self, i: usize, va: Va) -> Option<u32> {
         let app = self.apps[i].as_mut()?;
         app.space.read_u32(&mut self.k, &mut self.pool, va)
     }
-    fn wr32(&mut self, i: usize, va: u32, v: u32) -> bool {
+    /// A pointer-sized word of the app's ABI (8 bytes for an AArch64 app,
+    /// vma::WIDE), whole.
+    fn rdword(&mut self, i: usize, va: Va) -> Option<Va> {
+        if !super::vma::WIDE {
+            return self.rd32(i, va).map(Va::from);
+        }
+        let b = self.rd(i, va, 8)?;
+        Some(u64::from_le_bytes(b[..8].try_into().unwrap()))
+    }
+    fn wr32(&mut self, i: usize, va: Va, v: u32) -> bool {
         self.wr(i, va, &v.to_le_bytes())
     }
-    fn rstr(&mut self, i: usize, va: u32) -> Option<String> {
+    fn rstr(&mut self, i: usize, va: Va) -> Option<String> {
         let app = self.apps[i].as_mut()?;
         app.space.read_string(&mut self.k, &mut self.pool, va, 4096)
     }
@@ -228,7 +286,7 @@ impl Runtime {
         app.fds.len() as i32 - 1
     }
     /// An absolute path for `path` relative to `dirfd` (or the working directory).
-    fn at(&mut self, i: usize, dirfd: i32, path_ptr: u32) -> Result<String, i32> {
+    fn at(&mut self, i: usize, dirfd: i32, path_ptr: Va) -> Result<String, i32> {
         let path = self.rstr(i, path_ptr).ok_or(EFAULT)?;
         let base = if path.starts_with('/') || dirfd == AT_FDCWD {
             self.apps[i].as_ref().unwrap().cwd.clone()
@@ -247,7 +305,7 @@ impl Runtime {
         }
         Ok(path)
     }
-    fn timespec(&mut self, i: usize, ptr: u32, time64: bool) -> Option<u64> {
+    fn timespec(&mut self, i: usize, ptr: Va, time64: bool) -> Option<u64> {
         if time64 {
             let b = self.rd(i, ptr, 12)?;
             let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
@@ -260,7 +318,7 @@ impl Runtime {
             Some((sec.max(0) as u64) * 1_000_000_000 + u64::from(nsec))
         }
     }
-    fn put_timespec(&mut self, i: usize, ptr: u32, ns: u64, time64: bool) -> bool {
+    fn put_timespec(&mut self, i: usize, ptr: Va, ns: u64, time64: bool) -> bool {
         let (sec, nsec) = (ns / 1_000_000_000, (ns % 1_000_000_000) as u32);
         if time64 {
             let mut b = [0u8; 16];
@@ -284,7 +342,10 @@ impl Runtime {
     }
 
     fn dispatch(&mut self, i: usize, slot: usize, n: u32, m: &[u32; 16]) -> Outcome {
+        // `a`: the arguments as 32-bit words (ints, flags, counts); `v`: as
+        // whole addresses and lengths of app memory (`vargs`).
         let a = [m[0], m[1], m[2], m[3], m[4], m[5], m[6]];
+        let v = vargs(m);
         let tid = self.apps[i].as_ref().unwrap().threads[slot].tid;
         match n {
             // ---- process and threads ----
@@ -302,7 +363,7 @@ impl Runtime {
             2 => self.fork(i, slot, signal::SIGCHLD, 0, 0, 0, m),
             190 => self.vfork(i, slot, signal::SIGCHLD, 0, m),
             11 | 387 => {
-                let (dirfd, path, argv, envp) = if n == 11 { (AT_FDCWD, a[0], a[1], a[2]) } else { (a[0] as i32, a[1], a[2], a[3]) };
+                let (dirfd, path, argv, envp) = if n == 11 { (AT_FDCWD, v[0], v[1], v[2]) } else { (a[0] as i32, v[1], v[2], v[3]) };
                 // execveat(fd, "", ..., AT_EMPTY_PATH) runs the open file itself.
                 let p = if n == 387 && a[4] & 0x1000 != 0 && self.rstr(i, path).is_some_and(|s| s.is_empty()) {
                     match self.file(i, dirfd).map(|f| match &f.borrow().kind { Kind::File { path } => Some(path.clone()), _ => None }) {
@@ -314,14 +375,14 @@ impl Runtime {
                 };
                 self.execve(i, slot, p, argv, envp)
             }
-            114 => self.wait4(i, slot, a[0] as i32, a[1], a[2], a[3], None),
+            114 => self.wait4(i, slot, a[0] as i32, v[1], a[2], v[3], None),
             280 => {
                 // waitid(idtype, id, infop, options, rusage): P_ALL, P_PID, P_PGID.
                 let pid = match a[0] { 0 => -1, 1 => a[1] as i32, 2 => -(a[1] as i32), _ => return Done(EINVAL) };
                 if a[3] & 4 == 0 { return Done(EINVAL); } // only WEXITED is reported
-                self.wait4(i, slot, pid, 0, a[3], a[4], Some(a[2]))
+                self.wait4(i, slot, pid, 0, a[3], v[4], Some(v[2]))
             }
-            120 => self.clone(i, slot, a, m),
+            120 => self.clone(i, slot, a, v, m),
             435 => Done(ENOSYS), // clone3: callers fall back to clone
             224 => Done(tid as i32),
             20 => Done(self.apps[i].as_ref().unwrap().pid as i32),
@@ -331,7 +392,7 @@ impl Runtime {
             24 | 47 | 49 | 50 | 199 | 200 | 201 | 202 => Done(0),
             205 | 80 => Done(0),
             256 => {
-                self.apps[i].as_mut().unwrap().threads[slot].clear_tid = a[0];
+                self.apps[i].as_mut().unwrap().threads[slot].clear_tid = v[0];
                 Done(tid as i32)
             }
             338 | 172 | 97 | 96 | 241 | 154 | 156 => Done(0),
@@ -346,14 +407,14 @@ impl Runtime {
                     return Done(EINVAL);
                 }
                 mask[0] = 1;
-                if !self.wr(i, a[2], &mask) {
+                if !self.wr(i, v[2], &mask) {
                     return Done(EFAULT);
                 }
                 Done(len.min(4) as i32)
             }
             345 => {
-                if a[0] != 0 { self.wr32(i, a[0], 0); }
-                if a[1] != 0 { self.wr32(i, a[1], 0); }
+                if v[0] != 0 { self.wr32(i, v[0], 0); }
+                if v[1] != 0 { self.wr32(i, v[1], 0); }
                 Done(0)
             }
             // ---- signals (signals and processes, below) ----
@@ -362,27 +423,27 @@ impl Runtime {
             268 => self.kill(i, a[0] as i32, Some(a[1]), a[2], None),
             178 | 363 => {
                 // rt_sigqueueinfo(tgid, sig, info), rt_tgsigqueueinfo(tgid, tid, sig, info)
-                let (tid, sig, ptr) = if n == 178 { (None, a[1], a[2]) } else { (Some(a[1]), a[2], a[3]) };
+                let (tid, sig, ptr) = if n == 178 { (None, a[1], v[2]) } else { (Some(a[1]), a[2], v[3]) };
                 let Some(b) = self.rd(i, ptr, 24) else { return Done(EFAULT) };
                 let w = |k: usize| u32::from_le_bytes(b[k * 4..k * 4 + 4].try_into().unwrap());
                 let info = Info { signo: sig, code: w(2) as i32, a: w(3), b: w(4), c: w(5) };
                 self.kill(i, a[0] as i32, tid, sig, Some(info))
             }
-            174 => self.sigaction(i, a[0], a[1], a[2], a[3]),
+            174 => self.sigaction(i, a[0], v[1], v[2], a[3]),
             175 | 126 => {
                 let wide = n == 175;
                 if wide && a[3] != 8 {
                     return Done(EINVAL);
                 }
                 let size = if wide { 8 } else { 4 };
-                let set = if a[1] != 0 {
-                    let Some(b) = self.rd(i, a[1], size) else { return Done(EFAULT) };
+                let set = if v[1] != 0 {
+                    let Some(b) = self.rd(i, v[1], size) else { return Done(EFAULT) };
                     Some(b.iter().rev().fold(0u64, |v, x| v << 8 | u64::from(*x)))
                 } else {
                     None
                 };
                 let old = self.apps[i].as_ref().unwrap().threads[slot].sig.blocked;
-                if a[2] != 0 && !self.wr(i, a[2], &old.to_le_bytes()[..size]) {
+                if v[2] != 0 && !self.wr(i, v[2], &old.to_le_bytes()[..size]) {
                     return Done(EFAULT);
                 }
                 if let Some(set) = set {
@@ -398,16 +459,16 @@ impl Runtime {
                 let t = &app.threads[slot].sig;
                 let set = (signal::set_of(&t.pending) | signal::set_of(&app.sig.pending)) & t.blocked;
                 let size = if n == 176 { (a[1] as usize).min(8) } else { 4 };
-                Done(if self.wr(i, a[0], &set.to_le_bytes()[..size]) { 0 } else { EFAULT })
+                Done(if self.wr(i, v[0], &set.to_le_bytes()[..size]) { 0 } else { EFAULT })
             }
-            186 => self.sigaltstack(i, slot, a[0], a[1], m[sys::MR_SP]),
+            186 => self.sigaltstack(i, slot, v[0], v[1], call_sp(m)),
             179 | 29 => {
                 // rt_sigsuspend(mask, size) and pause: until a handler has run; then EINTR.
                 let mask = if n == 179 {
                     if a[1] != 8 {
                         return Done(EINVAL);
                     }
-                    let Some(b) = self.rd(i, a[0], 8) else { return Done(EFAULT) };
+                    let Some(b) = self.rd(i, v[0], 8) else { return Done(EFAULT) };
                     Some(u64::from_le_bytes(b[..8].try_into().unwrap()))
                 } else {
                     None
@@ -420,14 +481,17 @@ impl Runtime {
                 t.waiting = signal::WaitFor::Suspend;
                 Block(Wait::Signal, None)
             }
-            177 | 421 => self.sigtimedwait(i, slot, a, n == 421),
+            177 | 421 => self.sigtimedwait(i, slot, a, v, n == 421),
+            #[cfg(target_arch = "aarch64")]
+            173 => self.sigreturn64(i, slot),
+            #[cfg(not(target_arch = "aarch64"))]
             173 => self.sigreturn(i, slot, m),
             119 => Done(ENOSYS), // the old sigreturn: the signal gate always uses rt_sigreturn
             // ---- timers ----
-            104 | 105 => self.itimer(i, n == 104, a[0], a[1], a[2]),
-            257 => self.timer_create(i, a[0], a[1], a[2]),
-            258 | 409 => self.timer_settime(i, a[0], a[1], a[2], a[3], n == 409),
-            259 | 408 => self.timer_gettime(i, a[0], a[1], n == 408),
+            104 | 105 => self.itimer(i, n == 104, a[0], v[1], v[2]),
+            257 => self.timer_create(i, a[0], v[1], v[2]),
+            258 | 409 => self.timer_settime(i, a[0], a[1], v[2], v[3], n == 409),
+            259 | 408 => self.timer_gettime(i, a[0], v[1], n == 408),
             260 => match self.apps[i].as_ref().unwrap().sig.timers.iter().find(|t| t.id == a[0]) {
                 Some(t) => Done(t.overrun.min(i32::MAX as u32) as i32),
                 None => Done(EINVAL),
@@ -441,25 +505,27 @@ impl Runtime {
             // ---- memory ----
             45 => {
                 let app = self.apps[i].as_mut().unwrap();
-                Done(app.space.set_brk(&mut self.k, &mut self.pool, a[0]) as i32)
+                let brk = app.space.set_brk(&mut self.k, &mut self.pool, v[0]);
+                address_answer(brk)
             }
-            192 => self.mmap(i, a[0], a[1], a[2], a[3], a[4] as i32, a[5].wrapping_mul(4096)),
+            192 => self.mmap(i, v[0], v[1], a[2], a[3], a[4] as i32, a[5].wrapping_mul(4096)),
             91 => {
-                if a[0] & 0xfff != 0 || a[1] == 0 {
+                if v[0] & 0xfff != 0 || v[1] == 0 {
                     return Done(EINVAL);
                 }
-                let end = a[0].saturating_add(align_up(a[1], 4096)).min(USER_TOP);
                 let app = self.apps[i].as_mut().unwrap();
+                let top = app.space.layout.user_top;
+                let end = round_up(v[1], 4096).map_or(top, |l| v[0].saturating_add(l).min(top));
                 // The trampoline page is the runtime's: it is never unmapped.
-                if app.space.pinned(a[0], end) {
+                if app.space.pinned(v[0], end) {
                     return Done(EINVAL);
                 }
-                app.space.remove(&mut self.k, &mut self.pool, a[0], end);
+                app.space.remove(&mut self.k, &mut self.pool, v[0], end);
                 Done(0)
             }
             125 => {
                 if a[2] & 6 == 6 {
-                    match self.gate(i, &Action::MapWriteExec { addr: a[0], len: a[1] }) {
+                    match self.gate(i, &Action::MapWriteExec { addr: telemetry(v[0]), len: telemetry(v[1]) }) {
                         super::Gate::Allow => {}
                         super::Gate::Deny => return Done(EACCES),
                         super::Gate::Frozen => return Block(Wait::Frozen, None),
@@ -468,9 +534,9 @@ impl Runtime {
                 }
                 // The W^X policy (vma.rs) answers EACCES: no writable and
                 // executable memory, and no data turned into code.
-                let end = a[0].saturating_add(align_up(a[1], 4096));
+                let Some(end) = round_up(v[1], 4096).and_then(|l| v[0].checked_add(l)) else { return Done(ENOMEM) };
                 let app = self.apps[i].as_mut().unwrap();
-                match app.space.protect(a[0], end, a[2] & 7) {
+                match app.space.protect(v[0], end, a[2] & 7) {
                     Ok(()) => Done(0),
                     Err(e) => Done(e),
                 }
@@ -480,24 +546,24 @@ impl Runtime {
             219 => Done(ENOSYS),
             0xf0002 => {
                 let app = self.apps[i].as_mut().unwrap();
-                app.space.sync_code(a[0], a[1]);
+                app.space.sync_code(v[0], v[1]);
                 Done(0)
             }
             // The fork gate's own call (fork, above): nothing without a fork under way.
             signal::FORK_NR => self.fork_done(i, slot, m),
             0xf0005 => {
                 let tcb = self.apps[i].as_ref().unwrap().threads[slot].tcb;
-                Done(if sys::tcb_set_tls(tcb, a[0]).is_ok() { 0 } else { EINVAL })
+                Done(if sys::tcb_set_tls(tcb, v[0]).is_ok() { 0 } else { EINVAL })
             }
             // ---- time ----
             263 | 403 => {
                 let time64 = n == 403;
                 let now = self.clock(a[0]);
-                Done(if self.put_timespec(i, a[1], now, time64) { 0 } else { EFAULT })
+                Done(if self.put_timespec(i, v[1], now, time64) { 0 } else { EFAULT })
             }
             264 | 406 => {
-                if a[1] != 0 {
-                    self.put_timespec(i, a[1], 1, n == 406);
+                if v[1] != 0 {
+                    self.put_timespec(i, v[1], 1, n == 406);
                 }
                 Done(0)
             }
@@ -506,19 +572,19 @@ impl Runtime {
                 let mut b = [0u8; 8];
                 b[..4].copy_from_slice(&((now / 1_000_000_000) as u32).to_le_bytes());
                 b[4..].copy_from_slice(&(((now % 1_000_000_000) / 1000) as u32).to_le_bytes());
-                if a[0] != 0 {
-                    self.wr(i, a[0], &b);
+                if v[0] != 0 {
+                    self.wr(i, v[0], &b);
                 }
                 Done(0)
             }
             13 => Done((self.clock(0) / 1_000_000_000) as i32),
             162 => {
-                let Some(d) = self.timespec(i, a[0], false) else { return Done(EFAULT) };
+                let Some(d) = self.timespec(i, v[0], false) else { return Done(EFAULT) };
                 Block(Wait::Sleep, Some(sys::now_ns() + d))
             }
             265 | 407 => {
                 let time64 = n == 407;
-                let Some(t) = self.timespec(i, a[2], time64) else { return Done(EFAULT) };
+                let Some(t) = self.timespec(i, v[2], time64) else { return Done(EFAULT) };
                 let deadline = if a[1] & 1 != 0 {
                     // Absolute: convert the wall clock to the monotonic one.
                     let now = self.clock(a[0]);
@@ -530,7 +596,7 @@ impl Runtime {
             }
             158 => Done(0),
             77 => {
-                self.wr(i, a[1], &[0u8; 72]);
+                self.wr(i, v[1], &[0u8; 72]);
                 Done(0)
             }
             116 => {
@@ -543,18 +609,18 @@ impl Runtime {
                 b[20..24].copy_from_slice(&free.to_le_bytes());
                 b[40..42].copy_from_slice(&1u16.to_le_bytes());
                 b[52..56].copy_from_slice(&1u32.to_le_bytes());
-                self.wr(i, a[0], &b);
+                self.wr(i, v[0], &b);
                 Done(0)
             }
             // ---- futexes ----
-            240 | 422 => self.futex(i, a, n == 422),
+            240 | 422 => self.futex(i, a, v, n == 422),
             // ---- files ----
-            5 => self.open(i, AT_FDCWD, a[0], a[1]),
+            5 => self.open(i, AT_FDCWD, v[0], a[1]),
             322 | 437 => {
-                let flags = if n == 437 { self.rd32(i, a[2]).unwrap_or(0) } else { a[2] };
-                self.open(i, a[0] as i32, a[1], flags)
+                let flags = if n == 437 { self.rd32(i, v[2]).unwrap_or(0) } else { a[2] };
+                self.open(i, a[0] as i32, v[1], flags)
             }
-            8 => self.open(i, AT_FDCWD, a[0], O_CREAT | O_TRUNC | 1),
+            8 => self.open(i, AT_FDCWD, v[0], O_CREAT | O_TRUNC | 1),
             6 => {
                 let app = self.apps[i].as_mut().unwrap();
                 match app.fds.get_mut(a[0] as usize) {
@@ -574,22 +640,22 @@ impl Runtime {
                 }
                 Done(0)
             }
-            3 => self.read(i, a[0] as i32, a[1], a[2]),
+            3 => self.read(i, a[0] as i32, v[1], a[2]),
             4 => {
-                let r = self.write(i, a[0] as i32, a[1], a[2], None);
+                let r = self.write(i, a[0] as i32, v[1], a[2], None);
                 let blocking_audio = r == EAGAIN && self.file(i, a[0] as i32).map_or(false, |f| {
                     let f = f.borrow();
                     matches!(f.kind, Kind::Audio { .. }) && f.flags & O_NONBLOCK == 0
                 });
                 if blocking_audio {
-                    return Block(Wait::Audio { fd: a[0] as i32, buf: a[1], len: a[2] }, None);
+                    return Block(Wait::Audio { fd: a[0] as i32, buf: v[1], len: a[2] }, None);
                 }
                 let blocking_socket = r == EAGAIN && self.file(i, a[0] as i32).map_or(false, |f| {
                     let f = f.borrow();
                     matches!(f.kind, Kind::Tcp { .. } | Kind::Hci { .. } | Kind::Pipe { write: true, .. }) && f.flags & O_NONBLOCK == 0
                 });
                 if blocking_socket {
-                    return Block(Wait::Send { fd: a[0] as i32, buf: a[1], len: a[2] }, None);
+                    return Block(Wait::Send { fd: a[0] as i32, buf: v[1], len: a[2] }, None);
                 }
                 // A present the panel is still reading answers once it is copied.
                 let screen = self.file(i, a[0] as i32).map_or(false, |f| matches!(f.borrow().kind, Kind::Screen));
@@ -605,14 +671,17 @@ impl Runtime {
                     i: usize,
                     fd: i32,
                     write: bool,
-                    vec: u32,
+                    vec: Va,
                 }
                 impl super::iov::Vectored for Io<'_> {
-                    fn entry(&mut self, k: u32) -> Option<(u32, u32)> {
-                        let at = self.vec.wrapping_add(8 * k);
-                        Some((self.rt.rd32(self.i, at)?, self.rt.rd32(self.i, at.wrapping_add(4))?))
+                    fn entry(&mut self, k: u32) -> Option<(Va, u32)> {
+                        // struct iovec: two words of the app's ABI. A length
+                        // of 4 GiB or more is EFAULT, as before any copy.
+                        let w: Va = if super::vma::WIDE { 8 } else { 4 };
+                        let at = self.vec.checked_add(2 * w * Va::from(k))?;
+                        Some((self.rt.rdword(self.i, at)?, u32::try_from(self.rt.rdword(self.i, at.checked_add(w)?)?).ok()?))
                     }
-                    fn io(&mut self, base: u32, len: u32) -> i32 {
+                    fn io(&mut self, base: Va, len: u32) -> i32 {
                         if self.write {
                             self.rt.write(self.i, self.fd, base, len, None)
                         } else {
@@ -621,7 +690,7 @@ impl Runtime {
                     }
                 }
                 let fd = a[0] as i32;
-                let (base, len) = match super::iov::run(&mut Io { rt: self, i, fd, write: n == 146, vec: a[1] }, a[2], super::device::RW_SLICE) {
+                let (base, len) = match super::iov::run(&mut Io { rt: self, i, fd, write: n == 146, vec: v[1] }, a[2], super::device::RW_SLICE) {
                     super::iov::Outcome::Done(r) => return Done(r),
                     super::iov::Outcome::Wait { base, len } => (base, len),
                 };
@@ -650,9 +719,9 @@ impl Runtime {
                 let saved = f.borrow().offset;
                 f.borrow_mut().offset = offset;
                 let r = if n == 180 {
-                    self.read_now(i, a[0] as i32, a[1], a[2])
+                    self.read_now(i, a[0] as i32, v[1], a[2])
                 } else {
-                    self.write(i, a[0] as i32, a[1], a[2], Some(offset))
+                    self.write(i, a[0] as i32, v[1], a[2], Some(offset))
                 };
                 f.borrow_mut().offset = saved;
                 Done(r)
@@ -685,7 +754,7 @@ impl Runtime {
                 f.offset = new as u64;
                 drop(f);
                 if n == 140 {
-                    let ok = self.wr(i, a[3], &(new as u64).to_le_bytes());
+                    let ok = self.wr(i, v[3], &(new as u64).to_le_bytes());
                     return Done(if ok { 0 } else { EFAULT });
                 }
                 Done(new.min(i32::MAX as i64) as i32)
@@ -712,19 +781,19 @@ impl Runtime {
                 app.fds[target] = Some(f);
                 Done(target as i32)
             }
-            55 | 221 => self.fcntl(i, a[0] as i32, a[1], a[2]),
-            54 => self.ioctl(i, a[0] as i32, a[1], a[2]),
+            55 | 221 => self.fcntl(i, a[0] as i32, a[1], a[2], v[2]),
+            54 => self.ioctl(i, a[0] as i32, a[1], a[2], v[2]),
             195 | 196 => {
-                let p = match self.at(i, AT_FDCWD, a[0]) { Ok(p) => p, Err(e) => return Done(e) };
-                Done(self.stat_path(i, &p, a[1]))
+                let p = match self.at(i, AT_FDCWD, v[0]) { Ok(p) => p, Err(e) => return Done(e) };
+                Done(self.stat_path(i, &p, v[1]))
             }
-            197 => Done(self.fstat(i, a[0] as i32, a[1])),
+            197 => Done(self.fstat(i, a[0] as i32, v[1])),
             327 => {
-                if a[3] & 0x1000 != 0 && self.rstr(i, a[1]).map_or(false, |s| s.is_empty()) {
-                    return Done(self.fstat(i, a[0] as i32, a[2]));
+                if a[3] & 0x1000 != 0 && self.rstr(i, v[1]).map_or(false, |s| s.is_empty()) {
+                    return Done(self.fstat(i, a[0] as i32, v[2]));
                 }
-                let p = match self.at(i, a[0] as i32, a[1]) { Ok(p) => p, Err(e) => return Done(e) };
-                Done(self.stat_path(i, &p, a[2]))
+                let p = match self.at(i, a[0] as i32, v[1]) { Ok(p) => p, Err(e) => return Done(e) };
+                Done(self.stat_path(i, &p, v[2]))
             }
             397 => Done(ENOSYS), // statx: C libraries fall back to fstatat64
             266 | 267 => {
@@ -732,16 +801,16 @@ impl Runtime {
                 let mut b = [0u8; 84];
                 b[..4].copy_from_slice(&0x01021994u32.to_le_bytes());
                 b[4..8].copy_from_slice(&4096u32.to_le_bytes());
-                self.wr(i, a[2], &b);
+                self.wr(i, v[2], &b);
                 Done(0)
             }
             33 | 334 | 439 => {
-                let (dirfd, ptr) = if n == 33 { (AT_FDCWD, a[0]) } else { (a[0] as i32, a[1]) };
+                let (dirfd, ptr) = if n == 33 { (AT_FDCWD, v[0]) } else { (a[0] as i32, v[1]) };
                 let p = match self.at(i, dirfd, ptr) { Ok(p) => p, Err(e) => return Done(e) };
                 if let Err(e) = self.path_allowed(i, &p, false) { return Done(e); } // policy (manifest.rs)
                 Done(if self.fs.stat(&p).is_some() { 0 } else { ENOENT })
             }
-            217 | 141 => self.getdents(i, a[0] as i32, a[1], a[2]),
+            217 | 141 => self.getdents(i, a[0] as i32, v[1], a[2]),
             183 => {
                 let mut cwd = self.apps[i].as_ref().unwrap().cwd.clone().into_bytes();
                 cwd.push(0);
@@ -749,11 +818,11 @@ impl Runtime {
                     return Done(ERANGE);
                 }
                 let len = cwd.len() as i32;
-                Done(if self.wr(i, a[0], &cwd) { len } else { EFAULT })
+                Done(if self.wr(i, v[0], &cwd) { len } else { EFAULT })
             }
             12 | 133 => {
                 let p = if n == 12 {
-                    match self.at(i, AT_FDCWD, a[0]) { Ok(p) => p, Err(e) => return Done(e) }
+                    match self.at(i, AT_FDCWD, v[0]) { Ok(p) => p, Err(e) => return Done(e) }
                 } else {
                     let Some(f) = self.file(i, a[0] as i32) else { return Done(EBADF) };
                     let f = f.borrow();
@@ -770,7 +839,7 @@ impl Runtime {
                 }
             }
             39 | 323 => {
-                let (dirfd, ptr) = if n == 39 { (AT_FDCWD, a[0]) } else { (a[0] as i32, a[1]) };
+                let (dirfd, ptr) = if n == 39 { (AT_FDCWD, v[0]) } else { (a[0] as i32, v[1]) };
                 let p = match self.at(i, dirfd, ptr) { Ok(p) => p, Err(e) => return Done(e) };
                 // Violet Shield. A folder that exists changes nothing and keeps its EEXIST.
                 if self.fs.stat(&p).is_none() { if let Some(o) = self.gate_change(i, &p) { return o; } }
@@ -781,9 +850,9 @@ impl Runtime {
             }
             40 | 10 | 328 => {
                 let (dirfd, ptr, dir) = match n {
-                    40 => (AT_FDCWD, a[0], true),
-                    10 => (AT_FDCWD, a[0], false),
-                    _ => (a[0] as i32, a[1], a[2] & 0x200 != 0),
+                    40 => (AT_FDCWD, v[0], true),
+                    10 => (AT_FDCWD, v[0], false),
+                    _ => (a[0] as i32, v[1], a[2] & 0x200 != 0),
                 };
                 let p = match self.at(i, dirfd, ptr) { Ok(p) => p, Err(e) => return Done(e) };
                 if let Some(o) = self.gate_change(i, &p) { return o; } // Violet Shield
@@ -791,7 +860,7 @@ impl Runtime {
                 Done(match self.fs.unlink(&p, dir) { Ok(()) => 0, Err(e) => e })
             }
             38 | 329 | 382 => {
-                let (fa, fp, ta, tp) = if n == 38 { (AT_FDCWD, a[0], AT_FDCWD, a[1]) } else { (a[0] as i32, a[1], a[2] as i32, a[3]) };
+                let (fa, fp, ta, tp) = if n == 38 { (AT_FDCWD, v[0], AT_FDCWD, v[1]) } else { (a[0] as i32, v[1], a[2] as i32, v[3]) };
                 let from = match self.at(i, fa, fp) { Ok(p) => p, Err(e) => return Done(e) };
                 let to = match self.at(i, ta, tp) { Ok(p) => p, Err(e) => return Done(e) };
                 // Violet Shield: a rename changes both names and takes the contents along.
@@ -800,7 +869,7 @@ impl Runtime {
                 Done(match self.fs.rename(&from, &to) { Ok(()) => 0, Err(e) => e })
             }
             85 | 332 => {
-                let (dirfd, ptr, buf, len) = if n == 85 { (AT_FDCWD, a[0], a[1], a[2]) } else { (a[0] as i32, a[1], a[2], a[3]) };
+                let (dirfd, ptr, buf, len) = if n == 85 { (AT_FDCWD, v[0], v[1], a[2]) } else { (a[0] as i32, v[1], v[2], a[3]) };
                 let p = match self.at(i, dirfd, ptr) { Ok(p) => p, Err(e) => return Done(e) };
                 if p == "/proc/self/exe" {
                     let exe = self.apps[i].as_ref().unwrap().path.clone();
@@ -821,7 +890,7 @@ impl Runtime {
                     let f = f.borrow();
                     match &f.kind { Kind::File { path } => path.clone(), _ => return Done(EINVAL) }
                 } else {
-                    match self.at(i, AT_FDCWD, a[0]) { Ok(p) => p, Err(e) => return Done(e) }
+                    match self.at(i, AT_FDCWD, v[0]) { Ok(p) => p, Err(e) => return Done(e) }
                 };
                 // Violet Shield: truncate by path never went through open().
                 if matches!(n, 92 | 193) { if let Some(o) = self.gate_change(i, &path) { return o; } }
@@ -862,10 +931,10 @@ impl Runtime {
                 for (k, field) in ["Linux", "violet", "6.1.0-violetos", "#1 VioletOS open runtime", "armv7l", "(none)"].iter().enumerate() {
                     u[k * 65..k * 65 + field.len()].copy_from_slice(field.as_bytes());
                 }
-                Done(if self.wr(i, a[0], &u) { 0 } else { EFAULT })
+                Done(if self.wr(i, v[0], &u) { 0 } else { EFAULT })
             }
             191 | 369 => {
-                let (resource, old) = if n == 191 { (a[0], a[1]) } else { (a[1], a[3]) };
+                let (resource, old) = if n == 191 { (a[0], v[1]) } else { (a[1], v[3]) };
                 if old != 0 {
                     let (cur, max): (u64, u64) = match resource {
                         3 => (8 << 20, u64::MAX),
@@ -893,7 +962,7 @@ impl Runtime {
                 // bytes if the generator was never seeded.
                 let len = a[1].min(256 << 10);
                 // All of it must be writable before any of it is written.
-                if !self.apps[i].as_ref().unwrap().space.writable(a[0], len as usize) {
+                if !self.apps[i].as_ref().unwrap().space.writable(v[0], len as usize) {
                     return Done(EFAULT);
                 }
                 let mut chunk = [0u8; 256];
@@ -903,7 +972,7 @@ impl Runtime {
                     if !self.entropy.fill(&mut chunk[..n]) {
                         return Done(EIO);
                     }
-                    if !self.wr(i, a[0].wrapping_add(done), &chunk[..n]) {
+                    if !self.wr(i, v[0] + Va::from(done), &chunk[..n]) {
                         return Done(EFAULT);
                     }
                     done += n as u32;
@@ -914,24 +983,24 @@ impl Runtime {
             168 | 336 | 414 => {
                 let timeout = match n {
                     168 => (a[2] as i32 >= 0).then(|| u64::from(a[2]) * 1_000_000),
-                    _ => if a[2] == 0 { None } else { self.timespec(i, a[2], n == 414) },
+                    _ => if v[2] == 0 { None } else { self.timespec(i, v[2], n == 414) },
                 };
-                self.poll(i, a[0], a[1], timeout)
+                self.poll(i, v[0], a[1], timeout)
             }
             142 | 335 | 413 => Done(ENOSYS),
             250 | 357 => Done(self.install(i, OpenFile::new(Kind::Epoll { interest: Vec::new(), reported: Vec::new() }, 2), 0)),
-            251 => self.epoll_ctl(i, a[0] as i32, a[1], a[2] as i32, a[3]),
+            251 => self.epoll_ctl(i, a[0] as i32, a[1], a[2] as i32, v[3]),
             252 | 346 => {
                 let max = a[2];
                 if max == 0 {
                     return Done(EINVAL);
                 }
-                let got = self.epoll_collect(i, a[0] as i32, a[1], max);
+                let got = self.epoll_collect(i, a[0] as i32, v[1], max);
                 if got != 0 || a[3] == 0 {
                     return Done(got);
                 }
                 let deadline = (a[3] as i32 > 0).then(|| sys::now_ns() + u64::from(a[3]) * 1_000_000);
-                Block(Wait::Epoll { epfd: a[0] as i32, events: a[1], max }, deadline)
+                Block(Wait::Epoll { epfd: a[0] as i32, events: v[1], max }, deadline)
             }
             351 | 356 => Done(self.install(i, OpenFile::new(Kind::EventFd { count: u64::from(a[0]) }, 2 | a[1] & O_NONBLOCK), 0)),
             42 | 359 => {
@@ -943,7 +1012,7 @@ impl Runtime {
                 let mut b = [0u8; 8];
                 b[..4].copy_from_slice(&r.to_le_bytes());
                 b[4..].copy_from_slice(&w.to_le_bytes());
-                Done(if self.wr(i, a[0], &b) { 0 } else { EFAULT })
+                Done(if self.wr(i, v[0], &b) { 0 } else { EFAULT })
             }
             350 | 355 | 360 | 385 => Done(ENOSYS),
             // ---- sockets: TCP through Radio, DNS answered here (sockets.rs) ----
@@ -953,7 +1022,7 @@ impl Runtime {
                 Some(w) => Block(w, None),
                 None => Done(EACCES),
             },
-            281..=297 | 366 => self.socket_call(i, n, a),
+            281..=297 | 366 => self.socket_call(i, n, a, v),
             374 | 365 => Done(ENOSYS),
             _ => {
                 let app = self.apps[i].as_ref().unwrap();
@@ -982,8 +1051,11 @@ impl Runtime {
         Gone
     }
 
-    fn clone(&mut self, i: usize, slot: usize, a: [u32; 7], m: &[u32; 16]) -> Outcome {
-        let (flags, stack, ptid, tls, ctid) = (a[0], a[1], a[2], a[3], a[4]);
+    fn clone(&mut self, i: usize, slot: usize, a: [u32; 7], v: [Va; 7], m: &[u32; 16]) -> Outcome {
+        // The stack, TLS and both tid pointers are app addresses: whole.
+        let (flags, stack, ptid, ctid) = (a[0], v[1], v[2], v[4]);
+        #[cfg(target_arch = "aarch64")]
+        let tls = v[3];
         // A new process: musl's posix_spawn and Go's os/exec use CLONE_VM|CLONE_VFORK;
         // without CLONE_VM it is fork (CLONE_VFORK alone does not make the parent wait).
         if flags & CLONE_VM != 0 && flags & CLONE_VFORK != 0 {
@@ -992,6 +1064,32 @@ impl Runtime {
         if flags & CLONE_VM == 0 {
             return self.fork(i, slot, flags & 0xff, flags, ptid, ctid, m);
         }
+        #[cfg(target_arch = "aarch64")]
+        let child = {
+            // The parent's whole context, its call registers as the svc saw
+            // them (the 64-bit fault words), x0 = 0 in the child, which
+            // resumes after the svc on its own stack; CLONE_SETTLS sets tpidr_el0.
+            let parent = self.apps[i].as_ref().unwrap().threads[slot].tcb;
+            let Ok(mut c) = sys::tcb_read_context(parent) else { return Done(EAGAIN) };
+            let (abi, w) = (super::arch::NATIVE, sys::wide());
+            for k in 1..8 {
+                c.words[abi.context_arg0 + k] = w[k];
+            }
+            c.words[abi.context_arg0] = 0;
+            c.words[abi.context_pc] = w[MR_FAULT_IP] + 4;
+            c.words[abi.context_sp] = if stack != 0 { stack } else { w[sys::MR_SP] };
+            // (x30 is the parent's, from its context: message word 10 is ELR_EL1 here.)
+            if flags & CLONE_SETTLS != 0 {
+                c.words[abi.context_tls] = tls;
+            }
+            let tid = self.next_tid();
+            match self.spawn64(i, tid, c) {
+                Ok(c) => (c, tid),
+                Err(_) => return Done(EAGAIN),
+            }
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let child = {
         let parent = self.apps[i].as_ref().unwrap().threads[slot].tcb;
         let Ok(mut regs) = sys::tcb_read(parent) else { return Done(EAGAIN) };
         // The fault message holds r0-r7 as the svc saw them.
@@ -1004,17 +1102,20 @@ impl Runtime {
         regs.r6 = m[6];
         regs.r7 = m[7];
         regs.r14 = m[sys::MR_LR];
-        regs.sp = if stack != 0 { stack } else { m[sys::MR_SP] };
+        // (AArch32: the 32-bit words are the whole registers.)
+        regs.sp = if stack != 0 { a[1] } else { m[sys::MR_SP] };
         if flags & CLONE_SETTLS != 0 {
-            regs.tpidruro = tls;
+            regs.tpidruro = a[3];
         }
         let thumb = (m[MR_CPSR] >> 5) & 1;
         let target = m[MR_FAULT_IP].wrapping_add(4) | thumb;
         let tid = self.next_tid();
-        let child = match self.spawn(i, tid, regs, target) {
-            Ok(c) => c,
+        match self.spawn(i, tid, regs, target) {
+            Ok(c) => (c, tid),
             Err(_) => return Done(EAGAIN),
+        }
         };
+        let (child, tid) = child;
         if flags & CLONE_PARENT_SETTID != 0 {
             self.wr32(i, ptid, tid);
         }
@@ -1030,8 +1131,9 @@ impl Runtime {
         Done(tid as i32)
     }
 
-    fn futex(&mut self, i: usize, a: [u32; 7], time64: bool) -> Outcome {
-        let (addr, op, val, timeout) = (a[0], a[1] & 0x7f, a[2], a[3]);
+    fn futex(&mut self, i: usize, a: [u32; 7], v: [Va; 7], time64: bool) -> Outcome {
+        // uaddr, uaddr2 and (for a wait) the timeout are addresses: whole.
+        let (addr, op, val, timeout) = (v[0], a[1] & 0x7f, a[2], v[3]);
         match op {
             0 | 9 => {
                 let Some(current) = self.rd32(i, addr) else { return Done(EFAULT) };
@@ -1054,15 +1156,15 @@ impl Runtime {
             1 | 10 => Done(self.futex_wake(i, addr, val as usize) as i32),
             // Requeue: waking every waiter is a permitted spurious wakeup.
             3 | 4 => {
-                let woken = self.futex_wake(i, addr, usize::MAX) + self.futex_wake(i, a[4], usize::MAX);
+                let woken = self.futex_wake(i, addr, usize::MAX) + self.futex_wake(i, v[4], usize::MAX);
                 Done(woken.min(val as usize) as i32)
             }
-            5 => Done(self.futex_wake(i, addr, val as usize) as i32 + self.futex_wake(i, a[4], a[3] as usize) as i32),
+            5 => Done(self.futex_wake(i, addr, val as usize) as i32 + self.futex_wake(i, v[4], a[3] as usize) as i32),
             _ => Done(ENOSYS),
         }
     }
 
-    pub fn futex_wake(&mut self, i: usize, addr: u32, count: usize) -> usize {
+    pub fn futex_wake(&mut self, i: usize, addr: Va, count: usize) -> usize {
         let waiting: Vec<usize> = self.apps[i]
             .as_ref()
             .map(|app| {
@@ -1086,7 +1188,7 @@ impl Runtime {
         t
     }
 
-    fn open(&mut self, i: usize, dirfd: i32, path_ptr: u32, flags: u32) -> Outcome {
+    fn open(&mut self, i: usize, dirfd: i32, path_ptr: Va, flags: u32) -> Outcome {
         let path = match self.at(i, dirfd, path_ptr) {
             Ok(p) => p,
             Err(e) => return Done(e),
@@ -1191,7 +1293,7 @@ impl Runtime {
         Done(self.install(i, OpenFile::new(kind, flags), 0))
     }
 
-    fn read(&mut self, i: usize, fd: i32, buf: u32, len: u32) -> Outcome {
+    fn read(&mut self, i: usize, fd: i32, buf: Va, len: u32) -> Outcome {
         let r = self.read_now(i, fd, buf, len);
         if r != EAGAIN {
             return Done(r);
@@ -1209,7 +1311,7 @@ impl Runtime {
         (t > 0).then(|| sys::now_ns() + t)
     }
 
-    pub(crate) fn write(&mut self, i: usize, fd: i32, buf: u32, len: u32, at: Option<u64>) -> i32 {
+    pub(crate) fn write(&mut self, i: usize, fd: i32, buf: Va, len: u32, at: Option<u64>) -> i32 {
         let Some(f) = self.file(i, fd) else { return EBADF };
         if matches!(f.borrow().kind, Kind::Audio { .. }) {
             let r = self.write_audio(i, fd, buf, len);
@@ -1325,7 +1427,7 @@ impl Runtime {
         }
     }
 
-    fn fcntl(&mut self, i: usize, fd: i32, cmd: u32, arg: u32) -> Outcome {
+    fn fcntl(&mut self, i: usize, fd: i32, cmd: u32, arg: u32, _ptr: Va) -> Outcome {
         let Some(f) = self.file(i, fd) else { return Done(EBADF) };
         match cmd {
             0 | 1030 => Done(self.install_ref(i, f, arg as usize)),
@@ -1358,7 +1460,9 @@ impl Runtime {
         pos as i32
     }
 
-    fn ioctl(&mut self, i: usize, fd: i32, cmd: u32, arg: u32) -> Outcome {
+    /// `arg` is the third argument as a 32-bit word, `ptr` as an address.
+    fn ioctl(&mut self, i: usize, fd: i32, cmd: u32, arg: u32, ptr: Va) -> Outcome {
+        let _ = arg;
         let Some(f) = self.file(i, fd) else { return Done(EBADF) };
         let is_screen = matches!(f.borrow().kind, Kind::Screen);
         match cmd {
@@ -1368,16 +1472,16 @@ impl Runtime {
                 for (k, w) in info.iter().enumerate() {
                     b[k * 4..k * 4 + 4].copy_from_slice(&w.to_le_bytes());
                 }
-                Done(if self.wr(i, arg, &b) { 0 } else { EFAULT })
+                Done(if self.wr(i, ptr, &b) { 0 } else { EFAULT })
             }
             // SCREEN_IOC_WAIT_VSYNC: until the next frame starts; VsyncInfo (16 bytes) to arg if not 0.
             0x5604 if is_screen => {
                 let deadline = super::sys::now_ns() + 100_000_000;
-                Block(Wait::Vsync { after: self.beam.frame, ptr: arg }, Some(deadline))
+                Block(Wait::Vsync { after: self.beam.frame, ptr }, Some(deadline))
             }
             // AUDIO_IOC_CONFIG: 48 kHz s16, one or two channels.
             0x5610 => {
-                let Some(b) = self.rd(i, arg, 16) else { return Done(EFAULT) };
+                let Some(b) = self.rd(i, ptr, 16) else { return Done(EFAULT) };
                 let word = |k: usize| u32::from_le_bytes(b[k * 4..k * 4 + 4].try_into().unwrap());
                 let (rate, channels, format) = (word(0), word(1), word(2));
                 if rate != 48000 || !(1..=2).contains(&channels) || format != AUDIO_FMT_S16LE {
@@ -1393,7 +1497,7 @@ impl Runtime {
                 }
             }
             0x5421 => {
-                let on = self.rd32(i, arg).unwrap_or(0) != 0;
+                let on = self.rd32(i, ptr).unwrap_or(0) != 0;
                 let mut f = f.borrow_mut();
                 if on { f.flags |= O_NONBLOCK } else { f.flags &= !O_NONBLOCK }
                 Done(0)
@@ -1403,26 +1507,30 @@ impl Runtime {
                     Kind::Pipe { buffer, .. } => buffer.borrow().len() as u32,
                     _ => 0,
                 };
-                self.wr32(i, arg, n);
+                self.wr32(i, ptr, n);
                 Done(0)
             }
             _ => Done(ENOTTY),
         }
     }
 
-    fn mmap(&mut self, i: usize, addr: u32, len: u32, prot: u32, flags: u32, fd: i32, offset: u32) -> Outcome {
-        if len == 0 || len > 0x8000_0000 {
+    /// `addr` and `len` whole (a 64-bit app reserves tens of GiB here).
+    fn mmap(&mut self, i: usize, addr: Va, len: Va, prot: u32, flags: u32, fd: i32, offset: u32) -> Outcome {
+        let layout = self.apps[i].as_ref().unwrap().space.layout;
+        // At most half the 32-bit address space, or the whole 64-bit one.
+        let most = if layout.user_top > 1 << 32 { layout.user_top } else { 0x8000_0000 };
+        if len == 0 || len > most {
             return Done(EINVAL);
         }
         if prot & 6 == 6 {
-            match self.gate(i, &Action::MapWriteExec { addr, len }) {
+            match self.gate(i, &Action::MapWriteExec { addr: telemetry(addr), len: telemetry(len) }) {
                 super::Gate::Allow => {}
                 super::Gate::Deny => return Done(EACCES),
                 super::Gate::Frozen => return Block(Wait::Frozen, None),
                 super::Gate::Killed => return Gone,
             }
         }
-        let len = align_up(len, 4096);
+        let Some(len) = round_up(len, 4096) else { return Done(EINVAL) };
         // An app holding all the pool pages one app may gets no more memory.
         if self.apps[i].as_ref().unwrap().space.capped() {
             return Done(ENOMEM);
@@ -1431,16 +1539,19 @@ impl Runtime {
         let screen = flags & MAP_ANONYMOUS == 0
             && self.file(i, fd).map_or(false, |f| matches!(f.borrow().kind, Kind::Screen));
         let app = self.apps[i].as_mut().unwrap();
+        // A hint is taken above the low addresses (above 4 GiB for a 64-bit app,
+        // whose regions are all there) and below the mmap area's top.
+        let hint_floor: Va = if layout.user_top > 1 << 32 { 1 << 32 } else { 0x1000_0000 };
         let start = if fixed {
-            if addr & 0xfff != 0 || addr.checked_add(len).map_or(true, |e| e > USER_TOP) {
+            if addr & 0xfff != 0 || addr.checked_add(len).map_or(true, |e| e > layout.user_top) {
                 return Done(EINVAL);
             }
             if flags & MAP_FIXED_NOREPLACE != 0 && app.space.overlaps(addr, addr + len) {
                 return Done(EEXIST);
             }
             addr
-        } else if addr != 0 && addr & 0xffff == 0 && addr >= 0x1000_0000
-            && addr.checked_add(len).map_or(false, |e| e <= super::procmgr::MMAP_TOP)
+        } else if addr != 0 && addr & 0xffff == 0 && addr >= hint_floor
+            && addr.checked_add(len).map_or(false, |e| e <= layout.mmap_top)
             && !app.space.overlaps(addr, addr + len)
         {
             addr
@@ -1466,7 +1577,7 @@ impl Runtime {
                 self.apps[i].as_mut().unwrap().space.remove(&mut self.k, &mut self.pool, start, start + len);
                 return Done(e);
             }
-            return Done(start as i32);
+            return address_answer(start);
         }
         if flags & MAP_ANONYMOUS == 0 {
             let Some(f) = self.file(i, fd) else { return Done(EBADF) };
@@ -1479,7 +1590,7 @@ impl Runtime {
             let _ = MAP_SHARED; // Shared file mappings are not written back.
             let data = self.fs.contents(&path).map(|c| {
                 let s = (offset as usize).min(c.len());
-                let e = (s + len as usize).min(c.len());
+                let e = usize::try_from(len).map_or(c.len(), |l| s.saturating_add(l).min(c.len()));
                 c[s..e].to_vec()
             });
             if let Some(data) = data {
@@ -1495,10 +1606,10 @@ impl Runtime {
                 }
             }
         }
-        Done(start as i32)
+        address_answer(start)
     }
 
-    fn put_stat(&mut self, i: usize, st: fs::Stat, buf: u32) -> i32 {
+    fn put_stat(&mut self, i: usize, st: fs::Stat, buf: Va) -> i32 {
         let mut b = [0u8; 104];
         b[..8].copy_from_slice(&1u64.to_le_bytes());
         b[12..16].copy_from_slice(&(st.inode as u32).to_le_bytes());
@@ -1513,7 +1624,7 @@ impl Runtime {
         b[96..104].copy_from_slice(&st.inode.to_le_bytes());
         if self.wr(i, buf, &b) { 0 } else { EFAULT }
     }
-    fn stat_path(&mut self, i: usize, path: &str, buf: u32) -> i32 {
+    fn stat_path(&mut self, i: usize, path: &str, buf: Va) -> i32 {
         if let Err(e) = self.path_allowed(i, path, false) {
             return e; // policy (manifest.rs): another app's files do not exist
         }
@@ -1522,7 +1633,7 @@ impl Runtime {
             None => ENOENT,
         }
     }
-    fn fstat(&mut self, i: usize, fd: i32, buf: u32) -> i32 {
+    fn fstat(&mut self, i: usize, fd: i32, buf: Va) -> i32 {
         let Some(f) = self.file(i, fd) else { return EBADF };
         let st = match &f.borrow().kind {
             Kind::File { path } | Kind::Dir { path, .. } => self.fs.stat(path),
@@ -1534,7 +1645,7 @@ impl Runtime {
         }
     }
 
-    fn getdents(&mut self, i: usize, fd: i32, buf: u32, len: u32) -> Outcome {
+    fn getdents(&mut self, i: usize, fd: i32, buf: Va, len: u32) -> Outcome {
         let Some(f) = self.file(i, fd) else { return Done(EBADF) };
         let mut out = Vec::new();
         {
@@ -1569,10 +1680,11 @@ impl Runtime {
         Done(if self.wr(i, buf, &out) { n } else { EFAULT })
     }
 
-    fn poll(&mut self, i: usize, ptr: u32, nfds: u32, timeout: Option<u64>) -> Outcome {
+    fn poll(&mut self, i: usize, ptr: Va, nfds: u32, timeout: Option<u64>) -> Outcome {
         let mut fds = Vec::new();
         for k in 0..nfds.min(1024) {
-            let Some(b) = self.rd(i, ptr + 8 * k, 8) else { return Done(EFAULT) };
+            let Some(at) = ptr.checked_add(8 * Va::from(k)) else { return Done(EFAULT) };
+            let Some(b) = self.rd(i, at, 8) else { return Done(EFAULT) };
             let fd = i32::from_le_bytes(b[..4].try_into().unwrap());
             let events = i16::from_le_bytes(b[4..6].try_into().unwrap());
             fds.push((fd, events));
@@ -1584,7 +1696,7 @@ impl Runtime {
         // Clear revents for a timeout of zero or a later wake.
         if let Wait::Poll { fds, .. } = &wait {
             for k in 0..fds.len() {
-                self.wr(i, ptr + 8 * k as u32 + 6, &[0, 0]);
+                self.wr(i, ptr + 8 * k as Va + 6, &[0, 0]);
             }
         }
         match timeout {
@@ -1594,7 +1706,7 @@ impl Runtime {
         }
     }
 
-    fn epoll_ctl(&mut self, i: usize, epfd: i32, op: u32, fd: i32, event: u32) -> Outcome {
+    fn epoll_ctl(&mut self, i: usize, epfd: i32, op: u32, fd: i32, event: Va) -> Outcome {
         let (mask, data) = if op == 2 {
             (0, 0)
         } else {
@@ -1787,6 +1899,7 @@ impl Runtime {
         if fd < 0 || self.apps[i].is_none() {
             return o;
         }
+        let v = vargs(m);
         let flag = match n {
             5 => Some(m[1]),
             322 | 358 | 366 => Some(m[if n == 366 { 3 } else { 2 }]),
@@ -1795,11 +1908,11 @@ impl Runtime {
             41 | 63 | 285 | 250 | 351 => Some(0),
             55 | 221 if m[1] == 0 || m[1] == 1030 => Some(if m[1] == 1030 { O_CLOEXEC } else { 0 }),
             // openat2: the flags are in struct open_how (their low word).
-            437 => self.rd32(i, m[2]),
+            437 => self.rd32(i, v[2]),
             42 | 359 | 288 => {
                 // Both ends of a pipe (pipe2's flags are its second argument)
                 // or of a socket pair (SOCK_CLOEXEC in its type; the ends at its fourth).
-                let (flags, sv) = match n { 359 => (m[1], m[0]), 288 => (m[1], m[3]), _ => (0, m[0]) };
+                let (flags, sv) = match n { 359 => (m[1], v[0]), 288 => (m[1], v[3]), _ => (0, v[0]) };
                 for k in 0..2 {
                     if let Some(end) = self.rd32(i, sv + 4 * k) {
                         self.set_cloexec(i, end as i32, flags & O_CLOEXEC != 0);
@@ -1910,7 +2023,7 @@ impl Runtime {
         if let Some(s) = taker {
             if let signal::WaitFor::Set { info: ptr, .. } = app.threads[s].sig.waiting {
                 if ptr != 0 {
-                    self.wr(i, ptr, &signal::siginfo(&info));
+                    self.wr(i, ptr, &app_siginfo(&info));
                 }
             }
             return self.wake(i, s, sig as i32);
@@ -1941,7 +2054,7 @@ impl Runtime {
         self.reap(i);
     }
     /// A signal ends the process thread `slot` is: its app, or the vfork child it runs.
-    fn terminate(&mut self, i: usize, slot: usize, sig: u32, core: bool) {
+    pub(super) fn terminate(&mut self, i: usize, slot: usize, sig: u32, core: bool) {
         if self.apps[i].as_ref().is_some_and(|a| a.threads[slot].sig.vfork.is_some()) {
             // (Called during the child's own call or fault: its identity is swapped in.)
             self.vfork_exit(i, slot, signal::signaled(sig, core));
@@ -2078,7 +2191,7 @@ impl Runtime {
     /// The context of a thread stopped in a system call whose reply would set
     /// r0 to `r0` and resume at `pc`. r8-r12 are not in the fault message:
     /// the gate stores them in the frame itself.
-    fn call_context(&self, _i: usize, _slot: usize, m: &[u32; 16], r0: u32, pc: u32) -> signal::Context {
+    pub(crate) fn call_context(&self, _i: usize, _slot: usize, m: &[u32; 16], r0: u32, pc: u32) -> signal::Context {
         let mut r = [0u32; 13];
         r[..8].copy_from_slice(&m[..8]);
         r[0] = r0;
@@ -2140,6 +2253,30 @@ impl Runtime {
                 None => None,
             },
         };
+        // AArch64: the handler starts through the A64 gate with a Linux
+        // AArch64 frame (abi64.rs), the thread's registers written whole; a
+        // call or saved reply is then not answered (the write resumes it).
+        #[cfg(target_arch = "aarch64")]
+        {
+            let reply = match via { Via::Saved(r) => Some(r), _ => None };
+            let started = match (info, &via) {
+                (Some(info), Via::Reply | Via::Saved(_)) => {
+                    Some(self.call_regs64(i, slot, &ctx, reply).and_then(|regs| self.deliver64(i, slot, &regs, &info, None)).is_some())
+                }
+                // A fault's handler: fault_signal (below) delivers it itself.
+                _ => None,
+            };
+            if let Some(started) = started {
+                if let Some(r) = reply {
+                    sys::delete(r);
+                    self.k.release(r);
+                }
+                if !started {
+                    self.terminate(i, slot, signal::SIGSEGV, true);
+                }
+                return;
+            }
+        }
         let msg = match info {
             Some(info) => match self.frame(i, slot, &ctx, &info, trap) {
                 Some(msg) => msg,
@@ -2157,7 +2294,7 @@ impl Runtime {
                 let mut pc = ctx.pc;
                 if signal::thumb(ctx.cpsr) {
                     let app = self.apps[i].as_mut().unwrap();
-                    match app.space.stub(&mut self.k, &mut self.pool, slot, ctx.pc | 1) {
+                    match app.space.stub(&mut self.k, &mut self.pool, slot, ctx.pc | 1).and_then(|s| u32::try_from(s).ok()) {
                         Some(stub) => pc = stub,
                         None => return self.terminate(i, slot, signal::SIGSEGV, false),
                     }
@@ -2189,11 +2326,12 @@ impl Runtime {
         let app = self.apps[i].as_ref()?;
         let a = app.sig.action(info.signo);
         let t = &app.threads[slot].sig;
-        let at = signal::place(ctx.sp, &t.alt, a.flags & signal::SA_ONSTACK != 0)?;
+        // (AArch32 frames only: the frame, gate and handler are 32-bit addresses.)
+        let at = signal::place(ctx.sp.into(), &t.alt, a.flags & signal::SA_ONSTACK != 0)?;
         // sigsuspend: the handler returns to the mask from before the call.
         let saved_mask = t.suspend_mask.unwrap_or(t.blocked);
         let bytes = signal::encode(ctx, info, saved_mask, &t.alt, trap);
-        let gate = app.space.gate();
+        let (gate, handler, at32) = (u32::try_from(app.space.gate()).ok()?, u32::try_from(a.handler).ok()?, u32::try_from(at).ok()?);
         if !self.wr(i, at, &bytes) {
             return None;
         }
@@ -2206,14 +2344,14 @@ impl Runtime {
             app.sig.set_action(info.signo, Default::default());
         }
         let r = &ctx.r;
-        Some([info.signo, at, at + signal::UC as u32, a.handler, r[4], r[5], r[6], r[7], gate, at, ctx.lr, signal::user_cpsr(ctx.cpsr)])
+        Some([info.signo, at32, at32 + signal::UC as u32, handler, r[4], r[5], r[6], r[7], gate, at32, ctx.lr, signal::user_cpsr(ctx.cpsr)])
     }
 
     /// A thread blocked in a call takes a signal: its saved reply carries
     /// the handler (or the restart).
     fn interrupt(&mut self, i: usize, slot: usize) {
         let Some(t) = self.apps[i].as_ref().and_then(|a| a.threads.get(slot)) else { return };
-        let (Some(w), Some(_)) = (t.wait.clone(), t.reply) else { return };
+        let (Some(w), Some(cap)) = (t.wait.clone(), t.reply) else { return };
         if !self.interruptible(i, slot, &w) {
             return;
         }
@@ -2224,7 +2362,7 @@ impl Runtime {
             let got = signal::take(&mut app.threads[slot].sig.pending, set).or_else(|| signal::take(&mut app.sig.pending, set));
             if let Some(info) = got {
                 if ptr != 0 {
-                    self.wr(i, ptr, &signal::siginfo(&info));
+                    self.wr(i, ptr, &app_siginfo(&info));
                 }
                 return self.wake(i, slot, info.signo as i32);
             }
@@ -2237,7 +2375,18 @@ impl Runtime {
         // nanosleep and clock_nanosleep (relative) report the time left.
         let nr = saved[7];
         if ctx.r[0] == EINTR as u32 && matches!(nr, 162 | 265 | 407) && (nr == 162 || saved[1] & 1 == 0) {
-            let rem = if nr == 162 { saved[1] } else { saved[3] };
+            // The pointer, whole: on AArch64 from the call's own registers
+            // (nanosleep's x1, clock_nanosleep's x3; enter64 made both 407).
+            #[cfg(target_arch = "aarch64")]
+            let rem = {
+                let w = sys::widened(Some(cap), &saved);
+                if w[sys::MR_SYSCALL] == 101 { w[1] } else { w[3] }
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let rem = {
+                let _ = cap;
+                Va::from(if nr == 162 { saved[1] } else { saved[3] })
+            };
             let left = deadline.map_or(0, |d| d.saturating_sub(sys::now_ns()));
             if rem != 0 {
                 self.put_timespec(i, rem, left, nr == 407);
@@ -2259,7 +2408,7 @@ impl Runtime {
         sys::tcb_suspend(tcb);
         // Not on its way out of a trampoline either: a Thumb resume rewrites it.
         let regs = match sys::tcb_read(tcb) {
-            Ok(r) if signal::async_ok(r.cpsr) && r.pc.wrapping_sub(stubs) >= signal::GATE_OFFSET => r,
+            Ok(r) if signal::async_ok(r.cpsr) && Va::from(r.pc).wrapping_sub(stubs) >= Va::from(signal::GATE_OFFSET) => r,
             _ => return sys::tcb_resume(tcb),
         };
         if self.next_handled(i, slot).is_none() {
@@ -2332,11 +2481,17 @@ impl Runtime {
     /// makes the call again (it waited only because its app was held).
     fn call_again(&mut self, i: usize, slot: usize) {
         let Some(t) = self.apps[i].as_mut().and_then(|a| a.threads.get_mut(slot)) else { return };
-        let Ok(regs) = sys::tcb_read(t.tcb) else { return };
+        // (AArch64 has no Thumb, and no 32-bit register form to read.)
+        let thumb = if super::vma::WIDE {
+            false
+        } else {
+            let Ok(regs) = sys::tcb_read(t.tcb) else { return };
+            signal::thumb(regs.cpsr)
+        };
         let Some(reply) = t.reply.take() else { return };
         (t.wait, t.deadline, t.sig.held_call) = (None, None, false);
         let mut again = t.saved;
-        again[8] = again[8].wrapping_sub(if signal::thumb(regs.cpsr) { 2 } else { 4 });
+        again[8] = again[8].wrapping_sub(if thumb { 2 } else { 4 });
         sys::send(reply, &again);
         self.k.reply_done(reply);
     }
@@ -2364,7 +2519,7 @@ impl Runtime {
     /// leaves the runtime's answer as before: the app is ended (and its wait
     /// status says which signal). A handler that keeps returning to the same
     /// fault is stopped after signal::FAULT_LIMIT.
-    pub fn fault_signal(&mut self, i: usize, slot: usize, label: u32, addr: u32, access: Option<super::vma::Access>, fsr: u32) -> bool {
+    pub fn fault_signal(&mut self, i: usize, slot: usize, label: u32, addr: Va, access: Option<super::vma::Access>, fsr: u32) -> bool {
         let Some(app) = self.apps[i].as_ref() else { return false };
         let (sig, code) = match (label, access) {
             (sys::FAULT_VM, Some(a)) => match app.space.find(addr) {
@@ -2384,6 +2539,24 @@ impl Runtime {
         let t = &mut app.threads[slot];
         t.sig.faults += 1;
         let caught = a.handler > signal::SIG_IGN && t.sig.blocked & signal::bit(sig) == 0 && t.sig.faults <= signal::FAULT_LIMIT;
+        // AArch64: the thread's whole context at the fault, and a Linux
+        // AArch64 frame with the fault's address and ESR (abi64.rs).
+        #[cfg(target_arch = "aarch64")]
+        if caught {
+            let tcb = t.tcb;
+            let w = sys::wide();
+            let regs = sys::tcb_read_context(tcb).ok().map(|c| super::abi64::regs_of(&c));
+            let address = if label == sys::FAULT_VM { w[1] } else { regs.map_or(0, |r| r.pc) };
+            let esr = if label == sys::FAULT_VM { w[3] } else { 0 };
+            let info = Info { signo: sig, code, a: address as u32, b: 0, c: 0 };
+            if regs.and_then(|r| self.deliver64(i, slot, &r, &info, Some((address, esr)))).is_none() {
+                self.terminate(i, slot, signal::SIGSEGV, true);
+            }
+            if swapped && self.apps[i].as_ref().is_some_and(|a| a.threads[slot].sig.vfork.is_some()) {
+                self.vfork_swap(i, slot);
+            }
+            return true;
+        }
         let regs = if caught { sys::tcb_read(t.tcb).ok() } else { None };
         let Some(regs) = regs else {
             if swapped {
@@ -2398,7 +2571,8 @@ impl Runtime {
         if label == sys::FAULT_USER_EXCEPTION && signal::thumb(ctx.cpsr) {
             ctx.pc = ctx.pc.wrapping_add(2); // seL4 reports lr - 4 in Thumb too
         }
-        let fault_addr = if label == sys::FAULT_VM { addr } else { ctx.pc };
+        // (AArch32: its fault addresses are 32-bit.)
+        let fault_addr = if label == sys::FAULT_VM { addr as u32 } else { ctx.pc };
         let trap = signal::Trap { no: if label == sys::FAULT_VM { 14 } else { 6 }, error: fsr, addr: fault_addr };
         let info = Info { signo: sig, code, a: fault_addr, b: 0, c: 0 };
         self.resume_via(i, slot, ctx, Via::Write(regs), Some(info), &trap);
@@ -2410,15 +2584,18 @@ impl Runtime {
 
     // ---- signal system calls ----
 
-    fn sigaction(&mut self, i: usize, sig: u32, act: u32, old: u32, size: u32) -> Outcome {
+    fn sigaction(&mut self, i: usize, sig: u32, act: Va, old: Va, size: u32) -> Outcome {
         if signal::bit(sig) == 0 || size != 8 {
             return Done(EINVAL);
         }
-        // struct sigaction (ARM): handler, flags, restorer, mask (8 bytes).
+        // The kernel's struct sigaction in the app's ABI (../arch/compat.rs):
+        // handler, flags, restorer, mask (8 bytes). The handler and restorer
+        // are kept whole (an AArch64 app's lie above 4 GiB).
+        let abi = super::arch::NATIVE;
         let new = if act != 0 {
-            let Some(b) = self.rd(i, act, 20) else { return Done(EFAULT) };
-            let w = |k: usize| u32::from_le_bytes(b[k * 4..k * 4 + 4].try_into().unwrap());
-            Some(signal::Action { handler: w(0), flags: w(1), restorer: w(2), mask: u64::from(w(3)) | u64::from(w(4)) << 32 })
+            let Some(b) = self.rd(i, act, super::arch::compat::sigaction_bytes(abi)) else { return Done(EFAULT) };
+            let Some(a) = super::arch::compat::sigaction(abi, &b) else { return Done(EFAULT) };
+            Some(signal::Action { handler: a.handler, flags: a.flags as u32, restorer: a.restorer, mask: a.mask })
         } else {
             None
         };
@@ -2427,11 +2604,9 @@ impl Runtime {
         }
         if old != 0 {
             let a = self.apps[i].as_ref().unwrap().sig.action(sig);
-            let mut b = [0u8; 20];
-            for (k, v) in [a.handler, a.flags, a.restorer, a.mask as u32, (a.mask >> 32) as u32].iter().enumerate() {
-                b[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
-            }
-            if !self.wr(i, old, &b) {
+            let wide = super::arch::compat::Sigaction { handler: a.handler, flags: a.flags.into(), restorer: a.restorer, mask: a.mask };
+            let (b, n) = super::arch::compat::put_sigaction(abi, &wide);
+            if !self.wr(i, old, &b[..n]) {
                 return Done(EFAULT);
             }
         }
@@ -2447,34 +2622,23 @@ impl Runtime {
         Done(0)
     }
 
-    fn sigaltstack(&mut self, i: usize, slot: usize, new: u32, old: u32, sp: u32) -> Outcome {
+    fn sigaltstack(&mut self, i: usize, slot: usize, new: Va, old: Va, sp: Va) -> Outcome {
         let alt = self.apps[i].as_ref().unwrap().threads[slot].sig.alt;
         let next = if new != 0 {
-            let Some(b) = self.rd(i, new, 12) else { return Done(EFAULT) };
-            let w = |k: usize| u32::from_le_bytes(b[k * 4..k * 4 + 4].try_into().unwrap());
-            let (ss_sp, flags, size) = (w(0), w(1), w(2));
-            if alt.on(sp) {
-                return Done(EPERM);
+            // stack_t in the app's ABI: sp, flags (int), size.
+            let abi = super::arch::NATIVE;
+            let Some(b) = self.rd(i, new, 3 * abi.word_bytes()) else { return Done(EFAULT) };
+            let Some((ss_sp, flags, size)) = super::arch::compat::stack_t(abi, &b) else { return Done(EFAULT) };
+            match signal::alt_change(alt, sp, ss_sp, flags, size) {
+                Ok(next) => Some(next),
+                Err(e) => return Done(e),
             }
-            if flags & !(signal::SS_DISABLE | signal::SS_ONSTACK | 0x8000_0000) != 0 {
-                return Done(EINVAL);
-            }
-            Some(if flags & signal::SS_DISABLE != 0 {
-                signal::AltStack::default()
-            } else if size < signal::MINSIGSTKSZ {
-                return Done(ENOMEM);
-            } else {
-                signal::AltStack { sp: ss_sp, size, flags: 0 }
-            })
         } else {
             None
         };
         if old != 0 {
-            let mut b = [0u8; 12];
-            for (k, v) in [alt.sp, alt.report(sp), alt.size].iter().enumerate() {
-                b[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes());
-            }
-            if !self.wr(i, old, &b) {
+            let (b, n) = super::arch::compat::put_stack_t(super::arch::NATIVE, alt.sp, alt.report(sp), alt.size);
+            if !self.wr(i, old, &b[..n]) {
                 return Done(EFAULT);
             }
         }
@@ -2485,22 +2649,22 @@ impl Runtime {
     }
 
     /// rt_sigtimedwait(set, info, timeout, size).
-    fn sigtimedwait(&mut self, i: usize, slot: usize, a: [u32; 7], time64: bool) -> Outcome {
+    fn sigtimedwait(&mut self, i: usize, slot: usize, a: [u32; 7], v: [Va; 7], time64: bool) -> Outcome {
         if a[3] != 8 {
             return Done(EINVAL);
         }
-        let Some(b) = self.rd(i, a[0], 8) else { return Done(EFAULT) };
+        let Some(b) = self.rd(i, v[0], 8) else { return Done(EFAULT) };
         let set = u64::from_le_bytes(b[..8].try_into().unwrap()) & !signal::UNBLOCKABLE;
         let app = self.apps[i].as_mut().unwrap();
         let got = signal::take(&mut app.threads[slot].sig.pending, set).or_else(|| signal::take(&mut app.sig.pending, set));
         if let Some(info) = got {
-            if a[1] != 0 && !self.wr(i, a[1], &signal::siginfo(&info)) {
+            if v[1] != 0 && !self.wr(i, v[1], &app_siginfo(&info)) {
                 return Done(EFAULT);
             }
             return Done(info.signo as i32);
         }
-        let deadline = if a[2] != 0 {
-            let Some(t) = self.timespec(i, a[2], time64) else { return Done(EFAULT) };
+        let deadline = if v[2] != 0 {
+            let Some(t) = self.timespec(i, v[2], time64) else { return Done(EFAULT) };
             if t == 0 {
                 return Done(EAGAIN);
             }
@@ -2508,26 +2672,33 @@ impl Runtime {
         } else {
             None
         };
-        self.apps[i].as_mut().unwrap().threads[slot].sig.waiting = signal::WaitFor::Set { set, info: a[1] };
+        self.apps[i].as_mut().unwrap().threads[slot].sig.waiting = signal::WaitFor::Set { set, info: v[1] };
         Block(Wait::Signal, deadline)
     }
 
     /// rt_sigreturn, from the gate: the context in the frame at sp, as the
     /// handler left it, and the mask from before the handler.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     fn sigreturn(&mut self, i: usize, slot: usize, m: &[u32; 16]) -> Outcome {
-        let uc = self.rd(i, m[sys::MR_SP].wrapping_add(signal::UC as u32), (signal::FRAME as usize) - signal::UC);
-        let Some((ctx, mask, _)) = uc.as_deref().and_then(signal::decode) else {
+        let uc = self.rd(i, Va::from(m[sys::MR_SP].wrapping_add(signal::UC as u32)), (signal::FRAME as usize) - signal::UC);
+        let Some((ctx, mask, alt)) = uc.as_deref().and_then(signal::decode) else {
             self.terminate(i, slot, signal::SIGSEGV, true);
             return Gone;
         };
-        self.apps[i].as_mut().unwrap().threads[slot].sig.blocked = mask;
+        let t = &mut self.apps[i].as_mut().unwrap().threads[slot].sig;
+        t.blocked = mask;
+        // uc_stack, as Linux's restore_altstack: sigaltstack's rules at the
+        // frame's sp, and a change they refuse is left unmade.
+        if let Ok(next) = signal::alt_change(t.alt, m[sys::MR_SP].into(), alt.sp, alt.flags, alt.size) {
+            t.alt = next;
+        }
         self.resume(i, slot, ctx);
         Gone
     }
 
     // ---- timers ----
 
-    fn itimer(&mut self, i: usize, set: bool, which: u32, new: u32, old: u32) -> Outcome {
+    fn itimer(&mut self, i: usize, set: bool, which: u32, new: Va, old: Va) -> Outcome {
         if which != 0 {
             return Done(EINVAL); // ITIMER_VIRTUAL and ITIMER_PROF need CPU-time accounting
         }
@@ -2562,7 +2733,7 @@ impl Runtime {
     }
 
     /// timer_create(clock, sigevent, id): signals, SIGEV_NONE and SIGEV_THREAD_ID.
-    fn timer_create(&mut self, i: usize, clock: u32, sevp: u32, idp: u32) -> Outcome {
+    fn timer_create(&mut self, i: usize, clock: u32, sevp: Va, idp: Va) -> Outcome {
         if !matches!(clock, 0 | 1 | 4 | 7 | 8 | 9) {
             return Done(EINVAL); // CPU-time clocks need per-thread accounting
         }
@@ -2596,8 +2767,8 @@ impl Runtime {
         Done(0)
     }
 
-    fn timer_settime(&mut self, i: usize, id: u32, flags: u32, new: u32, old: u32, time64: bool) -> Outcome {
-        let size = if time64 { 16 } else { 8 };
+    fn timer_settime(&mut self, i: usize, id: u32, flags: u32, new: Va, old: Va, time64: bool) -> Outcome {
+        let size: Va = if time64 { 16 } else { 8 };
         let Some(k) = self.apps[i].as_ref().unwrap().sig.timers.iter().position(|t| t.id == id && id != signal::ITIMER) else { return Done(EINVAL) };
         let (Some(every), Some(value)) = (self.timespec(i, new, time64), self.timespec(i, new.wrapping_add(size), time64)) else { return Done(EFAULT) };
         if old != 0 {
@@ -2620,9 +2791,9 @@ impl Runtime {
         Done(0)
     }
 
-    fn timer_gettime(&mut self, i: usize, id: u32, out: u32, time64: bool) -> Outcome {
+    fn timer_gettime(&mut self, i: usize, id: u32, out: Va, time64: bool) -> Outcome {
         let Some(t) = self.apps[i].as_ref().unwrap().sig.timers.iter().find(|t| t.id == id && id != signal::ITIMER).copied() else { return Done(EINVAL) };
-        let size = if time64 { 16 } else { 8 };
+        let size: Va = if time64 { 16 } else { 8 };
         let ok = self.put_timespec(i, out, t.every, time64) && self.put_timespec(i, out.wrapping_add(size), t.left(sys::now_ns()), time64);
         Done(if ok { 0 } else { EFAULT })
     }
@@ -2633,8 +2804,10 @@ impl Runtime {
     /// caller's memory (procmgr.rs `fork_into`), its descriptors (shared open
     /// files, as on Linux), signal actions and mask, and one thread: the
     /// caller's, returning 0. It counts against the app limit and never closes
-    /// another app to make room.
-    fn fork(&mut self, i: usize, slot: usize, exit_signal: u32, flags: u32, ptid: u32, ctid: u32, m: &[u32; 16]) -> Outcome {
+    /// another app to make room. AArch64: the same, through the A64 fork
+    /// gate (../arch/signal64.rs FORK_HELPER, abi64.rs `fork_gate64`), the
+    /// child starting from the caller's whole context.
+    fn fork(&mut self, i: usize, slot: usize, exit_signal: u32, flags: u32, ptid: Va, ctid: Va, m: &[u32; 16]) -> Outcome {
         if self.apps[i].as_ref().unwrap().threads[slot].sig.vfork.is_some() {
             return Done(EAGAIN); // a vfork child has no memory of its own to copy
         }
@@ -2648,22 +2821,45 @@ impl Runtime {
         if self.pool.available() < resident + FORK_SPARE {
             return Done(ENOMEM);
         }
-        // The runtime cannot read the caller's VFP registers (d8-d15 are
-        // kept across calls, FPSCR holds its modes): the call goes round
-        // the fork gate first, which stores them where the copy takes them.
-        // (A clone with a child stack forks here, without them.)
-        if m[7] != signal::FORK_NR && !(m[7] == 120 && m[1] != 0) {
-            if let Some(o) = self.fork_gate(i, slot, [exit_signal, flags, ptid, ctid], m) {
+        // The runtime cannot read the caller's VFP (AArch64: SIMD)
+        // registers (d8-d15 are kept across calls, FPSCR holds its modes):
+        // the call goes round the fork gate first, which stores them where
+        // the copy takes them. (A clone with a child stack forks here, without them.)
+        let child_stack = if m[7] == 120 { vargs(m)[1] } else { 0 };
+        if m[7] != signal::FORK_NR && child_stack == 0 {
+            #[cfg(target_arch = "aarch64")]
+            let gated = self.fork_gate64(i, slot, [Va::from(exit_signal), Va::from(flags), ptid, ctid], m);
+            #[cfg(not(target_arch = "aarch64"))]
+            let gated = self.fork_gate(i, slot, [exit_signal, flags, ptid as u32, ctid as u32], m);
+            if let Some(o) = gated {
                 return o;
             }
         }
         let parent = &self.apps[i].as_ref().unwrap().threads[slot];
         let (tcb, blocked, alt) = (parent.tcb, parent.sig.blocked, parent.sig.alt);
-        let Ok(mut regs) = sys::tcb_read(tcb) else { return Done(EAGAIN) };
-        (regs.r0, regs.r1, regs.r2, regs.r3, regs.r4, regs.r5, regs.r6, regs.r7) = (0, m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
-        regs.r14 = m[sys::MR_LR];
-        regs.sp = if m[1] != 0 && m[7] == 120 { m[1] } else { m[sys::MR_SP] };
-        let target = m[MR_FAULT_IP].wrapping_add(4) | (m[MR_CPSR] >> 5) & 1;
+        // AArch64: the caller's whole context, its call registers as the svc
+        // saw them, x0 = 0, after the svc (in the fork helper, for a gated
+        // fork), on the child stack of a clone that names one.
+        #[cfg(target_arch = "aarch64")]
+        let start = {
+            let Ok(mut c) = sys::tcb_read_context(tcb) else { return Done(EAGAIN) };
+            let (abi, w) = (super::arch::NATIVE, sys::wide());
+            for k in 1..8 {
+                c.words[abi.context_arg0 + k] = w[k];
+            }
+            c.words[abi.context_arg0] = 0;
+            c.words[abi.context_pc] = w[MR_FAULT_IP] + 4;
+            c.words[abi.context_sp] = if child_stack != 0 { child_stack } else { w[sys::MR_SP] };
+            c
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (regs, target) = {
+            let Ok(mut regs) = sys::tcb_read(tcb) else { return Done(EAGAIN) };
+            (regs.r0, regs.r1, regs.r2, regs.r3, regs.r4, regs.r5, regs.r6, regs.r7) = (0, m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+            regs.r14 = m[sys::MR_LR];
+            regs.sp = if child_stack != 0 { m[1] } else { m[sys::MR_SP] };
+            (regs, m[MR_FAULT_IP].wrapping_add(4) | (m[MR_CPSR] >> 5) & 1)
+        };
         let mut space = match super::procmgr::Space::new(&mut self.k, self.untypeds[j]) {
             Ok(s) => s,
             Err(_) => {
@@ -2687,7 +2883,11 @@ impl Runtime {
         let p = self.apps[i].as_ref().unwrap();
         let sig = p.sig.fork_copy(p.pid);
         self.apps[j] = Some(self.child_app(i, pid, space, cnode, sig));
-        let Ok(s) = self.spawn(j, pid, regs, target) else {
+        #[cfg(target_arch = "aarch64")]
+        let started = self.spawn64(j, pid, start);
+        #[cfg(not(target_arch = "aarch64"))]
+        let started = self.spawn(j, pid, regs, target);
+        let Ok(s) = started else {
             self.reap(j);
             return Done(EAGAIN);
         };
@@ -2712,33 +2912,36 @@ impl Runtime {
     /// registers in the frame, the helper calls FORK_NR (`fork_done`), and
     /// parent and child each leave through the gate's rt_sigreturn with
     /// fork's result in the frame's r0. None if the frame does not fit.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     fn fork_gate(&mut self, i: usize, slot: usize, req: [u32; 4], m: &[u32; 16]) -> Option<Outcome> {
         let ctx = self.call_context(i, slot, m, m[0], m[MR_FAULT_IP].wrapping_add(4));
         let app = self.apps[i].as_ref()?;
         let t = &app.threads[slot].sig;
-        let at = signal::place(ctx.sp, &t.alt, false)?;
+        let at = signal::place(ctx.sp.into(), &t.alt, false)?;
         let bytes = signal::encode(&ctx, &Info::default(), t.blocked, &t.alt, &signal::Trap::default());
-        let gate = app.space.gate();
+        let (gate, at32) = (u32::try_from(app.space.gate()).ok()?, u32::try_from(at).ok()?);
         if !self.wr(i, at, &bytes) {
             return None;
         }
         let helper = gate - signal::GATE_OFFSET + signal::FORK_HELPER;
-        self.apps[i].as_mut()?.threads[slot].sig.forking = Some([at, req[0], req[1], req[2], req[3]]);
+        self.apps[i].as_mut()?.threads[slot].sig.forking = Some([at, req[0].into(), req[1].into(), req[2].into(), req[3].into()]);
         let r = &ctx.r;
-        sys::reply(&[0, at, at + signal::UC as u32, helper, r[4], r[5], r[6], r[7], gate, at, ctx.lr, signal::user_cpsr(ctx.cpsr)]);
+        sys::reply(&[0, at32, at32 + signal::UC as u32, helper, r[4], r[5], r[6], r[7], gate, at32, ctx.lr, signal::user_cpsr(ctx.cpsr)]);
         Some(Gone)
     }
     /// FORK_NR, from the fork helper: the fork itself. The child is the
     /// helper's thread at this call, so it returns into the gate too; each
-    /// side's frame gets its result (the child's 0, in the child's copy).
+    /// side's frame gets its result (the child's 0, in the child's copy):
+    /// r0 of an AArch32 frame, x0 (a whole 64-bit word) of an AArch64 one.
     fn fork_done(&mut self, i: usize, slot: usize, m: &[u32; 16]) -> Outcome {
         let Some([at, es, flags, ptid, ctid]) = self.apps[i].as_mut().unwrap().threads[slot].sig.forking.take() else { return Done(ENOSYS) };
-        let Done(pid) = self.fork(i, slot, es, flags, ptid, ctid, m) else { return Done(EAGAIN) };
-        let r0 = at.wrapping_add(signal::R0 as u32);
-        self.wr32(i, r0, pid as u32);
+        let Done(pid) = self.fork(i, slot, es as u32, flags as u32, ptid, ctid, m) else { return Done(EAGAIN) };
+        let (r0, word) = if super::vma::WIDE { (super::arch::signal64::REGS, 8) } else { (signal::R0, 4) };
+        let r0 = at + r0 as Va;
+        self.wr(i, r0, &(pid as i64).to_le_bytes()[..word]);
         if pid > 0 {
             if let Some((j, None)) = self.find_pid(pid as u32) {
-                self.wr32(j, r0, 0);
+                self.wr(j, r0, &[0u8; 8][..word]);
             }
         }
         Done(0)
@@ -2772,7 +2975,7 @@ impl Runtime {
     /// vfork, and clone with CLONE_VM|CLONE_VFORK (posix_spawn): the child is
     /// a thread in the parent's memory with its own process identity; the
     /// parent waits until it calls execve or exits.
-    fn vfork(&mut self, i: usize, slot: usize, exit_signal: u32, stack: u32, m: &[u32; 16]) -> Outcome {
+    fn vfork(&mut self, i: usize, slot: usize, exit_signal: u32, stack: Va, m: &[u32; 16]) -> Outcome {
         if self.apps[i].as_ref().unwrap().threads[slot].sig.vfork.is_some() {
             return Done(EAGAIN);
         }
@@ -2780,11 +2983,30 @@ impl Runtime {
         let app = self.apps[i].as_ref().unwrap();
         let parent = &app.threads[slot];
         let (tcb, blocked) = (parent.tcb, parent.sig.blocked);
-        let Ok(mut regs) = sys::tcb_read(tcb) else { return Done(EAGAIN) };
-        (regs.r0, regs.r1, regs.r2, regs.r3, regs.r4, regs.r5, regs.r6, regs.r7) = (0, m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
-        regs.r14 = m[sys::MR_LR];
-        regs.sp = if stack != 0 { stack } else { m[sys::MR_SP] };
-        let target = m[MR_FAULT_IP].wrapping_add(4) | (m[MR_CPSR] >> 5) & 1;
+        // AArch64: the parent's whole context, its call registers as the svc
+        // saw them, x0 = 0, after the svc on the child's stack (as clone).
+        #[cfg(target_arch = "aarch64")]
+        let start = {
+            let Ok(mut c) = sys::tcb_read_context(tcb) else { return Done(EAGAIN) };
+            let (abi, w) = (super::arch::NATIVE, sys::wide());
+            for k in 1..8 {
+                c.words[abi.context_arg0 + k] = w[k];
+            }
+            c.words[abi.context_arg0] = 0;
+            c.words[abi.context_pc] = w[MR_FAULT_IP] + 4;
+            c.words[abi.context_sp] = if stack != 0 { stack } else { w[sys::MR_SP] };
+            let _ = m;
+            c
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (regs, target) = {
+            let Ok(mut regs) = sys::tcb_read(tcb) else { return Done(EAGAIN) };
+            (regs.r0, regs.r1, regs.r2, regs.r3, regs.r4, regs.r5, regs.r6, regs.r7) = (0, m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+            regs.r14 = m[sys::MR_LR];
+            // (AArch32: its stack is a 32-bit address.)
+            regs.sp = if stack != 0 { stack as u32 } else { m[sys::MR_SP] };
+            (regs, m[MR_FAULT_IP].wrapping_add(4) | (m[MR_CPSR] >> 5) & 1)
+        };
         let v = Vfork {
             pid,
             fds: app.fds.clone(),
@@ -2801,7 +3023,11 @@ impl Runtime {
         if !signal::room_for_child(&app.sig.children) {
             return Done(EAGAIN);
         }
-        let Ok(s) = self.spawn(i, pid, regs, target) else { return Done(EAGAIN) };
+        #[cfg(target_arch = "aarch64")]
+        let started = self.spawn64(i, pid, start);
+        #[cfg(not(target_arch = "aarch64"))]
+        let started = self.spawn(i, pid, regs, target);
+        let Ok(s) = started else { return Done(EAGAIN) };
         let app = self.apps[i].as_mut().unwrap();
         app.threads[s].sig.blocked = blocked;
         app.threads[s].sig.vfork = Some(alloc::boxed::Box::new(v));
@@ -2910,21 +3136,23 @@ impl Runtime {
 
     /// Finish a child wait if a child it matches has ended: the status, the
     /// zombie gone (unless WNOWAIT), and the call's result.
-    fn wait_result(&mut self, i: usize, k: usize, status: u32, options: u32, rusage: u32, infop: Option<u32>) -> i32 {
+    fn wait_result(&mut self, i: usize, k: usize, status: Va, options: u32, rusage: Va, infop: Option<Va>) -> i32 {
         let app = self.apps[i].as_mut().unwrap();
         let c = app.sig.children[k];
         if infop.is_none() || options & 0x0100_0000 == 0 {
             app.sig.children.remove(k);
         }
         let st = c.status.unwrap_or(0);
+        // The app ABI's struct rusage, all zero: a wait that blocked ends
+        // here, past abi64's conversion of the call.
         if rusage != 0 {
-            self.wr(i, rusage, &[0u8; 72]);
+            self.wr(i, rusage, &[0u8; super::arch::compat::RUSAGE64][..rusage_bytes()]);
         }
         match infop {
             Some(ptr) => {
                 let (code, value) = signal::child_code(st);
                 let info = Info { signo: signal::SIGCHLD, code, a: c.pid, b: 0, c: value };
-                let ok = ptr == 0 || self.wr(i, ptr, &signal::siginfo(&info));
+                let ok = ptr == 0 || self.wr(i, ptr, &app_siginfo(&info));
                 if ok { 0 } else { EFAULT }
             }
             None => {
@@ -2950,7 +3178,7 @@ impl Runtime {
     }
 
     /// wait4(pid, status, options, rusage), and waitid with `infop`.
-    fn wait4(&mut self, i: usize, slot: usize, pid: i32, status: u32, options: u32, rusage: u32, infop: Option<u32>) -> Outcome {
+    fn wait4(&mut self, i: usize, slot: usize, pid: i32, status: Va, options: u32, rusage: Va, infop: Option<Va>) -> Outcome {
         let app = self.apps[i].as_ref().unwrap();
         match signal::wait_pick(&app.sig.children, pid, app.pid) {
             Err(()) => Done(ECHILD),
@@ -2971,11 +3199,11 @@ impl Runtime {
     }
 
     /// argv or envp: a NULL-terminated array of strings (NULL: none).
-    fn strings(&mut self, i: usize, mut ptr: u32) -> Result<Vec<String>, i32> {
+    fn strings(&mut self, i: usize, mut ptr: Va) -> Result<Vec<String>, i32> {
         let mut out = Vec::new();
         let mut bytes = 0;
         while ptr != 0 {
-            let p = self.rd32(i, ptr).ok_or(EFAULT)?;
+            let p = self.rdword(i, ptr).ok_or(EFAULT)?;
             if p == 0 {
                 break;
             }
@@ -2986,7 +3214,7 @@ impl Runtime {
             if out.len() > signal::ARG_STRINGS || bytes > signal::ARG_BYTES {
                 return Err(E2BIG);
             }
-            ptr = ptr.wrapping_add(4);
+            ptr = ptr.checked_add(if super::vma::WIDE { 8 } else { 4 }).ok_or(EFAULT)?;
         }
         Ok(out)
     }
@@ -3019,6 +3247,10 @@ impl Runtime {
         let loaded = cnode.and_then(|_| super::procmgr::load(&mut space, k, &mut self.pool, image, ld, argv, envp, random, layout));
         let stubs = loaded.and_then(|l| {
             space.add(layout.stubs, layout.stubs + super::procmgr::WINDOW, super::procmgr::PROT_READ | super::procmgr::PROT_EXEC);
+            #[cfg(target_arch = "aarch64")]
+            if !super::abi64::install_gate(&mut space, k, &mut self.pool) {
+                return Err("out of memory");
+            }
             space.resolve(k, &mut self.pool, layout.stubs).map(|_| l).ok_or("out of memory")
         });
         match (cnode, stubs) {
@@ -3062,7 +3294,7 @@ impl Runtime {
     /// Shield, entropy), so a failed execve returns with the caller intact.
     /// A plain execve rebuilds the caller's own app slot; a vfork child's
     /// takes a free one (the parent's memory stays the parent's).
-    fn execve(&mut self, i: usize, slot: usize, path: String, argv_ptr: u32, envp_ptr: u32) -> Outcome {
+    fn execve(&mut self, i: usize, slot: usize, path: String, argv_ptr: Va, envp_ptr: Va) -> Outcome {
         let argv = match self.strings(i, argv_ptr) { Ok(v) => v, Err(e) => return Done(e) };
         let envp = match self.strings(i, envp_ptr) { Ok(v) => v, Err(e) => return Done(e) };
         if let Err(e) = self.path_allowed(i, &path, false) {
@@ -3137,12 +3369,13 @@ impl Runtime {
         // Another app's program started by this one is not that app (manifest.rs `exec_identity`).
         let (owner, new_hash) = self.exec_identity(i, &path, owner, new_hash);
         let mut drawn = [0u8; 40];
-        if !self.entropy.fill(&mut drawn) && !(super::entropy::collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
+        if !self.entropy.fill(&mut drawn) && !(super::sys::entropy_collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
             return Done(EAGAIN);
         }
         let mut random = [0u8; 16];
         random.copy_from_slice(&drawn[..16]);
-        let layout = super::procmgr::Layout::random(&drawn[16..]);
+        // A fresh random layout of the ABI: vma::Layout64 for an AArch64 app.
+        let layout = super::procmgr::Layout::native_random(&drawn[16..]);
         // Everything the loader would refuse (segment places, code sharing a
         // 64 KiB page with data, the loader's room), refused while the caller
         // is still there: after this only running out of memory can fail.
@@ -3226,8 +3459,14 @@ impl Runtime {
     /// The first thread of an execve'd program, with the caller's mask and
     /// pending signals.
     fn exec_start(&mut self, j: usize, pid: u32, loaded: super::procmgr::Loaded, blocked: u64, pending: Vec<Info>, program: &str) {
-        let regs = sys::Regs { sp: loaded.sp, ..Default::default() };
-        match self.spawn(j, pid, regs, loaded.entry) {
+        #[cfg(not(target_arch = "aarch64"))]
+        let started = match (u32::try_from(loaded.sp), u32::try_from(loaded.entry)) {
+            (Ok(sp), Ok(entry)) => self.spawn(j, pid, sys::Regs { sp, ..Default::default() }, entry),
+            _ => Err(EINVAL),
+        };
+        #[cfg(target_arch = "aarch64")]
+        let started = self.spawn64(j, pid, super::arch::NATIVE.start_context(loaded.entry, loaded.sp, 0, 0));
+        match started {
             Ok(s) => {
                 let app = self.apps[j].as_mut().unwrap();
                 (app.threads[s].sig.blocked, app.threads[s].sig.pending) = (blocked, pending);
@@ -3243,6 +3482,19 @@ impl Runtime {
     }
 }
 
+/// A siginfo_t in the app's ABI: AArch64's union starts at 16, AArch32's at 12.
+fn app_siginfo(info: &Info) -> [u8; 128] {
+    #[cfg(target_arch = "aarch64")]
+    return super::abi64::siginfo(info);
+    #[cfg(not(target_arch = "aarch64"))]
+    return signal::siginfo(info);
+}
+
 fn app_digest(rt: &Runtime, j: usize) -> [u8; 32] {
     rt.apps[j].as_ref().map_or([0; 32], |a| a.digest)
+}
+
+/// Bytes of the app ABI's struct rusage (AArch32 72, AArch64 144).
+pub fn rusage_bytes() -> usize {
+    if super::vma::WIDE { super::arch::compat::RUSAGE64 } else { super::arch::compat::RUSAGE32 }
 }

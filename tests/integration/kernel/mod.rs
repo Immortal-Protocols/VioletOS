@@ -154,7 +154,7 @@ pub mod sys {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Mapping {
         pub pd: u32,
-        pub va: u32,
+        pub va: u64,
         pub writable: bool,
         pub exec: bool,
     }
@@ -186,14 +186,14 @@ pub mod sys {
     pub fn asid_assign(_pd: u32) -> Result<(), i32> {
         Ok(())
     }
-    pub fn pt_map(_pt: u32, _pd: u32, _va: u32) -> Result<(), i32> {
+    pub fn pt_map(_pt: u32, _pd: u32, _va: u64) -> Result<(), i32> {
         Ok(())
     }
     pub fn copy(dest: u32, src: u32) -> Result<(), i32> {
         HW.with(|h| h.borrow_mut().frames.insert(dest, src));
         Ok(())
     }
-    pub fn page_map(frame: u32, pd: u32, va: u32, writable: bool, exec: bool) -> Result<(), i32> {
+    pub fn page_map(frame: u32, pd: u32, va: u64, writable: bool, exec: bool) -> Result<(), i32> {
         assert!(!(writable && exec), "a page mapped writable and executable at {va:#x}");
         assert_eq!(va as usize & (PAGE - 1), 0, "a mapping not on a page boundary");
         HW.with(|h| {
@@ -222,11 +222,11 @@ pub mod sys {
     }
     /// The hardware mapping of the page at `va` in address space
     /// `pd`: (writable, executable), or None if nothing is mapped there.
-    pub fn at(pd: u32, va: u32) -> Option<(bool, bool)> {
-        HW.with(|h| h.borrow().mapped.values().find(|m| m.pd == pd && m.va == va & !(PAGE as u32 - 1)).map(|m| (m.writable, m.exec)))
+    pub fn at(pd: u32, va: u64) -> Option<(bool, bool)> {
+        HW.with(|h| h.borrow().mapped.values().find(|m| m.pd == pd && m.va == va & !(PAGE as u64 - 1)).map(|m| (m.writable, m.exec)))
     }
     /// What the MMU would do with `access` at `va`: Ok, or the fault.
-    pub fn mmu(pd: u32, va: u32, write: bool, exec: bool) -> Result<(), &'static str> {
+    pub fn mmu(pd: u32, va: u64, write: bool, exec: bool) -> Result<(), &'static str> {
         match at(pd, va) {
             None => Err("translation fault"),
             Some((w, _)) if write && !w => Err("permission fault (write)"),

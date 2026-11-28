@@ -38,7 +38,7 @@ mod sys {
     }
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct Mapping {
-        pub va: u32,
+        pub va: u64,
         pub writable: bool,
         pub exec: bool,
     }
@@ -58,14 +58,14 @@ mod sys {
     pub fn asid_assign(_pd: u32) -> Result<(), i32> {
         Ok(())
     }
-    pub fn pt_map(_pt: u32, _pd: u32, _va: u32) -> Result<(), i32> {
+    pub fn pt_map(_pt: u32, _pd: u32, _va: u64) -> Result<(), i32> {
         Ok(())
     }
     pub fn copy(dest: u32, src: u32) -> Result<(), i32> {
         HW.with(|h| h.borrow_mut().frames.insert(dest, src));
         Ok(())
     }
-    pub fn page_map(frame: u32, _pd: u32, va: u32, writable: bool, exec: bool) -> Result<(), i32> {
+    pub fn page_map(frame: u32, _pd: u32, va: u64, writable: bool, exec: bool) -> Result<(), i32> {
         assert!(!(writable && exec), "a page mapped writable and executable at {va:#x}");
         assert_eq!(va & 0xffff, 0);
         HW.with(|h| {
@@ -97,7 +97,7 @@ mod sys {
         page_unmap(slot);
     }
     /// The app's mapping of the 64 KiB page at `va`: (writable, executable).
-    pub fn at(va: u32) -> Option<(bool, bool)> {
+    pub fn at(va: u64) -> Option<(bool, bool)> {
         HW.with(|h| h.borrow().mapped.values().find(|m| m.va == va & !0xffff).map(|m| (m.writable, m.exec)))
     }
 }
@@ -215,7 +215,7 @@ fn started(kind: u16, layout: Layout) -> (World, procmgr::Loaded) {
 }
 /// A byte the test's "app" writes and maps from files; the loaded program has none.
 const SHELLCODE: u8 = 0xcc;
-const STUBS: u32 = vma::STUBS_BASE;
+const STUBS: u64 = vma::STUBS_BASE;
 
 impl World {
     /// No page the hardware would run holds a byte the app chose: every
@@ -229,13 +229,13 @@ impl World {
             }
         });
     }
-    fn fault(&mut self, va: u32, access: Access) -> bool {
+    fn fault(&mut self, va: u64, access: Access) -> bool {
         self.space.fault(&mut self.k, &mut self.pool, va, access)
     }
-    fn write(&mut self, va: u32, data: &[u8]) -> bool {
+    fn write(&mut self, va: u64, data: &[u8]) -> bool {
         self.space.write(&mut self.k, &mut self.pool, va, data)
     }
-    fn read(&mut self, va: u32, len: usize) -> Option<Vec<u8>> {
+    fn read(&mut self, va: u64, len: usize) -> Option<Vec<u8>> {
         let mut v = vec![0u8; len];
         self.space.read(&mut self.k, &mut self.pool, va, &mut v).then_some(v)
     }
@@ -413,6 +413,41 @@ fn random_layouts_stay_apart_and_vary() {
     assert_eq!(Layout::random(&[]), Layout::fixed());
 }
 
+#[test]
+fn aarch64_layouts_are_sparse_wide_and_random() {
+    use vma::*;
+    let mut seed = 0x2545f4914f6cdd1du64;
+    let (mut pies, mut mmaps, mut stacks) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    let (mut min_mmap, mut max_pie, mut max_stack) = (u64::MAX, 0, 0);
+    for _ in 0..100_000 {
+        let l = Layout64::random(&random_bytes(&mut seed));
+        for a in [l.pie_base, l.brk_gap, l.mmap_top, l.stack_top, l.stubs] {
+            assert_eq!(a & 0xffff, 0, "64 KiB windows, as AArch32");
+        }
+        assert!(l.stack_pad % 16 == 0 && l.stack_pad < 4096);
+        // Nothing in the low 4 GiB: an address cut to 32 bits faults.
+        assert!(l.pie_base >= 1 << 32);
+        // A 4 GiB program and its 256 MiB heap gap still end below mmap.
+        assert!(l.pie_base + (4 << 30) + l.brk_gap <= MMAP_BASE64);
+        // Room for TiB-scale PROT_NONE reservations below every mmap top.
+        assert!(l.mmap_top - MMAP_BASE64 >= 40 << 40);
+        assert!(l.stack_top - (8 << 20) >= MMAP_TOP64 && l.stack_top <= STACK_TOP64);
+        assert!(l.stubs >= STACK_TOP64 + 0x10000 && l.stubs + 0x10000 <= USER_TOP64);
+        min_mmap = min_mmap.min(l.mmap_top);
+        max_pie = max_pie.max(l.pie_base);
+        max_stack = max_stack.max(l.stack_top);
+        pies.insert(l.pie_base);
+        mmaps.insert(l.mmap_top);
+        stacks.insert(l.stack_top);
+    }
+    // Far more distinct placements than AArch32's 4096: about every draw differs.
+    assert!(pies.len() > 99_000 && mmaps.len() > 99_000 && stacks.len() > 98_000, "{} {} {}", pies.len(), mmaps.len(), stacks.len());
+    assert!(max_pie > PIE_BASE64 + (1 << 39) && min_mmap < MMAP_TOP64 - (1 << 43) && max_stack < STACK_TOP64);
+    assert_eq!(USER_TOP64, 0x8000_0000_0000, "runtime/arch AARCH64.user_top");
+    assert_eq!(Layout64::random(&[0; 24]), Layout64::fixed());
+    assert_eq!(Layout64::random(&[]), Layout64::fixed());
+}
+
 // ---- procmgr.rs: the loader ----
 
 #[test]
@@ -446,7 +481,7 @@ fn loader_maps_segments_with_their_own_rights() {
     let mut random = 0;
     loop {
         let pair = w.read(at, 8).unwrap();
-        let (key, value) = (u32::from_le_bytes(pair[..4].try_into().unwrap()), u32::from_le_bytes(pair[4..].try_into().unwrap()));
+        let (key, value) = (u32::from_le_bytes(pair[..4].try_into().unwrap()), u64::from(u32::from_le_bytes(pair[4..].try_into().unwrap())));
         if key == 0 {
             break;
         }
@@ -548,7 +583,8 @@ fn loader_survives_hostile_headers() {
     let mut pie_high = good.clone();
     pie_high[16] = 3;
     pie_high[52 + 8..52 + 12].copy_from_slice(&0xfff0_0000u32.to_le_bytes());
-    assert_eq!(try_load(&pie_high), Some("bad segment address"));
+    // (Addresses are 64-bit sums now: past the program area, not a wrapped one.)
+    assert_eq!(try_load(&pie_high), Some("segment too high"));
     assert_eq!(try_load(&good[..40]), Some("not a 32-bit little-endian ELF file"));
 }
 
@@ -756,11 +792,11 @@ fn unmapping_part_of_a_page_drops_rights_with_it() {
 #[test]
 fn random_operations_keep_every_invariant() {
     let mut seed = 0x1234_5678_9abc_def1u64;
-    let mut next = move |n: u32| {
+    let mut next = move |n: u64| {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
-        ((seed >> 20) as u32) % n
+        (seed >> 20) % n
     };
     let (mut refused, mut executable_faults, mut file_maps, mut threads) = (0, 0, 0, 0);
     // Code that loses execute never gets it back, so start over now and then.
@@ -778,7 +814,7 @@ fn random_operations_keep_every_invariant() {
         };
         let start = base + next(64) * 0x1000;
         let end = start + (1 + next(24)) * 0x1000;
-        let prot = next(8);
+        let prot = next(8) as u32;
         match next(8) {
             0 => {
                 // mmap with MAP_FIXED, half the time of a file the app wrote.
@@ -797,7 +833,7 @@ fn random_operations_keep_every_invariant() {
                 // clone: the trampoline is written, in the runtime's page only.
                 let slot = threads % 8192;
                 let stub = w.space.stub(&mut w.k, &mut w.pool, slot, 0x20d91).expect("the trampoline page is the runtime's");
-                assert_eq!(stub, w.space.layout.stubs + 8 * slot as u32);
+                assert_eq!(stub, w.space.layout.stubs + 8 * slot as u64);
                 threads += 1;
             }
             1 | 2 => {
@@ -907,7 +943,7 @@ fn the_trampoline_page_cannot_be_freed_or_replaced() {
     assert!(!w.space.pinned(stubs - 0x1000, stubs) && !w.space.pinned(stubs + 0x10000, stubs + 0x11000));
     w.space.remove(&mut w.k, &mut w.pool, vma::STUBS_BASE, vma::USER_TOP);
     w.space.remove(&mut w.k, &mut w.pool, stubs + 0x1000, stubs + 0x2000);
-    w.space.remove(&mut w.k, &mut w.pool, 0, u32::MAX);
+    w.space.remove(&mut w.k, &mut w.pool, 0, u64::MAX);
     assert_eq!(w.pool.available() - free, used - 1, "the program's pages were freed, the trampoline page was not");
     assert_eq!(w.space.usage().0, 1);
     assert_eq!(sys::at(stubs), Some((false, true)));
@@ -1208,8 +1244,8 @@ fn musl_like_loader(code_with_data: bool) -> Vec<u8> {
     let code_at = if code_with_data { 0x1000 } else { 0x10000 };
     elf(3, code_at + 0x100, &[(0, vec![0x41; 0x200], 0x200, 4), (code_at, vec![0x42; 0x400], 0x400, 5), (0x20000, vec![0x43; 0x40], 0x2000, 6)])
 }
-fn aux(w: &mut World, sp: u32) -> Vec<(u32, u32)> {
-    let argc = w.read(sp, 4).map(|b| u32::from_le_bytes(b[..4].try_into().unwrap())).unwrap();
+fn aux(w: &mut World, sp: u64) -> Vec<(u32, u64)> {
+    let argc = w.read(sp, 4).map(|b| u64::from(u32::from_le_bytes(b[..4].try_into().unwrap()))).unwrap();
     let mut at = sp + 4 + 4 * (argc + 1);
     while w.read(at, 4).unwrap() != [0, 0, 0, 0] {
         at += 4;
@@ -1218,7 +1254,7 @@ fn aux(w: &mut World, sp: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     loop {
         let b = w.read(at, 8).unwrap();
-        let (k, v) = (u32::from_le_bytes(b[..4].try_into().unwrap()), u32::from_le_bytes(b[4..].try_into().unwrap()));
+        let (k, v) = (u32::from_le_bytes(b[..4].try_into().unwrap()), u64::from(u32::from_le_bytes(b[4..].try_into().unwrap())));
         if k == 0 {
             return out;
         }
@@ -1319,11 +1355,11 @@ fn the_trampoline_page_holds_the_signal_gate() {
     let (mut w, _) = started(2, Layout::fixed());
     w.space.add(STUBS, STUBS + 0x10000, RX);
     assert_eq!(w.space.stub(&mut w.k, &mut w.pool, 3, 0x20d91), Some(STUBS + 24));
-    assert_eq!(w.space.gate(), STUBS + signal::GATE_OFFSET);
-    let words: Vec<u32> = (0..signal::GATE.len() as u32)
+    assert_eq!(w.space.gate(), STUBS + u64::from(signal::GATE_OFFSET));
+    let words: Vec<u32> = (0..signal::GATE.len() as u64)
         .map(|k| {
             let mut b = [0u8; 4];
-            w.space.read(&mut w.k, &mut w.pool, STUBS + signal::GATE_OFFSET + 4 * k, &mut b);
+            w.space.read(&mut w.k, &mut w.pool, STUBS + u64::from(signal::GATE_OFFSET) + 4 * k, &mut b);
             u32::from_le_bytes(b)
         })
         .collect();
@@ -1342,13 +1378,13 @@ fn mappings_of(index: u32) -> usize {
         h.mapped.keys().filter(|frame| h.frames.get(frame) == Some(&index)).count()
     })
 }
-const SHARED: u32 = 0x5000_0000;
+const SHARED: u64 = 0x5000_0000;
 
 #[test]
 fn a_pool_page_is_never_mapped_in_two_address_spaces() {
     let mut w = world();
     let mut other = Space::new(&mut w.k, 2).unwrap();
-    let end = SHARED + sys::PAGE as u32;
+    let end = SHARED + sys::PAGE as u64;
     w.space.add(SHARED, end, RW);
     other.add(SHARED, end, RW);
     let page = w.pool.take().unwrap();
@@ -1380,14 +1416,14 @@ fn only_the_apps_pages_and_app_addresses_can_be_mapped() {
     let mut w = world();
     // As at boot: pages below 8 are the runtime's heap, from 64 up the system image.
     procmgr::ledger().limit(8, 64);
-    let end = SHARED + 4 * sys::PAGE as u32;
+    let end = SHARED + 4 * sys::PAGE as u64;
     w.space.add(SHARED, end, RW);
     for outside in [0, 7, 64, 95, u32::MAX] {
         assert_eq!(w.space.map(&mut w.k, &w.pool, SHARED, outside, false), Err(EACCES), "page {outside}");
         assert_eq!(mappings_of(outside), 0);
     }
     w.space.map(&mut w.k, &w.pool, SHARED, 8, false).unwrap();
-    w.space.map(&mut w.k, &w.pool, SHARED + sys::PAGE as u32, 63, false).unwrap();
+    w.space.map(&mut w.k, &w.pool, SHARED + sys::PAGE as u64, 63, false).unwrap();
     // Nothing is mapped at or above the top of app memory, whatever the regions say.
     assert_eq!(w.space.map(&mut w.k, &w.pool, vma::USER_TOP, 9, false), Err(EACCES));
     assert_eq!(w.space.map(&mut w.k, &w.pool, 0xffff_0000, 9, false), Err(EACCES));
@@ -1404,7 +1440,7 @@ fn only_the_apps_pages_and_app_addresses_can_be_mapped() {
 fn a_page_handed_out_while_still_held_is_passed_over() {
     let mut w = world();
     let mut other = Space::new(&mut w.k, 2).unwrap();
-    let end = SHARED + sys::PAGE as u32;
+    let end = SHARED + sys::PAGE as u64;
     w.space.add(SHARED, end, RW);
     other.add(SHARED, end, RW);
     let page = w.pool.take().unwrap();
@@ -1432,14 +1468,14 @@ fn a_held_page_off_the_free_list_comes_back_once_its_holder_lets_go() {
     // X holds page P, and P is wrongly on the free list as well.
     let mut w = world();
     let mut x = Space::new(&mut w.k, 3).unwrap();
-    x.add(SHARED, SHARED + sys::PAGE as u32, RW);
+    x.add(SHARED, SHARED + sys::PAGE as u64, RW);
     let p = w.pool.take().unwrap();
     x.map(&mut w.k, &w.pool, SHARED, p, true).unwrap();
     assert!(x.write(&mut w.k, &mut w.pool, SHARED, b"live data"));
     w.pool.give_back(p);
     // Another app's touch passes P over: it gets another page, and P leaves the free list.
     let free = w.pool.available();
-    w.space.add(SHARED, SHARED + sys::PAGE as u32, RW);
+    w.space.add(SHARED, SHARED + sys::PAGE as u64, RW);
     assert!(w.fault(SHARED, Access::Write));
     assert_eq!(w.pool.available(), free - 2, "P passed over and dropped, one page taken");
     assert_eq!(procmgr::ledger().owner(p), x.pd);
@@ -1455,7 +1491,7 @@ fn fork_never_copies_into_a_page_another_space_holds() {
     // Another app X holds page P, and P is wrongly on the free list as well
     // (the stale give-back the ledger is there for), at the front.
     let mut x = Space::new(&mut w.k, 3).unwrap();
-    x.add(SHARED, SHARED + sys::PAGE as u32, RW);
+    x.add(SHARED, SHARED + sys::PAGE as u64, RW);
     let p = w.pool.take().unwrap();
     x.map(&mut w.k, &w.pool, SHARED, p, true).unwrap();
     w.pool.give_back(p);
@@ -1560,4 +1596,60 @@ fn a_static_pie_can_relocate_itself_wherever_it_lands() {
         w.space.destroy(&mut w.k, &mut w.pool);
     }
     assert!(bases.len() >= 20, "the base did not move: {bases:x?}");
+}
+
+// ---- the AArch64 layout in an address space: whole 64-bit addresses ----
+
+/// A space with an AArch64 app's layout (vma::Layout64): regions, pages,
+/// copies and the W^X rules work on whole 64-bit addresses. A region far
+/// above 4 GiB and another at its low 32 bits are different memory, a copy
+/// is checked over its whole 64-bit range, and nothing wraps.
+#[test]
+fn layout64_addresses_are_never_cut_to_32_bits() {
+    let mut w = world();
+    let layout: Layout = vma::Layout64::random(&[0x5a; 24]).into();
+    w.space.layout = layout;
+    let high: u64 = 0x1234_4000_0000; // its low word is 0x4000_0000
+    let alias = high & 0xffff_ffff;
+    w.space.add(high, high + 0x10000, RW);
+    w.space.add(alias, alias + 0x10000, RW);
+    assert!(w.write(high, b"high") && w.write(alias, b"low!"));
+    assert_eq!(w.read(high, 4).unwrap(), b"high", "the high page is its own memory");
+    assert_eq!(w.read(alias, 4).unwrap(), b"low!", "its low 32 bits are another page");
+    assert!(w.fault(high + 0x100, Access::Write) && sys::at(high) == Some((true, false)));
+    // The low alias gone: a copy at it is refused, the high one still works.
+    w.space.remove(&mut w.k, &mut w.pool, alias, alias + 0x10000);
+    assert!(w.read(alias, 4).is_none() && !w.write(alias, b"x"));
+    assert_eq!(w.read(high, 4).unwrap(), b"high");
+    // A copy is checked over its whole range: across 4 GiB, and one that
+    // would wrap the 64-bit address space.
+    let edge = (1u64 << 32) - 0x10000;
+    w.space.add(edge, edge + 0x10000, RW);
+    assert!(w.read(edge + 0xfff0, 0x20).is_none(), "past the region at 4 GiB");
+    w.space.add(1 << 32, (1 << 32) + 0x10000, RW);
+    assert_eq!(w.read(edge + 0xfff0, 0x20).unwrap().len(), 0x20, "regions on both sides of 4 GiB");
+    assert!(!vma::permits(&w.space.vmas, u64::MAX - 8, 16, PROT_READ));
+    assert!(w.read(u64::MAX - 8, 16).is_none());
+    // W^X at high addresses as at low ones: never writable and executable,
+    // no data made code, nothing else in a 64 KiB window that holds code.
+    let code = layout.pie_base;
+    w.space.add(code, code + 0x10000, RX);
+    assert!(w.space.refuses(high + 0x20000, high + 0x30000, RWX));
+    assert!(w.space.refuses(code + 0x10000, code + 0x11000, RW) == false, "the next window is free");
+    assert_eq!(w.space.protect(high, high + 0x10000, RX), Err(EACCES));
+    assert!(vma::near_code(&w.space.vmas, code + 0x8000, code + 0x9000));
+    assert!(!w.fault(code, Access::Write) && w.fault(code, Access::Exec));
+    w.check();
+    // Mapping: below the layout's top only.
+    assert_eq!(w.space.map(&mut w.k, &w.pool, vma::USER_TOP64, 9, false), Err(EACCES));
+    assert!(vma::USER_TOP < layout.user_top && layout.mmap_base == vma::MMAP_BASE64);
+    // mmap's search stays in the 64-bit mmap band, with room for 64 GiB.
+    let at = w.space.free_range(64 << 30).unwrap();
+    assert!(at >= vma::MMAP_BASE64 && at + (64 << 30) <= layout.mmap_top);
+    // The heap stops at the program band's top, not at the AArch32 one.
+    w.space.brk_start = code + 0x20000;
+    w.space.brk = w.space.brk_start;
+    let want = w.space.brk_start + 0x30000;
+    assert_eq!(w.space.set_brk(&mut w.k, &mut w.pool, want), want);
+    assert_eq!(w.space.set_brk(&mut w.k, &mut w.pool, vma::MMAP_BASE64 + 1), want, "past the program band");
 }

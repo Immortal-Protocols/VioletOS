@@ -17,17 +17,61 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = ROOT / "build/sel4/qemu"
+# IMAGE is the 32-bit (AArch32) system (VIOLET_ARCH=aarch32, make qemu32-image).
+# The default, AArch64 (targets/qemu64/stack.py, make qemu-image), has its image
+# directory here, and the board whose emulator, CPU and memory it boots with
+# (targets/board/qemu64.json).
+IMAGES = {"aarch32": IMAGE, "aarch64": ROOT / "build/sel4/qemu-aarch64"}
 sys.path.insert(0,str(ROOT/"system/package-manager"))
+sys.path.insert(0,str(ROOT/"image/packages"))
+sys.path.insert(0,str(ROOT/"targets/board"))
 from manage import launch_catalogs, acknowledge_rollback
+
+
+def arch_of(arch=None):
+    """`arch`, or VIOLET_ARCH (aarch64 unless set; image/packages/violet_arch.py)."""
+    import violet_arch
+    return arch or violet_arch.selected()
+
+
+def image_for(arch=None):
+    """The image main() boots: IMAGE as it is now for AArch32 (tests point it
+    at their own image), the AArch64 directory otherwise."""
+    arch = arch_of(arch)
+    return IMAGE if arch == "aarch32" else IMAGES[arch]
+
+
+def boot_devices(image, arch):
+    """The emulator binary, machine options and the -device loaders that start
+    `image`: the 32-bit loader zImage and its entry stub, or the AArch64 image
+    at the load address its plan (qemu64.json, targets/qemu64) names."""
+    if arch == "aarch32":
+        cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on", "-cpu", "max"]
+        for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
+                                      ("entry.bin", "0x44000000", ",cpu-num=0")]:
+            cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
+        return cmd[:5], cmd[5:]
+    import board as boards
+    plan = json.loads((image/"qemu64.json").read_text())
+    board = boards.load(plan["board"])
+    if board["arch"] != arch:
+        raise SystemExit(f"{image}: built for {board['arch']}, not {arch}")
+    spec = board["emulator"]
+    devices = ["-device", f"loader,file={str(image/plan['image']).replace(',', ',,')},addr={plan['load']:#x},force-raw=on",
+               "-device", f"loader,addr={plan['entry']:#x},cpu-num=0"]
+    return [spec["binary"], "-machine", spec["machine"], "-cpu", board["cpu"]], devices
 
 RAM_SIZE = 1024**3
 # The emulator's Wi-Fi: two open networks and a WPA2 one (password "violet-home").
 DEFAULT_NETWORKS = ["VIOLET LAB", "GUEST WIFI", {"name": "VIOLET HOME", "password": "violet-home"}]
 
-def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,None),peer=None):
+def machine(image=None, watchdog=False, scenario=0, disk=None, catalogs=(None,None),peer=None,arch=None):
+    arch = arch_of(arch)
+    # The default is the directory as it was at import (tests rely on that).
+    image = IMAGES[arch] if image is None else image
     network="guestport" if peer is not None else "wifi"
-    cmd = ["qemu-system-arm", "-machine", "virt,gic-version=3,virtualization=on",
-           "-cpu", "max", "-accel", "tcg", "-m", "1G", "-smp", os.environ.get("VIOLET_CORES", "1"), "-display", "none",
+    emulator, boot = boot_devices(Path(image), arch)
+    cmd = emulator + ["-accel", "tcg", "-m", "1G", "-smp", os.environ.get("VIOLET_CORES", "1"), "-display", "none",
            "-monitor", "none", "-global","virtio-mmio.force-legacy=false",
            "-netdev","user,id=wifi,restrict=on","-device",
            f"virtio-net-device,netdev={network},bus=virtio-mmio-bus.8,mac=52:54:00:56:00:01", "-no-reboot"]
@@ -55,9 +99,7 @@ def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,N
         import root_key
         blob = os.environ.get("VIOLET_ROOT_KEY") or root_key.ensure(str(disk) + ".rootkey")
         cmd += ["-device", f"loader,file={str(blob).replace(',', ',,')},addr={root_key.ADDRESS},force-raw=on"]
-    for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
-                                  ("entry.bin", "0x44000000", ",cpu-num=0")]:
-        cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
+    cmd += boot
     # Verified boot: the bootloader model's stored rollback floor (tools/ota_boot.py), for the loader.
     if (image/"rollback-floor").exists():
         from boot_manifest import floor_devices
@@ -70,7 +112,7 @@ def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,N
     if inbox:
         from package_format import inspect
         source=Path(inbox).resolve()
-        inspect(source.read_bytes())
+        inspect(source.read_bytes(), arch=arch)
         cmd+=["-device",f"loader,file={str(source).replace(',', ',,')},addr=0x49600000,force-raw=on"]
     for address,path in zip(("0x49400000","0x49500000"),catalogs):
         if path:
@@ -115,6 +157,7 @@ def finish(process):
         process.wait()
 
 def main(viewer):
+    IMAGE = image_for()
     with tempfile.TemporaryDirectory(prefix="violet-qemu-") as tmp, endpoint_peer() as peer:
         ram = Path(tmp)/"guest.ram"
         with ram.open("wb") as stream:

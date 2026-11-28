@@ -2,7 +2,7 @@
 
 The Moto supervisor starts [USB Diagnostics](process.rs) as a separate Rust process from package 21. It owns the handset USB controller and exposes read-only snapshots of Radio, Power and startup status. Mac clients use the same connection to stage signed replacements, request a scan or join, read the saved stopwatch value, and request a reboot. Radio owns Wi-Fi, Storage owns the catalog and checkpoint, and the supervisor verifies package signatures and decides which package runs.
 
-The [host clients](host/) run on the Mac. Build them with `make build/moto-debug build/moto-package`. Run `build/moto-debug` for a JSON snapshot and `build/moto-package diagnostics-status` for the running package checksum and trial generation.
+The [host clients](host/) run on the Mac. Build them with `make build/moto-debug build/moto-package`. Run `build/moto-debug` for a JSON snapshot and `build/moto-package diagnostics-status` for the running package checksum and trial generation. Images that answer vendor request 0x59 add `word_bits` (32 or 64: which architecture's VioletOS answered), `entry_el` (the level LK entered the AArch64 loader at), `last_fault` (the supervisor's last fault record on AArch64: process, label, four message words) and `boot_disk` (why the AArch64 loader could not open the boot history, when it could not); older images stall the request and the fields are absent.
 
 Run `build/moto-package reboot-bootloader` to restart the handset into fastboot, or `host/moto-flash IMAGE` to flash slot B and wait for VioletOS to return. See [hands-free image flashing](../../targets/moto-g-pure/README.md#hands-free-image-flashing).
 

@@ -23,7 +23,7 @@ Before rebooting, the test also replaces Tally while its old process is running
 and verifies that reopening starts the new version on the same boot.
 
 Needs the image built with the test relay:
-    VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu-image
+    VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu32-image
 and the Mac app (xcodebuild, see companion/mac/README.md).
 """
 from pathlib import Path
@@ -40,6 +40,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "targets/qemu"))
 import home_grid
+# This suite boots the 32-bit (AArch32) image: build/sel4/qemu, make qemu32-image.
+os.environ["VIOLET_ARCH"] = "aarch32"
 import run
 
 APP = ROOT / "build/mac-agent/Build/Products/Debug/Violet Agent.app/Contents/MacOS/Violet Agent"
@@ -234,7 +236,7 @@ def main():
     original = ROOT / "build/sel4/qemu"
     cpio = (original / "initfs.cpio").read_bytes()
     if b"violet-relay.test" not in cpio or b"violet-relay.test:3478" not in cpio:
-        raise SystemExit("Build the image with the test relay: VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu-image")
+        raise SystemExit("Build the image with the test relay: VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 make qemu32-image")
     if not free(8787):
         raise SystemExit("Port 8787 is busy")
     relay = subprocess.Popen([sys.executable, str(ROOT / "tools/chariot-relay/relay.py"), "--host", "127.0.0.1", "--port", "8787", "--stun", "3478"],

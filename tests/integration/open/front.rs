@@ -50,7 +50,7 @@ pub enum Touched {
 
 const MAP_FIXED: u32 = 0x10;
 const MAP_ANONYMOUS: u32 = 0x20;
-const USER_TOP: u32 = vma::USER_TOP;
+const USER_TOP: u32 = vma::USER_TOP as u32;
 
 fn align_up(v: u32, a: u32) -> u32 {
     v.wrapping_add(a - 1) & !(a - 1)
@@ -62,7 +62,7 @@ fn setting_key(k: &str) -> bool {
 impl Runtime {
     fn rstr(&mut self, i: usize, ptr: u32) -> Option<String> {
         let app = self.apps[i].as_mut()?;
-        app.space.read_string(&mut self.k, &mut self.pool, ptr, 4096)
+        app.space.read_string(&mut self.k, &mut self.pool, ptr.into(), 4096)
     }
     /// syscall.rs `at`.
     fn at(&mut self, i: usize, dirfd: i32, path_ptr: u32) -> Result<String, i32> {
@@ -293,7 +293,7 @@ impl Runtime {
             // ---- memory (syscall.rs "memory") ----
             45 => {
                 let app = self.apps[i].as_mut().unwrap();
-                app.space.set_brk(&mut self.k, &mut self.pool, a[0]) as i32
+                app.space.set_brk(&mut self.k, &mut self.pool, a[0].into()) as i32
             }
             192 => self.mmap(i, a[0], a[1], a[2], a[3], a[4] as i32, a[5].wrapping_mul(4096)),
             91 => {
@@ -302,10 +302,10 @@ impl Runtime {
                 }
                 let end = a[0].saturating_add(align_up(a[1], 4096)).min(USER_TOP);
                 let app = self.apps[i].as_mut().unwrap();
-                if app.space.pinned(a[0], end) {
+                if app.space.pinned(a[0].into(), end.into()) {
                     return EINVAL;
                 }
-                app.space.remove(&mut self.k, &mut self.pool, a[0], end);
+                app.space.remove(&mut self.k, &mut self.pool, a[0].into(), end.into());
                 0
             }
             125 => {
@@ -313,7 +313,7 @@ impl Runtime {
                     return EACCES;
                 }
                 let end = a[0].saturating_add(align_up(a[1], 4096));
-                match self.apps[i].as_mut().unwrap().space.protect(a[0], end, a[2] & 7) {
+                match self.apps[i].as_mut().unwrap().space.protect(a[0].into(), end.into(), a[2] & 7) {
                     Ok(()) => 0,
                     Err(e) => e,
                 }
@@ -322,7 +322,7 @@ impl Runtime {
             // written; nothing unless the generator was seeded.
             384 => {
                 let len = a[1].min(256 << 10);
-                if !self.apps[i].as_ref().unwrap().space.writable(a[0], len as usize) {
+                if !self.apps[i].as_ref().unwrap().space.writable(a[0].into(), len as usize) {
                     return EFAULT;
                 }
                 let mut b = alloc::vec![0u8; len as usize];
@@ -330,7 +330,7 @@ impl Runtime {
                     return EIO;
                 }
                 let app = self.apps[i].as_mut().unwrap();
-                if app.space.write(&mut self.k, &mut self.pool, a[0], &b) { len as i32 } else { EFAULT }
+                if app.space.write(&mut self.k, &mut self.pool, a[0].into(), &b) { len as i32 } else { EFAULT }
             }
             // exit, exit_group
             1 | 248 => {
@@ -355,7 +355,7 @@ impl Runtime {
         let mut b = [0u8; 20];
         {
             let app = self.apps[i].as_mut().unwrap();
-            if !app.space.read(&mut self.k, &mut self.pool, act, &mut b) {
+            if !app.space.read(&mut self.k, &mut self.pool, act.into(), &mut b) {
                 return EFAULT;
             }
         }
@@ -363,7 +363,7 @@ impl Runtime {
             return EINVAL;
         }
         let w = |k: usize| u32::from_le_bytes(b[k * 4..k * 4 + 4].try_into().unwrap());
-        let action = signal::Action { handler: w(0), flags: w(1), restorer: w(2), mask: u64::from(w(3)) | u64::from(w(4)) << 32 };
+        let action = signal::Action { handler: w(0).into(), flags: w(1), restorer: w(2).into(), mask: u64::from(w(3)) | u64::from(w(4)) << 32 };
         self.apps[i].as_mut().unwrap().sig.set_action(sig, action);
         0
     }
@@ -404,7 +404,7 @@ impl Runtime {
             let app = self.apps[k].as_mut().unwrap();
             let action = app.sig.action(sig);
             match signal::disposition(&action, sig) {
-                signal::Disposition::Handle => app.delivered.push((sig, action.handler)),
+                signal::Disposition::Handle => app.delivered.push((sig, action.handler as u32)),
                 signal::Disposition::Terminate { core } => {
                     crate::log!("{} (pid {}) killed by signal {}", app.name, app.pid, sig);
                     let (pid, ppid, status) = (app.pid, app.sig.ppid, signal::signaled(sig, core));
@@ -473,14 +473,14 @@ impl Runtime {
         };
         let app = self.apps[i].as_mut().unwrap();
         // Copies into app memory go by the app's own regions (procmgr.rs `write`).
-        if app.space.write(&mut self.k, &mut self.pool, buf, &data) { data.len() as i32 } else { EFAULT }
+        if app.space.write(&mut self.k, &mut self.pool, buf.into(), &data) { data.len() as i32 } else { EFAULT }
     }
 
     fn write(&mut self, i: usize, fd: i32, buf: u32, len: u32) -> i32 {
         let mut data = alloc::vec![0u8; len.min(64 << 10) as usize];
         {
             let app = self.apps[i].as_mut().unwrap();
-            if !app.space.read(&mut self.k, &mut self.pool, buf, &mut data) {
+            if !app.space.read(&mut self.k, &mut self.pool, buf.into(), &mut data) {
                 return EFAULT;
             }
         }
@@ -523,10 +523,11 @@ impl Runtime {
             return EACCES;
         }
         let len = align_up(len, 4096);
+        let (addr, len) = (u64::from(addr), u64::from(len));
         let fixed = flags & MAP_FIXED != 0;
         let app = self.apps[i].as_mut().unwrap();
         let start = if fixed {
-            if addr & 0xfff != 0 || addr.checked_add(len).map_or(true, |e| e > USER_TOP) {
+            if addr & 0xfff != 0 || addr.checked_add(len).map_or(true, |e| e > u64::from(USER_TOP)) {
                 return EINVAL;
             }
             addr
@@ -572,6 +573,7 @@ impl Runtime {
     /// hardware holds the mappings procmgr.rs made; an access they do not
     /// serve is a fault, which `Space::fault` resolves or refuses.
     pub fn touch(&mut self, i: usize, va: u32, access: Access) -> Touched {
+        let va = u64::from(va);
         let (write, exec) = (access == Access::Write, access == Access::Exec);
         let pd = self.apps[i].as_ref().unwrap().space.pd;
         if sys::mmu(pd, va, write, exec).is_ok() {
@@ -610,7 +612,7 @@ impl Runtime {
         let action = app.sig.action(sig);
         app.thread.faults += 1;
         if action.handler > signal::SIG_IGN && app.thread.blocked & signal::bit(sig) == 0 && app.thread.faults <= signal::FAULT_LIMIT {
-            app.delivered.push((sig, action.handler));
+            app.delivered.push((sig, action.handler as u32));
             return Touched::Signal(sig, code);
         }
         crate::log!("{} (pid {}): bad memory access ({:?}) at {:#x}", app.name, app.pid, access, va);

@@ -1,5 +1,5 @@
 {
-  "about": "Every difference between the AArch64 QEMU kernel (kernel/sel4/aarch64/build.py) and upstream seL4. Same rules as kernel/sel4/delta.json; a source hash written as \"shared\" is the one recorded there. After a deliberate change run python3 kernel/sel4/aarch64/build.py --update.",
+  "about": "Every difference between the AArch64 kernels (QEMU and handset) (kernel/sel4/aarch64/build.py) and upstream seL4. Same rules as kernel/sel4/delta.json; a source hash written as \"shared\" is the one recorded there. After a deliberate change run python3 kernel/sel4/aarch64/build.py --update.",
   "upstream": {
     "name": "seL4-17.0.0",
     "sha256": "cda7844ba516ba8920ba1f24ec8ab98302f0527007c1ec0cfe294aa46443b0fe"
@@ -30,7 +30,7 @@
       "KernelAllowSMCCalls": {
         "verified": "ON",
         "violetos": "OFF",
-        "proof": "Fewer kernel calls: no SMC forwarding is reachable (and the build checks no SMC instruction is present)."
+        "proof": "Upstream's general SMC forwarding is off. The handset kernel instead has the ellis Wi-Fi extension (four fixed secure-monitor calls behind one root cap, ellis-wifi.patch); the QEMU kernel makes no SMC (the build checks)."
       },
       "KernelMaxNumBootinfoUntypedCaps": {
         "verified": "50",
@@ -47,7 +47,8 @@
       "KernelArmExportVCNTUser": "ON",
       "KernelArmExportPTMRUser": "OFF",
       "KernelIsMCS": "OFF",
-      "KernelDebugBuild": "OFF"
+      "KernelDebugBuild": "OFF",
+      "KernelRootCNodeSizeBits": "16"
     }
   },
   "changed": {
@@ -66,12 +67,48 @@
     "tools/hardware.yml": {
       "from": "platform/sel4/board/gic-single-core.py",
       "why": "Adds the violet,ellis-boot-gic device rule: the kernel maps the distributor and four redistributor frames."
+    },
+    "include/arch/arm/arch/64/mode/object/structures.bf": {
+      "from": "kernel/sel4/aarch64/ellis-wifi.patch",
+      "why": "Adds ellis_wifi_cap (arch cap tag 29) on the ellis platform."
+    },
+    "include/arch/arm/arch/64/mode/object/structures.h": {
+      "from": "kernel/sel4/aarch64/ellis-wifi.patch",
+      "why": "The ellis_wifi_cap has no size, object or region, like the ASID control cap."
+    },
+    "src/arch/arm/kernel/boot.c": {
+      "from": "kernel/sel4/aarch64/ellis-wifi.patch",
+      "why": "Puts the ellis_wifi_cap in the root task's seL4_CapSMC slot (the slot upstream's SMC cap would use; KernelAllowSMCCalls stays OFF)."
+    },
+    "src/arch/arm/64/object/objecttype.c": {
+      "from": "kernel/sel4/aarch64/ellis-wifi.patch",
+      "why": "Derivation gives a null cap (no copies), and an invocation goes to ellisWifiInvocation (invoke.h)."
+    },
+    "libsel4/include/sel4/constants.h": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "Adds seL4_TCBFlag_ellisTimer (0x2) and, with CONFIG_ELLIS_TIMER_GRANT, puts it in seL4_TCBFlag_MASK so TCB SetFlags accepts it."
+    },
+    "src/object/tcb.c": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "TCB SetFlags refuses (IllegalOperation) to set or clear seL4_TCBFlag_ellisTimer unless the invoking thread has it; on the running thread the change takes effect at once."
+    },
+    "src/arch/arm/64/kernel/thread.c": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "Arch_switchToThread sets CNTKCTL_EL1.EL0PTEN for a thread with seL4_TCBFlag_ellisTimer and clears it for any other."
+    },
+    "include/arch/arm/arch/64/mode/fastpath/fastpath.h": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "The IPC fastpath's thread switch (switchToThread_fp) does the same, so no switch leaves the previous thread's timer access in place."
+    },
+    "src/kernel/boot.c": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "The root task (the supervisor) starts with seL4_TCBFlag_ellisTimer and EL0PTEN set: it is the only thread that may hand the flag on."
     }
   },
   "added": {
     "src/plat/ellis/config.cmake": {
       "from": "kernel/sel4/aarch64/config.cmake",
-      "why": "The ellis platform as an AArch64 kernel on Cortex-A53 with GICv3 and the ARM generic timer, QEMU timing only. Not an upstream platform."
+      "why": "The ellis platform as an AArch64 kernel on Cortex-A53 with GICv3 and the ARM generic timer: QEMU virt's 62.5 MHz timer, or the handset's 13 MHz with VioletHandsetBoard. Not an upstream platform."
     },
     "src/plat/ellis/kernel-overlay.dts": {
       "from": "platform/sel4/board/kernel-overlay.dts",
@@ -83,20 +120,46 @@
     },
     "src/plat/ellis/factory-base.dts": {
       "from": "platform/sel4/board/qemu.dts",
-      "why": "The base device tree for QEMU virt."
+      "why": "The base device tree: qemu.dts for QEMU; for the handset, the tree decompiled from the factory boot image at build time (not in this repository), as the 32-bit handset kernel's.",
+      "handset": {
+        "factory_boot_sha256": "36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a",
+        "how": "For the handset, kernel/sel4/aarch64/build.py decompiles the base device tree from the factory boot image with dtc. The build stops unless that image has this SHA-256."
+      }
     },
     "libsel4/sel4_plat_include/ellis/sel4/plat/api/constants.h": {
       "why": "A copy of upstream's imx8mm-evk/sel4/plat/api/constants.h.",
       "copy_of": "libsel4/sel4_plat_include/imx8mm-evk/sel4/plat/api/constants.h"
+    },
+    "src/plat/ellis/wifi/monitor.S": {
+      "from": "kernel/sel4/aarch64/monitor.S",
+      "why": "Four secure-monitor call stubs with fixed MediaTek SiP function IDs, in A64. Assembled for the handset only."
+    },
+    "include/arch/arm/arch/object/ellis_wifi/invoke.h": {
+      "from": "platform/sel4/board/wifi/invoke.h",
+      "why": "ellisWifiInvocation, the 32-bit kernel's: one of four permitted requests becomes one secure-monitor call with fixed arguments. On QEMU the stubs are C functions that fail."
+    },
+    "include/arch/arm/arch/object/ellis_wifi/table.h": {
+      "from": "platform/sel4/board/wifi/table.h",
+      "why": "The four permitted operations and their fixed monitor arguments, the 32-bit kernel's."
+    },
+    "include/arch/arm/arch/object/ellis_timer.h": {
+      "from": "kernel/sel4/aarch64/ellis_timer.h",
+      "why": "ellisTimerAccess: CNTKCTL_EL1.EL0PTEN from the TCB's seL4_TCBFlag_ellisTimer (the EL0 physical timer, PPI 30; the kernel's tick is the virtual timer, PPI 27)."
     }
   },
   "sources": {
-    "kernel/sel4/aarch64/config.cmake": "07633d007cb36379627ec958d3e2b5247e5ee6c111b0401552dd49d240886e43",
+    "kernel/sel4/aarch64/config.cmake": "72536b1fb95c4f81fca465a1f31b956e9a3332f9a563ada3bbdf9313de59d7c4",
     "kernel/sel4/aarch64/linux-svc.patch": "0e8fc3de8d2fc133d482fbb9e276804532f5bd7413bdcd99566d068cccaa4f6d",
     "platform/sel4/board/kernel-overlay.dts": "shared",
     "platform/sel4/board/moto-radio-memory.dts": "shared",
     "platform/sel4/board/qemu.dts": "shared",
-    "platform/sel4/board/gic-single-core.py": "shared"
+    "platform/sel4/board/gic-single-core.py": "shared",
+    "kernel/sel4/aarch64/ellis-wifi.patch": "679a0fe0ff378764a3ba5257b3e39ea71068c4e6ef01b458d4d15137145df73e",
+    "kernel/sel4/aarch64/monitor.S": "14407163fd43ab87db5bae7631dbb0a862dec0874ec68d9769a486b5298446e5",
+    "platform/sel4/board/wifi/invoke.h": "shared",
+    "platform/sel4/board/wifi/table.h": "shared",
+    "kernel/sel4/aarch64/ellis-timer.patch": "0600b277fd245c44c15259f7bf46a3ff405be67ce60e1ac9abd8e68ca7795358",
+    "kernel/sel4/aarch64/ellis_timer.h": "610e579765c072164aa08edee1ec602507b6325a0d578071c62f7ff63d964358"
   },
   "options": {
     "CMAKE_TOOLCHAIN_FILE": {
@@ -147,11 +210,29 @@
     },
     "KernelArmExportPTMRUser": {
       "value": "OFF",
-      "why": "No user thread may program the EL0 physical timer: the kernel does not switch it between threads, so any app could cancel or move another thread's wake-up."
+      "why": "Not exported to every user thread: the kernel does not switch the EL0 physical timer between threads, so any app could cancel or move another thread's wake-up. ellis-timer.patch instead enables it (CNTKCTL_EL1.EL0PTEN) only while a thread with seL4_TCBFlag_ellisTimer runs: the supervisor and its timekeeper."
     },
     "KernelArmHypervisorSupport": {
       "value": "OFF",
       "why": "The kernel runs at EL1; QEMU virt without virtualization starts there."
+    },
+    "KernelRootCNodeSizeBits": {
+      "value": "16",
+      "why": "The supervisor's root CNode: on AArch64 its device windows, scanout and camera are mapped as 4 KiB frames (no 64 KiB or 1 MiB pages), about 6000 capabilities on QEMU, beyond the default 4096 slots."
+    },
+    "VioletHandsetBoard": {
+      "value": "ON for the handset, OFF for QEMU",
+      "expression": "'ON' if target == 'moto' else 'OFF'",
+      "why": "Selects the handset's 13 MHz timer instead of QEMU virt's 62.5 MHz (src/plat/ellis/config.cmake)."
     }
+  },
+  "smc": {
+    "functions": [
+      "moto_emi_call",
+      "moto_emi_read_offset",
+      "moto_emi_set_window",
+      "moto_random_words"
+    ],
+    "why": "The only SMC instructions in the AArch64 kernels: the stubs in monitor.S, handset only. The QEMU kernel has none (the build checks both)."
   }
 }

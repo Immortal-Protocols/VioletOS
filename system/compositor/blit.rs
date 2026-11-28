@@ -44,13 +44,18 @@ pub fn widen3(dst: &mut [u32], src: &[u32]) {
 /// kept as loops: the compiler would otherwise call a general memcpy and
 /// memset, which cost Display more code than everything else here.
 pub mod plain {
+    // On a 64-bit Arm device (aarch64-unknown-none) these loops are the
+    // whole path, and they stay one 32-bit store a pixel too: the compiler
+    // would otherwise widen them to 16-byte vector stores or memset, which
+    // fault on a surface the kernel maps as device memory, where every access
+    // must be aligned to its own size.
     #[inline(always)]
     fn put(d: &mut u32, p: u32) {
-        #[cfg(target_arch = "arm")]
+        #[cfg(any(target_arch = "arm", all(target_arch = "aarch64", target_os = "none")))]
         unsafe {
             core::ptr::write_volatile(d, p)
         }
-        #[cfg(not(target_arch = "arm"))]
+        #[cfg(not(any(target_arch = "arm", all(target_arch = "aarch64", target_os = "none"))))]
         {
             *d = p;
         }

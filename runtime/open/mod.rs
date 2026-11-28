@@ -5,6 +5,11 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+#[cfg(target_arch = "aarch64")]
+pub mod abi64;
+/// What differs between AArch32 and AArch64 (runtime/arch), pure code.
+#[path = "../arch/mod.rs"]
+pub mod arch;
 pub mod contain;
 pub mod appstore;
 pub mod data;
@@ -117,21 +122,23 @@ macro_rules! log {
 }
 
 #[derive(Clone)]
+/// (Every app address a wait keeps is whole: vma::Va.)
 pub enum Wait {
-    Futex { app: usize, addr: u32 },
+    Futex { app: usize, addr: vma::Va },
     Sleep,
-    Poll { fds: Vec<(i32, i16)>, ptr: u32, time64: bool },
-    Epoll { epfd: i32, events: u32, max: u32 },
-    Read { fd: i32, buf: u32, len: u32 },
-    /// recvfrom/recvmsg: a read whose source address goes to `name`.
-    RecvFrom { fd: i32, buf: u32, len: u32, name: u32, name_len: u32 },
+    Poll { fds: Vec<(i32, i16)>, ptr: vma::Va, time64: bool },
+    Epoll { epfd: i32, events: vma::Va, max: u32 },
+    Read { fd: i32, buf: vma::Va, len: u32 },
+    /// recvfrom/recvmsg: a read whose source address goes to `name`
+    /// (`name_len`: the address of its length).
+    RecvFrom { fd: i32, buf: vma::Va, len: u32, name: vma::Va, name_len: vma::Va },
     /// A blocking accept/accept4 on a listening socket (sockets.rs).
-    Accept { fd: i32, addr: u32, len: u32, flags: u32 },
+    Accept { fd: i32, addr: vma::Va, len: vma::Va, flags: u32 },
     /// A blocking write to /dev/violet/audio waiting for room in the ring.
-    Audio { fd: i32, buf: u32, len: u32 },
+    Audio { fd: i32, buf: vma::Va, len: u32 },
     /// A blocking connect, or a send waiting for room in the socket's ring.
     Connect { fd: i32 },
-    Send { fd: i32, buf: u32, len: u32 },
+    Send { fd: i32, buf: vma::Va, len: u32 },
     /// Held by a Violet Shield freeze; answered with EACCES when the app thaws.
     Frozen,
     /// A call that finished while its app was frozen (lifecycle or Shield):
@@ -141,7 +148,7 @@ pub enum Wait {
     /// answers the write with `result`.
     Present { result: i32 },
     /// SCREEN_IOC_WAIT_VSYNC: until a frame after `after` starts; VsyncInfo to `ptr`.
-    Vsync { after: u64, ptr: u32 },
+    Vsync { after: u64, ptr: vma::Va },
     /// An open or socket that needs the user's answer to the consent prompt
     /// up for it (trusted_ui.rs `pending`): run again once it is answered
     /// or withdrawn, when policy has the answer.
@@ -189,7 +196,8 @@ pub struct Thread {
     pub deadline: Option<u64>,
     /// The fault message to answer with when it wakes: r0..r7 and FaultIP.
     pub saved: [u32; 9],
-    pub clear_tid: u32,
+    /// set_tid_address / CLONE_CHILD_CLEARTID: an app address, or 0.
+    pub clear_tid: vma::Va,
     pub alive: bool,
     pub slot: u32,
     /// Its scheduling context (MCS), or 0.
@@ -382,7 +390,7 @@ impl Runtime {
             foreground: None,
             shell: device::Shell::default(),
             next_pid: 100,
-            entropy: entropy::boot(),
+            entropy: sys::entropy_boot(),
             contact: None,
             last_poll: 0,
             stats: Stats::default(),
@@ -479,12 +487,13 @@ impl Runtime {
         // AT_RANDOM and a random address-space layout; without a seeded
         // generator nothing starts, rather than start predictably.
         let mut drawn = [0u8; 40];
-        if !self.entropy.fill(&mut drawn) && !(entropy::collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
+        if !self.entropy.fill(&mut drawn) && !(sys::entropy_collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
             return Err(String::from("no entropy to start an app"));
         }
         let mut random = [0u8; 16];
         random.copy_from_slice(&drawn[..16]);
-        let layout = procmgr::Layout::random(&drawn[16..]);
+        // AArch64 apps: vma::Layout64, the 47-bit layout above 4 GiB.
+        let layout = procmgr::Layout::native_random(&drawn[16..]);
         let untyped = self.untypeds[index];
         let k = &mut self.k;
         let mut space = Space::new(k, untyped).map_err(|e| alloc::format!("address space: {}", e))?;
@@ -530,7 +539,12 @@ impl Runtime {
         // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
         // The app has the page read-execute; the runtime writes it through its own mapping.
         space.add(layout.stubs, layout.stubs + procmgr::WINDOW, procmgr::PROT_READ | procmgr::PROT_EXEC);
-        let Some(_) = space.resolve(k, &mut self.pool, layout.stubs) else {
+        // AArch64: the A64 signal gate, at the end of the same page (abi64.rs).
+        #[cfg(target_arch = "aarch64")]
+        let gate = abi64::install_gate(&mut space, k, &mut self.pool);
+        #[cfg(not(target_arch = "aarch64"))]
+        let gate = true;
+        let Some(_) = space.resolve(k, &mut self.pool, layout.stubs).filter(|_| gate) else {
             space.destroy(k, &mut self.pool);
             self.release_objects(index, core::mem::take(&mut space.object_slots));
             return Err(String::from("out of memory"));
@@ -560,9 +574,15 @@ impl Runtime {
         for _ in 0..3 {
             app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
         }
-        let regs = sys::Regs { sp: loaded.sp, ..Default::default() };
         self.apps[index] = Some(app);
-        if let Err(e) = self.spawn(index, pid, regs, loaded.entry) {
+        #[cfg(not(target_arch = "aarch64"))]
+        let started = match (u32::try_from(loaded.sp), u32::try_from(loaded.entry)) {
+            (Ok(sp), Ok(entry)) => self.spawn(index, pid, sys::Regs { sp, ..Default::default() }, entry),
+            _ => Err(-22),
+        };
+        #[cfg(target_arch = "aarch64")]
+        let started = self.spawn64(index, pid, arch::NATIVE.start_context(loaded.entry, loaded.sp, 0, 0));
+        if let Err(e) = started {
             self.reap(index);
             return Err(alloc::format!("thread: {}", e));
         }
@@ -588,6 +608,9 @@ impl Runtime {
     /// Thumb) with `regs`. seL4 clears the Thumb bit in a written CPSR, so the
     /// thread starts at its ARM-mode trampoline, which jumps there.
     pub fn spawn(&mut self, index: usize, tid: u32, mut regs: sys::Regs, target: u32) -> Result<usize, i32> {
+        if vma::WIDE {
+            return Err(-22); // the AArch32 register form: spawn64
+        }
         let app = self.apps[index].as_mut().unwrap();
         // A thread that ended (exit, a vfork child after execve) leaves its
         // slot, TCB and fault endpoint for the next: posix_spawn makes and
@@ -605,7 +628,7 @@ impl Runtime {
                 let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
                 sys::tcb_schedule(tcb, sc, 0, tier)?;
             }
-            let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
+            let stub = app.space.stub(k, &mut self.pool, slot, target).and_then(|s| u32::try_from(s).ok()).ok_or(-12)?;
             (regs.pc, regs.cpsr) = (stub, 0x10);
             let t = &mut app.threads[s];
             (t.tid, t.wait, t.deadline, t.saved, t.clear_tid, t.alive) = (tid, None, None, [0; 9], 0, true);
@@ -636,7 +659,7 @@ impl Runtime {
         }
         // The trampoline page is looked up each time, never through a kept
         // address: no thread starts if the runtime's page is not there.
-        let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
+        let stub = app.space.stub(k, &mut self.pool, slot, target).and_then(|s| u32::try_from(s).ok()).ok_or(-12)?;
         regs.pc = stub;
         regs.cpsr = 0x10;
         app.threads.push(Thread {
@@ -653,6 +676,60 @@ impl Runtime {
             sig: signal::Thread::new(0),
         });
         sys::tcb_write(tcb, true, &regs)?;
+        Ok(slot)
+    }
+
+    /// AArch64: create a thread in app `index` that starts with context `c`
+    /// (its pc, sp, x0 and tpidr_el0 set). A64 code needs no trampoline: the
+    /// kernel starts it where the context says. The slot, kernel objects and
+    /// scheduling are `spawn`'s.
+    #[cfg(target_arch = "aarch64")]
+    pub fn spawn64(&mut self, index: usize, tid: u32, c: arch::Context) -> Result<usize, i32> {
+        let app = self.apps[index].as_mut().unwrap();
+        let reuse = app.threads.iter().position(|t| !t.alive && t.reply.is_none());
+        let slot = reuse.unwrap_or(app.threads.len());
+        if slot >= (1 << APP_CNODE_BITS) - 2 {
+            return Err(-11);
+        }
+        let k = &mut self.k;
+        let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
+        let tcb = if let Some(s) = reuse {
+            let tcb = app.threads[s].tcb;
+            if sys::cores() > 1 {
+                sys::tcb_schedule(tcb, 0, 0, tier)?;
+            }
+            let t = &mut app.threads[s];
+            (t.tid, t.wait, t.deadline, t.saved, t.clear_tid, t.alive) = (tid, None, None, [0; 9], 0, true);
+            t.sig = signal::Thread::new(0);
+            tcb
+        } else {
+            let tcb = app.space.object(k, Object::Tcb, 0)?;
+            let ep_slot = slot as u32 + 1;
+            sys::mint_into(app.cnode, ep_slot, APP_CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
+            sys::tcb_configure(tcb, ep_slot, app.cnode, APP_CNODE_BITS, app.space.pd)?;
+            // (The AArch64 kernel is built without MCS: kernel/sel4/aarch64.)
+            if sys::cores() > 1 {
+                sys::tcb_schedule(tcb, 0, 0, tier)?;
+            }
+            app.threads.push(Thread {
+                tid,
+                tcb,
+                reply: None,
+                wait: None,
+                deadline: None,
+                saved: [0; 9],
+                clear_tid: 0,
+                alive: true,
+                slot: slot as u32,
+                sc: 0,
+                sig: signal::Thread::new(0),
+            });
+            tcb
+        };
+        if let Err(e) = sys::tcb_write_context(tcb, true, &c) {
+            app.threads[slot].alive = false;
+            return Err(e);
+        }
         Ok(slot)
     }
 
@@ -765,9 +842,19 @@ impl Runtime {
             unsafe { ((r.mrs[0] & 0xffc) as usize as *mut u32).write_volatile(0) };
         }
         match r.label {
+            #[cfg(target_arch = "aarch64")]
+            sys::FAULT_UNKNOWN_SYSCALL => {
+                if let Some(mrs) = self.enter64(index, &r) {
+                    self.syscall(index, slot, &mrs);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
-                let (pc, addr) = (r.mrs[0], r.mrs[1]);
+                #[cfg(target_arch = "aarch64")]
+                let (pc, addr) = (sys::wide()[0], arch::enter64::fault_address(sys::wide()[1]));
+                #[cfg(not(target_arch = "aarch64"))]
+                let (pc, addr) = (r.mrs[0], vma::Va::from(r.mrs[1]));
                 // Read, write or instruction fetch: the region must allow it (vma.rs).
                 let access = vma::access(r.mrs[2], r.mrs[3]);
                 let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
@@ -810,7 +897,7 @@ impl Runtime {
                 }
             }
             // An undefined instruction: SIGILL, to a handler if there is one.
-            sys::FAULT_USER_EXCEPTION if self.fault_signal(index, slot, r.label, r.mrs[0], None, 0) => {}
+            sys::FAULT_USER_EXCEPTION if self.fault_signal(index, slot, r.label, vma::Va::from(r.mrs[0]), None, 0) => {}
             _ => {
                 let app = self.apps[index].as_mut().unwrap();
                 log!("{} (pid {}): fault {} at pc {:#x}", app.name, app.pid, r.label, r.mrs[0]);

@@ -168,9 +168,68 @@ def keep_storage(image):
     return out
 
 
+def getvar(name):
+    """A bootloader variable, or None if this bootloader does not answer it
+    (another MBM build, or the AOSP spelling without the underscore)."""
+    result = ok("fastboot", "getvar", name, timeout=30)
+    if not result or result.returncode:
+        return None
+    for line in (result.stdout + result.stderr).splitlines():
+        if line.startswith(f"{name}:"):
+            return line.split(":", 2)[-1].strip()
+    return None
+
+
+def select_b(fallback_reboots):
+    """Make B active with fresh tries.
+
+    MBM restores B's tries (to 7) only when B is not already the current slot:
+    `set_active b` on a current B with no tries left changes nothing, and the
+    next boot then falls through to fastboot ("No bootable A/B slot"). Seen
+    once (November 27, 2026, on the MBM the Moto README names): with neither
+    slot bootable, one reboot fell through to fastboot with A current, after
+    which `set_active b` restored B's tries. slot-bootable:_a is not a sure
+    sign that A will not boot (A has reported "No" and still started a
+    VioletOS), so the reboot may start A instead: VioletOS or Android is
+    then taken back to fastboot, which makes A current all the same. A
+    bootloader that does not answer the variables gets the plain
+    `set_active b`, as before this check.
+    """
+    fastboot("set_active", "b")
+    # The 64-bit image marks B successful once healthy (targets/moto-g-pure
+    # README, "Slot B is marked successful"), and LK never falls back from a
+    # marked slot: make the new image a counted trial. Switching to A and back
+    # gives B 7 tries, unmarked; A is only selected, never written.
+    if getvar("slot-successful:_b") == "yes":
+        log("Slot B is marked successful; set_active a, set_active b so the new image is a counted trial")
+        fastboot("set_active", "a")
+        fastboot("set_active", "b")
+        if getvar("slot-successful:_b") == "yes":
+            raise SystemExit("Slot B is still marked successful after set_active a/b: an image that does not boot "
+                             "would never fall back to A. boot_b is written; the handset is in fastboot.")
+    tries, a_bootable = getvar("slot-retry-count:_b"), getvar("slot-bootable:_a")
+    if tries != "0" or a_bootable != "No":
+        return
+    log("Slot B has no tries left; rebooting once so the bootloader resets them")
+    fastboot("reboot")
+    now = wait_for({"fastboot", "violet", "android"}, 90)
+    if now is None:
+        raise SystemExit("After the reboot to reset slot B's tries the handset reached neither fastboot, "
+                         "VioletOS nor Android. boot_b is written; reselect B from fastboot (fastboot set_active b).")
+    if now != "fastboot":
+        log(f"The bootloader started slot A ({now}), not fastboot; going back to fastboot")
+        to_fastboot(fallback_reboots)
+    fastboot("set_active", "b")
+    tries = getvar("slot-retry-count:_b")
+    log(f"Slot B tries: {tries}")
+    if tries == "0":
+        raise SystemExit("Slot B still has no tries after set_active b: it would not boot. boot_b is written and "
+                         "the handset is in fastboot; check fastboot getvar all (slot-retry-count:_b).")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("image", nargs="?", type=Path, default=BUILD / "sel4/moto/boot.img")
+    parser.add_argument("image", nargs="?", type=Path, default=BUILD / "sel4/moto-aarch64/boot.img")
     parser.add_argument("--fallback-reboots", type=int, default=8,
                         help="VioletOS reboots to try if fastboot is not requested directly")
     parser.add_argument("--fastboot-only", action="store_true",
@@ -208,7 +267,7 @@ def main():
     if args.take_userdata or args.slot_a:
         log(f"Flashing {args.image} to boot_a, the fallback slot")
         fastboot("flash", "boot_a", str(args.image))
-    fastboot("set_active", "b")
+    select_b(args.fallback_reboots)
     log("Slot B selected; rebooting")
     fastboot("reboot")
     # A first boot can fall back to Android (for example after a warm reset with

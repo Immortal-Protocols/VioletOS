@@ -27,6 +27,24 @@ fn interrupted_boot_recovered_after_reopening_disk() {
     assert_eq!(checkpoint(1,512),Ok(2));
     assert_eq!(checkpoint(4,512),Ok(2));
     assert_eq!(checkpoint(1,512),Ok(4));
+    // The AArch64 loader's stages: its first keeps the last stage before it,
+    // and the next boot (either loader) reports how far it got.
+    assert_eq!(checkpoint(21,512),Ok(1));
+    assert_eq!(checkpoint(22,512),Ok(1));
+    assert_eq!(checkpoint(23,512),Ok(1));
+    assert_eq!(checkpoint(5,512),Ok(1));
+    assert_eq!(checkpoint(1,512),Ok(5));
+    assert_eq!(checkpoint(7,512),Err(()));
+    assert_eq!(checkpoint(20,512),Err(()));
+    // A refused 64-bit boot (verified boot reason 7, before stage 21) is
+    // that boot's first and last stage; the next boot reports it.
+    assert_eq!(checkpoint(97,512),Ok(1));
+    assert_eq!(checkpoint(21,512),Ok(97));
+    assert_eq!(checkpoint(45,512),Ok(21));
+    assert_eq!(checkpoint(1,512),Ok(45));
+    for bad in [40u8, 52, 60, 72, 90, 100] {
+        assert_eq!(checkpoint(bad,512),Err(()));
+    }
     std::fs::remove_file(path).unwrap();
 }
 #[test]

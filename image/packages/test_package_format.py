@@ -7,6 +7,7 @@
 """
 
 import binascii
+import os
 import json
 from pathlib import Path
 import struct
@@ -17,6 +18,8 @@ import unittest
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+# The fixtures are AArch32 packages; the arch test below sets VIOLET_ARCH itself.
+os.environ["VIOLET_ARCH"] = "aarch32"
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "system/package-manager"))
 import package_format
@@ -34,11 +37,11 @@ def public_pem(private, path):
     return path
 
 
-def unsigned(identity, size=8192, fill=0x5A, abi=None, code=4096):
+def unsigned(identity, size=8192, fill=0x5A, abi=None, code=4096, arch="aarch32"):
     image = bytearray([fill]) * size
     if 11 <= identity <= 14:
         image[-20:] = b"APP1" + b"NOTEBOOK".ljust(16, b"\0")
-    abi = package_format.package_abi(identity) if abi is None else abi
+    abi = package_format.package_abi(identity, arch) if abi is None else abi
     return struct.pack("<4s5I", b"VPK2", abi, identity, code, size, binascii.crc32(image)) + bytes(image)
 
 
@@ -242,6 +245,56 @@ class Format(unittest.TestCase):
             inspect(for_handset, self.keys.points, "qemu")
         with self.assertRaisesRegex(ValueError, "signature is invalid"):
             inspect(for_qemu[:-TRAILER] + for_handset[-TRAILER:-68] + b"QEMU" + for_handset[-64:], self.keys.points, "qemu")
+
+    def test_each_supervisor_takes_only_its_own_architecture(self):
+        # The 32-bit words are what they always were; AArch64 adds 0x64 in the top byte.
+        self.assertEqual([package_format.package_abi(i) for i in (1, 3, 7)], [1, 2, 1])
+        self.assertEqual([package_format.package_abi(i, "aarch64") for i in (1, 3, 7)],
+                         [0x64000001, 0x64000002, 0x64000001])
+        self.assertEqual(package_format.radio_abi(4, "aarch64"), 0x64000004)
+        wide = {i: self.keys.dev.sign(unsigned(i, arch="aarch64"), 1) for i in (1, 3, 4, 5, 7)}
+        narrow = {i: self.keys.dev.sign(unsigned(i), 1) for i in (1, 3, 4, 5, 7)}
+        self.assertEqual(package_format.package_arch(wide[3]), "aarch64")
+        self.assertEqual(package_format.package_arch(narrow[3]), "aarch32")
+        for identity in wide:
+            self.assertEqual(inspect(wide[identity], self.keys.points, "qemu", arch="aarch64"), identity)
+            self.assertEqual(inspect(narrow[identity], self.keys.points, "qemu", arch="aarch32"), identity)
+            with self.assertRaisesRegex(ValueError, "built for aarch64, not aarch32"):
+                inspect(wide[identity], arch="aarch32")
+            with self.assertRaisesRegex(ValueError, "built for aarch32, not aarch64"):
+                inspect(narrow[identity], arch="aarch64")
+        # The architecture is in the signed bytes: relabelling a package breaks its signature.
+        relabelled = bytearray(narrow[5])
+        struct.pack_into("<I", relabelled, 4, package_format.package_abi(5, "aarch64"))
+        with self.assertRaisesRegex(ValueError, "signature is invalid"):
+            inspect(bytes(relabelled), self.keys.points, "qemu", arch="aarch64")
+        # Radio's private-RAM ABIs exist for both architectures, and only as their own.
+        self.assertEqual(inspect(self.keys.dev.sign(unsigned(7, abi=package_format.radio_abi(4, "aarch64")), 1), arch="aarch64"), 7)
+        with self.assertRaises(ValueError):
+            inspect(self.keys.dev.sign(unsigned(7, abi=4), 1), arch="aarch64")
+        # An unknown top byte is refused, whichever architecture asks.
+        for arch in ("aarch32", "aarch64"):
+            with self.assertRaisesRegex(ValueError, "unknown architecture"):
+                inspect(self.keys.dev.sign(unsigned(5, abi=0x20000001), 1), arch=arch)
+        # A catalog is of one architecture: mixing them fails, each packs alone.
+        self.assertEqual(sorted(unpack(pack(wide.values(), arch="aarch64"), arch="aarch64")), [1, 3, 4, 5, 7])
+        with self.assertRaises(ValueError):
+            unpack(pack(wide.values(), arch="aarch64"), arch="aarch32")
+        with self.assertRaises(ValueError):
+            pack([*list(narrow.values())[:4], wide[7]], arch="aarch32")
+        # With no arch given, the build's own (VIOLET_ARCH) decides; unset, it is AArch64.
+        from unittest import mock
+        with mock.patch.dict("os.environ", {"VIOLET_ARCH": ""}):
+            self.assertEqual(package_format.selected_arch(), "aarch64")
+            self.assertEqual(inspect(wide[5]), 5)
+        with mock.patch.dict("os.environ", {"VIOLET_ARCH": "aarch32"}):
+            self.assertEqual(inspect(narrow[5]), 5)
+        with mock.patch.dict("os.environ", {"VIOLET_ARCH": "aarch64"}):
+            self.assertEqual(inspect(wide[5]), 5)
+            with self.assertRaises(ValueError):
+                inspect(narrow[5])
+        with self.assertRaises(ValueError):
+            package_format.selected_arch("arm64")
 
     def test_catalog_round_trip(self):
         blobs = [self.keys.dev.sign(unsigned(i, size=4096 + 4 * i + 1), i) for i in (1, 3, 4, 5, 7)]

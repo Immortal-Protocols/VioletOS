@@ -88,19 +88,26 @@ pub(super) unsafe fn commit_bank(ptr: *const u8, length: usize, active: u32) -> 
         1 - first
     };
     let data = core::slice::from_raw_parts(ptr, length);
+    // The checksum of the bytes as they went to the disk. If the source
+    // reads differently afterwards (memory the writer saw without the
+    // owner's caches), the sectors and the checksum would disagree and the
+    // loader would refuse the bank at the next boot: commit nothing.
+    let mut written = !0u32;
     for (n, chunk) in data.chunks(512).enumerate() {
         let mut sector = [0; 512];
         sector[..chunk.len()].copy_from_slice(chunk);
+        written = crate::journal::crc_update(written, &sector[..chunk.len()]);
         if d.write(index * BANK + 1 + n, &mut sector).is_err() {
             return 0;
         }
     }
-    if d.flush().is_err() {
+    let crc = sum(data);
+    if !written != crc || d.flush().is_err() {
         return 0;
     }
     let mut h = [0; 512];
     h[..4].copy_from_slice(b"VOL1");
-    for (i, v) in [generation, length as u32, sum(data)]
+    for (i, v) in [generation, length as u32, crc]
         .into_iter()
         .enumerate()
     {

@@ -4,6 +4,12 @@ A folder with main.rs is built as a static Rust std program for
 armv7-unknown-linux-musleabihf, and one with main.go as a Go program for
 linux/arm (GOARM=7); any other files are copied as they are, so a script with
 a #! line runs without a build step.
+
+VIOLET_ARCH=aarch64 builds the same image for AArch64 programs instead
+(aarch64-unknown-linux-musl, Go linux/arm64, C against the AArch64 musl that
+tools/build_python.py builds, Python from its AArch64 tree), for the AArch64
+system's image (targets/qemu64/stack.py). ARCHES below holds every
+architecture-specific choice; the AArch32 ones are the build's original values.
 """
 from pathlib import Path
 import glob
@@ -17,8 +23,43 @@ ROOT = Path(__file__).resolve().parents[1]
 LIMIT = 0x06000000
 TARGET = "armv7-unknown-linux-musleabihf"
 
+# Both phones' cores are Cortex-A53s (QEMU runs -cpu max): tune for them and
+# let rustc vectorize fills, copies and blends with NEON, which the
+# armv7-unknown-linux-musleabihf target leaves off (docs/8ms-frame-pipeline-rfc.md).
+CPU_FLAGS = ["-C", "target-cpu=cortex-a53", "-C", "target-feature=+neon"]
 
-def toolchain():
+# Each architecture's app build. NEON is part of AArch64 (no feature to add);
+# its atomics stay ARMv8.0 load/store-exclusive (no LSE, which the A53 lacks,
+# and no run-time HWCAP probe), as for its C library (tools/build_python.py).
+ARCHES = {
+    "aarch32": {"target": TARGET, "cpu": CPU_FLAGS,
+                "cflags": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
+                "c_flags": ["--target=armv7-linux-musleabihf", "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard"],
+                "go": {"GOARCH": "arm", "GOARM": "7"}, "loader": "lib/ld-musl-armhf.so.1",
+                "seal": ROOT / "build/open-toolchain/relro-seal.o", "elf": (1, 40)},
+    "aarch64": {"target": "aarch64-unknown-linux-musl",
+                "cpu": ["-C", "target-cpu=cortex-a53", "-C", "target-feature=-outline-atomics"],
+                "cflags": "--target=aarch64-linux-musl -march=armv8-a -mcpu=cortex-a53 -mno-outline-atomics",
+                "c_flags": ["--target=aarch64-linux-musl", "-march=armv8-a", "-mcpu=cortex-a53", "-mno-outline-atomics"],
+                "go": {"GOARCH": "arm64"}, "loader": "lib/ld-musl-aarch64.so.1",
+                "seal": ROOT / "build/open-toolchain/aarch64/relro-seal.o", "elf": (2, 183)},
+}
+
+
+def arch_of(arch=None):
+    """`arch`, or VIOLET_ARCH (aarch64 unless set)."""
+    if arch is None:
+        sys.path.insert(0, str(ROOT / "image/packages"))
+        import violet_arch
+        arch = violet_arch.selected()
+    return arch
+
+
+def app(arch=None):
+    return ARCHES[arch_of(arch)]
+
+
+def toolchain(target=TARGET):
     """rustc with the musl target installed, and the rust-lld that ships with it."""
     import shutil
     candidates = [os.environ.get("VIOLET_HOST_RUSTC"), shutil.which("rustc"),
@@ -31,9 +72,10 @@ def toolchain():
         sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
         host = next(line.split()[1] for line in subprocess.run([rustc, "-vV"], capture_output=True, text=True).stdout.splitlines()
                     if line.startswith("host:"))
-        if (sysroot / "lib/rustlib" / TARGET).is_dir():
+        if (sysroot / "lib/rustlib" / target).is_dir():
             return Path(rustc), lld_for(sysroot, host)
-    raise SystemExit(f"Install the Rust target first: rustup target add {TARGET}")
+    raise SystemExit(f"Install the Rust target first: rustup target add {target}"
+                     + (" (or python3 targets/qemu64/toolchain.py)" if target != TARGET else ""))
 
 
 def lld_for(sysroot, host):
@@ -47,35 +89,44 @@ def lld_for(sysroot, host):
     return sysroot / "lib/rustlib" / host / "bin/rust-lld"
 
 
-# Both phones' cores are Cortex-A53s (QEMU runs -cpu max): tune for them and
-# let rustc vectorize fills, copies and blends with NEON, which the
-# armv7-unknown-linux-musleabihf target leaves off (docs/8ms-frame-pipeline-rfc.md).
-CPU_FLAGS = ["-C", "target-cpu=cortex-a53", "-C", "target-feature=+neon"]
-
-
 def pie():
     """Whether programs are built position-independent (the default; VIOLET_OPEN_PIE=0 turns it off)."""
     return os.environ.get("VIOLET_OPEN_PIE") != "0"
 
 
-def relro_seal(out=None):
-    """tools/relro_seal.rs as an ARM object for every static PIE's link (its
+def relro_seal(out=None, arch="aarch32"):
+    """tools/relro_seal.rs as an object for every static PIE's link (its
     .init_array entry makes PT_GNU_RELRO read-only before main), built with
-    the apps' rustc when the source is newer than the object."""
+    the apps' rustc when the source is newer than the object. An object with
+    no .init_array entry seals nothing, so the build stops rather than link it."""
+    a = ARCHES[arch]
     source = ROOT / "tools/relro_seal.rs"
-    out = Path(out or ROOT / "build/open-toolchain/relro-seal.o")
+    out = Path(out or a["seal"])
     if not out.exists() or out.stat().st_mtime < source.stat().st_mtime:
-        rustc, _ = toolchain()
+        rustc, _ = toolchain(a["target"])
         out.parent.mkdir(parents=True, exist_ok=True)
         part = out.with_name(f"{out.name}.{os.getpid()}")
         subprocess.run([rustc, "--edition=2021", "--crate-type=lib", "--emit=obj", "-C", "opt-level=2",
                         "-C", "panic=abort", "-C", "relocation-model=pic", "-C", "codegen-units=1",
-                        "--target", TARGET, source, "-o", part], check=True)
+                        "--target", a["target"], source, "-o", part], check=True)
+        if arch != "aarch32" and not seals(part.read_bytes()):
+            part.unlink()
+            raise SystemExit(f"tools/relro_seal.rs built for {a['target']} has no .init_array entry: "
+                             "it would leave every program's RELRO writable. Port its seal to this architecture first.")
         part.replace(out)
     return out
 
 
-def pie_flags(rustc, seal=None):
+def seals(obj):
+    """Whether a relocatable object has a non-empty .init_array (ELF32 or ELF64)."""
+    sys.path.insert(0, str(ROOT / "image/packages"))
+    import violet_arch
+    rows, names = violet_arch.sections(obj)
+    strings = obj[rows[names][4]:rows[names][4] + rows[names][5]]
+    return any(strings[r[0]:].split(b"\0")[0].startswith(b".init_array") and r[5] for r in rows)
+
+
+def pie_flags(rustc, seal=None, arch="aarch32"):
     """The Rust apps are linked as static position-independent executables,
     which the Open Runtime loads at a random address. rustc has no static-PIE
     mode for this target, so the link is spelled out: musl's self-relocating
@@ -86,26 +137,29 @@ def pie_flags(rustc, seal=None):
     if not pie():
         return []
     sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
-    crt = sysroot / "lib/rustlib" / TARGET / "lib/self-contained"
+    crt = sysroot / "lib/rustlib" / ARCHES[arch]["target"] / "lib/self-contained"
     # -z relro: constant pointer tables in PT_GNU_RELRO, which relro_seal.o
     # makes read-only once rcrt1 has relocated them (tools/relro_seal.rs).
     link = ["-pie", "--no-dynamic-linker", "-static", "-z", "text", "-z", "relro", crt / "rcrt1.o", crt / "crti.o",
-            crt / "crtbeginS.o", f"-L{crt}", seal or relro_seal(), crt / "crtendS.o", crt / "crtn.o"]
+            crt / "crtbeginS.o", f"-L{crt}", seal or relro_seal(arch=arch), crt / "crtendS.o", crt / "crtn.o"]
     return ["-C", "relocation-model=pic", "-C", "link-self-contained=no",
             *[part for arg in link for part in ("-C", f"link-arg={arg}")]]
 
 
-def build_rust(source, out):
-    rustc, lld = toolchain()
-    subprocess.run([rustc, "--edition=2021", "-O", "-C", "strip=symbols", "--target", TARGET, *CPU_FLAGS,
-                    *pie_flags(rustc), "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
+def build_rust(source, out, arch="aarch32"):
+    a = ARCHES[arch]
+    rustc, lld = toolchain(a["target"])
+    subprocess.run([rustc, "--edition=2021", "-O", "-C", "strip=symbols", "--target", a["target"], *a["cpu"],
+                    *pie_flags(rustc, arch=arch), "-C", f"linker={lld}", "-C", "linker-flavor=ld.lld", source, "-o", out], check=True)
 
 
-def build_cargo(work):
+def build_cargo(work, arch="aarch32"):
     """The Cargo workspace in apps/ (the built-in apps and their shared crate),
-    for ARMv7 musl. ring, under rustls, compiles a little C with the NDK's clang."""
+    for ARMv7 (or AArch64) musl. ring, under rustls, compiles a little C with the NDK's clang."""
     import shutil
-    rustc, lld = toolchain()
+    a = ARCHES[arch]
+    TARGET = a["target"]
+    rustc, lld = toolchain(TARGET)
     cargo = rustc.parent / "cargo"
     if not cargo.exists():
         cargo = Path(shutil.which("cargo") or "cargo")
@@ -117,9 +171,9 @@ def build_cargo(work):
     env = dict(os.environ, **{
         f"CC_{key}": str(bins[0] / "clang"),
         f"AR_{key}": str(bins[0] / "llvm-ar"),
-        f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
+        f"CFLAGS_{key}": a["cflags"],
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *CPU_FLAGS, *pie_flags(rustc)]),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *a["cpu"], *pie_flags(rustc, arch=arch)]),
         "CARGO_TARGET_DIR": str(ROOT / "build/open-cargo"),
         "RUSTC": str(rustc),
     })
@@ -133,7 +187,7 @@ def build_cargo(work):
     return ROOT / "build/open-cargo" / TARGET / "release"
 
 
-def ladybird_toolchain(version):
+def ladybird_toolchain(version, TARGET=TARGET):
     """A rustc at least as new as Ladybird's pinned Rust, with the musl target.
     VIOLET_LADYBIRD_RUSTC names one; otherwise rustup's toolchain of that
     version (in ~/.rustup or in a RUSTUP_HOME under build/), or rustc on PATH."""
@@ -158,16 +212,18 @@ def ladybird_toolchain(version):
                      f"rustup toolchain install {version} --target {TARGET}")
 
 
-def build_ladybird(folder):
+def build_ladybird(folder, arch="aarch32"):
     """The Ladybird browser: its own Cargo workspace on Ladybird's Rust HTML
     parser, fetched at a pinned commit, built with Ladybird's Rust version."""
     import shutil
+    a = ARCHES[arch]
+    TARGET = a["target"]
     sys.path.insert(0, str(ROOT / "tools"))
     import fetch_ladybird
     checkout = fetch_ladybird.main()
     version = next(line.split('"')[1] for line in (checkout / "rust-toolchain.toml").read_text().splitlines()
                    if line.strip().startswith("channel"))
-    rustc, lld = ladybird_toolchain(version)
+    rustc, lld = ladybird_toolchain(version, TARGET)
     cargo = rustc.parent / "cargo"
     if not cargo.exists():
         cargo = Path(shutil.which("cargo") or "cargo")
@@ -187,52 +243,55 @@ def build_ladybird(folder):
     bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
     if bins:
         env.update({f"CC_{key}": str(bins[0] / "clang"), f"AR_{key}": str(bins[0] / "llvm-ar"),
-                    f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard"})
+                    f"CFLAGS_{key}": a["cflags"]})
     # The static-PIE link goes to the program's own rustc call only (cargo
     # rustc), not into RUSTFLAGS; the crates under it are position-independent as built.
-    build = ["rustc", "--release", "--locked", "--target", TARGET, "--bin", "ladybird", "--", *map(str, pie_flags(rustc))] if pie() \
+    build = ["rustc", "--release", "--locked", "--target", TARGET, "--bin", "ladybird", "--", *map(str, pie_flags(rustc, arch=arch))] if pie() \
         else ["build", "--release", "--locked", "--target", TARGET]
     subprocess.run([cargo, *build], cwd=folder, env=env, check=True)
     return ROOT / "build/ladybird-cargo" / TARGET / "release/ladybird"
 
 
-def build_go(folder, out):
-    """A standard Go program for linux/arm (ARMv7, hard float), statically linked."""
+def build_go(folder, out, arch="aarch32"):
+    """A standard Go program for linux/arm (ARMv7, hard float) or linux/arm64, statically linked."""
     import shutil
     go = os.environ.get("VIOLET_GO") or shutil.which("go") or "/opt/homebrew/bin/go"
     if not Path(go).exists():
         raise SystemExit("Install Go to build Go apps (for example: brew install go)")
-    env = dict(os.environ, GOOS="linux", GOARCH="arm", GOARM="7", CGO_ENABLED="0",
+    env = dict(os.environ, GOOS="linux", **ARCHES[arch]["go"], CGO_ENABLED="0",
                GOCACHE=str(out.parent / "go-cache"), GOPATH=str(out.parent / "go-path"), GOFLAGS="-trimpath")
     if not (folder / "go.mod").exists():
         env["GO111MODULE"] = "off"
     subprocess.run([go, "build", "-ldflags=-s -w", "-o", out.resolve(), "."], cwd=folder, env=env, check=True)
 
 
-def c_toolchain():
+def c_toolchain(arch="aarch32"):
     """clang from the Android NDK with the musl sysroot built by tools/build_python.py."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_python
+    t = build_python.TARGETS[arch]
     ndk = Path(os.environ.get("ANDROID_NDK_HOME", Path.home() / "Library/Android/sdk/ndk/28.2.13676358"))
     bin_dir = next(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
-    sysroot = ROOT / "build/open-toolchain/sysroot"
-    builtins = next(ndk.glob("toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
+    sysroot = t.sysroot
+    builtins = next(ndk.glob(f"toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/{t.builtins}"))
     if not (sysroot / "lib/libc.a").exists():
-        raise SystemExit("Build the musl sysroot first: python3 tools/build_python.py musl")
-    flags = ["--target=armv7-linux-musleabihf", "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
-             f"--sysroot={sysroot}", "-isystem", str(sysroot / "include")]
+        raise SystemExit("Build the musl sysroot first: " + f"VIOLET_ARCH={arch} "
+                         + "python3 tools/build_python.py musl")
+    flags = [*ARCHES[arch]["c_flags"], f"--sysroot={sysroot}", "-isystem", str(sysroot / "include")]
     link = ["-static", "-fuse-ld=lld", "-nostdlib", str(sysroot / "lib/crt1.o"), str(sysroot / "lib/crti.o")]
     if pie():
         # A static PIE: musl's self-relocating start file, no text relocations,
         # and its RELRO sealed read-only before main (tools/relro_seal.rs).
         flags.append("-fPIE")
         link = ["-static-pie", "-Wl,-z,text", "-Wl,-z,relro", "-fuse-ld=lld", "-nostdlib", str(sysroot / "lib/rcrt1.o"),
-                str(sysroot / "lib/crti.o"), str(relro_seal())]
+                str(sysroot / "lib/crti.o"), str(relro_seal(arch=arch))]
     tail = [f"-L{sysroot / 'lib'}", "-lc", str(builtins), str(sysroot / "lib/crtn.o")]
     return bin_dir / "clang", flags, link, tail
 
 
-def build_c(folder, out):
+def build_c(folder, out, arch="aarch32"):
     """A static C program against musl, from every .c file in the folder."""
-    clang, flags, link, tail = c_toolchain()
+    clang, flags, link, tail = c_toolchain(arch)
     sources = sorted(str(p) for p in folder.glob("*.c"))
     subprocess.run([clang, *flags, "-O2", *link, *sources, "-lm", *tail, "-o", out], check=True)
 
@@ -241,39 +300,45 @@ def build_c(folder, out):
 LOADER = "lib/ld-musl-armhf.so.1"
 
 
-def musl_loader():
+def musl_loader(arch="aarch32"):
     """musl's shared libc.so, which is also its dynamic loader, built once
     (out of tree, from the musl source tools/build_python.py fetches) into
-    build/open-toolchain/musl-shared. Only images that set VIOLET_OPEN_LDSO=1
-    (make test-abi) ship it, as /lib/ld-musl-armhf.so.1."""
-    work = ROOT / "build/open-toolchain/musl-shared"
+    build/open-toolchain/musl-shared (build/open-toolchain/aarch64/musl-shared).
+    Only images that set VIOLET_OPEN_LDSO=1 (make test-abi) ship it, as
+    /lib/ld-musl-armhf.so.1 (/lib/ld-musl-aarch64.so.1)."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_python
+    t = build_python.TARGETS[arch]
+    work = t.work / "musl-shared"
     lib = work / "lib/libc.so"
     if lib.exists():
         return lib
-    sys.path.insert(0, str(ROOT / "tools"))
-    import build_python
-    source = build_python.fetch(build_python.MUSL)
+    source = build_python.fetch(build_python.MUSL, t.work)
     b = build_python.ndk_bin()
-    builtins = next(b.parent.glob("lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
+    builtins = build_python.builtins_for(t, b)
     tools = {"AR": str(b / "llvm-ar"), "RANLIB": str(b / "llvm-ranlib")}
     work.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, CC=f"{b / 'clang'} {build_python.FLAGS}", **tools)
-    subprocess.run([source / "configure", "--prefix=/", "--target=arm-linux-musleabihf", "--disable-static"],
+    env = dict(os.environ, CC=f"{b / 'clang'} {t.flags}", **tools)
+    subprocess.run([source / "configure", "--prefix=/", f"--target={t.triple}", "--disable-static"],
                    cwd=work, env=env, check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["make", f"-j{os.cpu_count()}", *[f"{k}={v}" for k, v in tools.items()], f"LIBCC={builtins}", "lib/libc.so"],
                    cwd=work, check=True, stdout=subprocess.DEVNULL)
     return lib
 
 
-def build_c_dynamic(folder, out):
+def build_c_dynamic(folder, out, arch="aarch32"):
     """A C program linked against musl's libc.so, run by /lib/ld-musl-armhf.so.1
     (a folder with a file named "dynamic"; only with VIOLET_OPEN_LDSO=1)."""
     if os.environ.get("VIOLET_OPEN_LDSO") != "1":
         raise SystemExit("dynamically linked programs need VIOLET_OPEN_LDSO=1")
-    clang, flags, _, _ = c_toolchain()
-    sysroot = ROOT / "build/open-toolchain/sysroot"
-    lib = musl_loader()
-    builtins = next(Path(clang).parent.parent.glob("lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_python
+    t = build_python.TARGETS[arch]
+    clang, flags, _, _ = c_toolchain(arch)
+    sysroot = t.sysroot
+    lib = musl_loader(arch)
+    LOADER = ARCHES[arch]["loader"]
+    builtins = next(Path(clang).parent.parent.glob(f"lib/clang/*/lib/linux/{t.builtins}"))
     sources = sorted(str(p) for p in folder.glob("*.c"))
     subprocess.run([clang, *flags, "-O2", "-fPIE", "-pie", "-fuse-ld=lld", "-nostdlib", sysroot / "lib/Scrt1.o",
                     sysroot / "lib/crti.o", *sources, f"-L{lib.parent}", "-lc", builtins, sysroot / "lib/crtn.o",
@@ -373,22 +438,49 @@ def entry(name, data, mode, mtime=0):
 
 # Test programs left out of the handset image, which must fit its boot partition
 # (Python alone is 17 MB); QEMU runs them all.
-def release_gate(files, fixed_ok, allow_fixed):
+def release_gate(files, fixed_ok, allow_fixed, arch="aarch32"):
     """tools/elf_check.py over every ELF file in the image ({name: (bytes,
     mode)}), wherever it is: execve runs any of them. Returns the programs let
-    through with a fixed base; raises SystemExit for any it refuses."""
+    through with a fixed base; raises SystemExit for any it refuses.
+
+    The checker skips any file it cannot read. For AArch32 that is how the
+    gate has always worked; for another architecture every ELF file must be
+    one of that architecture's programs and one the checker reads, or the
+    build stops: an unread program would ship with no W^X, PIE or RELRO check."""
     sys.path.insert(0, str(ROOT / "tools"))
     import elf_check
-    return elf_check.check({name: data for name, (data, _) in files.items() if data[:4] == b"\x7fELF"},
-                           fixed_ok=fixed_ok, allow_fixed=allow_fixed)
+    elves = {name: data for name, (data, _) in files.items() if data[:4] == b"\x7fELF"}
+    if arch != "aarch32":
+        unread = refused_by_class(elves, arch, elf_check.inspect)
+        if unread:
+            raise SystemExit(f"the release gate (tools/elf_check.py) cannot check these {arch} files, "
+                             "so the image is not built:\n  " + "\n  ".join(unread))
+    return elf_check.check(elves, fixed_ok=fixed_ok, allow_fixed=allow_fixed, arch=arch)
+
+
+def refused_by_class(elves, arch, inspect):
+    """"name: why" for each ELF file that is not `arch`'s, or that `inspect` cannot read."""
+    import struct
+    elf_class, machine = ARCHES[arch]["elf"]
+    out = []
+    for name, data in sorted(elves.items()):
+        if len(data) < 20 or data[4] != elf_class or data[5] != 1 or struct.unpack_from("<H", data, 18)[0] != machine:
+            out.append(f"{name}: not a little-endian {arch} ELF file")
+        elif inspect(data, arch) is None:
+            out.append(f"{name}: tools/elf_check.py does not read it")
+    return out
 
 
 HANDSET_SKIP = {"gonet", "pyhello", "pynet", "pypaint", "pytone"}
 
 
-def main(out, python=True, compress=False, skip=()):
+def main(out, python=True, compress=False, skip=(), arch=None):
     """compress=True writes "VGZ1", the gzip length, then the gzip of the
-    archive (the handset carries it compressed in its boot image's ramdisk)."""
+    archive (the handset carries it compressed in its boot image's ramdisk).
+    `arch` is the programs' architecture: VIOLET_ARCH (aarch64) unless given."""
+    arch = arch_of(arch)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build_python
     out = Path(out)
     work = out.parent / "initfs-build"
     work.mkdir(parents=True, exist_ok=True)
@@ -408,7 +500,7 @@ def main(out, python=True, compress=False, skip=()):
             continue
         if app.name == "ladybird":
             try:
-                binary = build_ladybird(app)
+                binary = build_ladybird(app, arch)
             except (SystemExit, subprocess.CalledProcessError) as e:
                 print(f"skipping ladybird: {e}", file=sys.stderr)
                 continue
@@ -417,7 +509,7 @@ def main(out, python=True, compress=False, skip=()):
         if (app / "Cargo.toml").exists():
             if cargo_out is None:
                 try:
-                    cargo_out = build_cargo(work)
+                    cargo_out = build_cargo(work, arch)
                 except (SystemExit, subprocess.CalledProcessError) as e:
                     print(f"skipping the Rust apps: {e}", file=sys.stderr)
                     cargo_out = False
@@ -427,7 +519,7 @@ def main(out, python=True, compress=False, skip=()):
         if (app / "main.go").exists():
             binary = work / app.name
             try:
-                build_go(app, binary)
+                build_go(app, binary, arch)
             except SystemExit as e:
                 print(f"skipping {app.name}: {e}", file=sys.stderr)
                 continue
@@ -442,7 +534,7 @@ def main(out, python=True, compress=False, skip=()):
         if (app / "main.c").exists():
             binary = work / app.name
             try:
-                (build_c_dynamic if (app / "dynamic").exists() else build_c)(app, binary)
+                (build_c_dynamic if (app / "dynamic").exists() else build_c)(app, binary, arch)
             except (SystemExit, StopIteration) as e:
                 print(f"skipping {app.name}: {e}", file=sys.stderr)
                 continue
@@ -451,7 +543,7 @@ def main(out, python=True, compress=False, skip=()):
         if (app / "main.rs").exists():
             binary = work / app.name
             try:
-                build_rust(app / "main.rs", binary)
+                build_rust(app / "main.rs", binary, arch)
             except SystemExit as e:
                 print(f"skipping {app.name}: {e}", file=sys.stderr)
                 continue
@@ -478,8 +570,8 @@ def main(out, python=True, compress=False, skip=()):
     extra = os.environ.get("VIOLET_INITFS_EXTRA")
     # VIOLET_OPEN_NO_PYTHON=1 leaves Python out, as on the handset (make test-agent installs it as a package).
     python = python and os.environ.get("VIOLET_OPEN_NO_PYTHON") != "1"
-    if not extra and python and (ROOT / "build/open-toolchain/python-root/bin/python3").exists():
-        extra = str(ROOT / "build/open-toolchain/python-root")
+    if not extra and python and (build_python.TARGETS[arch].pyroot / "bin/python3").exists():
+        extra = str(build_python.TARGETS[arch].pyroot)
         # A python3 linked before the current rules (fixed address, or RELRO not sealed) is relinked, not shipped.
         stale = elf_check.inspect((Path(extra) / "bin/python3").read_bytes())
         if stale is not None and not allow_fixed and (elf_check.problems(stale) or not stale["pie"]):
@@ -494,13 +586,13 @@ def main(out, python=True, compress=False, skip=()):
                 files[rel] = (path.read_bytes(), 0o100755 if os.access(path, os.X_OK) else 0o100644)
     # musl's dynamic loader, for dynamically linked programs (make test-abi).
     if os.environ.get("VIOLET_OPEN_LDSO") == "1":
-        files[LOADER] = (musl_loader().read_bytes(), 0o100755)
+        files[ARCHES[arch]["loader"]] = (musl_loader(arch).read_bytes(), 0o100755)
     # The loader refuses programs that break W^X: fail here, not on the phone.
     # The release gate: every program is position-independent, so its code
     # moves on every start, and seals its RELRO. Only Go test programs
     # (fixed_ok) are let through. Every ELF file is a program execve may run,
     # wherever it is in the tree.
-    fixed = release_gate(files, fixed_ok, allow_fixed)
+    fixed = release_gate(files, fixed_ok, allow_fixed, arch)
     if fixed:
         print(f"{'NOT A RELEASE BUILD (VIOLET_OPEN_PIE=0): ' if allow_fixed else 'test programs with a '}"
               f"fixed code address (not PIE; stack, heap and mappings still move): {' '.join(fixed)}", file=sys.stderr)
@@ -523,5 +615,6 @@ def main(out, python=True, compress=False, skip=()):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else ROOT / "build/sel4/qemu/initfs.cpio",
+    default = ROOT / ("build/sel4/qemu/initfs.cpio" if arch_of() == "aarch32" else "build/sel4/qemu-aarch64/initfs.cpio")
+    main(sys.argv[1] if len(sys.argv) > 1 else default,
          compress="--gzip" in sys.argv)

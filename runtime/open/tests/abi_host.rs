@@ -193,23 +193,42 @@ fn gate_offsets_match_the_frame() {
 }
 
 #[test]
+fn sigreturn_and_sigaltstack_change_the_alternate_stack_by_one_rule() {
+    // A handler that edits uc_stack changes the thread's alternate stack on
+    // return (Linux restore_altstack), by sigaltstack's own rules.
+    let alt = AltStack { sp: 0x7000_0000, size: 0x4000, flags: 0 };
+    let new = AltStack { sp: 0x6000_0000, size: 0x8000, flags: 0 };
+    assert_eq!(alt_change(alt, 0xbe00_0000, 0x6000_0000, 0, 0x8000), Ok(new));
+    assert_eq!(alt_change(alt, 0xbe00_0000, 0, SS_DISABLE, 0), Ok(AltStack::default()));
+    // uc_stack as written (SS_ONSTACK reported): the same stack.
+    assert_eq!(alt_change(alt, 0xbe00_0000, 0x7000_0000, SS_ONSTACK, 0x4000), Ok(alt));
+    // Still on it: refused (sigreturn leaves it as it was).
+    assert_eq!(alt_change(alt, 0x7000_1000, 0, SS_DISABLE, 0), Err(-1));
+    assert_eq!(alt_change(alt, 0xbe00_0000, 0x6000_0000, 0, 256), Err(-12));
+    assert_eq!(alt_change(alt, 0xbe00_0000, 0x6000_0000, 8, 0x8000), Err(-22));
+    // A stack above 4 GiB is an AArch64 app's (vma::Layout64); one that wraps is EFAULT.
+    assert_eq!(alt_change(alt, 0xbe00_0000, 1 << 32, 0, 0x8000), Ok(AltStack { sp: 1 << 32, size: 0x8000, flags: 0 }));
+    assert_eq!(alt_change(alt, 0xbe00_0000, u64::MAX - 0x100, 0, 0x8000), Err(-14));
+}
+
+#[test]
 fn frames_go_on_the_right_stack() {
     let alt = AltStack { sp: 0x7000_0000, size: 0x4000, flags: 0 };
     // No SA_ONSTACK: below sp, 8-byte aligned.
-    assert_eq!(place(0xbe00_0104, &alt, false), Some((0xbe00_0104 - FRAME) & !7));
+    assert_eq!(place(0xbe00_0104, &alt, false), Some((0xbe00_0104 - FRAME as u64) & !7));
     // SA_ONSTACK: at the top of the alternate stack.
     let f = place(0xbe00_0000, &alt, true).unwrap();
-    assert_eq!(f, (0x7000_4000 - FRAME) & !7);
+    assert_eq!(f, (0x7000_4000 - FRAME as u64) & !7);
     assert!(alt.on(f));
     // Already on it (a nested signal): below the current sp.
-    assert_eq!(place(0x7000_2000, &alt, true), Some((0x7000_2000 - FRAME) & !7));
+    assert_eq!(place(0x7000_2000, &alt, true), Some((0x7000_2000 - FRAME as u64) & !7));
     // Overflowing the alternate stack is refused.
     assert_eq!(place(0x7000_0100, &alt, true), None);
     let tiny = AltStack { sp: 0x7000_0000, size: 256, flags: 0 };
     assert_eq!(place(0xbe00_0000, &tiny, true), None);
     // Disabled: the normal stack.
     let off = AltStack::default();
-    assert_eq!(place(0xbe00_0000, &off, true), Some((0xbe00_0000 - FRAME) & !7));
+    assert_eq!(place(0xbe00_0000, &off, true), Some((0xbe00_0000 - FRAME as u64) & !7));
     assert_eq!(place(100, &off, false), None, "no wrap below zero");
     assert_eq!(off.report(0), SS_DISABLE);
     assert_eq!(alt.report(0x7000_1000), SS_ONSTACK);
@@ -426,7 +445,7 @@ fn random_bytes_never_panic() {
         let _ = elf::plan(&f[..len]);
         let _ = elf::plan(&f);
         if let Ok(p) = elf::plan(&f) {
-            let _ = (p.span(), p.phdr_at(next()));
+            let _ = (p.span(), p.phdr_at(next().into()));
         }
     }
 }
@@ -480,7 +499,7 @@ fn the_dry_run_finds_what_the_loader_refuses() {
     let same = [PT_LOAD, 0x100, 0x10100, 0, 0x40, 0x100, 6, 0x10000];
     assert!(elf::check(&elf_file(2, &[text, same], &[0u8; 0x200]), None, &layout).is_err());
     // Past the program area (the mmap area starts at MMAP_BASE).
-    let high = [PT_LOAD, 0, vma::MMAP_BASE - 0x1000, 0, 0x200, 0x2000, 5, 0x10000];
+    let high = [PT_LOAD, 0, (vma::MMAP_BASE - 0x1000) as u32, 0, 0x200, 0x2000, 5, 0x10000];
     assert_eq!(elf::check(&elf_file(2, &[high], &[0u8; 0x200]), None, &layout), Err("segment too high"));
     // A dynamically linked program needs a loader that keeps the rules too.
     let prog = dynamic_program();
@@ -594,4 +613,135 @@ fn the_fork_helper_follows_the_gate() {
     assert_eq!(GATE[k + 1], 0xef000000); // svc #0
     assert_eq!(GATE[k + 2], 0xe12fff1e); // bx lr
     assert!(GATE_OFFSET as usize + GATE.len() * 4 <= 0x10000, "the gate fits in the trampoline page");
+}
+
+// ---- elf.rs: AArch64 (ELF64) programs ----
+
+/// A minimal ELF64 AArch64 file. Each header: (type, flags, offset, vaddr, filesz, memsz).
+fn elf64_file(kind: u16, phdrs: &[(u32, u32, u64, u64, u64, u64)], tail: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; 64];
+    b[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    b[16..18].copy_from_slice(&kind.to_le_bytes());
+    b[18..20].copy_from_slice(&183u16.to_le_bytes());
+    b[24..32].copy_from_slice(&0x40_1234u64.to_le_bytes());
+    b[32..40].copy_from_slice(&64u64.to_le_bytes());
+    b[54..56].copy_from_slice(&56u16.to_le_bytes());
+    b[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+    for &(t, f, off, va, fs, ms) in phdrs {
+        b.extend_from_slice(&t.to_le_bytes());
+        b.extend_from_slice(&f.to_le_bytes());
+        for v in [off, va, va, fs, ms, 0x1000] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(tail);
+    b
+}
+const TOP64: u64 = 0x8000_0000_0000;
+
+#[test]
+fn aarch64_programs_plan_like_aarch32_ones() {
+    let text = (PT_LOAD, 5, 0, 0x40_0000, 0x200, 0x200);
+    let data = (PT_LOAD, 6, 0x200, 0x41_0200, 0x40, 0x2000);
+    let f = elf64_file(2, &[text, data], &[0u8; 0x300]);
+    let p = elf::plan64(&f, TOP64).unwrap();
+    assert!(!p.pie && !p.interp && !p.mixed_pages());
+    assert_eq!((p.entry, p.segs.len()), (0x40_1234, 2));
+    assert_eq!(p.span(), (0x40_0000, 0x41_3000));
+    assert_eq!(p.phdr_at(0), 0x40_0000 + 64);
+    // A dynamically linked PIE naming musl's AArch64 loader, with segments
+    // that need 64-bit addresses once placed.
+    let ld = b"/lib/ld-musl-aarch64.so.1\0";
+    let at = 64 + 3 * 56;
+    let pie = elf64_file(3, &[(PT_PHDR, 4, 64, 64, 3 * 56, 3 * 56), (PT_INTERP, 4, at as u64, at as u64, ld.len() as u64, ld.len() as u64), (PT_LOAD, 5, 0, 0, 0x400, 0x400)],
+                         &[ld.as_slice(), &[0u8; 0x400]].concat());
+    let p = elf::plan64(&pie, TOP64).unwrap();
+    assert!(p.pie && p.interp && !p.loader_ok());
+    assert_eq!(p.phdr_at(0x5555_0000_0000), 0x5555_0000_0040);
+    // The loader itself: a PIE with no interpreter.
+    let loader = elf64_file(3, &[(PT_LOAD, 5, 0, 0, 0x100, 0x100)], &[0u8; 0x100]);
+    assert!(elf::plan64(&loader, TOP64).unwrap().loader_ok());
+}
+
+#[test]
+fn aarch64_programs_are_refused_as_aarch32_ones_are() {
+    let text = (PT_LOAD, 5, 0, 0x40_0000, 0x200, 0x200);
+    let ok = elf64_file(2, &[text], &[0u8; 0x200]);
+    assert!(elf::plan64(&ok, TOP64).is_ok());
+    assert!(elf::plan64(&ok[..60], TOP64).is_err());
+    // Each ABI's loader takes only its own programs.
+    assert_eq!(elf::plan(&ok).unwrap_err(), "not a 32-bit little-endian ELF file");
+    let arm32 = elf_file(2, &[[PT_LOAD, 0, 0x10000, 0, 0x200, 0x200, 5, 0x10000]], &[0u8; 0x200]);
+    assert_eq!(elf::plan64(&arm32, TOP64).unwrap_err(), "not a 64-bit little-endian ELF file");
+    let mut bad = ok.clone();
+    bad[18] = 62; // x86-64
+    assert_eq!(elf::plan64(&bad, TOP64).unwrap_err(), "not an AArch64 executable");
+    let mut bad = ok.clone();
+    bad[16] = 1;
+    assert_eq!(elf::plan64(&bad, TOP64).unwrap_err(), "not an executable");
+    let mut bad = ok.clone();
+    bad[56] = 200;
+    assert_eq!(elf::plan64(&bad, TOP64).unwrap_err(), "bad program headers");
+    let mut bad = ok.clone();
+    bad[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(elf::plan64(&bad, TOP64).unwrap_err(), "bad program headers", "phoff overflows");
+    // W^X, sizes and placement.
+    let wx = elf64_file(2, &[(PT_LOAD, 7, 0, 0x40_0000, 0x200, 0x200)], &[0u8; 0x200]);
+    assert_eq!(elf::plan64(&wx, TOP64).unwrap_err(), "a segment is writable and executable");
+    let past = elf64_file(2, &[(PT_LOAD, 5, 0x100, 0x40_0000, u64::MAX - 0x80, u64::MAX - 0x80)], &[]);
+    assert_eq!(elf::plan64(&past, TOP64).unwrap_err(), "bad segment");
+    let big = elf64_file(2, &[(PT_LOAD, 5, 0, 0x40_0000, 0x300, 0x200)], &[0u8; 0x400]);
+    assert_eq!(elf::plan64(&big, TOP64).unwrap_err(), "bad segment", "filesz > memsz");
+    let high = elf64_file(2, &[(PT_LOAD, 6, 0, TOP64 - 0x1000, 0x10, 0x2000)], &[0u8; 0x10]);
+    assert_eq!(elf::plan64(&high, TOP64).unwrap_err(), "segment too high", "past user space");
+    let wrap = elf64_file(2, &[(PT_LOAD, 6, 0, u64::MAX - 0xfff, 0x10, 0x2000)], &[0u8; 0x10]);
+    assert_eq!(elf::plan64(&wrap, TOP64).unwrap_err(), "segment too high");
+    // Code and data on one 4 KiB page.
+    let mixed = elf64_file(2, &[(PT_LOAD, 5, 0, 0x40_0000, 0x200, 0x200), (PT_LOAD, 6, 0x200, 0x40_0200, 0x10, 0x10)], &[0u8; 0x210]);
+    assert!(elf::plan64(&mixed, TOP64).unwrap().mixed_pages());
+    // Only musl's AArch64 loader, exactly: not the AArch32 one, not a prefix.
+    for name in [&b"/lib/ld-musl-armhf.so.1\0"[..], b"/lib/ld-musl-aarch64.so.1", b"/lib/ld-musl-aarch64.so.1x\0", b"/tmp/ld.so\0"] {
+        let at = 64 + 2 * 56;
+        let f = elf64_file(2, &[(PT_INTERP, 4, at as u64, 0, name.len() as u64, name.len() as u64), text], &[name, &[0u8; 0x200]].concat());
+        assert!(elf::plan64(&f, TOP64).unwrap_err().contains("unsupported loader"), "{:?}", std::str::from_utf8(name));
+    }
+    let none = elf64_file(2, &[(PT_PHDR, 4, 64, 64, 56, 56)], &[]);
+    assert_eq!(elf::plan64(&none, TOP64).unwrap_err(), "no loadable segments");
+}
+
+#[test]
+fn aarch64_programs_keep_their_whole_addresses() {
+    // The 64-bit runtime places apps by vma::Layout64, above 4 GiB: an
+    // AArch64 program's plan keeps its 64-bit addresses and sizes whole.
+    let text = (PT_LOAD, 5, 0, 0x40_0000, 0x200, 0x200);
+    let data = (PT_LOAD, 6, 0x200, 0x41_0200, 0x40, 0x2000);
+    let f = elf64_file(2, &[text, data], &[0u8; 0x300]);
+    let p = elf::plan64(&f, TOP64).unwrap();
+    assert!(!p.pie && !p.interp);
+    assert_eq!((p.entry, p.phentsize, p.segs.len()), (0x40_1234, 56, 2));
+    assert_eq!(p.segs[1], elf::Seg { vaddr: 0x41_0200, offset: 0x200, filesz: 0x40, memsz: 0x2000, flags: 6 });
+    assert_eq!(p.span(), (0x40_0000, 0x41_3000));
+    // Above 4 GiB: kept as it is, never cut to its low word.
+    let high = elf64_file(2, &[(PT_LOAD, 5, 0, 0x1_0000_0000, 0x200, 0x200)], &[0u8; 0x200]);
+    assert_eq!(elf::plan64(&high, TOP64).unwrap().segs[0].vaddr, 0x1_0000_0000);
+    let huge = elf64_file(3, &[(PT_LOAD, 6, 0, 0, 0x100, 0x1_0000_0000)], &[0u8; 0x100]);
+    assert_eq!(elf::plan64(&huge, TOP64).unwrap().segs[0].memsz, 0x1_0000_0000);
+    // A PIE at a Layout64 base: its regions are 47-bit addresses in the
+    // program band, the W^X rules the same; past the band it is refused.
+    let pie = elf64_file(3, &[(PT_LOAD, 5, 0, 0, 0x200, 0x200), (PT_LOAD, 6, 0x200, 0x1_0200, 0x40, 0x2000)], &[0u8; 0x300]);
+    let plan = elf::plan64(&pie, TOP64).unwrap();
+    for seed in [[0u8; 24], [0x55; 24], [0xff; 24]] {
+        let l: vma::Layout = vma::Layout64::random(&seed).into();
+        let mut vmas = Vec::new();
+        for s in &plan.segs {
+            elf::region(&mut vmas, s, l.pie_base, l.mmap_base).unwrap();
+        }
+        assert_eq!(vmas[0], vma::Vma { start: l.pie_base, end: l.pie_base + 0x1000, prot: vma::PROT_READ | vma::PROT_EXEC });
+        assert!(vmas.iter().all(|v| v.start >= 1 << 32 && v.end <= l.mmap_base) && !vma::mixed(&vmas));
+        assert_eq!(elf::region(&mut vmas, &plan.segs[1], l.mmap_base - 0x1000, l.mmap_base), Err("segment too high"));
+    }
+    // The AArch32 runtime (and the host) loads ELF32 only.
+    assert!(!vma::WIDE);
+    assert_eq!(elf::plan(&f).unwrap_err(), "not a 32-bit little-endian ELF file");
+    assert_eq!(elf::LOADER, "/lib/ld-musl-armhf.so.1");
 }

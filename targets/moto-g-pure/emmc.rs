@@ -330,9 +330,9 @@ impl Disk {
 // misc + 4 and the first 16 MiB of boot_a and boot_b (in boot_b that ends
 // exactly at the storage marker). Nothing is offered while Android may still
 // be on slot A: only once `moto-flash --take-userdata` has claimed userdata.
-#[cfg(slot_ota)]
+#[cfg(any(slot_ota, slot_mark))]
 #[path = "slot.rs"]
-mod slot;
+pub mod slot;
 #[cfg(slot_ota)]
 impl Disk {
     pub const SLOT_SECTORS: u32 = 16 * 1024 * 1024 / 512;
@@ -376,6 +376,48 @@ impl Disk {
     pub fn slot_write(&mut self, lba: u32, s: &mut Sector) -> Result<(), ()> {
         let at = self.slot_lba(lba)?;
         self.finish(transfer(24, at, s))
+    }
+}
+
+// Marking the running boot slot successful, as the stock boot HAL's
+// MarkBootSuccessful does (slot.rs), so LK stops spending its tries on a
+// healthy VioletOS. Built with `--cfg slot_mark` (the AArch64 handset build,
+// image/packages/build.py). It reaches one sector: misc + 4, found by name in
+// the live CRC-checked GPT (whose boot_b must be where this volume is),
+// holding the 32-byte bootloader_control record at byte 0x800 of misc. The
+// record is read and must decode (magic, version, two slots, CRC) before
+// anything is written; the sector is written back with only that record
+// changed (successful, tries 1 for `running`; nothing when it is already
+// marked), flushed and read back. `before` and `after` are the record as read
+// and as it stands afterwards, for USB Diagnostics.
+#[cfg(slot_mark)]
+impl Disk {
+    fn control_sector(&mut self) -> Result<u32, slot::Error> {
+        let ext = read_card(8, 0).map_err(|_| slot::Error::Io)?;
+        let capacity = u32::from_le_bytes([ext[212], ext[213], ext[214], ext[215]]);
+        let mut found = [None; 2];
+        slot::gpt_find(|lba| read_card(17, lba), capacity, &[b"misc", b"boot_b"], &mut found)?;
+        let (misc, b) = (found[0].ok_or(slot::Error::Slot)?, found[1].ok_or(slot::Error::Slot)?);
+        if b.0 != volume::BOOT_B || misc.1 - misc.0 < slot::MISC_SECTOR {
+            return Err(slot::Error::Slot);
+        }
+        Ok(misc.0 + slot::MISC_SECTOR)
+    }
+    pub fn mark_running_slot(&mut self, running: usize, before: &mut [u8; 32], after: &mut [u8; 32])
+        -> Result<bool, slot::Error> {
+        if self.retired {
+            return Err(slot::Error::Io);
+        }
+        let lba = self.control_sector()?;
+        let first = read_card(17, lba).map_err(|_| slot::Error::Io)?;
+        before.copy_from_slice(&first[..32]);
+        let changed = slot::update(|| read_card(17, lba), |s| transfer(24, lba, s), |c| c.mark_successful(running))?;
+        if changed {
+            self.flush().map_err(|_| slot::Error::Io)?;
+        }
+        let last = read_card(17, lba).map_err(|_| slot::Error::Io)?;
+        after.copy_from_slice(&last[..32]);
+        Ok(changed)
     }
 }
 

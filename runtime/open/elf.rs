@@ -8,17 +8,21 @@
 //! against musl: its PT_INTERP must name exactly LOADER, the one dynamic
 //! loader the system image ships (musl's libc.so). Any other interpreter is
 //! refused.
-use super::vma::{self, Layout, Vma, MMAP_BASE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use super::vma::{self, Layout, Va, Vma, PROT_EXEC, PROT_READ, PROT_WRITE};
 use alloc::vec::Vec;
 
-pub const LOADER: &str = "/lib/ld-musl-armhf.so.1";
+/// The one dynamic loader a program may name: musl's for the ABI this
+/// runtime serves (AArch32 armhf, or AArch64 when vma::WIDE).
+pub const LOADER: &str = if vma::WIDE { LOADER64 } else { LOADER32 };
+pub const LOADER32: &str = "/lib/ld-musl-armhf.so.1";
 
+/// One PT_LOAD segment, of an ELF32 or ELF64 program, in whole addresses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Seg {
-    pub vaddr: u32,
-    pub offset: u32,
-    pub filesz: u32,
-    pub memsz: u32,
+    pub vaddr: Va,
+    pub offset: Va,
+    pub filesz: Va,
+    pub memsz: Va,
     /// PF_X 1, PF_W 2, PF_R 4.
     pub flags: u32,
 }
@@ -27,12 +31,12 @@ pub struct Seg {
 pub struct Plan {
     /// ET_DYN: loaded at a base the loader picks.
     pub pie: bool,
-    pub entry: u32,
-    pub phoff: u32,
+    pub entry: Va,
+    pub phoff: Va,
     pub phentsize: u32,
     pub phnum: u32,
     /// PT_PHDR's address, if there is one.
-    pub phdr: Option<u32>,
+    pub phdr: Option<Va>,
     /// PT_LOAD segments with memory.
     pub segs: Vec<Seg>,
     /// It has PT_INTERP (which names LOADER).
@@ -47,8 +51,19 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// The program headers of a 32-bit little-endian ARM executable.
+/// The program headers of a program for the ABI this runtime serves: a
+/// 32-bit ARM executable, or (vma::WIDE) a 64-bit AArch64 one checked by
+/// `plan64`, with its 64-bit addresses whole (vma::Layout64 places it).
 pub fn plan(image: &[u8]) -> Result<Plan, &'static str> {
+    if vma::WIDE {
+        plan64(image, vma::USER_TOP64)
+    } else {
+        plan32(image)
+    }
+}
+
+/// The program headers of a 32-bit little-endian ARM executable.
+pub fn plan32(image: &[u8]) -> Result<Plan, &'static str> {
     if image.len() < 52 || &image[..4] != b"\x7fELF" || image[4] != 1 || image[5] != 1 {
         return Err("not a 32-bit little-endian ELF file");
     }
@@ -67,7 +82,7 @@ pub fn plan(image: &[u8]) -> Result<Plan, &'static str> {
     if phentsize < 32 || headers_end.map_or(true, |e| e > image.len()) {
         return Err("bad program headers");
     }
-    let mut p = Plan { pie, entry: field(24)?, phoff, phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
+    let mut p = Plan { pie, entry: field(24)?.into(), phoff: phoff.into(), phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
     for i in 0..phnum as usize {
         let h = phoff as usize + i * phentsize as usize;
         let w = |k: usize| u32_at(image, h + 4 * k).ok_or("bad program headers");
@@ -87,13 +102,105 @@ pub fn plan(image: &[u8]) -> Result<Plan, &'static str> {
                 if p.segs.len() >= 16 {
                     return Err("too many segments");
                 }
-                p.segs.push(Seg { vaddr, offset, filesz, memsz, flags });
+                p.segs.push(Seg { vaddr: vaddr.into(), offset: offset.into(), filesz: filesz.into(), memsz: memsz.into(), flags });
             }
             3 => {
                 let path = (offset as usize).checked_add(filesz as usize).and_then(|e| image.get(offset as usize..e));
-                let ok = !p.interp && path.is_some_and(|s| s.len() == LOADER.len() + 1 && s.ends_with(b"\0") && &s[..LOADER.len()] == LOADER.as_bytes());
+                let ok = !p.interp && path.is_some_and(|s| s.len() == LOADER32.len() + 1 && s.ends_with(b"\0") && &s[..LOADER32.len()] == LOADER32.as_bytes());
                 if !ok {
                     return Err("dynamically linked against an unsupported loader (only /lib/ld-musl-armhf.so.1)");
+                }
+                p.interp = true;
+            }
+            6 => p.phdr = Some(vaddr.into()),
+            _ => {}
+        }
+    }
+    if p.segs.is_empty() {
+        return Err("no loadable segments");
+    }
+    Ok(p)
+}
+
+// ---- AArch64 programs (ELF64) ----
+
+/// Why a dynamically linked program cannot start (procmgr.rs `load` too).
+pub const NO_LOADER: &str = if vma::WIDE {
+    "its dynamic loader /lib/ld-musl-aarch64.so.1 is not in the system image"
+} else {
+    "its dynamic loader /lib/ld-musl-armhf.so.1 is not in the system image"
+};
+pub const NOT_LOADER: &str = if vma::WIDE { "/lib/ld-musl-aarch64.so.1 is not a dynamic loader" } else { "/lib/ld-musl-armhf.so.1 is not a dynamic loader" };
+
+/// The dynamic loader an AArch64 program may name: musl's, as shipped.
+pub const LOADER64: &str = "/lib/ld-musl-aarch64.so.1";
+/// e_machine EM_AARCH64.
+pub const EM_AARCH64: u32 = 183;
+
+/// A 64-bit program's segments and plan are the same types (whole addresses).
+pub type Seg64 = Seg;
+pub type Plan64 = Plan;
+
+fn u64_at(b: &[u8], at: usize) -> Option<u64> {
+    let s = b.get(at..at.checked_add(8)?)?;
+    let mut w = [0u8; 8];
+    w.copy_from_slice(s);
+    Some(u64::from_le_bytes(w))
+}
+
+/// The program headers of a 64-bit little-endian AArch64 executable, with
+/// the checks `plan` makes: in-file and non-overflowing segments, no segment
+/// both writable and executable, at most 16, PT_INTERP naming exactly
+/// LOADER64. A fixed-address (ET_EXEC) program must also lie below
+/// `user_top`; a PIE's segments are checked again where they are placed.
+pub fn plan64(image: &[u8], user_top: Va) -> Result<Plan, &'static str> {
+    if image.len() < 64 || &image[..4] != b"\x7fELF" || image[4] != 2 || image[5] != 1 {
+        return Err("not a 64-bit little-endian ELF file");
+    }
+    let half = |at| u16_at(image, at).ok_or("bad ELF header");
+    let long = |at| u64_at(image, at).ok_or("bad ELF header");
+    if half(18)? != EM_AARCH64 {
+        return Err("not an AArch64 executable");
+    }
+    let pie = match half(16)? {
+        2 => false,
+        3 => true,
+        _ => return Err("not an executable"),
+    };
+    let (phoff, phentsize, phnum) = (long(32)?, half(54)?, half(56)?);
+    let headers_end = usize::try_from(phoff).ok().and_then(|o| (phentsize as usize).checked_mul(phnum as usize)?.checked_add(o));
+    if phentsize < 56 || headers_end.map_or(true, |e| e > image.len()) {
+        return Err("bad program headers");
+    }
+    let mut p = Plan { pie, entry: long(24)?, phoff, phentsize, phnum, phdr: None, segs: Vec::new(), interp: false };
+    for i in 0..phnum as usize {
+        let h = phoff as usize + i * phentsize as usize;
+        let w32 = |at: usize| u32_at(image, h + at).ok_or("bad program headers");
+        let w64 = |at: usize| u64_at(image, h + at).ok_or("bad program headers");
+        let (ptype, flags, offset, vaddr, filesz, memsz) = (w32(0)?, w32(4)?, w64(8)?, w64(16)?, w64(32)?, w64(40)?);
+        match ptype {
+            1 if memsz != 0 => {
+                let in_file = offset.checked_add(filesz).is_some_and(|e| e <= image.len() as u64);
+                if !in_file || filesz > memsz {
+                    return Err("bad segment");
+                }
+                let end = vaddr.checked_add(memsz).ok_or("segment too high")?;
+                if !pie && end > user_top {
+                    return Err("segment too high");
+                }
+                if flags & 3 == 3 {
+                    return Err("a segment is writable and executable");
+                }
+                if p.segs.len() >= 16 {
+                    return Err("too many segments");
+                }
+                p.segs.push(Seg { vaddr, offset, filesz, memsz, flags });
+            }
+            3 => {
+                let path = usize::try_from(offset).ok().and_then(|o| image.get(o..o.checked_add(usize::try_from(filesz).ok()?)?));
+                let ok = !p.interp && path.is_some_and(|s| s.len() == LOADER64.len() + 1 && s.ends_with(b"\0") && &s[..LOADER64.len()] == LOADER64.as_bytes());
+                if !ok {
+                    return Err("dynamically linked against an unsupported loader (only /lib/ld-musl-aarch64.so.1)");
                 }
                 p.interp = true;
             }
@@ -109,14 +216,14 @@ pub fn plan(image: &[u8]) -> Result<Plan, &'static str> {
 
 impl Plan {
     /// The lowest and highest address the segments use, rounded out to 4 KiB.
-    pub fn span(&self) -> (u32, u32) {
+    pub fn span(&self) -> (Va, Va) {
         let lo = self.segs.iter().map(|s| s.vaddr).min().unwrap_or(0) & !0xfff;
         let hi = self.segs.iter().map(|s| s.vaddr.saturating_add(s.memsz)).max().unwrap_or(0);
         (lo, hi.saturating_add(0xfff) & !0xfff)
     }
-    /// Where the program headers are once loaded at `base`: PT_PHDR, else
-    /// the segment that holds them in the file.
-    pub fn phdr_at(&self, base: u32) -> u32 {
+    /// Where the program headers are once loaded at `base` (AT_PHDR):
+    /// PT_PHDR, else the segment that holds them in the file.
+    pub fn phdr_at(&self, base: Va) -> Va {
         if let Some(v) = self.phdr {
             return base.wrapping_add(v);
         }
@@ -130,6 +237,17 @@ impl Plan {
     pub fn loader_ok(&self) -> bool {
         self.pie && !self.interp
     }
+    /// Whether two segments share a 4 KiB page with different protections
+    /// (code with data): refused, since a page has one protection.
+    pub fn mixed_pages(&self) -> bool {
+        let pages = |s: &Seg| (s.vaddr >> 12, (s.vaddr.saturating_add(s.memsz).saturating_add(0xfff)) >> 12);
+        self.segs.iter().enumerate().any(|(i, a)| {
+            self.segs[i + 1..].iter().any(|b| {
+                let ((a0, a1), (b0, b1)) = (pages(a), pages(b));
+                a0 < b1 && b0 < a1 && (a.flags ^ b.flags) & 1 != 0
+            })
+        })
+    }
 }
 
 // ---- where the segments go (the loader's rules, with no memory touched) ----
@@ -139,7 +257,7 @@ impl Plan {
 /// read-execute, data read-write), 4 KiB-rounded, and a data neighbour on
 /// the same 4 KiB page keeping both protections. Code sharing a page with
 /// data is refused. Returns (address, end, rounded start, rounded end).
-pub fn region(vmas: &mut Vec<Vma>, s: &Seg, base: u32, limit: u32) -> Result<(u32, u32, u32, u32), &'static str> {
+pub fn region(vmas: &mut Vec<Vma>, s: &Seg, base: Va, limit: Va) -> Result<(Va, Va, Va, Va), &'static str> {
     let va = base.checked_add(s.vaddr).ok_or("bad segment address")?;
     let end = va.checked_add(s.memsz).filter(|&e| e <= limit).ok_or("segment too high")?;
     let mut prot = PROT_READ;
@@ -159,25 +277,25 @@ pub fn region(vmas: &mut Vec<Vma>, s: &Seg, base: u32, limit: u32) -> Result<(u3
 }
 
 /// A free range of `len` bytes (rounded up to 64 KiB pages) in the mmap
-/// area below `top`, highest first (procmgr.rs `free_range`).
-pub fn free_in(vmas: &[Vma], top: u32, len: u32) -> Option<u32> {
-    let page = 1u32 << 16;
+/// area [`mmap_base`, `top`), highest first (procmgr.rs `free_range`).
+pub fn free_in(vmas: &[Vma], mmap_base: Va, top: Va, len: Va) -> Option<Va> {
+    let page: Va = 1 << 16;
     let len = len.checked_add(page - 1)? & !(page - 1);
     let mut top = top;
     for v in vmas.iter().rev() {
         if v.start >= top {
             continue;
         }
-        let floor = v.end.max(MMAP_BASE).checked_add(page - 1)? & !(page - 1);
+        let floor = v.end.max(mmap_base).checked_add(page - 1)? & !(page - 1);
         if floor <= top && top - floor >= len {
             return Some(top - len);
         }
         top = top.min(v.start & !(page - 1));
-        if top <= MMAP_BASE {
+        if top <= mmap_base {
             return None;
         }
     }
-    (top >= MMAP_BASE.checked_add(len)?).then(|| top - len)
+    (top >= mmap_base.checked_add(len)?).then(|| top - len)
 }
 
 /// Everything procmgr.rs `load` checks before it touches memory, on a fresh
@@ -190,16 +308,16 @@ pub fn check(image: &[u8], ld: Option<&[u8]>, layout: &Layout) -> Result<(), &'s
     let base = if p.pie { layout.pie_base } else { 0 };
     let mut vmas = Vec::new();
     for s in &p.segs {
-        region(&mut vmas, s, base, MMAP_BASE)?;
+        region(&mut vmas, s, base, layout.mmap_base)?;
     }
     if p.interp {
-        let l = plan(ld.ok_or("its dynamic loader /lib/ld-musl-armhf.so.1 is not in the system image")?)?;
+        let l = plan(ld.ok_or(NO_LOADER)?)?;
         if !l.loader_ok() {
-            return Err("/lib/ld-musl-armhf.so.1 is not a dynamic loader");
+            return Err(NOT_LOADER);
         }
         let (lo, hi) = l.span();
         let lo = lo & !0xffff;
-        let at = free_in(&vmas, layout.mmap_top, hi - lo).ok_or("no room for the dynamic loader")?;
+        let at = free_in(&vmas, layout.mmap_base, layout.mmap_top, hi - lo).ok_or("no room for the dynamic loader")?;
         for s in &l.segs {
             region(&mut vmas, s, at.wrapping_sub(lo), layout.mmap_top)?;
         }

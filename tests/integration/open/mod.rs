@@ -57,6 +57,8 @@ shipped! {
     hcimux = "../../../runtime/open/hcimux.rs";
     frames = "../../../runtime/open/frames.rs";
     powerctl = "../../../runtime/open/powerctl.rs";
+    // runtime/open/mod.rs includes it the same way: the AArch64 call translation.
+    arch = "../../../runtime/arch/mod.rs";
 }
 
 pub mod front;

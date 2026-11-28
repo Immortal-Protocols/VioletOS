@@ -73,7 +73,7 @@ fn nothing_of_the_apps_goes_into_a_page_that_holds_code() {
     let rt = &mut w.rt;
     let app = rt.apps[probe].as_mut().unwrap();
     let mut code = [0u8; 16];
-    assert!(app.space.read(&mut rt.k, &mut rt.pool, CODE, &mut code));
+    assert!(app.space.read(&mut rt.k, &mut rt.pool, u64::from(CODE), &mut code));
     assert_eq!(code, [0x22; 16]);
 }
 
@@ -81,7 +81,7 @@ fn nothing_of_the_apps_goes_into_a_page_that_holds_code() {
 fn the_trampoline_page_is_the_runtimes() {
     let (mut w, probe) = phone();
     let mut p = w.app(probe);
-    let stubs = p.layout().stubs;
+    let stubs = p.layout().stubs as u32; // (an AArch32 app: a 32-bit address)
     p.write_file("/tmp/wxprobe.code", &[0xcc; 4096]).unwrap();
     let shell = p.open("/tmp/wxprobe.code", O_RDWR).unwrap();
     assert_eq!(p.munmap(stubs, 65536), Err(EINVAL));
@@ -124,9 +124,9 @@ fn system_calls_do_not_write_where_the_app_may_not() {
     let rt = &mut w.rt;
     let app = rt.apps[probe].as_mut().unwrap();
     let (mut code, mut before, mut kept) = ([0u8; 16], [1u8; 512], [0u8; 16]);
-    assert!(app.space.read(&mut rt.k, &mut rt.pool, CODE, &mut code) && code == [0x22; 16], "code unchanged");
-    assert!(app.space.read(&mut rt.k, &mut rt.pool, two + 65536 - 512, &mut before) && before == [0; 512], "nothing written before the refusal");
-    assert!(app.space.read(&mut rt.k, &mut rt.pool, hidden, &mut kept) && kept != [0; 16], "PROT_NONE keeps contents");
+    assert!(app.space.read(&mut rt.k, &mut rt.pool, u64::from(CODE), &mut code) && code == [0x22; 16], "code unchanged");
+    assert!(app.space.read(&mut rt.k, &mut rt.pool, u64::from(two + 65536 - 512), &mut before) && before == [0; 512], "nothing written before the refusal");
+    assert!(app.space.read(&mut rt.k, &mut rt.pool, u64::from(hidden), &mut kept) && kept != [0; 16], "PROT_NONE keeps contents");
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn read32(w: &mut World, i: usize, va: u32) -> [u8; 32] {
     let rt = &mut w.rt;
     let app = rt.apps[i].as_mut().unwrap();
     let mut out = [0u8; 32];
-    assert!(app.space.read(&mut rt.k, &mut rt.pool, va, &mut out));
+    assert!(app.space.read(&mut rt.k, &mut rt.pool, u64::from(va), &mut out));
     out
 }
 
@@ -240,7 +240,7 @@ fn the_layout_moves_between_launches_and_boots() {
             let i = w.open_app("wxprobe");
             let mut p = w.app(i);
             let (l, sp, random) = (p.layout(), p.sp(), p.at_random());
-            assert!(sp < l.stack_top && sp > l.stack_top - 0x2_0000);
+            assert!(u64::from(sp) < l.stack_top && u64::from(sp) > l.stack_top - 0x2_0000);
             stacks.insert(sp);
             heaps.insert(p.brk(0));
             mmaps.insert(p.mmap(0, 65536, RW, ANON, -1).unwrap());

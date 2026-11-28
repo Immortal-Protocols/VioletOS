@@ -60,6 +60,40 @@ int main(void) {
         int history_len = libusb_control_transfer(h, 0xc0, 0x56, 0, 0, history, sizeof history, 1000);
         if (history_len == sizeof history && !memcmp(history, "VBH1", 4))
           printf(",\"previous_boot_stage\":%u", word(history + 4));
+        // Newer images: word size, the AArch64 loader's entry level, the last fault.
+        unsigned char arch[56];
+        int arch_len = libusb_control_transfer(h, 0xc0, 0x59, 0, 0, arch, sizeof arch, 1000);
+        if ((arch_len == 52 || arch_len == sizeof arch) && !memcmp(arch, "VAR1", 4)) {
+          printf(",\"word_bits\":%u,\"entry_el\":%u", word(arch + 4),
+                 (word(arch + 8) >> 16) == 0x454c ? word(arch + 8) & 0xff : 0);
+          printf(",\"last_fault\":[%u,%u,%u,%u,%u,%u]", word(arch + 12), word(arch + 16), word(arch + 20),
+                 word(arch + 24), word(arch + 28), word(arch + 32));
+          // The AArch64 loader's verified boot: the system version it accepted.
+          if (arch_len == sizeof arch && (word(arch + 52) >> 16) == 0x5642)
+            printf(",\"verified_boot_version\":%u", word(arch + 52) & 0xffff);
+          else if (arch_len == sizeof arch)
+            printf(",\"verified_boot_version\":0");
+          if (arch[36]) {
+            printf(",\"boot_disk\":\"");
+            for (unsigned j = 36; j < 52 && arch[j]; j++)
+              putchar(arch[j] >= 32 && arch[j] < 127 && arch[j] != '"' && arch[j] != '\\' ? arch[j] : '?');
+            putchar('"');
+          }
+        }
+        // The AArch64 handset's boot-slot mark (supervisor.c mark_running_slot).
+        unsigned char mark[64];
+        int mark_len = libusb_control_transfer(h, 0xc0, 0x5a, 0, 0, mark, sizeof mark, 1000);
+        if (mark_len == sizeof mark && !memcmp(mark, "VSL1", 4)) {
+          unsigned sl = word(mark + 4);
+          printf(",\"slot_mark\":{\"running_slot\":\"%s\",\"status\":%u,\"attempts\":%u,"
+                 "\"wrote\":%u,\"slot\":%u,\"record_before\":\"",
+                 (sl >> 16) != 0x534c ? "unknown" : (sl & 0xffff) == 1 ? "_a" : (sl & 0xffff) == 2 ? "_b" : "?",
+                 word(mark + 8), word(mark + 12), word(mark + 16), word(mark + 20));
+          for (unsigned j = 24; j < 56; j++) printf("%02x", mark[j]);
+          printf("\",\"slots_after\":\"");
+          for (unsigned j = 56; j < 64; j++) printf("%02x", mark[j]);
+          printf("\"}");
+        }
         unsigned char radio[52];
         count = libusb_control_transfer(h, 0xc0, 0x53, 0, 0, radio,
                                         sizeof radio, 1000);

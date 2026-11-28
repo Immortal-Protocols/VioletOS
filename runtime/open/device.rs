@@ -5,6 +5,7 @@
 use super::abi::*;
 use super::policy::Cap;
 use super::sys::{self, FRAMEBUFFER, PAGE};
+use super::vma::Va;
 use super::{request, Runtime, Wait, MAX_APPS};
 use crate::protocol::*;
 use alloc::collections::VecDeque;
@@ -762,17 +763,17 @@ impl Runtime {
     }
 
     /// Map the surface into the app (mmap of /dev/violet/screen).
-    pub fn map_surface(&mut self, i: usize, va: u32, len: u32, offset: u32) -> Result<(), i32> {
+    pub fn map_surface(&mut self, i: usize, va: Va, len: Va, offset: u32) -> Result<(), i32> {
         self.surface(i)?;
         let app = self.apps[i].as_mut().unwrap();
         let pages = app.surface.as_ref().unwrap().pages.clone();
         let first = offset as usize / PAGE;
-        let count = (len as usize + PAGE - 1) / PAGE;
+        let count = usize::try_from(len).map_err(|_| super::syscall::EINVAL)?.div_ceil(PAGE);
         if first + count > pages.len() {
             return Err(super::syscall::EINVAL);
         }
         for n in 0..count {
-            let at = va + (n * PAGE) as u32;
+            let at = va + (n * PAGE) as Va;
             app.space.map(&mut self.k, &self.pool, at, pages[first + n], false)?;
         }
         Ok(())
@@ -837,7 +838,7 @@ impl Runtime {
                 }
                 let app = self.apps[i].as_mut().unwrap();
                 for (k, rev) in out.iter().enumerate() {
-                    app.space.write(&mut self.k, &mut self.pool, ptr + 8 * k as u32 + 6, &rev.to_le_bytes());
+                    app.space.write(&mut self.k, &mut self.pool, ptr + 8 * k as Va + 6, &rev.to_le_bytes());
                 }
                 Some(n)
             }
@@ -913,7 +914,7 @@ impl Runtime {
         }
     }
 
-    pub fn epoll_collect(&mut self, i: usize, epfd: i32, events: u32, max: u32) -> i32 {
+    pub fn epoll_collect(&mut self, i: usize, epfd: i32, events: Va, max: u32) -> i32 {
         let interest = {
             let app = self.apps[i].as_ref().unwrap();
             let Some(Some(f)) = app.fds.get(epfd as usize) else { return super::syscall::EBADF };
@@ -950,7 +951,7 @@ impl Runtime {
             bytes[..4].copy_from_slice(&rev.to_le_bytes());
             bytes[8..].copy_from_slice(&data.to_le_bytes());
             let app = self.apps[i].as_mut().unwrap();
-            app.space.write(&mut self.k, &mut self.pool, events + 16 * n, &bytes);
+            app.space.write(&mut self.k, &mut self.pool, events + 16 * Va::from(n), &bytes);
             n += 1;
         }
         if !edges.is_empty() {
@@ -988,7 +989,7 @@ impl Runtime {
     }
 
     /// Read without blocking; EAGAIN when nothing is available yet.
-    pub fn read_now(&mut self, i: usize, fd: i32, buf: u32, len: u32) -> i32 {
+    pub fn read_now(&mut self, i: usize, fd: i32, buf: Va, len: u32) -> i32 {
         use super::syscall::*;
         let f = match self.apps[i].as_ref().unwrap().fds.get(fd as usize) {
             Some(Some(f)) => f.clone(),
@@ -1148,7 +1149,7 @@ impl Runtime {
     }
 
     /// Write PCM; 0 means the ring is full and nothing was taken.
-    pub fn write_audio(&mut self, i: usize, fd: i32, buf: u32, len: u32) -> i32 {
+    pub fn write_audio(&mut self, i: usize, fd: i32, buf: Va, len: u32) -> i32 {
         use super::syscall::*;
         let f = match self.apps[i].as_ref().unwrap().fds.get(fd as usize) {
             Some(Some(f)) => f.clone(),

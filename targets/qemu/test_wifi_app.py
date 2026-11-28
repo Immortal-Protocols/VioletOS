@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "targets/qemu"))
 import home_grid
+# This suite boots the 32-bit (AArch32) image: build/sel4/qemu, make qemu32-image.
+os.environ["VIOLET_ARCH"] = "aarch32"
 import run
 
 SCRIPT = r'''#!/usr/bin/env python3
@@ -169,7 +171,7 @@ with TemporaryDirectory() as tmp:
     viewer = Path(tmp) / "input.py"
     original = run.ROOT / "build/sel4/qemu"
     if not (original / "initfs.cpio").exists():
-        raise SystemExit("Build the QEMU image first (make qemu-image).")
+        raise SystemExit("Build the 32-bit QEMU image first (make qemu32-image).")
     viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
     viewer.chmod(0o755)
     image = Path(tmp) / "image"

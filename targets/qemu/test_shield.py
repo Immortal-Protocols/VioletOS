@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "targets/qemu"))
 import home_grid  # noqa: E402
+# This suite boots the 32-bit (AArch32) image: build/sel4/qemu, make qemu32-image.
+os.environ["VIOLET_ARCH"] = "aarch32"
 import run  # noqa: E402
 
 # The demo apps (apps/shield-demo) get icons on Home after the built-in ones.
@@ -283,7 +285,7 @@ def main():
     args = ap.parse_args()
     original = ROOT / "build/sel4/qemu"
     if not (original / "zImage").exists():
-        raise SystemExit("Build the QEMU image first (make qemu-image).")
+        raise SystemExit("Build the 32-bit QEMU image first (make qemu32-image).")
     record = Path(args.record).resolve() if args.record else None
     if record:
         record.mkdir(parents=True, exist_ok=True)

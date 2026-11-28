@@ -10,6 +10,7 @@
 //! runtime cannot reach another thread's VFP registers), calls the handler,
 //! loads them back from the frame (so a handler that edits the context is
 //! obeyed) and calls rt_sigreturn. The libc's sa_restorer is not used.
+use super::vma::Va;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -24,8 +25,8 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGSTOP: u32 = 19;
 pub const NSIG: u32 = 64;
 
-pub const SIG_DFL: u32 = 0;
-pub const SIG_IGN: u32 = 1;
+pub const SIG_DFL: Va = 0;
+pub const SIG_IGN: Va = 1;
 pub const SA_NOCLDWAIT: u32 = 2;
 pub const SA_ONSTACK: u32 = 0x0800_0000;
 pub const SA_RESTART: u32 = 0x1000_0000;
@@ -55,11 +56,13 @@ pub const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 /// Faults the hardware raises: taken before any other pending signal.
 const SYNCHRONOUS: u64 = (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 10) | (1 << 30);
 
+/// A signal action. The handler and restorer are app addresses, whole for
+/// either ABI (an AArch64 handler lies above 4 GiB, vma::Layout64).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Action {
-    pub handler: u32,
+    pub handler: Va,
     pub flags: u32,
-    pub restorer: u32,
+    pub restorer: Va,
     pub mask: u64,
 }
 
@@ -77,8 +80,8 @@ pub struct Info {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AltStack {
-    pub sp: u32,
-    pub size: u32,
+    pub sp: Va,
+    pub size: Va,
     pub flags: u32,
 }
 impl Default for AltStack {
@@ -87,12 +90,41 @@ impl Default for AltStack {
     }
 }
 impl AltStack {
-    pub fn on(&self, sp: u32) -> bool {
+    pub fn on(&self, sp: Va) -> bool {
         self.flags & SS_DISABLE == 0 && sp > self.sp && sp - self.sp <= self.size
     }
     /// ss_flags as sigaltstack and uc_stack report them.
-    pub fn report(&self, sp: u32) -> u32 {
+    pub fn report(&self, sp: Va) -> u32 {
         if self.flags & SS_DISABLE != 0 { SS_DISABLE } else if self.on(sp) { SS_ONSTACK } else { 0 }
+    }
+}
+
+/// The alternate stack a thread at `sp` with `current` gets from a stack_t
+/// of (ss_sp, flags, size), by sigaltstack's rules (Linux do_sigaltstack):
+/// EPERM while on the current one, EINVAL for unknown flags, ENOMEM for a
+/// stack under MINSIGSTKSZ, EFAULT for one that would wrap the address space.
+/// sigaltstack answers the error; rt_sigreturn (restore_altstack) leaves the
+/// stack as it was.
+pub fn alt_change(current: AltStack, sp: Va, ss_sp: u64, flags: u32, size: u64) -> Result<AltStack, i32> {
+    const EPERM: i32 = -1;
+    const EFAULT: i32 = -14;
+    const ENOMEM: i32 = -12;
+    const EINVAL: i32 = -22;
+    if flags & SS_DISABLE == 0 && ss_sp.checked_add(size).is_none() {
+        return Err(EFAULT);
+    }
+    if current.on(sp) {
+        return Err(EPERM);
+    }
+    if flags & !(SS_DISABLE | SS_ONSTACK | 0x8000_0000) != 0 {
+        return Err(EINVAL);
+    }
+    if flags & SS_DISABLE != 0 {
+        Ok(AltStack::default())
+    } else if size < u64::from(MINSIGSTKSZ) {
+        Err(ENOMEM)
+    } else {
+        Ok(AltStack { sp: ss_sp, size, flags: 0 })
     }
 }
 
@@ -215,9 +247,10 @@ pub enum WaitFor {
     /// pause or sigsuspend: any handled signal ends it with EINTR.
     Suspend,
     /// sigtimedwait: a signal in `set` is taken and its siginfo written to `info`.
-    Set { set: u64, info: u32 },
+    Set { set: u64, info: Va },
     /// wait4/waitid on children matching `pid` (as wait4's argument).
-    Child { pid: i32, status: u32, options: u32, waitid: bool, rusage: u32 },
+    /// (`status` and `rusage`: app addresses, 0 for none.)
+    Child { pid: i32, status: Va, options: u32, waitid: bool, rusage: Va },
     /// The parent of a vfork child, until the child calls execve or exits.
     Vfork { child: u32 },
 }
@@ -237,7 +270,8 @@ pub struct Thread<V> {
     /// A fork on its way through the fork gate: the frame holding the
     /// caller's context and VFP registers, then fork's exit signal, clone
     /// flags, parent and child tid pointers.
-    pub forking: Option<[u32; 5]>,
+    /// A fork through the gate: the frame, exit signal, flags, ptid, ctid.
+    pub forking: Option<[Va; 5]>,
     /// Its call waits only because its app is held (parked, or another
     /// process of its owner is frozen): it is made again once released.
     pub held_call: bool,
@@ -341,9 +375,10 @@ pub fn siginfo(info: &Info) -> [u8; 128] {
 pub fn encode(ctx: &Context, info: &Info, mask: u64, alt: &AltStack, trap: &Trap) -> Vec<u8> {
     let mut b = alloc::vec![0u8; FRAME as usize];
     b[..128].copy_from_slice(&siginfo(info));
-    put(&mut b, UC + 8, alt.sp);
-    put(&mut b, UC + 12, alt.report(ctx.sp));
-    put(&mut b, UC + 16, alt.size);
+    // (An AArch32 frame: its app's addresses are 32-bit, so these are whole.)
+    put(&mut b, UC + 8, alt.sp as u32);
+    put(&mut b, UC + 12, alt.report(ctx.sp.into()));
+    put(&mut b, UC + 16, alt.size.min(u64::from(u32::MAX)) as u32);
     put(&mut b, MCONTEXT, trap.no);
     put(&mut b, MCONTEXT + 4, trap.error);
     put(&mut b, MCONTEXT + 8, mask as u32);
@@ -373,17 +408,17 @@ pub fn decode(uc: &[u8]) -> Option<(Context, u64, AltStack)> {
     ctx.pc = w(R0 + 60);
     ctx.cpsr = w(R0 + 64);
     let mask = (u64::from(w(SIGMASK)) | u64::from(w(SIGMASK + 4)) << 32) & !UNBLOCKABLE;
-    let alt = AltStack { sp: w(UC + 8), flags: w(UC + 12), size: w(UC + 16) };
+    let alt = AltStack { sp: w(UC + 8).into(), flags: w(UC + 12), size: w(UC + 16).into() };
     Some((ctx, mask, alt))
 }
 
 /// Where the frame goes: below `sp`, or at the top of the alternate stack
 /// for an SA_ONSTACK handler when the thread is not already on it. None if it
 /// does not fit there (the thread is then ended with SIGSEGV, as on Linux).
-pub fn place(sp: u32, alt: &AltStack, onstack: bool) -> Option<u32> {
+pub fn place(sp: Va, alt: &AltStack, onstack: bool) -> Option<Va> {
     let switch = onstack && alt.flags & SS_DISABLE == 0 && !alt.on(sp);
     let top = if switch { alt.sp.checked_add(alt.size)? } else { sp };
-    let frame = top.checked_sub(FRAME)? & !7;
+    let frame = top.checked_sub(FRAME.into())? & !7;
     if (switch || alt.on(sp)) && frame < alt.sp {
         return None;
     }

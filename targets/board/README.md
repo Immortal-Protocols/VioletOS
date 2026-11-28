@@ -4,7 +4,7 @@ One JSON file per board says what is true of that machine: its CPU architecture,
 
 | Board | Architecture | What it is |
 | --- | --- | --- |
-| [xt2163dl](xt2163dl.json) | AArch32 | The Moto G Pure handset. |
+| [xt2163dl](xt2163dl.json) | AArch32 | The Moto G Pure handset. Its AArch64 image (`make moto`, the default) uses the same memory map and device windows; the board check also compares the handset timer frequency with the AArch64 kernel's. |
 | [qemu](qemu.json) | AArch32 | QEMU `virt` with the handset's memory map: the default test target. |
 | [qemu64](qemu64.json) | AArch64 | QEMU `virt` for the [AArch64 bring-up](../qemu64/README.md). |
 

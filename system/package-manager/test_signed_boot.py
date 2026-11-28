@@ -24,6 +24,9 @@ import time
 repo = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(repo / "tools"))
 sys.path.insert(0, str(repo / "image/packages"))
+import os
+# This suite boots the 32-bit (AArch32) image: build/sel4/qemu, make qemu32-image.
+os.environ["VIOLET_ARCH"] = "aarch32"
 from run import IMAGE, machine
 from package_format import HEADER, TRAILER, unpack
 import sign

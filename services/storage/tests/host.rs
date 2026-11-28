@@ -47,6 +47,8 @@ mod syscall {
     pub const ENOTEMPTY: i32 = -39;
 }
 mod fs_tests;
+// The package catalog banks Storage commits on the handset.
+mod catalog_tests;
 
 // protocol.rs declares the IPC calls of the target; nothing here makes them.
 #[no_mangle]

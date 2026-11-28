@@ -77,11 +77,67 @@ def sentinel_key(repo, dest):
     return out
 
 
+BASE = 0x100000
+
+
+def component_script(arch):
+    """Every component's linker script: linked at BASE, its entry first.
+
+    AArch64 also drops the unwind tables clang and rustc emit there (panics
+    abort; nothing unwinds). The AArch32 text is the one the build always used.
+    """
+    discard = "*(.ARM.exidx*) *(.ARM.extab*)" + (" *(.eh_frame*)" if arch == "aarch64" else "")
+    return f"""ENTRY(process_entry)
+SECTIONS {{
+ . = {BASE:#x};
+ .text : {{ KEEP(*(.entry)) *(.text*) *(.rodata*) . = ALIGN(4096); }}
+ .data : {{ *(.data*) *(.got*) }}
+ .bss (NOLOAD) : {{ *(.bss*) *(COMMON) }}
+ image_end = .;
+ /DISCARD/ : {{ {discard} }}
+}}"""
+
+
+def link_flags(arch):
+    """ld.lld flags beyond the script. lld's AArch64 default page size is 64 KiB;
+    the supervisor maps packages in 4 KiB pages on both architectures."""
+    return ["-z", "max-page-size=4096"] if arch == "aarch64" else []
+
+
+def package_image(data, skip_bss_at=None):
+    """(code size, image bytes) of a linked component ELF (ELF32 or ELF64).
+
+    The image is every allocated section from BASE, NOBITS left zero, except a
+    NOBITS section at `skip_bss_at` (the handset Radio's private RAM, which is
+    outside its image). The code (.text) must start at BASE and fill whole pages.
+    """
+    import violet_arch
+    sections, idx = violet_arch.sections(data)
+    st = sections[idx]
+    strings = data[st[4] : st[4] + st[5]]
+    allocated = [s for s in sections if s[2] & 2 and s[5]]
+    code = next(s for s in allocated if strings[s[0] :].split(b"\0")[0] == b".text")
+    if code[3] != BASE or code[5] % 4096:
+        raise ValueError(f".text must start at {BASE:#x} and fill whole pages")
+    if skip_bss_at is not None:
+        allocated = [s for s in allocated if not (s[1] == 8 and s[3] == skip_bss_at)]
+    end = max(s[3] + s[5] for s in allocated)
+    image = bytearray(end - BASE)
+    for s in allocated:
+        if s[1] != 8:
+            image[s[3] - BASE : s[3] - BASE + s[5]] = data[s[4] : s[4] + s[5]]
+    return code[5], image
+
+
 def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=None, storage_backend=None, target="qemu"):
-    from package_format import package_abi
+    from package_format import package_abi, radio_abi
     # The architecture comes from VIOLET_ARCH (violet_arch.py): aarch32 unless set.
+    # It decides the Rust target, the link, and the architecture recorded in
+    # every package's ABI word (package_format.ARCH_ABI); `common` and `incs`
+    # (the C flags and libsel4 headers) come from the caller for the same one.
     import violet_arch
     violet_arch.require_components()
+    arch = violet_arch.selected()
 
     platform_include = repo / "platform/sel4/include"
     dest = out / "packages"
@@ -119,15 +175,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
         scripts["radio"] = board / "radio.rs"
         scripts["usb-diagnostics"] = repo / "services/usb-diagnostics/process.rs"
     script = dest / "component.ld"
-    script.write_text("""ENTRY(process_entry)
-SECTIONS {
- . = 0x100000;
- .text : { KEEP(*(.entry)) *(.text*) *(.rodata*) . = ALIGN(4096); }
- .data : { *(.data*) *(.got*) }
- .bss (NOLOAD) : { *(.bss*) *(COMMON) }
- image_end = .;
- /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) }
-}""")
+    script.write_text(component_script(arch))
     transport = dest / "transport.o"
     run(
         common
@@ -267,6 +315,10 @@ SECTIONS {
                 *(["--cfg", "open_fault_probe"] if name == "open" and os.environ.get("VIOLET_TEST_FAULT") == "1"
                   and os.environ.get("VIOLET_RELEASE") != "1" else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
+                # The AArch64 handset marks its running boot slot successful
+                # (targets/moto-g-pure/emmc.rs mark_running_slot): only misc's
+                # bootloader_control record, after the supervisor's health signal.
+                *(["--cfg", "slot_mark"] if target == "moto" and name == "storage" and arch == "aarch64" else []),
                 crate,
                 "-o",
                 lib,
@@ -324,6 +376,7 @@ SECTIONS {
             [
                 cc.with_name("ld.lld"),
                 "--gc-sections",
+                *link_flags(arch),
                 "-T",
                 link_script,
                 "--start-group",
@@ -336,26 +389,7 @@ SECTIONS {
                 elf,
             ]
         )
-        data = elf.read_bytes()
-        off = struct.unpack_from("<I", data, 32)[0]
-        size, count, idx = struct.unpack_from("<3H", data, 46)
-        sections = [
-            struct.unpack_from("<10I", data, off + j * size) for j in range(count)
-        ]
-        st = sections[idx]
-        strings = data[st[4] : st[4] + st[5]]
-        allocated = [s for s in sections if s[2] & 2 and s[5]]
-        code = next(s for s in allocated if strings[s[0] :].split(b"\0")[0] == b".text")
-        assert code[3] == 0x100000 and code[5] % 4096 == 0
-        if moto_radio:
-            allocated = [s for s in allocated if not (s[1] == 8 and s[3] == 0x02800000)]
-        end = max(s[3] + s[5] for s in allocated)
-        image = bytearray(end - 0x100000)
-        for s in allocated:
-            if s[1] != 8:
-                image[s[3] - 0x100000 : s[3] - 0x100000 + s[5]] = data[
-                    s[4] : s[4] + s[5]
-                ]
+        code_size, image = package_image(elf.read_bytes(), 0x02800000 if moto_radio else None)
         if "entry" in item:
             image += b"APP1" + item["title"].encode("ascii").ljust(16, b"\0")
             if len(image) > 65512:
@@ -369,9 +403,9 @@ SECTIONS {
         header = struct.pack(
             "<4s5I",
             b"VPK2",
-            4 if moto_radio else package_abi(item["id"]),
+            radio_abi(4, arch) if moto_radio else package_abi(item["id"], arch),
             item["id"],
-            code[5],
+            code_size,
             len(image),
             binascii.crc32(image),
         )
@@ -383,5 +417,5 @@ SECTIONS {
     from package_format import catalog_limit, pack
 
     (out / "catalog.bin").write_bytes(
-        pack([(dest / (n + ".vpk")).read_bytes() for n in names], limit=catalog_limit(target))
+        pack([(dest / (n + ".vpk")).read_bytes() for n in names], limit=catalog_limit(target), arch=arch)
     )

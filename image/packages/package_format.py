@@ -4,10 +4,20 @@
 A package is a VPK2 record: header[24] | image[size] | signature trailer[80]
 (sign.py). inspect() checks a record's shape; given the pinned keys it also
 checks the publisher signature, as the supervisor does before running it.
+
+The header's ABI word also names the CPU architecture the image was built for
+(ARCH_ABI): nothing for AArch32, so every 32-bit package is byte for byte what
+it was, and 0x64 in the top byte for AArch64. The word is inside the signed
+bytes, and a supervisor accepts only the exact words of its own architecture,
+so a 32-bit supervisor never loads a 64-bit package nor a 64-bit one a 32-bit
+package; a catalog holds packages of one architecture only.
 """
 
 import binascii
+import os
+from pathlib import Path
 import struct
+import sys
 
 LIMIT = 1 << 20
 # The handset's built-in and installed catalogs: its catalog banks
@@ -35,9 +45,44 @@ def package_window(identity):
     return 0x80000 if identity in OWN_STACK else 0x3E000
 
 
-def package_abi(identity):
+# The architecture part of the ABI word: the top byte. AArch32 keeps the words
+# it always had (1, 2 for Runtime, 3 or 4 for Radio); AArch64 sets 0x64.
+ARCH_ABI = {"aarch32": 0, "aarch64": 0x64 << 24}
+ARCH_MASK = 0xFF << 24
+
+
+def selected_arch(arch=None):
+    """`arch`, or the build's architecture (VIOLET_ARCH, image/packages/violet_arch.py)."""
+    if arch is not None:
+        if arch not in ARCH_ABI:
+            raise ValueError(f"unknown architecture {arch!r}")
+        return arch
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import violet_arch
+    return violet_arch.selected(os.environ)
+
+
+def package_abi(identity, arch="aarch32"):
     # Runtime also boots as service workers using the supervisor's mailbox ABI.
-    return 2 if identity == 3 else 1
+    return (2 if identity == 3 else 1) | ARCH_ABI[arch]
+
+
+def radio_abi(revision, arch="aarch32"):
+    """Radio's private-RAM ABIs (3: 128 KiB, 4: 192 KiB; supervisor.c), for `arch`."""
+    if revision not in (3, 4):
+        raise ValueError("Radio's ABI is 3 or 4")
+    return revision | ARCH_ABI[arch]
+
+
+def package_arch(blob):
+    """The architecture a record's header names, whatever the build's own is."""
+    if len(blob) < HEADER:
+        raise ValueError("truncated package")
+    tag = struct.unpack_from("<I", blob, 4)[0] & ARCH_MASK
+    for name, value in ARCH_ABI.items():
+        if value == tag:
+            return name
+    raise ValueError("package names no known architecture")
 
 
 def version(blob):
@@ -45,15 +90,24 @@ def version(blob):
     return struct.unpack_from("<I", blob, len(blob) - TRAILER + 8)[0]
 
 
-def inspect(blob, keys=None, target=None):
+def inspect(blob, keys=None, target=None, arch=None):
+    """The record's component ID once its shape (and, given keys, its signature) checks out.
+
+    `arch` is the architecture the record must be built for: the build's own
+    (VIOLET_ARCH) unless given. A record of another architecture is refused.
+    """
+    arch = selected_arch(arch)
     if len(blob) < HEADER + TRAILER:
         raise ValueError("truncated package")
     magic, abi, identity, code, size, crc = struct.unpack_from("<4s5I", blob)
     if magic == b"VPK1":
         raise ValueError("unsigned VPK1 package: rebuild it to get a signed VPK2")
+    if magic == b"VPK2" and abi & ARCH_MASK != ARCH_ABI[arch]:
+        other = next((name for name, tag in ARCH_ABI.items() if tag == abi & ARCH_MASK), "an unknown architecture")
+        raise ValueError(f"unsupported package or ABI: built for {other}, not {arch}")
     if (
         magic != b"VPK2"
-        or (abi != package_abi(identity) and (identity, abi) not in ((7, 3), (7, 4)))
+        or (abi != package_abi(identity, arch) and (identity, abi) not in ((7, radio_abi(3, arch)), (7, radio_abi(4, arch))))
         or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24, 25, 26))
     ):
         raise ValueError("unsupported package or ABI")
@@ -103,10 +157,12 @@ def floor_record(floors):
     return struct.pack("<4sI", b"VFL1", len(floors)) + b"".join(struct.pack("<2I", i, v) for i, v in sorted(floors.items()))
 
 
-def pack(packages, floors=None, limit=LIMIT):
+def pack(packages, floors=None, limit=LIMIT, arch=None):
+    """A VCT1 catalog of `packages`, all built for `arch` (the build's own unless given)."""
+    arch = selected_arch(arch)
     records = {}
     for blob in packages:
-        identity = inspect(blob)
+        identity = inspect(blob, arch=arch)
         if identity in records:
             raise ValueError("duplicate package identity")
         records[identity] = blob
@@ -129,7 +185,8 @@ def pack(packages, floors=None, limit=LIMIT):
     return result
 
 
-def _parse(data, limit=LIMIT):
+def _parse(data, limit=LIMIT, arch=None):
+    arch = selected_arch(arch)
     if len(data) < 16:
         raise ValueError("truncated catalog")
     magic, size, count, crc = struct.unpack_from("<4s3I", data)
@@ -147,7 +204,7 @@ def _parse(data, limit=LIMIT):
             raise ValueError("truncated package header")
         length = HEADER + struct.unpack_from("<I", data, pos + 16)[0] + TRAILER
         blob = data[pos : pos + length]
-        identity = inspect(blob)
+        identity = inspect(blob, arch=arch)
         if identity in blobs:
             raise ValueError("duplicate component")
         blobs[identity] = blob
@@ -166,16 +223,16 @@ def _parse(data, limit=LIMIT):
         if list(record) != sorted(record) or len(record) != entries:
             raise ValueError("invalid version floor record")
     # pack() refuses bad floors and packages below them; the bytes must match exactly.
-    if pack(blobs.values(), record, limit) != data:
+    if pack(blobs.values(), record, limit, arch) != data:
         raise ValueError("invalid catalog contents")
     return blobs, record
 
 
-def unpack(data, limit=LIMIT):
+def unpack(data, limit=LIMIT, arch=None):
     """{component ID: record} of a catalog."""
-    return _parse(data, limit)[0]
+    return _parse(data, limit, arch)[0]
 
 
-def floors(data):
+def floors(data, arch=None):
     """{component ID: version} from a catalog's floor record (empty without one)."""
-    return _parse(data)[1]
+    return _parse(data, arch=arch)[1]

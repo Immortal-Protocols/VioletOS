@@ -153,7 +153,7 @@ impl Runtime {
         let args = [String::from(path)];
         let loaded = procmgr::load(&mut space, &mut self.k, &mut self.pool, &image, None, &args, &[], at_random, layout).map_err(String::from)?;
         // mod.rs `start`: the trampoline page, the runtime's own region.
-        space.add(layout.stubs, layout.stubs + crate::kernel::sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
+        space.add(layout.stubs, layout.stubs + crate::kernel::sys::PAGE as u64, procmgr::PROT_READ | procmgr::PROT_EXEC);
         if space.resolve(&mut self.k, &mut self.pool, layout.stubs).is_none() {
             space.destroy(&mut self.k, &mut self.pool);
             return Err(String::from("out of memory"));
@@ -185,10 +185,10 @@ impl Runtime {
             thread: signal::Thread::new(0),
             delivered: Vec::new(),
             low_memory: 0,
-            scratch,
+            scratch: scratch as u32,
             random: at_random,
-            entry: loaded.entry,
-            sp: loaded.sp,
+            entry: loaded.entry as u32,
+            sp: loaded.sp as u32,
         });
         Ok(slot)
     }
