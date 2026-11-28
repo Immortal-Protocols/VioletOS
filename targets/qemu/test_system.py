@@ -29,8 +29,11 @@ Boot 2, from slot B as a trial: the phone is locked from the start (the
 
 `--arch aarch64` checks the AArch64 build of the same system instead
 (targets/qemu64/stack.py; `make qemu64 QEMU64_STACK=1`, not in the loop):
-one boot, the layers it reaches in order (AARCH64_LAYERS below), then a
-64-bit program's signals and posix_spawn (targets/qemu64/test-apps/abi64).
+verified boot first (four short boots to the entry stub's line: the image
+starts; a changed kernel byte, a changed root task byte and a rollback floor
+above its version are refused), then one boot, the layers it reaches in order
+(AARCH64_LAYERS below), then a 64-bit program's signals and posix_spawn
+(targets/qemu64/test-apps/abi64).
 
 The image must be the one `make test-system` builds: VIOLET_SYSTEM_VERSION=2,
 VIOLET_UPDATE_URL=https://updates.violet.test/latest.vota, the test CA of
@@ -551,13 +554,27 @@ AARCH64_ABI = [
     "abi64: missing program refused true",
     "abi64 done",
 ]
+# targets/qemu64/test-apps/c64, a 64-bit C program, opened twice: fork
+# without CLONE_VM (the child's writes stay its own, its exit status comes
+# back, d9 survives through the A64 fork gate) and vma::Layout64 (every
+# part above 4 GiB, a 64 GiB reservation, a fixed mapping far above 4 GiB
+# copied from by a call while its low 32 bits are EFAULT, W^X).
+C64_LINES = [
+    "c64: fork 1 child exit 27, parent kept 1 10 3, fp 1",
+    "c64: above 4 GiB 1",
+    "c64: reserve 64 GiB 1",
+    "c64: fixed 1 copy 4 'high', low word -1 errno 14",
+    "c64: wx refused 1 1",
+    "c64 done",
+]
 AARCH64_SCRIPT = r"""#!/usr/bin/env python3
-import json, mmap, os, struct, sys, time
+import json, mmap, os, re, struct, sys, time
 ram = open(sys.argv[1], "r+b")
 log = mmap.mmap(ram.fileno(), 0x10000, offset=0x49220000 - 0x40000000)
 screen = mmap.mmap(ram.fileno(), 720 * 1600 * 4, offset=0x79450000 - 0x40000000, prot=mmap.PROT_READ)
 LAYERS = json.loads(os.environ["AARCH64_LAYERS"])
 ABI = json.loads(os.environ["AARCH64_ABI"])
+C64 = json.loads(os.environ["AARCH64_C64"])
 
 def text():
     n = struct.unpack_from("<I", log, 4)[0]
@@ -619,10 +636,85 @@ for line in ABI:
         fail(f"abi64 did not print {line!r}")
 until("abi64 exits", lambda: "exited with status 0" in everything()[start:], 15)
 print("AArch64 layer: signals (handler, siginfo, a fault's handler) and posix_spawn in a 64-bit program: ok", file=sys.stderr)
+layouts = []
+for launch in range(2):
+    time.sleep(1)  # Home back in front
+    start = len(everything())
+    open_icon("c64")
+    until(f"c64 (launch {launch + 1}) finishes", lambda: "c64 done" in everything()[start:], 60)
+    out = everything()[start:]
+    for line in C64:
+        if line not in out:
+            fail(f"c64 (launch {launch + 1}) did not print {line!r}")
+    found = re.search(r"c64: layout main=(\S+) stack=(\S+) heap=(\S+) mmap=(\S+)", out)
+    if not found:
+        fail("c64 printed no layout")
+    layouts.append(found.groups())
+    print(f"AArch64 layout, launch {launch + 1}: main {found.group(1)} stack {found.group(2)} heap {found.group(3)} mmap {found.group(4)}", file=sys.stderr)
+    until("c64 exits", lambda: "exited with status 0" in everything()[start:], 15)
+for k, part in enumerate(("program", "stack", "heap", "mmap")):
+    if layouts[0][k] == layouts[1][k]:
+        fail(f"the {part} did not move between two launches ({layouts[0][k]})")
+print("AArch64 layer: fork without CLONE_VM in a 64-bit C program (copy of memory, exit status, SIMD kept): ok", file=sys.stderr)
+print("AArch64 layer: vma::Layout64 (program, stack, heap and mmap above 4 GiB and moved between launches, "
+      "a 64 GiB reservation, no 32-bit alias of a high address, W^X): ok", file=sys.stderr)
 notes = sorted({l.strip() for l in everything().splitlines() if "unsupported AArch64 system call" in l})
 if notes:
     print("AArch64: note: " + "; ".join(notes), file=sys.stderr)
 """
+
+
+def serial_boot(image, until, seconds=20):
+    """Boot the AArch64 image directory `image` (tools/run.py's machine) with the
+    console on a pipe until a line containing `until` is printed: the console so far."""
+    import selectors
+    import time
+    cmd = run.machine(image=image, arch="aarch64") + ["-serial", "stdio"]
+    guest = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    out, deadline = b"", time.monotonic() + seconds
+    try:
+        with selectors.DefaultSelector() as wait:
+            wait.register(guest.stdout, selectors.EVENT_READ)
+            while until.encode() not in out and time.monotonic() < deadline and guest.poll() is None:
+                if wait.select(0.1):
+                    out += os.read(guest.stdout.fileno(), 4096)
+    finally:
+        run.finish(guest)
+        guest.stdout.close()
+    return out.decode(errors="replace")
+
+
+def aarch64_verified_boot(original):
+    """Verified boot on AArch64 (targets/qemu64/verify.c in the entry stub): the
+    image as built starts, and one changed byte in the kernel or the root task,
+    or a rollback floor above the image's version, stops it at the refusal line
+    (boot/loader/verified.rs reasons 7, 8 and 5), before the kernel runs. Each
+    refused boot ends within a second of QEMU starting."""
+    plan = json.loads((original / "qemu64.json").read_text())
+    signed = plan.get("verified")
+    if not signed:
+        fail(f"{original / 'qemu64.json'} records no verified boot: rebuild with targets/qemu64/stack.py")
+    version = signed["version"]
+    ok = f"VioletOS loader: verified boot, system version {version}"
+    cases = [("the image as built starts", None, None, ok),
+             ("a changed kernel byte is refused", "kernel", None, "VioletOS loader: boot refused, reason 7"),
+             ("a changed root task byte is refused", "root", None, "VioletOS loader: boot refused, reason 8"),
+             (f"a rollback floor of {version + 1} is refused", None, version + 1, "VioletOS loader: boot refused, reason 5")]
+    for what, part, floor, line in cases:
+        with TemporaryDirectory() as tmp:
+            image = Path(tmp)
+            blob = bytearray((original / "qemu64.bin").read_bytes())
+            if part:
+                at, length = signed[part]
+                blob[at + length // 2] ^= 0x01
+            (image / "qemu64.bin").write_bytes(blob)
+            (image / "qemu64.json").symlink_to(original / "qemu64.json")
+            if floor is not None:
+                (image / "rollback-floor").write_text(str(floor))
+            console = serial_boot(image, line)
+            if line not in console or (line != ok and ok in console):
+                fail(f"verified boot: {what}: expected {line!r}, the console said {console[-400:]!r}")
+            print(f"AArch64 layer: verified boot: {what}: ok ({line})", file=sys.stderr)
 
 
 def aarch64_layers():
@@ -636,14 +728,17 @@ def aarch64_layers():
     if not known.exists():
         fail(f"the AArch64 image has no differences.json: rebuild it with targets/qemu64/stack.py ({original})")
     differences = json.loads(known.read_text())
-    if differences.get("verified_boot") is not False or not differences.get("differences"):
-        fail(f"{known} does not record the AArch64 image's verified boot as absent: rebuild it")
+    if differences.get("verified_boot") is not True:
+        fail(f"{known} does not record verified boot: rebuild the AArch64 image with targets/qemu64/stack.py")
+    aarch64_verified_boot(original)
     for d in differences["differences"]:
         print(f"AArch64 layer ABSENT (security difference from AArch32): {d}", file=sys.stderr)
     os.environ["AARCH64_USER_TIMER"] = "1" if differences["user_timer"] else "0"
     cpio = (original / "initfs.cpio").read_bytes()
-    if "abi64" not in home_grid.apps(cpio):
-        fail("the AArch64 image has no abi64 (targets/qemu64/test-apps): rebuild it with targets/qemu64/stack.py")
+    for probe in ("abi64", "c64"):
+        if probe not in home_grid.apps(cpio):
+            fail(f"the AArch64 image has no {probe} (targets/qemu64/test-apps; c64 needs the AArch64 musl: "
+                 "VIOLET_ARCH=aarch64 python3 tools/build_python.py musl): rebuild it with targets/qemu64/stack.py")
     with TemporaryDirectory() as tmp:
         image = Path(tmp) / "image"
         image.mkdir()
@@ -653,14 +748,17 @@ def aarch64_layers():
         run.IMAGES["aarch64"] = image
         os.environ["AARCH64_LAYERS"] = json.dumps(AARCH64_LAYERS)
         os.environ["AARCH64_ABI"] = json.dumps(AARCH64_ABI)
+        os.environ["AARCH64_C64"] = json.dumps(C64_LINES)
         viewer = Path(tmp) / "input.py"
         viewer.write_text(home_grid.viewer(AARCH64_SCRIPT, cpio))
         viewer.chmod(0o755)
         if run.main(str(viewer)) != 0:
             fail("the AArch64 system test failed (above)")
-    print("AArch64 system checked: kernel, supervisor and services, /data, the Open Runtime with its policy and "
-          "Sentinel, the 720 x 1600 screen, Home as a 64-bit program, and a 64-bit program's signal handlers and posix_spawn. "
-          "Absent on AArch64: " + "; ".join(differences["differences"]))
+    print("AArch64 system checked: verified boot (a changed kernel or root task and an old version refused), kernel, "
+          "supervisor and services, /data, the Open Runtime with its policy and "
+          "Sentinel, the 720 x 1600 screen, Home as a 64-bit program, a 64-bit program's signal handlers and posix_spawn, "
+          "fork without CLONE_VM and the 47-bit layout (vma::Layout64) in a 64-bit C program. "
+          "Absent on AArch64: " + ("; ".join(differences["differences"]) or "nothing"))
 
 
 if __name__ == "__main__":

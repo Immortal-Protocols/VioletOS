@@ -30,10 +30,6 @@ DEFAULT = "aarch32"
 # app (elf.rs plan) until its dispatch is widened; the build says so.
 UNPORTED = []
 APP_ABI_UNPORTED = [
-    "runtime/open: AArch64 programs run below 4 GiB with the AArch32 layout's randomization (vma.rs Layout; "
-    "Layout64's 47-bit layout is not used yet)",
-    "runtime/open: fork (a new process with a copy of the caller's memory) answers ENOSYS for AArch64 programs "
-    "(the fork gate is A32 code; vfork and posix_spawn work)",
     "runtime/arch/enter64.rs: AArch64 calls whose structures are not converted answer ENOSYS "
     "(recvmmsg, sendmmsg, timer_create, waitid, itimers, sigqueueinfo, preadv/pwritev, pselect6, execveat, clone3...)",
 ]

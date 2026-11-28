@@ -112,8 +112,7 @@ def assemble(regions, base):
 # What this image gives up against the AArch32 one, as test_system.py --arch
 # aarch64 prints and checks it (stack.py writes it to differences.json), so a
 # boot that passes every layer cannot read as one with these protections.
-NO_VERIFIED_BOOT = ("verified boot: absent (the qemu64 entry stub checks no signed manifest; the kernel and the "
-                    "supervisor load unverified, packages are still signature-checked by the supervisor)")
+# (Verified boot is not one: the entry stub checks a signed manifest, verify.c.)
 NO_USER_TIMER = ("no user timer (KernelArmExportPTMRUser=OFF): the supervisor's timekeeper and its stuck-WFI guard are "
                  "compiled out, and the Open Runtime polls at a fixed priority instead of taking IRQ 30")
 
@@ -140,4 +139,4 @@ def user_timer(cache, headers):
 
 def differences(timer):
     """The AArch64 image's security differences from AArch32, for differences.json."""
-    return [NO_VERIFIED_BOOT] + ([] if timer else [NO_USER_TIMER])
+    return [] if timer else [NO_USER_TIMER]

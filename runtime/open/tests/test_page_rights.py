@@ -231,7 +231,7 @@ class PageRights(unittest.TestCase):
             writable, cached, execute = args[3:]
             if execute == "exec as i32":
                 # page_map: the caller's own two booleans, cached.
-                self.assertRegex(where, r"pub fn page_map\(frame: u32, pd: u32, va: u32, writable: bool, exec: bool\)", f"sys.rs:{line}")
+                self.assertRegex(where, r"pub fn page_map\(frame: u32, pd: u32, va: u64, writable: bool, exec: bool\)", f"sys.rs:{line}")
                 self.assertEqual((writable, cached), ("writable as i32", "1"), f"sys.rs:{line}")
             else:
                 # Anything else (device memory) is never executable.

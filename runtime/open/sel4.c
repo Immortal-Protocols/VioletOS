@@ -38,7 +38,7 @@ unsigned open_object_type(unsigned which) {
    kernel rewrites the entries in place and flushes the address space's TLB).
    Read-only unless `writable`; Execute-Never unless `exec`. The callers never
    ask for both (W^X); if one did, the mapping would still not be executable. */
-int open_page_map(unsigned frame, unsigned pd, unsigned va, int writable, int cached, int exec) {
+int open_page_map(unsigned frame, unsigned pd, unsigned long va, int writable, int cached, int exec) {
   seL4_CapRights_t rights = writable ? seL4_AllRights : seL4_CanRead;
   unsigned attributes = cached ? seL4_ARM_Default_VMAttributes : 0;
   if (!exec || writable) attributes |= seL4_ARM_ExecuteNever;
@@ -48,7 +48,7 @@ int open_page_unmap(unsigned frame) { return seL4_ARM_Page_Unmap(frame); }
 int open_page_unify(unsigned frame, unsigned bytes) {
   return seL4_ARM_Page_Unify_Instruction(frame, 0, bytes);
 }
-int open_pt_map(unsigned pt, unsigned pd, unsigned va) {
+int open_pt_map(unsigned pt, unsigned pd, unsigned long va) {
   return seL4_ARM_PageTable_Map(pt, pd, va, seL4_ARM_Default_VMAttributes);
 }
 int open_asid_assign(unsigned pool, unsigned pd) { return seL4_ARM_ASIDPool_Assign(pool, pd); }
@@ -169,7 +169,7 @@ int open_tcb_read(unsigned tcb, unsigned *regs) {
 }
 #endif
 // The thread pointer (TPIDRURO). Unlike a register write, this keeps the Thumb bit.
-int open_tcb_set_tls(unsigned tcb, unsigned base) { return seL4_TCB_SetTLSBase(tcb, base); }
+int open_tcb_set_tls(unsigned tcb, unsigned long base) { return seL4_TCB_SetTLSBase(tcb, base); }
 int open_tcb_suspend(unsigned tcb) { return seL4_TCB_Suspend(tcb); }
 int open_tcb_resume(unsigned tcb) { return seL4_TCB_Resume(tcb); }
 

@@ -214,8 +214,8 @@ class Differences(unittest.TestCase):
             image.user_timer("", [])
 
     def test_the_lost_protections_are_named(self):
-        self.assertEqual(image.differences(True), [image.NO_VERIFIED_BOOT])
-        self.assertEqual(image.differences(False), [image.NO_VERIFIED_BOOT, image.NO_USER_TIMER])
+        self.assertEqual(image.differences(True), [])
+        self.assertEqual(image.differences(False), [image.NO_USER_TIMER])
 
 
 if __name__ == "__main__":

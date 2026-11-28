@@ -9,6 +9,14 @@ use super::{sys, Runtime};
 
 // The conversion due after the call being dispatched (one at a time).
 static mut AFTER: After = After::None;
+// The call's arguments as its 64-bit registers held them, in the places the
+// dispatcher reads them (enter64 `wide`): its addresses and lengths of app memory.
+static mut ARGS: [u64; 6] = [0; 6];
+
+/// The arguments of the AArch64 call being dispatched, whole (syscall.rs `vargs`).
+pub fn args() -> [u64; 6] {
+    unsafe { *core::ptr::addr_of!(ARGS) }
+}
 
 impl Runtime {
     /// The 32-bit fault message the dispatcher takes for an AArch64 thread's
@@ -19,7 +27,14 @@ impl Runtime {
         let mut args = [0u64; 6];
         args.copy_from_slice(&wide[..6]);
         let number = wide[sys::MR_SYSCALL];
-        match enter64::translate(number, args) {
+        // The fork helper's own call (signal64::FORK_NR): the runtime's
+        // private number, as the AArch32 helper makes it (syscall.rs `fork_done`).
+        let entry = if number == signal64::FORK_NR {
+            Entry::Call { number: super::signal::FORK_NR, args: [0; 6], wide: [0; 6], after: After::None }
+        } else {
+            enter64::translate(number, args)
+        };
+        match entry {
             Entry::Answer(e) => {
                 if e == enter64::ENOSYS {
                     if let Some(app) = self.apps[i].as_ref() {
@@ -34,12 +49,15 @@ impl Runtime {
                 sys::reply(&saved);
                 None
             }
-            Entry::Call { number, args, after } => {
+            Entry::Call { number, args, wide, after } => {
                 let mut mrs = r.mrs;
                 mrs[..6].copy_from_slice(&args);
                 mrs[7] = number;
                 sys::show(&mrs);
-                unsafe { *core::ptr::addr_of_mut!(AFTER) = after };
+                unsafe {
+                    *core::ptr::addr_of_mut!(AFTER) = after;
+                    *core::ptr::addr_of_mut!(ARGS) = wide;
+                }
                 Some(mrs)
             }
         }
@@ -106,7 +124,7 @@ pub fn put_regs(c: &mut Context, r: &signal64::Regs) {
 /// trampoline page, which the app has read-execute and cannot change.
 pub fn install_gate(space: &mut Space, k: &mut Kernel, pool: &mut Pool) -> bool {
     let stubs = space.layout.stubs;
-    let Some(at) = space.resolve(k, pool, stubs + signal64::GATE_OFFSET as u32) else { return false };
+    let Some(at) = space.resolve(k, pool, stubs + signal64::GATE_OFFSET) else { return false };
     for (n, word) in signal64::GATE.iter().enumerate() {
         unsafe { ((at + 4 * n) as *mut u32).write_volatile(*word) };
     }
@@ -142,9 +160,8 @@ impl Runtime {
         let a = app.sig.action(info.signo);
         let t = &app.threads[slot];
         let tcb = t.tcb;
-        let alt = signal64::AltStack { sp: t.sig.alt.sp.into(), flags: t.sig.alt.flags, size: t.sig.alt.size.into() };
+        let alt = signal64::AltStack { sp: t.sig.alt.sp, flags: t.sig.alt.flags, size: t.sig.alt.size };
         let at = signal64::place(regs.sp, &alt, a.flags & signal::SA_ONSTACK != 0)?;
-        let at32 = u32::try_from(at).ok()?;
         let mask = t.sig.suspend_mask.unwrap_or(t.sig.blocked);
         let info_bytes = match fault {
             Some((address, _)) => signal64::siginfo_fault(info.signo, info.code, address),
@@ -152,9 +169,9 @@ impl Runtime {
         };
         let mut frame = alloc::vec![0u8; signal64::TOTAL];
         signal64::encode(&mut frame, regs, &info_bytes, mask, &alt, fault.map_or(0, |f| f.0), fault.map(|f| f.1))?;
-        let gate = u64::from(app.space.layout.stubs) + signal64::GATE_OFFSET;
+        let gate = app.space.layout.stubs + signal64::GATE_OFFSET;
         let app = self.apps[i].as_mut()?;
-        if !app.space.write(&mut self.k, &mut self.pool, at32, &frame) {
+        if !app.space.write(&mut self.k, &mut self.pool, at, &frame) {
             return None;
         }
         let t = &mut app.threads[slot].sig;
@@ -164,7 +181,7 @@ impl Runtime {
         if a.flags & signal::SA_RESETHAND != 0 {
             app.sig.set_action(info.signo, Default::default());
         }
-        let entry = signal64::gate_entry(regs, info.signo, at, a.handler.into(), gate);
+        let entry = signal64::gate_entry(regs, info.signo, at, a.handler, gate);
         let mut c = sys::tcb_read_context(tcb).ok()?;
         put_regs(&mut c, &entry);
         sys::tcb_write_context(tcb, true, &c).ok()
@@ -177,11 +194,12 @@ impl Runtime {
         let w = sys::wide();
         let Some(tcb) = self.apps[i].as_ref().map(|a| a.threads[slot].tcb) else { return Outcome::Gone };
         let mut frame = alloc::vec![0u8; signal64::FRAME];
-        let read = u32::try_from(w[sys::MR_SP]).ok().is_some_and(|sp| {
-            let app = self.apps[i].as_mut().unwrap();
-            app.space.read(&mut self.k, &mut self.pool, sp, &mut frame)
-        });
-        let restored = if read { signal64::decode(&frame, u64::from(super::vma::USER_TOP), w[sys::MR_CPSR]) } else { None };
+        let Some(app) = self.apps[i].as_mut() else { return Outcome::Gone };
+        // The frame at sp, whole; a pc or sp it gives must lie in the app's
+        // own address space (its layout's top).
+        let user_top = app.space.layout.user_top;
+        let read = app.space.read(&mut self.k, &mut self.pool, w[sys::MR_SP], &mut frame);
+        let restored = if read { signal64::decode(&frame, user_top, w[sys::MR_CPSR]) } else { None };
         let started = restored.and_then(|r| {
             let mut c = sys::tcb_read_context(tcb).ok()?;
             put_regs(&mut c, &r.regs);
@@ -189,8 +207,7 @@ impl Runtime {
             t.blocked = r.mask & !signal::UNBLOCKABLE;
             // uc_stack, as Linux's restore_altstack: sigaltstack's rules at
             // the frame's sp, and a change they refuse is left unmade.
-            let sp = w[sys::MR_SP] as u32;
-            if let Ok(alt) = signal::alt_change(t.alt, sp, r.alt.sp, r.alt.flags, r.alt.size) {
+            if let Ok(alt) = signal::alt_change(t.alt, w[sys::MR_SP], r.alt.sp, r.alt.flags, r.alt.size) {
                 t.alt = alt;
             }
             sys::tcb_write_context(tcb, true, &c).ok()
@@ -199,5 +216,41 @@ impl Runtime {
             self.terminate(i, slot, signal::SIGSEGV, true);
         }
         Outcome::Gone
+    }
+
+    /// fork of an AArch64 thread, through the fork gate as on AArch32
+    /// (syscall.rs `fork_gate`): a signal frame with the caller's registers
+    /// returning from its call goes below its stack, and the thread restarts
+    /// at the A64 gate with the fork helper (signal64::FORK_HELPER) as the
+    /// handler. The gate stores q0-q31, FPSR and FPCR in the frame, the
+    /// helper makes FORK_NR (`fork_done`: the copy, the child at the
+    /// helper's svc), and parent and child each leave through rt_sigreturn
+    /// with fork's result as x0 in their frame. `req`: exit signal, flags,
+    /// ptid, ctid. None if the frame does not fit: fork goes on without it.
+    pub fn fork_gate64(&mut self, i: usize, slot: usize, req: [super::vma::Va; 4], m: &[u32; 16]) -> Option<Outcome> {
+        let ctx = self.call_context(i, slot, m, m[0], m[sys::MR_FAULT_IP].wrapping_add(4));
+        let regs = self.call_regs64(i, slot, &ctx, None)?;
+        let app = self.apps[i].as_ref()?;
+        let t = &app.threads[slot];
+        let tcb = t.tcb;
+        let alt = signal64::AltStack { sp: t.sig.alt.sp, flags: t.sig.alt.flags, size: t.sig.alt.size };
+        let at = signal64::place(regs.sp, &alt, false)?;
+        let mut frame = alloc::vec![0u8; signal64::TOTAL];
+        signal64::encode(&mut frame, &regs, &[0u8; 128], t.sig.blocked, &alt, 0, None)?;
+        let (gate, helper) = (app.space.layout.stubs + signal64::GATE_OFFSET, app.space.layout.stubs + signal64::FORK_HELPER);
+        let app = self.apps[i].as_mut()?;
+        if !app.space.write(&mut self.k, &mut self.pool, at, &frame) {
+            return None;
+        }
+        let entry = signal64::gate_entry(&regs, 0, at, helper, gate);
+        let mut c = sys::tcb_read_context(tcb).ok()?;
+        put_regs(&mut c, &entry);
+        app.threads[slot].sig.forking = Some([at, req[0], req[1], req[2], req[3]]);
+        // The context write restarts the thread there; the call is not answered.
+        if sys::tcb_write_context(tcb, true, &c).is_err() {
+            self.apps[i].as_mut()?.threads[slot].sig.forking = None;
+            return None;
+        }
+        Some(Outcome::Gone)
     }
 }

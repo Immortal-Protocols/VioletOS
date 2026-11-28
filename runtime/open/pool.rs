@@ -117,7 +117,7 @@ impl Pool {
         for (u, &bits) in POOL_BITS.iter().enumerate() {
             for _ in 0..1u32 << (bits - PAGE_BITS) {
                 retype(SLOT_POOL + u as u32, PAGE_OBJECT, PAGE_BITS, first_slot + index)?;
-                let va = (POOL_VA + index as usize * PAGE) as u32;
+                let va = (POOL_VA + index as usize * PAGE) as u64;
                 // AArch32: one second-level table per 1 MiB, made before its
                 // first page. AArch64 has up to three levels below the root and
                 // a last-level table covers 2 MiB, so the page's mapping says

@@ -20,7 +20,7 @@
     "regions": {
       "kernel": {"pa": "0x40000000", "size": "0x00400000", "what": "kernel image and its zeroed data"},
       "root": {"pa": "0x40400000", "size": "0x00400000", "va": "0x00100000", "what": "the bootstrap task's image and stack"},
-      "loader": {"pa": "0x40800000", "size": "0x00010000", "what": "the entry stub and its boot page tables"},
+      "loader": {"pa": "0x40800000", "size": "0x00040000", "what": "the entry stub, its boot page tables and the verified-boot check"},
       "staging": {"pa": "0x48000000", "size": "0x01000000", "what": "where QEMU loads the image before the stub copies it to the start of RAM"}
     }
   },

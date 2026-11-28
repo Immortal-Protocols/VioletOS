@@ -181,7 +181,8 @@ What `test_system.py` checks on AArch32 and has **no AArch64 counterpart yet**:
 | AArch32 check | On AArch64 |
 | --- | --- |
 | Linux ABI apps (cdyn, cfault, charden, cproc, csig, goabi, rsig) | Not built: they need an AArch64 musl C toolchain. A 64-bit Rust program (`targets/qemu64/test-apps/abi64`) covers signals, siginfo, a fault's handler and posix_spawn. fork without `CLONE_VM` answers ENOSYS. |
-| W^X and layout randomization on real page tables (wxprobe) | Not probed end to end. The same `sel4.c` `open_page_map` sets ExecuteNever; host `memory::*` covers the decisions. |
+| W^X and layout randomization on real page tables (wxprobe) | `test_system.py --arch aarch64` runs test-apps/c64 twice: every part above 4 GiB and moved between launches, W^X refusals, a high address's low 32 bits EFAULT. Host `memprot_host` `layout64_addresses_are_never_cut_to_32_bits` and `memory::*` cover the decisions. |
 | The policy probe (boot 1) | Not run. Host `policy::*` and the integration scenario above cover the decisions. |
-| Verified boot, the timekeeper | Absent on AArch64. Printed as absent layers from `differences.json`, never as passes. |
+| Verified boot | `test_system.py --arch aarch64`: the image starts; a changed kernel or root task byte and a floor above its version are refused. |
+| The timekeeper | Absent on AArch64. Printed as an absent layer from `differences.json`, never as a pass. |
 | The trusted UI's lock kept across a restart (boot 2) | Not run on AArch64. |

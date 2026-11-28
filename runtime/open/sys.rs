@@ -4,10 +4,10 @@
 extern "C" {
     fn open_retype(untyped: u32, kind: u32, bits: u32, root: u32, slot: u32) -> i32;
     fn open_object_type(which: u32) -> u32;
-    fn open_page_map(frame: u32, pd: u32, va: u32, writable: i32, cached: i32, exec: i32) -> i32;
+    fn open_page_map(frame: u32, pd: u32, va: usize, writable: i32, cached: i32, exec: i32) -> i32;
     fn open_page_unmap(frame: u32) -> i32;
     fn open_page_unify(frame: u32, bytes: u32) -> i32;
-    fn open_pt_map(pt: u32, pd: u32, va: u32) -> i32;
+    fn open_pt_map(pt: u32, pd: u32, va: usize) -> i32;
     fn open_asid_assign(pool: u32, pd: u32) -> i32;
     fn open_cnode_copy(root: u32, dest: u32, bits: u32, src_root: u32, src: u32, src_bits: u32) -> i32;
     fn open_cnode_mint(root: u32, dest: u32, bits: u32, src_root: u32, src: u32, src_bits: u32, badge: u32) -> i32;
@@ -22,7 +22,7 @@ extern "C" {
     fn open_tcb_priority(tcb: u32, authority: u32, priority: u32) -> i32;
     fn open_tcb_write(tcb: u32, resume: i32, regs: *const u32) -> i32;
     fn open_tcb_read(tcb: u32, regs: *mut u32) -> i32;
-    fn open_tcb_set_tls(tcb: u32, base: u32) -> i32;
+    fn open_tcb_set_tls(tcb: u32, base: usize) -> i32;
     fn open_tcb_suspend(tcb: u32) -> i32;
     fn open_tcb_resume(tcb: u32) -> i32;
     fn open_receive(ep: u32, block: i32, badge: *mut u32, mrs: *mut u32) -> u32;
@@ -226,11 +226,18 @@ fn check(e: i32) -> Result<(), i32> {
 /// Map a page of memory, or change the rights of one mapped at `va` already.
 /// It is read-only unless `writable` and Execute-Never unless `exec`; asking
 /// for both gives a writable page that cannot be executed.
-pub fn page_map(frame: u32, pd: u32, va: u32, writable: bool, exec: bool) -> Result<(), i32> {
-    check(unsafe { open_page_map(frame, pd, va, writable as i32, 1, exec as i32) })
+pub fn page_map(frame: u32, pd: u32, va: u64, writable: bool, exec: bool) -> Result<(), i32> {
+    check(unsafe { open_page_map(frame, pd, word(va)?, writable as i32, 1, exec as i32) })
 }
-pub fn device_map(frame: u32, pd: u32, va: u32) -> Result<(), i32> {
-    check(unsafe { open_page_map(frame, pd, va, 1, 0, 0) })
+pub fn device_map(frame: u32, pd: u32, va: u64) -> Result<(), i32> {
+    check(unsafe { open_page_map(frame, pd, word(va)?, 1, 0, 0) })
+}
+/// seL4_RangeError.
+pub const RANGE_ERROR: i32 = 4;
+/// An app address as the kernel's word: an address a 32-bit kernel cannot
+/// name is refused, never cut.
+fn word(va: u64) -> Result<usize, i32> {
+    usize::try_from(va).map_err(|_| RANGE_ERROR)
 }
 pub fn page_unmap(frame: u32) {
     unsafe { open_page_unmap(frame) };
@@ -239,8 +246,8 @@ pub fn page_unmap(frame: u32) {
 pub fn page_unify(frame: u32) {
     unsafe { open_page_unify(frame, PAGE as u32) };
 }
-pub fn pt_map(pt: u32, pd: u32, va: u32) -> Result<(), i32> {
-    check(unsafe { open_pt_map(pt, pd, va) })
+pub fn pt_map(pt: u32, pd: u32, va: u64) -> Result<(), i32> {
+    check(unsafe { open_pt_map(pt, pd, word(va)?) })
 }
 pub fn asid_assign(pd: u32) -> Result<(), i32> {
     check(unsafe { open_asid_assign(SLOT_ASID, pd) })
@@ -380,8 +387,8 @@ pub fn tcb_read(tcb: u32) -> Result<Regs, i32> {
     check(unsafe { open_tcb_read(tcb, &mut r as *mut Regs as *mut u32) })?;
     Ok(r)
 }
-pub fn tcb_set_tls(tcb: u32, base: u32) -> Result<(), i32> {
-    check(unsafe { open_tcb_set_tls(tcb, base) })
+pub fn tcb_set_tls(tcb: u32, base: u64) -> Result<(), i32> {
+    check(unsafe { open_tcb_set_tls(tcb, word(base)?) })
 }
 pub fn tcb_suspend(tcb: u32) {
     unsafe { open_tcb_suspend(tcb) };
@@ -438,17 +445,18 @@ pub fn send(cap: u32, mrs: &[u32]) {
     unsafe { open_send(cap, mrs.as_ptr(), mrs.len() as u32) }
 }
 #[cfg(target_arch = "aarch64")]
-pub use calls::{reply, send, show, wide, widened};
+pub use calls::{reply, send, set_result, show, wide, widened};
 
-/// AArch64: the runtime answers calls in 32-bit words (an app's addresses
-/// are below 4 GiB), but a thread's registers are 64-bit, and Linux returns
-/// from a call with every register but x0 as it was. So each fault is
-/// received whole and kept: what the dispatcher was shown (`show`, the call
-/// translated by ../arch/enter64.rs) and the 64-bit words it came from. An
-/// answer word the runtime left as shown goes back as the thread had it; one
-/// it changed goes back as that 32-bit value. x0 of an answered system call
-/// is always its result (enter64::widen). A saved reply keeps its call's
-/// words until it is sent.
+/// AArch64: the runtime answers calls in 32-bit words, but a thread's
+/// registers are 64-bit, and Linux returns from a call with every register
+/// but x0 as it was. So each fault is received whole and kept: what the
+/// dispatcher was shown (`show`, the call translated by ../arch/enter64.rs)
+/// and the 64-bit words it came from. An answer word the runtime left as
+/// shown goes back as the thread had it; one it changed goes back as that
+/// 32-bit value. x0 of an answered system call is always its result
+/// (enter64::widen): the whole address for a call that answers one
+/// (`set_result`: mmap, brk). A saved reply keeps its call's words until it
+/// is sent.
 #[cfg(target_arch = "aarch64")]
 mod calls {
     use super::{receive64, reply64, send64, Received, SLOT_FAULT_EP};
@@ -460,8 +468,10 @@ mod calls {
         syscall: bool,
         wide: [u64; WORDS],
         shown: [u32; WORDS],
+        /// An address answer: its 32-bit form, and the whole value.
+        result: Option<(u32, u64)>,
     }
-    const NONE: Call = Call { syscall: true, wide: [0; WORDS], shown: [0; WORDS] };
+    const NONE: Call = Call { syscall: true, wide: [0; WORDS], shown: [0; WORDS], result: None };
     // One thread serves every fault, and no caller keeps a reference.
     static mut CURRENT: Call = NONE;
     static mut SAVED: BTreeMap<u32, Call> = BTreeMap::new();
@@ -478,7 +488,7 @@ mod calls {
         for (n, v) in r.mrs.iter_mut().enumerate() {
             *v = w.mrs[n] as u32;
         }
-        *current() = Call { syscall: w.label == super::FAULT_UNKNOWN_SYSCALL, wide: w.mrs, shown: r.mrs };
+        *current() = Call { syscall: w.label == super::FAULT_UNKNOWN_SYSCALL, wide: w.mrs, shown: r.mrs, result: None };
         let _ = SLOT_FAULT_EP;
         r
     }
@@ -490,11 +500,16 @@ mod calls {
     pub fn show(mrs: &[u32; 16]) {
         current().shown = *mrs;
     }
+    /// The call being served answers the whole address `whole`, which the
+    /// dispatcher's 32-bit words carry as `low`.
+    pub fn set_result(low: u32, whole: u64) {
+        current().result = Some((low, whole));
+    }
     pub fn keep(slot: u32) {
         saved().insert(slot, *current());
     }
     fn widen(call: &Call, mrs: &[u32], out: &mut [u64; WORDS]) -> usize {
-        super::super::arch::enter64::widen(call.syscall, &call.wide, &call.shown, mrs, out)
+        super::super::arch::enter64::widen(call.syscall, &call.wide, &call.shown, mrs, call.result, out)
     }
     pub fn reply(mrs: &[u32]) {
         let mut out = [0u64; WORDS];

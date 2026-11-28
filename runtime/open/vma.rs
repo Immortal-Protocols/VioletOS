@@ -29,34 +29,39 @@
 use alloc::vec::Vec;
 
 /// The runtime serves AArch64 programs (built for aarch64-unknown-none, the
-/// 64-bit Open Runtime): every app is then an ELF64 AArch64 program, still
-/// placed by this file's 32-bit layout below 4 GiB, so an address the app
-/// passes fits the runtime's u32 regions (system calls, ../arch/enter64.rs).
-/// False on the host and for the AArch32 runtime.
+/// 64-bit Open Runtime): every app is then an ELF64 AArch64 program placed by
+/// `Layout64`, the 47-bit layout below, above 4 GiB. False on the host and for
+/// the AArch32 runtime.
 pub const WIDE: bool = cfg!(all(target_arch = "aarch64", target_os = "none"));
+
+/// An address in an app, of either ABI: 64 bits wide everywhere in the
+/// runtime (regions, pages, copies, the loader), so an AArch64 address is
+/// never cut to 32 and an AArch32 one is the same number. Every rule here
+/// works on whole addresses: a range that would wrap is refused, not cut.
+pub type Va = u64;
 
 pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
 
 /// App address-space layout: the fixed bounds the random layout stays within.
-pub const MMAP_BASE: u32 = 0x4000_0000;
-pub const MMAP_TOP: u32 = 0xb000_0000;
-pub const STACK_TOP: u32 = 0xbf00_0000;
-pub const STACK_SIZE: u32 = 8 << 20;
+pub const MMAP_BASE: Va = 0x4000_0000;
+pub const MMAP_TOP: Va = 0xb000_0000;
+pub const STACK_TOP: Va = 0xbf00_0000;
+pub const STACK_SIZE: Va = 8 << 20;
 /// The trampoline page (thread i starts at stubs + 8 * i) is one of these pages.
-pub const STUBS_BASE: u32 = 0xbf10_0000;
-pub const STUBS_PAGES: u32 = 224;
+pub const STUBS_BASE: Va = 0xbf10_0000;
+pub const STUBS_PAGES: Va = 224;
 /// Highest address an app may use; the kernel starts at 0xe0000000.
-pub const USER_TOP: u32 = 0xc000_0000;
-const PIE_BASE: u32 = 0x0040_0000;
+pub const USER_TOP: Va = 0xc000_0000;
+const PIE_BASE: Va = 0x0040_0000;
 /// The W^X policy's unit, and the layout's: 64 KiB.
-const WINDOW: u32 = 0x1_0000;
+const WINDOW: Va = 0x1_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Vma {
-    pub start: u32,
-    pub end: u32,
+    pub start: Va,
+    pub end: Va,
     pub prot: u32,
 }
 
@@ -124,11 +129,11 @@ impl Access {
 }
 
 /// Index of the first region ending above `va` (regions are sorted and disjoint).
-fn first(vmas: &[Vma], va: u32) -> usize {
+fn first(vmas: &[Vma], va: Va) -> usize {
     vmas.partition_point(|v| v.end <= va)
 }
 
-pub fn find(vmas: &[Vma], va: u32) -> Option<&Vma> {
+pub fn find(vmas: &[Vma], va: Va) -> Option<&Vma> {
     vmas.get(first(vmas, va)).filter(|v| v.start <= va)
 }
 
@@ -137,7 +142,7 @@ pub const ANY: u32 = 8;
 
 /// The OR of the protections of the regions touching [start, end), with ANY
 /// set if there is one; 0 if there is none.
-pub fn union(vmas: &[Vma], start: u32, end: u32) -> u32 {
+pub fn union(vmas: &[Vma], start: Va, end: Va) -> u32 {
     let mut prot = 0;
     if start < end {
         for v in &vmas[first(vmas, start)..] {
@@ -152,11 +157,11 @@ pub fn union(vmas: &[Vma], start: u32, end: u32) -> u32 {
 
 /// Whether every byte of [start, start + len) lies in a region whose
 /// protection has a bit of `mask` (mask ANY: in any region at all).
-pub fn permits(vmas: &[Vma], start: u32, len: usize, mask: u32) -> bool {
+pub fn permits(vmas: &[Vma], start: Va, len: usize, mask: u32) -> bool {
     if len == 0 {
         return true;
     }
-    let Some(end) = u32::try_from(len).ok().and_then(|l| start.checked_add(l)) else { return false };
+    let Some(end) = Va::try_from(len).ok().and_then(|l| start.checked_add(l)) else { return false };
     let mut at = start;
     for v in &vmas[first(vmas, start)..] {
         if v.start > at || (v.prot | ANY) & mask == 0 {
@@ -176,7 +181,7 @@ pub fn permits(vmas: &[Vma], start: u32, len: usize, mask: u32) -> bool {
 /// with the runtime's heap: None if the range is not readable (nothing is
 /// allocated), and None if the heap cannot hold it (the call fails; the
 /// runtime does not).
-pub fn buffer(vmas: &[Vma], va: u32, len: usize) -> Option<Vec<u8>> {
+pub fn buffer(vmas: &[Vma], va: Va, len: usize) -> Option<Vec<u8>> {
     if !permits(vmas, va, len, 7) || len > isize::MAX as usize {
         return None;
     }
@@ -216,17 +221,17 @@ pub fn resize_file(content: &mut Vec<u8>, end: u64, shrink: bool) -> Result<(), 
     Ok(())
 }
 
-fn page_down(v: u32) -> u32 {
+fn page_down(v: Va) -> Va {
     v & !(WINDOW - 1)
 }
-fn page_up(v: u32) -> u32 {
+fn page_up(v: Va) -> Va {
     v.saturating_add(WINDOW - 1) & !(WINDOW - 1)
 }
 
 /// The W^X policy for an app changing its own memory: whether giving
 /// [start, end) the protection `prot` is refused. `fresh` is a new mapping
 /// (mmap, brk); otherwise a change to regions that exist (mprotect).
-pub fn refuses(vmas: &[Vma], start: u32, end: u32, prot: u32, fresh: bool) -> bool {
+pub fn refuses(vmas: &[Vma], start: Va, end: Va, prot: u32, fresh: bool) -> bool {
     if prot & PROT_EXEC != 0 {
         // Never writable and executable; and code comes only from the loader,
         // so a change may keep execute where every part has it, never add it.
@@ -250,7 +255,7 @@ pub fn refuses(vmas: &[Vma], start: u32, end: u32, prot: u32, fresh: bool) -> bo
 }
 
 /// Whether a 64 KiB window touched by [start, end) holds code.
-pub fn near_code(vmas: &[Vma], start: u32, end: u32) -> bool {
+pub fn near_code(vmas: &[Vma], start: Va, end: Va) -> bool {
     union(vmas, page_down(start), page_up(end)) & PROT_EXEC != 0
 }
 
@@ -270,14 +275,14 @@ pub fn mixed(vmas: &[Vma]) -> bool {
 }
 
 /// Mark [start, end) with `prot`, replacing whatever was there.
-pub fn insert(vmas: &mut Vec<Vma>, start: u32, end: u32, prot: u32) {
+pub fn insert(vmas: &mut Vec<Vma>, start: Va, end: Va, prot: u32) {
     carve(vmas, start, end);
     let at = vmas.partition_point(|v| v.start < start);
     vmas.insert(at, Vma { start, end, prot });
 }
 
 /// Remove [start, end) from the regions, splitting any that straddle it.
-pub fn carve(vmas: &mut Vec<Vma>, start: u32, end: u32) {
+pub fn carve(vmas: &mut Vec<Vma>, start: Va, end: Va) {
     let mut out = Vec::with_capacity(vmas.len() + 1);
     for v in vmas.drain(..) {
         if v.end <= start || v.start >= end {
@@ -295,26 +300,42 @@ pub fn carve(vmas: &mut Vec<Vma>, start: u32, end: u32) {
 }
 
 /// Where a program's parts go. Everything is a multiple of 64 KiB (the
-/// policy's window) except the stack pointer's padding.
+/// policy's window) except the stack pointer's padding. The bounds of the
+/// ABI's address space come with it: the AArch32 one below 3 GiB, or
+/// `Layout64`'s (`From<Layout64>`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout {
     /// Load address of a position-independent executable (ET_DYN).
-    pub pie_base: u32,
+    pub pie_base: Va,
     /// Distance from the end of the program to the start of the heap (brk).
-    pub brk_gap: u32,
+    pub brk_gap: Va,
     /// mmap hands out addresses downward from here.
-    pub mmap_top: u32,
-    pub stack_top: u32,
+    pub mmap_top: Va,
+    pub stack_top: Va,
     /// Bytes left unused at the top of the stack.
-    pub stack_pad: u32,
+    pub stack_pad: Va,
     /// The trampoline page.
-    pub stubs: u32,
+    pub stubs: Va,
+    /// The program and its heap stay below here; mmap's area starts here.
+    pub mmap_base: Va,
+    /// Highest address the app may use.
+    pub user_top: Va,
 }
 
 impl Layout {
     /// The layout before randomization, for tests that need known addresses.
     pub const fn fixed() -> Layout {
-        Layout { pie_base: PIE_BASE, brk_gap: 0, mmap_top: MMAP_TOP, stack_top: STACK_TOP, stack_pad: 0, stubs: STUBS_BASE }
+        Layout { pie_base: PIE_BASE, brk_gap: 0, mmap_top: MMAP_TOP, stack_top: STACK_TOP, stack_pad: 0, stubs: STUBS_BASE,
+                 mmap_base: MMAP_BASE, user_top: USER_TOP }
+    }
+    /// The layout of the ABI this runtime serves, before randomization.
+    pub fn native() -> Layout {
+        if WIDE { Layout64::fixed().into() } else { Layout::fixed() }
+    }
+    /// A random layout for the ABI this runtime serves: `Layout64` for an
+    /// AArch64 runtime (`WIDE`), `random` otherwise.
+    pub fn native_random(bytes: &[u8]) -> Layout {
+        if WIDE { Layout64::random(bytes).into() } else { Layout::random(bytes) }
     }
 
     /// A layout from 24 random bytes: 12 bits of 64 KiB steps for the PIE
@@ -322,9 +343,9 @@ impl Layout {
     /// 8 for the heap gap, and one of 224 trampoline pages.
     pub fn random(bytes: &[u8]) -> Layout {
         // Six little-endian words; a short slice leaves the rest zero.
-        let mut r = [0u32; 6];
+        let mut r = [0 as Va; 6];
         for (word, b) in r.iter_mut().zip(bytes.chunks_exact(4)) {
-            *word = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            *word = Va::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
         }
         Layout {
             pie_base: PIE_BASE + (r[0] & 0xfff) * WINDOW,
@@ -333,6 +354,8 @@ impl Layout {
             stack_top: STACK_TOP - (r[3] & 0x7ff) * WINDOW,
             stack_pad: (r[4] & 0xff) * 16,
             stubs: STUBS_BASE + (r[5] % STUBS_PAGES) * WINDOW,
+            mmap_base: MMAP_BASE,
+            user_top: USER_TOP,
         }
     }
 }
@@ -382,7 +405,7 @@ impl Layout64 {
         for (word, b) in r.iter_mut().zip(bytes.chunks_exact(4)) {
             *word = u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
         }
-        let w = u64::from(WINDOW);
+        let w = WINDOW;
         let bits = |v: u64, n: u32| v & ((1u64 << n) - 1);
         Layout64 {
             pie_base: PIE_BASE64 + bits(r[0], PIE_BITS64) * w,
@@ -392,5 +415,14 @@ impl Layout64 {
             stack_pad: (r[4] & 0xff) * 16,
             stubs: STUBS_BASE64 + (r[5] % STUBS_PAGES64) * w,
         }
+    }
+}
+
+/// An AArch64 app's layout, with its bounds: the program and heap below the
+/// mmap band, mmap from MMAP_BASE64, everything below USER_TOP64.
+impl From<Layout64> for Layout {
+    fn from(l: Layout64) -> Layout {
+        Layout { pie_base: l.pie_base, brk_gap: l.brk_gap, mmap_top: l.mmap_top, stack_top: l.stack_top, stack_pad: l.stack_pad,
+                 stubs: l.stubs, mmap_base: MMAP_BASE64, user_top: USER_TOP64 }
     }
 }

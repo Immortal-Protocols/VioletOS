@@ -13,13 +13,12 @@ VIOLET_ARCH=aarch64 (image/packages/violet_arch.py). Packages carry AArch64 in
 their signed ABI word (image/packages/package_format.py ARCH_ABI), so this
 supervisor and the AArch32 one each refuse the other's.
 
-Not here yet, and said where it matters: verified boot (the AArch32 loader
-checks a signed manifest; this image is entered by the qemu64 entry stub, which
-checks nothing) and the user timer (this kernel does not export it, so the
-timekeeper and its guard are off and the Open Runtime polls): both are written
-to differences.json, which test_system.py --arch aarch64 prints and checks;
-the handset, and parts of the 64-bit app ABI (fork, a 47-bit
-layout; violet_arch.APP_ABI_UNPORTED). The build
+Verified boot is the AArch32 QEMU loader's (verify.c in the entry stub: a
+signed manifest for the kernel and the supervisor, the rollback floor).
+Not here yet, and said where it matters: the user timer (this kernel does not
+export it, so the timekeeper and its guard are off and the Open Runtime polls),
+written to differences.json, which test_system.py --arch aarch64 prints and checks;
+and parts of the 64-bit app ABI (violet_arch.APP_ABI_UNPORTED). The build
 stops, naming the reason, where a layer is not ported (violet_arch.UNPORTED),
 and the release gate (tools/elf_check.py, which reads ELF64) refuses any app
 it would not load. Apps whose toolchain is missing (an AArch64 musl and Python
@@ -158,15 +157,11 @@ def build(out):
     if len(root) > ROOT_BYTES - 8192:
         sys.exit(f"root.bin is {len(root)} bytes: under 8192 bytes would be left for the root task's stack")
     print(sign_summary(signer))
-    # The kernel maps the whole window for the root task: image, then stack.
-    entry = image.symbols(cc.with_name("llvm-nm"), out / "root.elf")["_start"]
-    kernel_bytes = image.boot_image(out, board, kernel, root.ljust(ROOT_BYTES, b"\0"), entry, image.c_flags(cc, board), run)
-
     # The open apps for aarch64 Linux, through the same release gate, and
     # this target's test program (test-apps/abi64: signals and processes,
     # which targets/qemu/test_system.py --arch aarch64 runs from Home). This
-    # image is for development only (no verified boot), as the AArch32 test
-    # image with its test apps is.
+    # image is for development, as the AArch32 test image with its test apps
+    # is. Built before the boot image, whose manifest may bind it.
     from build_initfs import main as build_initfs
     extra = [str(HERE / "test-apps")] + [d for d in os.environ.get("VIOLET_OPEN_EXTRA_APPS", "").split(":") if d]
     saved = os.environ.get("VIOLET_OPEN_EXTRA_APPS")
@@ -178,10 +173,38 @@ def build(out):
             os.environ.pop("VIOLET_OPEN_EXTRA_APPS")
         else:
             os.environ["VIOLET_OPEN_EXTRA_APPS"] = saved
+
+    # Verified boot (boot/loader/verified.rs, docs/verified-boot.md), as the
+    # AArch32 QEMU loader does it: the entry stub starts the kernel and the
+    # supervisor only if they match a manifest signed by a key this image pins
+    # (the packages' signer), at a version not below the rollback floor
+    # tools/run.py hands over; the /apps image is bound too in a release or
+    # with VIOLET_BOOT_BIND_APPS=1. The check is verify.c with the AArch32
+    # loader's verified_lib.rs and BearSSL, built for AArch64.
+    from boot_manifest import build as boot_manifest, verify as check_boot_manifest, system_version
+    bind_apps = signer.release or os.environ.get("VIOLET_BOOT_BIND_APPS") == "1"
+    apps = (out / "initfs.cpio").read_bytes() if bind_apps else None
+    try:
+        boot_version = system_version(root, os.environ.get("VIOLET_SYSTEM_VERSION"), signer.release)
+    except ValueError as e:
+        sys.exit(f"verified boot: {e}")
+    run(rust + ["--crate-type=staticlib", REPO / "boot/loader/verified_lib.rs", "-o", "loader-verified.a"])
+
+    def verify(kernel_image, root_window):
+        signed = boot_manifest(signer, boot_version, kernel_image, root_window, apps)
+        check_boot_manifest(signed, signer.keys, "qemu", kernel_image, root_window, apps, require_apps=signer.release)
+        return signed, ["loader-verified.a", "verify-crypto.o", build_crypto(REPO, out, common)[1], "strings.o"]
+
+    # The kernel maps the whole window for the root task: image, then stack.
+    entry = image.symbols(cc.with_name("llvm-nm"), out / "root.elf")["_start"]
+    kernel_bytes = image.boot_image(out, board, kernel, root.ljust(ROOT_BYTES, b"\0"), entry, image.c_flags(cc, board), run, verify)
+    print("Verified boot: the entry stub checks the kernel and the root task" +
+          (" and the /apps image." if bind_apps else "; the /apps image is NOT bound (developer image)."))
+
     # What this image gives up against AArch32, for test_system.py --arch aarch64 to print and check.
     differences = image.layout.differences(timer)
     import json
-    (out / "differences.json").write_text(json.dumps({"verified_boot": False, "user_timer": timer,
+    (out / "differences.json").write_text(json.dumps({"verified_boot": True, "boot_apps_bound": bind_apps, "user_timer": timer,
                                                       "differences": differences}, indent=2) + "\n")
     print(f"qemu-aarch64: kernel {kernel_bytes} bytes, supervisor {len(root)} bytes")
     for d in differences:

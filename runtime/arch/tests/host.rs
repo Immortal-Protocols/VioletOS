@@ -567,10 +567,44 @@ fn structures_convert_between_the_abis() {
     assert_eq!(mmap_pages(&AARCH32, 3), Some(3));
 }
 
+/// A call's 32-bit words only (its `wide` registers are tested apart).
+fn words(e: arch::enter64::Entry) -> arch::enter64::Entry {
+    use arch::enter64::Entry;
+    match e {
+        Entry::Call { number, args, after, .. } => Entry::Call { number, args, wide: [0; 6], after },
+        e => e,
+    }
+}
+
+#[test]
+fn the_dispatcher_gets_every_address_whole() {
+    use arch::enter64::*;
+    let wide = |n, a| match translate(n, a) {
+        Entry::Call { wide, after, .. } => (wide, after),
+        e => panic!("{e:?}"),
+    };
+    // read(3, a buffer above 4 GiB, 16): the 32-bit word is NOWHERE, the
+    // address the dispatcher reads app memory at is the register itself.
+    let high = 0x1234_5678_9000u64;
+    assert_eq!(wide(63, [3, high, 16, 0, 0, 0]).0, [3, high, 16, 0, 0, 0]);
+    // mmap's address and a length of 64 GiB (a JavaScript engine's reservation).
+    assert_eq!(wide(222, [high, 64 << 30, 0, 0x22, u64::MAX, 0]).0[..2], [high, 64 << 30]);
+    // Moved with the call where it is rewritten: nanosleep's two pointers
+    // are clock_nanosleep's third and fourth, statfs's buffer its third.
+    assert_eq!(wide(101, [high, high + 16, 0, 0, 0, 0]).0, [1, 0, high, high + 16, 0, 0]);
+    assert_eq!(wide(43, [high, high + 0x100, 0, 0, 0, 0]), ([high, 84, high + 0x100, 0, 0, 0], After::Statfs(high + 0x100)));
+    assert_eq!(wide(80, [3, high, 0, 0, 0, 0]).1, After::Stat(high));
+    assert_eq!(wide(67, [3, high, 64, 0x1_2345_6789, 0, 0]).0, [3, high, 64, 0, 0x2345_6789, 1]);
+    assert_eq!(wide(163, [7, high, 0, 0, 0, 0]).0, [0, 7, 0, high, 0, 0]);
+    // A sign-extended address stays one no app has (above user space).
+    assert_eq!(wide(64, [1, 0xffff_ffff_bef0_0000, 16, 0, 0, 0]).0[1], 0xffff_ffff_bef0_0000);
+}
+
 #[test]
 fn aarch64_calls_enter_the_one_dispatcher_as_their_aarch32_meaning() {
     use arch::enter64::*;
-    let call = |number, args| Entry::Call { number, args, after: After::None };
+    let call = |number, args| Entry::Call { number, args, wide: [0; 6], after: After::None };
+    let translate = |n, a| words(translate(n, a));
     // Same layout: the number translated, the words narrowed. AT_FDCWD and
     // an ioctl request with bit 31 come sign-extended and stay what they were.
     assert_eq!(translate(56, [(-100i64) as u64, 0x1000, 2, 0, 0, 0]), call(322, [(-100i32) as u32, 0x1000, 2, 0, 0, 0]));
@@ -604,9 +638,9 @@ fn aarch64_calls_enter_the_one_dispatcher_as_their_aarch32_meaning() {
     assert_eq!(translate(164, [7, 0x100, 0, 0, 0, 0]), call(369, [0, 7, 0x100, 0, 0, 0]), "setrlimit");
     assert_eq!(translate(169, [0, 0, 0, 0, 0, 0]), Entry::Answer(0), "gettimeofday without a timeval");
     // Structures the dispatcher fills in are converted after it.
-    assert_eq!(translate(80, [3, 0x500, 0, 0, 0, 0]), Entry::Call { number: 197, args: [3, 0x500, 0, 0, 0, 0], after: After::Stat(0x500) });
-    assert_eq!(translate(169, [0x600, 0, 0, 0, 0, 0]), Entry::Call { number: 403, args: [0, 0x600, 0, 0, 0, 0], after: After::Timeval(0x600) });
-    assert_eq!(translate(43, [0x10, 0x700, 0, 0, 0, 0]), Entry::Call { number: 266, args: [0x10, 84, 0x700, 0, 0, 0], after: After::Statfs(0x700) });
+    assert_eq!(translate(80, [3, 0x500, 0, 0, 0, 0]), Entry::Call { number: 197, args: [3, 0x500, 0, 0, 0, 0], wide: [0; 6], after: After::Stat(0x500) });
+    assert_eq!(translate(169, [0x600, 0, 0, 0, 0, 0]), Entry::Call { number: 403, args: [0, 0x600, 0, 0, 0, 0], wide: [0; 6], after: After::Timeval(0x600) });
+    assert_eq!(translate(43, [0x10, 0x700, 0, 0, 0, 0]), Entry::Call { number: 266, args: [0x10, 84, 0x700, 0, 0, 0], wide: [0; 6], after: After::Statfs(0x700) });
     // Pointer-holding structures go to the dispatcher, which reads them in
     // the app's layout; everything else with another layout is ENOSYS, named.
     for n in WIDE_IN_DISPATCH {
@@ -624,7 +658,8 @@ fn aarch64_calls_enter_the_one_dispatcher_as_their_aarch32_meaning() {
 #[test]
 fn a_sign_extended_address_is_no_app_address() {
     use arch::enter64::*;
-    let call = |number, args| Entry::Call { number, args, after: After::None };
+    let call = |number, args| Entry::Call { number, args, wide: [0; 6], after: After::None };
+    let translate = |n, a| words(translate(n, a));
     // Linux: a kernel-half pointer is EFAULT. Here it must not alias the
     // app's own stack at 0xbef0_0000 (write, mprotect, munmap, mmap FIXED).
     let kernel_half = 0xffff_ffff_bef0_0000u64;
@@ -635,7 +670,7 @@ fn a_sign_extended_address_is_no_app_address() {
     // A sign-extended size is no size either.
     assert_eq!(translate(63, [3, 0x1000, 0xffff_ffff_8000_0000, 0, 0, 0]), call(3, [3, 0x1000, NOWHERE, 0, 0, 0]));
     // Int arguments keep their sign: fd -1 and AT_FDCWD, pid -1, ioctl's request.
-    assert_eq!(translate(260, [(-1i64) as u64, 0x100, 0, 0, 0, 0]), Entry::Call { number: 114, args: [u32::MAX, 0x100, 0, 0, 0, 0], after: After::None });
+    assert_eq!(translate(260, [(-1i64) as u64, 0x100, 0, 0, 0, 0]), Entry::Call { number: 114, args: [u32::MAX, 0x100, 0, 0, 0, 0], wide: [0; 6], after: After::None });
     assert_eq!(translate(56, [(-100i64) as u64, 0x1000, 0, 0, 0, 0]), call(322, [(-100i32) as u32, 0x1000, 0, 0, 0, 0]));
     // Every argument the table names exists in the call.
     for c in arch::linux::CALLS {
@@ -655,30 +690,59 @@ fn x0_of_an_answered_call_is_its_result() {
     (shown[0], shown[1], shown[2], shown[8]) = (0xffff_fff7, 0x1000, 16, svc);
     let answer = [(-9i32) as u32, 0x1000, 16, 0, 0, 0, 0, 0, svc + 4];
     let mut out = [0u64; 16];
-    assert_eq!(widen(true, &wide, &shown, &answer, &mut out), 9);
+    assert_eq!(widen(true, &wide, &shown, &answer, None, &mut out), 9);
     assert_eq!(out[0] as i64, -9, "an error, as musl reads it");
     assert_eq!((out[1], out[2], out[8]), (0x1000, 16, u64::from(svc + 4)));
     // Any errno result equal to the call's x0 (uname(0xfffffff2): EFAULT).
     (wide[0], shown[0]) = (0xffff_fff2, 0xffff_fff2);
     let answer = [(-14i32) as u32, 0x1000, 16, 0, 0, 0, 0, 0, svc + 4];
-    widen(true, &wide, &shown, &answer, &mut out);
+    widen(true, &wide, &shown, &answer, None, &mut out);
     assert_eq!(out[0] as i64, -14);
     // A result is zero-extended, a register the call left is the thread's own.
     wide[3] = 0xdead_beef_0000_0001;
     shown[3] = 1;
     let answer = [0x8000_0000, 0x1000, 16, 1, 0, 0, 0, 0, svc + 4];
-    widen(true, &wide, &shown, &answer, &mut out);
+    widen(true, &wide, &shown, &answer, None, &mut out);
     assert_eq!((out[0], out[3]), (0x8000_0000, 0xdead_beef_0000_0001));
     // A call made again (back on the svc): x0 as the thread had it.
     (wide[0], shown[0]) = ((-100i64) as u64, (-100i32) as u32);
     let again = [shown[0], 0x1000, 16, 1, 0, 0, 0, 0, svc];
-    widen(true, &wide, &shown, &again, &mut out);
+    widen(true, &wide, &shown, &again, None, &mut out);
     assert_eq!((out[0], out[8]), ((-100i64) as u64, u64::from(svc)));
     // nanosleep shown as clock_nanosleep(1, ...): made again, x0 is the pointer.
     (wide[0], shown[0]) = (0x2000, 1);
     let again = [1, 0, 0x2000, 0, 0, 0, 0, 0, svc];
-    widen(true, &wide, &shown, &again, &mut out);
+    widen(true, &wide, &shown, &again, None, &mut out);
     assert_eq!(out[0], 0x2000);
+}
+
+#[test]
+fn code_and_addresses_above_4_gib_come_back_whole() {
+    use arch::enter64::*;
+    // A program above 4 GiB (vma::Layout64): the svc at a 47-bit address.
+    let svc = 0x1000_2345_6788u64;
+    let mut wide = [0u64; 16];
+    let mut shown = [0u32; 16];
+    (wide[0], wide[1], wide[8], wide[9]) = (0, 0x2000, svc, 0x7ff0_0000_1000);
+    (shown[0], shown[1], shown[8], shown[9]) = (0, 0x2000, svc as u32, 0x0000_1000);
+    let mut out = [0u64; 16];
+    // Answered: past the svc, from the whole address; sp as the thread had it.
+    widen(true, &wide, &shown, &[0, 0x2000, 0, 0, 0, 0, 0, 0, svc as u32 + 4, shown[9]], None, &mut out);
+    assert_eq!((out[8], out[9]), (svc + 4, 0x7ff0_0000_1000));
+    // Back onto the svc, and an svc whose low word wraps past it.
+    widen(true, &wide, &shown, &[0, 0x2000, 0, 0, 0, 0, 0, 0, svc as u32], None, &mut out);
+    assert_eq!(out[8], svc);
+    let edge = 0x1000_ffff_fffcu64;
+    (wide[8], shown[8]) = (edge, edge as u32);
+    widen(true, &wide, &shown, &[0, 0, 0, 0, 0, 0, 0, 0, (edge as u32).wrapping_add(4)], None, &mut out);
+    assert_eq!(out[8], edge + 4, "never cut to the low word");
+    // mmap answered an address above 4 GiB: x0 is all of it.
+    let mapped = 0x6fff_f000_0000u64;
+    widen(true, &wide, &shown, &[mapped as u32, 0, 0, 0, 0, 0, 0, 0, (edge as u32).wrapping_add(4)], Some((mapped as u32, mapped)), &mut out);
+    assert_eq!(out[0], mapped);
+    // A result the runtime changed since (an error, a restart): not the address.
+    widen(true, &wide, &shown, &[(-4i32) as u32, 0, 0, 0, 0, 0, 0, 0, (edge as u32).wrapping_add(4)], Some((mapped as u32, mapped)), &mut out);
+    assert_eq!(out[0] as i64, -4);
 }
 
 #[test]
@@ -717,7 +781,7 @@ fn structures_the_dispatcher_wrote_become_the_aarch64_ones() {
     for a in [After::Stat(0), After::Rusage(0), After::Statfs(0), After::Tms(0), After::Sysinfo(0), After::Timeval(0)] {
         assert!(sizes(a).unwrap().2 <= MAX_AFTER);
     }
-    // A fault above 4 GiB lands in no app's region, never on a low address.
+    // A fault above 4 GiB is looked up whole, never as a low address.
     assert_eq!(fault_address(0x1000), 0x1000);
-    assert_eq!(fault_address(1 << 32 | 0x1000), NOWHERE);
+    assert_eq!(fault_address(1 << 32 | 0x1000), 1 << 32 | 0x1000);
 }
