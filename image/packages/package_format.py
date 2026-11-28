@@ -24,6 +24,17 @@ HEADER = 24
 TRAILER = 80
 
 
+# Services whose stack is outside their image (supervisor.c own_stack) and the
+# Open Runtime may fill 0x80000 bytes; Runtime (3) 0x38000; the rest 0x3E000.
+OWN_STACK = (4, 5, 6, 7, 8, 21, 22, 24, 25, 26)
+
+
+def package_window(identity):
+    if identity == 3:
+        return 0x38000
+    return 0x80000 if identity in OWN_STACK else 0x3E000
+
+
 def package_abi(identity):
     # Runtime also boots as service workers using the supervisor's mailbox ABI.
     return 2 if identity == 3 else 1
@@ -46,8 +57,7 @@ def inspect(blob, keys=None, target=None):
         or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24, 25, 26))
     ):
         raise ValueError("unsupported package or ABI")
-    # The Open Runtime (24) keeps its stack elsewhere, so its image may be larger.
-    window = 0x80000 if identity == 24 else 0x3E000
+    window = package_window(identity)
     if not 0 < code <= size <= window or code % 4096 or len(blob) != HEADER + size + TRAILER:
         raise ValueError("invalid segment sizes")
     image = blob[HEADER : HEADER + size]

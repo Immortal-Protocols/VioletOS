@@ -71,10 +71,12 @@ enum { SENTINEL = CAMERA + 1, OPEN_SLOT_SENTINEL = 9, SENTINEL_HEAP = 0x02800000
        SENTINEL_REQUEST = 0x09300000, SENTINEL_REPLY = 0x09310000,
        OPEN_SENTINEL_REQUEST = 0x09140000, OPEN_SENTINEL_REPLY = 0x09148000 };
 enum { SENTINEL_ROOT_KEY = 0x09320000 };
-// Every other package ends below its two-page stack at 0x13e000. The Open
-// Runtime's stack is at OPEN_STACK_TOP instead, so its image may run on up to
-// 0x180000, well below its IPC buffer at 0x200000.
-enum { OPEN_WINDOW = 0x80000 };
+// The launcher, watchdog, Runtime and catalog apps end below their two-page
+// stack at 0x13e000. The Open Runtime's stack is at OPEN_STACK_TOP instead, so
+// its image may run on up to 0x180000, well below its IPC buffer at 0x200000.
+// The services (own_stack) keep their stacks out of the image too, so they get
+// the same SERVICE_WINDOW.
+enum { OPEN_WINDOW = 0x80000, SERVICE_WINDOW = 0x80000 };
 // The Open Runtime's CSpace and the capabilities the supervisor places in it.
 // Runtime knows it as client 9, an identity no catalog app uses.
 // OPEN_BITS: a slot for each 4 KiB page of its pool and one more for each
@@ -171,6 +173,17 @@ static unsigned package_version(const struct package *p) {
   memcpy(&version, p->bytes + p->size + 8, 4);
   return version;
 }
+
+// Services whose stack is kept out of their image (stack_top), so their
+// package may fill SERVICE_WINDOW. Everyone else keeps the 0x3e000 window
+// below the stack at 0x13e000 (Runtime: 0x38000, under its larger stack).
+static bool own_stack(unsigned id) {
+  return id == TOUCH || id == DISPLAY || id == STORAGE || id == RADIO || id == POWER ||
+         id == USB_DIAG || id == AUDIO || id == CAMERA || id == SENTINEL;
+}
+static unsigned package_window(unsigned id) {
+  return id == RUNTIME ? 0x38000 : id == OPEN_RT ? OPEN_WINDOW : own_stack(id) ? SERVICE_WINDOW : 0x3e000;
+}
 static bool valid_package(const struct package *p, unsigned limit) {
   if (limit < sizeof(*p) + SIGNATURE) return false;
   bool abi_ok=p->abi==(p->id==RUNTIME ? 2u : 1u);
@@ -187,7 +200,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
       !abi_ok || !p->id || p->id == PACKAGES ||
       !allowed_id || !p->code || p->code % PAGE || p->size < p->code ||
       p->size > limit - sizeof(*p) - SIGNATURE ||
-      p->size > (p->id == RUNTIME ? 0x38000 : p->id == OPEN_RT ? OPEN_WINDOW : 0x3e000))
+      p->size > package_window(p->id))
     return false;
   if (p->id >= 11 && p->id < COUNT) {
     if (p->size > 65512 || p->size < p->code + 20 ||
@@ -300,17 +313,20 @@ static void private_page(struct process *p, unsigned va,
                               (exec ? 0 : seL4_ARM_ExecuteNever)));
   if (va == IPC_BUFFER)
     t->ipc = frame;
-  else if (va >= BASE && va < STACK_TOP)
+  else if (va >= BASE && va < STACK_TOP && (va - BASE) / PAGE < 64)
     p->frames[(va - BASE) / PAGE] = frame;
 }
 // Storage uses nested 512-byte sector buffers. Keep its stack separate from
 // the package image, with an unmapped guard page below it. Radio's stack is
-// separate too, so its package may use the full 0x3e000-byte image window.
+// separate too, and so is every other own_stack service's (two pages at
+// SERVICE_STACK_TOP, clear of the private RAM at 0x02800000), so their
+// packages may use the whole SERVICE_WINDOW.
 enum { STORAGE_STACK_TOP = 0x02400000, STORAGE_STACK_PAGES = 8 };
 enum { RADIO_STACK_TOP = 0x02600000, RADIO_STACK_PAGES = 8 };
+enum { SERVICE_STACK_TOP = 0x02a00000 };
 static unsigned stack_top(unsigned id) {
   return id == STORAGE ? STORAGE_STACK_TOP : id == RADIO ? RADIO_STACK_TOP
-         : id == OPEN_RT ? OPEN_STACK_TOP : STACK_TOP;
+         : id == OPEN_RT ? OPEN_STACK_TOP : own_stack(id) ? SERVICE_STACK_TOP : STACK_TOP;
 }
 static seL4_CPtr spare_ram(unsigned type, unsigned bits);
 static void prepare_process(unsigned id) {
@@ -359,8 +375,8 @@ static void prepare_process(unsigned id) {
     for (unsigned i = 1; i <= OPEN_STACK_PAGES; i++)
       private_page(p, OPEN_STACK_TOP - i * PAGE, 0, 0, false);
   } else {
-    private_page(p, STACK_TOP - 2 * PAGE, 0, 0, false);
-    private_page(p, STACK_TOP - PAGE, 0, 0, false);
+    private_page(p, stack_top(id) - 2 * PAGE, 0, 0, false);
+    private_page(p, stack_top(id) - PAGE, 0, 0, false);
   }
   private_page(p, IPC_BUFFER, 0, 0, false);
   grant(t, FAULT_SLOT, life, 16 + id, false);
@@ -1065,8 +1081,8 @@ static void wire(void) {
   local_catalog = device(0,0x43c00000,0x0d000000,20);
   device(0,0x43d00000,0x0d100000,20);
   usb_scratch = (unsigned char *)local_catalog + CATALOG_LIMIT;
-  // The largest upload (a 0x3e000-byte image with its header and signature).
-  _Static_assert(0x200000 - 4 - CATALOG_LIMIT >= 24 + 0x3e000 + 80, "the USB trial scratch is too small");
+  // The largest upload (a SERVICE_WINDOW image with its header and signature).
+  _Static_assert(0x200000 - 4 - CATALOG_LIMIT >= 24 + SERVICE_WINDOW + 80, "the USB trial scratch is too small");
   // The catalog being composed: 2 MiB of RAM, made again each generation as
   // the inbox is, from spare untypeds (spare_section).
   for (unsigned i = 0; i < 2; i++) {
@@ -2163,7 +2179,7 @@ void root_main(seL4_BootInfo *bi) {
         } else if(key==0x60) { // New upload invalidates every previous partial package.
           package_authorized = signature_started = false;
           uploaded=upload_size=0;
-          if(val>=sizeof(*inbox)+SIGNATURE && val<=sizeof(*inbox)+0x3e000+SIGNATURE) {
+          if(val>=sizeof(*inbox)+SIGNATURE && val<=sizeof(*inbox)+SERVICE_WINDOW+SIGNATURE) {
             upload_size=val;upload_crc=n;ok=1;
           }
         } else if(key==0x61 && n && n<=40 && val==uploaded && n<=upload_size-uploaded) {

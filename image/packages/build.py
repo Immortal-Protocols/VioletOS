@@ -362,7 +362,8 @@ SECTIONS {
                 raise ValueError("application exceeds 64 KiB package slot")
         # The supervisor rejects a package over its image window and boots
         # whatever older copy it has, so stop here instead.
-        window = 0x38000 if item["id"] == 3 else 0x80000 if item["id"] == 24 else 0x3E000
+        from package_format import package_window
+        window = package_window(item["id"])
         if len(image) > window:
             raise SystemExit(f"{name}: {len(image):#x} bytes, over its {window:#x}-byte package window")
         header = struct.pack(

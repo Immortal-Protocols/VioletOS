@@ -34,7 +34,7 @@ static int stage(libusb_device_handle *h,const char *file) {
     if(!f){perror(file);return 1;}
     // A VPK2 record: 24-byte header, the image, then the 80-byte signature
     // trailer ("VSG1", key, version, target, signature). The handset verifies it.
-    static unsigned char bytes[0x3e000+24+80+1];
+    static unsigned char bytes[0x80000+24+80+1];
     size_t n=fread(bytes,1,sizeof bytes,f);
     int bad=ferror(f);fclose(f);
     if(!bad && n>=4 && !memcmp(bytes,"VPK1",4)) {

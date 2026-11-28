@@ -184,10 +184,14 @@ class Format(unittest.TestCase):
             self.keys.dev.sign(body[:-1], 1)
         with self.assertRaisesRegex(ValueError, "checksum"):
             inspect(self.keys.dev.sign(body[:HEADER] + b"\0" + body[HEADER + 1 :], 1))
-        # Window limits are unchanged: the trailer does not count against the image.
-        self.assertEqual(inspect(self.keys.dev.sign(unsigned(7, size=0x3E000), 1)), 7)
+        # Window limits: the trailer does not count against the image. Services
+        # with their own stack (Radio 7, Touch 4, ...) and the Open Runtime get
+        # 0x80000; Runtime 0x38000; the launcher and catalog apps 0x3E000.
+        self.assertEqual(inspect(self.keys.dev.sign(unsigned(7, size=0x80000), 1)), 7)
+        self.assertEqual(inspect(self.keys.dev.sign(unsigned(4, size=0x80000), 1)), 4)
         self.assertEqual(inspect(self.keys.dev.sign(unsigned(24, size=0x80000), 1)), 24)
-        for identity, size in [(7, 0x3F000), (3, 0x39000), (24, 0x81000)]:
+        self.assertEqual(inspect(self.keys.dev.sign(unsigned(1, size=0x3E000), 1)), 1)
+        for identity, size in [(7, 0x81000), (4, 0x81000), (1, 0x3F000), (3, 0x39000), (24, 0x81000)]:
             with self.assertRaises(ValueError):
                 inspect(self.keys.dev.sign(unsigned(identity, size=size), 1))
         # The handset's Radio is ABI 3 (128 KiB of private RAM) or ABI 4 (192 KiB); nothing else is.

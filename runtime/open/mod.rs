@@ -1711,7 +1711,7 @@ impl Stats {
 /// Enough heap to report a failed start before the pool exists (the pool
 /// then adds HEAP_PAGES of its own; see pool.rs).
 /// 7.9 KiB: with the other statics, the package (code and zeroed data) must
-/// stay within its 0x3e000-byte window.
+/// stay within its 0x80000-byte window.
 static mut BOOT_HEAP: [u64; 1008] = [0; 1008];
 
 /// Recovery's view of the runtime (contain.rs `recover`).
