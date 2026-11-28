@@ -23,6 +23,8 @@ An app is either **Rust** (native, fastest) or **Python** (a single script, no c
 
 ## What the app may use (both recipes)
 
+For an app that fetches a URL, include `caps: net` in `manifest.txt` before building. Pass the exact `path` printed by `./build` to `install_app`. Rust apps with a manifest have a separately packaged install file under `target/agent-out/`.
+
 An app gets only its own `/data`, the screen and touch unless it says what else it needs in a `manifest.txt` next to its `app.txt`, one line:
 
 ```

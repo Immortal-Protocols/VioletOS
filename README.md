@@ -200,7 +200,7 @@ export VIOLET_TOUCH_FW=/path/to/djn_nt36525b_a_novatek_ts_fw.bin
 make moto
 ```
 
-VioletOS boots from slot B and leaves Android on slot A. With USB connected, `services/usb-diagnostics/host/moto-flash build/sel4/moto/boot.img` reaches fastboot without touching the phone, flashes slot B and waits for VioletOS to answer. The boot image carries the loader, seL4, the first task and its catalog, the Wi-Fi firmware and, in place of Android's ramdisk, the compressed `/apps` image. A 1 MiB storage volume and the catalog banks follow it in the partition.
+VioletOS boots from slot B and leaves Android on slot A. With USB connected, `services/usb-diagnostics/host/moto-flash build/sel4/moto/boot.img` reaches fastboot without touching the phone, flashes slot B and waits for VioletOS to answer. On a handset whose slot B has no valid bootloader images yet (`WARNING: Bootloader images on target slot b are not valid!!`), see [flashing a slot-A-only handset](targets/moto-g-pure/README.md#flashing-a-slot-a-only-handset-empty-slot-b). The boot image carries the loader, seL4, the first task and its catalog, the Wi-Fi firmware and, in place of Android's ramdisk, the compressed `/apps` image. A 1 MiB storage volume and the catalog banks follow it in the partition.
 
 Useful tools on the Mac:
 

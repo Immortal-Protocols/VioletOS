@@ -15,12 +15,15 @@ struct Line: Identifiable {
 }
 
 final class AgentModel: ObservableObject {
+    enum CodexSignIn { case checking, required, inTerminal, signedIn }
+
     @Published var relayUp = false
     @Published var online = false
     @Published var phone: PairedPhone?
     @Published var lines: [Line] = []
     @Published var heard = ""
     @Published var codexState = "Starting the builder…"
+    @Published private(set) var codexSignIn: CodexSignIn = .checking
     @Published var speechState = "Starting Rose…"
     /// Rose's own dashboard (her life, journal, tasks and transcripts) on this Mac.
     @Published var dashboard: String?
@@ -60,6 +63,10 @@ final class AgentModel: ObservableObject {
     /// The agent: Rose, from RoseOS.
     private let rose = RoseAgent()
     private var roseReady = false
+    private let speechEnabled = !CommandLine.arguments.contains("--no-speech")
+    private let codexHome: URL
+    private var login: CodexLogin?
+    private var terminalLogin: (command: CodexLogin.TerminalCommand, deadline: Date, restart: Bool)?
     /// Apps: Codex writes, builds and installs them in the workspace, for a task Rose started.
     private var builder: Codex!
     /// The build Rose asked for: her task id, when it started, whether she stopped it.
@@ -98,8 +105,9 @@ final class AgentModel: ObservableObject {
         identity = Store.identity(saved)
         let fm = FileManager.default
         let profile = ProcessInfo.processInfo.environment["VIOLET_AGENT_PROFILE"] ?? ""
-        support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent(profile.isEmpty ? "Violet Agent" : "Violet Agent \(profile)")
+        let applicationSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        support = applicationSupport.appendingPathComponent(profile.isEmpty ? "Violet Agent" : "Violet Agent \(profile)")
+        codexHome = applicationSupport.appendingPathComponent("Violet Agent/Codex")
         try? fm.createDirectory(at: support, withIntermediateDirectories: true)
         let path = Bundle.main.object(forInfoDictionaryKey: "VioletRepoPath") as? String ?? ""
         // The checkout it was built from, else ~/VioletOS (a worktree may be gone).
@@ -157,14 +165,13 @@ final class AgentModel: ObservableObject {
                   FileManager.default.fileExists(atPath: LocomoSetup.installedApp.path) {
             enableLocomo(LocomoSetup.installedApp)
         }
-        if args.contains("--no-speech") {
-            speechState = "No agent (--no-speech)"
-        } else {
-            startRose()
-        }
+        speechState = speechEnabled ? "Rose is checking ChatGPT sign-in…" : "No agent (--no-speech)"
         prepareWorkspace()
         startBuilder()
-        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.writeStatus() }
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.checkTerminalLogin()
+            self?.writeStatus()
+        }
     }
 
     private func prepareWorkspace() {
@@ -195,7 +202,7 @@ final class AgentModel: ObservableObject {
     /// Rose keeps her state with this profile: her name and voice, her life and journal, transcripts.
     var roseProfile: URL { support.appendingPathComponent("rose") }
 
-    private func startRose() {
+    private func startRose(login: CodexLogin) {
         rose.onBus = { [weak self] m in self?.bus(m) }
         rose.onControl = { [weak self] m in self?.link.send(["t": "audio", "ctl": m]) }
         rose.onPCM = { [weak self] seg, pcm in self?.sendSpeech(seg, pcm) }
@@ -219,8 +226,10 @@ final class AgentModel: ObservableObject {
             self.log("Rose: \(why)")
         }
         speechState = "Starting Rose (her voice models and Codex)…"
-        _ = rose.start(repo: repo, profile: roseProfile, name: agentName, voice: saved.voice,
-                       log: support.appendingPathComponent("rose.log"))
+        if rose.start(repo: repo, profile: roseProfile, name: agentName, voice: saved.voice,
+                      log: support.appendingPathComponent("rose.log"), login: login) {
+            rose.phone(online: online)
+        }
     }
 
     /// A typed turn from the Mac window, heard by Rose as if spoken.
@@ -314,8 +323,76 @@ final class AgentModel: ObservableObject {
                          "required": ["name", "title", "path"]]],
     ]
 
+    func signInToCodex() {
+        if let terminalLogin {
+            do {
+                try terminalLogin.command.cancel()
+                self.terminalLogin?.restart = true
+                codexState = "Restarting ChatGPT sign-in…"
+            } catch {
+                codexState = "Could not restart sign-in: \(error.localizedDescription)"
+            }
+            return
+        }
+        guard codexSignIn == .required, let login else { return }
+        do {
+            let command = try login.terminalCommand()
+            terminalLogin = (command, Date().addingTimeInterval(15 * 60), false)
+            codexSignIn = .inTerminal
+            codexState = "Complete ChatGPT sign-in in Terminal."
+            let terminal = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+            NSWorkspace.shared.open([command.script], withApplicationAt: terminal, configuration: .init()) { [weak self] _, error in
+                guard let error else { return }
+                DispatchQueue.main.async {
+                    guard self?.terminalLogin?.command.directory == command.directory else { return }
+                    self?.finishTerminalLogin(error: "Could not open Terminal: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            codexState = "Could not start sign-in: \(error.localizedDescription)"
+        }
+    }
+
+    private func checkTerminalLogin() {
+        guard let terminalLogin else { return }
+        if let status = terminalLogin.command.exitStatus {
+            finishTerminalLogin(error: status == 0 ? nil : "Sign-in did not finish. Try again.")
+            if status != 0 && terminalLogin.restart { signInToCodex() }
+        } else if Date() >= terminalLogin.deadline {
+            try? terminalLogin.command.cancel()
+            self.terminalLogin?.deadline = .distantFuture
+            codexState = "Closing the expired Terminal sign-in…"
+        }
+    }
+
+    private func finishTerminalLogin(error: String?) {
+        terminalLogin?.command.cleanUp()
+        terminalLogin = nil
+        if let error {
+            codexSignIn = .required
+            codexState = error
+        } else {
+            startBuilder()
+        }
+    }
+
     private func startBuilder() {
-        builder = Codex("builder", workspace: workspace, instructions: Self.builderInstructions, tools: Self.builderTools)
+        codexSignIn = .checking
+        codexState = "Checking ChatGPT sign-in…"
+        guard let binary = Codex.binary() else {
+            codexState = "Install Codex CLI 0.167.1 or later, then reopen Violet Agent."
+            if speechEnabled { speechState = "Rose needs Codex CLI" }
+            return
+        }
+        let login = CodexLogin(home: codexHome, binary: binary)
+        do { try login.prepare() } catch {
+            codexState = "Could not prepare Codex sign-in: \(error.localizedDescription)"
+            if speechEnabled { speechState = "Rose needs a writable Codex directory" }
+            return
+        }
+        self.login = login
+        let builder = Codex("builder", workspace: workspace, instructions: Self.builderInstructions, tools: Self.builderTools)
+        self.builder = builder
         builder.onLog = { [weak self] s in self?.log(s) }
         builder.onMessage = { [weak self] _, t in self?.builderReply = t }
         builder.onProgress = { [weak self] p in
@@ -328,13 +405,31 @@ final class AgentModel: ObservableObject {
                 return done(["success": false, "contentItems": [["type": "inputText", "text": "Unknown tool \(tool)"]]])
             }
             if let b = self.building { self.rose.buildProgress(b.task, "Installing \(args["title"] ?? "the app") on the phone.") }
-            self.install(args) { ok, text in done(["success": ok, "contentItems": [["type": "inputText", "text": text]]]) }
+            self.install(args, fromBuilder: true) { ok, text in done(["success": ok, "contentItems": [["type": "inputText", "text": text]]]) }
         }
         builder.onTurnEnd = { [weak self] ok in self?.buildEnded(ok) }
-        builder.start { [weak self] err in
-            self?.codexState = err.map { "Builder: \($0)" } ?? "Builder ready (\(self?.builder.model ?? ""))"
-            if let err { self?.log("builder: \(err)") }
-        }
+        builder.start(login: login, account: { [weak self] signedIn in
+            guard let self else { return }
+            self.codexSignIn = signedIn ? .signedIn : .required
+            guard self.speechEnabled else { return }
+            if signedIn {
+                self.startRose(login: login)
+            } else {
+                self.speechState = "Rose is waiting for ChatGPT sign-in"
+            }
+        }, ready: { [weak self, weak builder] error in
+            guard let self, let builder else { return }
+            if let error {
+                self.codexState = error
+                self.log("builder: \(error)")
+                if self.speechEnabled, self.codexSignIn == .checking {
+                    self.speechState = "Rose could not check ChatGPT sign-in"
+                }
+                builder.stop()
+            } else {
+                self.codexState = "Builder ready (\(builder.model))"
+            }
+        })
     }
 
     /// Rose started a build task: the builder takes it, and reports back to her task.
@@ -794,13 +889,25 @@ final class AgentModel: ObservableObject {
         link.send(["t": "state", "state": state])
     }
 
-    private func install(_ args: [String: Any], _ done: @escaping (Bool, String) -> Void) {
+    private func install(_ args: [String: Any], fromBuilder: Bool = false, _ done: @escaping (Bool, String) -> Void) {
         let name = args["name"] as? String ?? ""
         let title = args["title"] as? String ?? name
         let path = URL(fileURLWithPath: args["path"] as? String ?? "").standardizedFileURL
         guard path.path.hasPrefix(workspace.appendingPathComponent("target").path) || pendingInstallAllowed(path),
               let data = try? Data(contentsOf: path), !data.isEmpty else {
             return done(false, "That program is not in the workspace's build output.")
+        }
+        if fromBuilder {
+            guard name.range(of: #"^[a-z0-9_-]{1,12}$"#, options: .regularExpression) != nil else {
+                return done(false, "Use the app folder name printed by ./build.")
+            }
+            let language = data.starts(with: Data("#!".utf8)) ? "python" : "apps"
+            let source = workspace.appendingPathComponent(language).appendingPathComponent(name)
+            do {
+                try AppManifest.check(program: data, source: source)
+            } catch {
+                return done(false, "The install file does not match the app's manifest.txt. Rebuild with a manifest-aware builder and install the path printed by ./build.")
+            }
         }
         guard online else {
             // The link can drop for a moment (a network change, a relay hiccup): wait for it before giving up.
@@ -809,7 +916,7 @@ final class AgentModel: ObservableObject {
             log("install of \(name) waits for the phone to come back")
             var retry = args
             retry["_wait_until"] = deadline
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.install(retry, done) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.install(retry, fromBuilder: fromBuilder, done) }
             return
         }
         let started = Date()
@@ -838,7 +945,7 @@ final class AgentModel: ObservableObject {
             // Not known yet (the phone's hello may still be on its way): ask it.
             appLists.append { [weak self] o in
                 self?.phonePython = o["python"] as? Bool
-                self?.install(args, done)
+                self?.install(args, fromBuilder: fromBuilder, done)
             }
             link.send(["t": "apps"])
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
