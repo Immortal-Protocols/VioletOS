@@ -26,7 +26,7 @@ parser.add_argument("--radio-package", type=Path, help="exercise an independentl
 parser.add_argument("--diagnostics-trial", choices=("fault", "timeout", "confirm"),
                     help="start at the post-activation boundary with a test Diagnostics candidate")
 parser.add_argument("--arch", choices=("aarch32", "aarch64"), default="aarch32",
-                    help="aarch64: the AArch64 handset build (make moto64) on QEMU's AArch64 kernel")
+                    help="aarch64: the AArch64 handset build (make moto) on QEMU's AArch64 kernel; aarch32 (the default here): make moto32")
 args = parser.parse_args()
 
 
@@ -34,7 +34,7 @@ def run_aarch64():
     """The AArch64 handset build (targets/moto-g-pure/build64.py, make moto64) on QEMU.
 
     The loader (loader64.S, loader.c) is relinked around the AArch64 QEMU kernel
-    (make qemu64-image QEMU64_STACK=1: QEMU's interrupt controller and timer,
+    (make qemu-image: QEMU's interrupt controller and timer,
     the Wi-Fi extension's failing stubs); the supervisor, catalog and the open
     apps' image are the handset build's. QEMU starts the CPU at EL2 with the
     image away from its link address, as the handset's LK may: the loader moves
@@ -44,7 +44,7 @@ def run_aarch64():
     import importlib.util
     moto64 = repo / "build/sel4/moto-aarch64"
     qemu64 = repo / "build/sel4/qemu-aarch64"
-    for need, how in ((moto64 / "loader.json", "make moto64"), (qemu64 / "kernel/kernel.elf", "make qemu64-image QEMU64_STACK=1")):
+    for need, how in ((moto64 / "loader.json", "make moto"), (qemu64 / "kernel/kernel.elf", "make qemu-image")):
         if not need.is_file():
             raise SystemExit(f"{need} is missing: {how}")
     assert layout(moto64) == layout(qemu64), "kernel memory reservations differ"
@@ -146,7 +146,7 @@ def signed(blob):
     signer = sign.config(repo, "moto")
     target, pinned = sign.load_keys(moto / "package-keys.json")
     assert target == "moto" and pinned.get(signer.key_id) == signer.keys[signer.key_id], \
-        "build/sel4/moto was not built with this developer key: run make moto again"
+        "build/sel4/moto was not built with this developer key: run make moto32 again"
     return bytearray(sign.resign(bytes(blob), signer))
 
 

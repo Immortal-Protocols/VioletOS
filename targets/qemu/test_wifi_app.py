@@ -171,7 +171,7 @@ with TemporaryDirectory() as tmp:
     viewer = Path(tmp) / "input.py"
     original = run.ROOT / "build/sel4/qemu"
     if not (original / "initfs.cpio").exists():
-        raise SystemExit("Build the QEMU image first (make qemu-image).")
+        raise SystemExit("Build the 32-bit QEMU image first (make qemu32-image).")
     viewer.write_text(home_grid.viewer(SCRIPT, (original / "initfs.cpio").read_bytes()))
     viewer.chmod(0o755)
     image = Path(tmp) / "image"

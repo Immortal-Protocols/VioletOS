@@ -1,4 +1,4 @@
-/* Linux signals under the Open Runtime (make test-system): handlers with siginfo
+/* Linux signals under the Open Runtime (make test-system32): handlers with siginfo
  * on an alternate stack, masks and pending signals, SIGSEGV and SIGILL taken by
  * handlers, a thread interrupted while it runs in user code (its VFP registers
  * and, in Thumb code, its IT and GE state kept), SA_RESTART against EINTR (in

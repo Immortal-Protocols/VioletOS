@@ -15,7 +15,7 @@ its output from the guest's screen and the Open Runtime's log:
   7. Home returns to the Home app.
 
 `--arch aarch64` runs it on the AArch64 build of the system
-(targets/qemu64/stack.py, `make qemu64 QEMU64_STACK=1`).
+(targets/qemu64/stack.py, `make qemu-image`).
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

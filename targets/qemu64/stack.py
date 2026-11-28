@@ -4,7 +4,7 @@ apps for aarch64 Linux, on the same delta-checked 64-bit kernel and entry stub
 as the bring-up image.
 
     python3 targets/qemu64/stack.py [--out DIR]     default build/sel4/qemu-aarch64
-    make qemu64-image QEMU64_STACK=1                the same, after the bring-up image
+    make qemu-image                                 the same (the default QEMU image)
     VIOLET_ARCH=aarch64 python3 tools/run.py VIEWER boots it
 
 It is the QEMU half of platform/sel4/loader/build.py with one architecture

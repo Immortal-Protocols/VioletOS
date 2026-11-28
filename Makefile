@@ -311,14 +311,15 @@ test-integration:
 	HOST_RUSTC="$(HOST_RUSTC)" tests/integration/run.sh
 
 # The local loop, everything to run before pushing: the host unit tests
-# (with the integration tests), the one QEMU end-to-end test, then the two
-# QEMU tests CI runs. test-system leaves the normal image behind, so test-ci
-# builds nothing more.
+# (with the integration tests), the AArch64 end-to-end test, the two QEMU
+# tests CI runs (on the AArch64 image test-system built), then the 32-bit
+# system's end-to-end test, which leaves the normal 32-bit image behind.
 .PHONY: test-local
 test-local:
 	$(MAKE) test-unit
 	$(MAKE) test-system
 	$(MAKE) test-ci
+	$(MAKE) test-system32
 
 # The QEMU tests CI runs: one boot of the supervisor and its services (touch,
 # the watchdog, Home answering a tap), then Home, Settings and Music across

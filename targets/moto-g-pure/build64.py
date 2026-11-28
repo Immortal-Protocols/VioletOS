@@ -1,4 +1,4 @@
-"""Build VioletOS for the XT2163DL in AArch64: `make moto64`.
+"""Build VioletOS for the XT2163DL in AArch64: `make moto` (the default handset image).
 
     VIOLET_STOCK_BOOT=.../boot.img python3 targets/moto-g-pure/build64.py [--out DIR] [--probe-stage N]
 

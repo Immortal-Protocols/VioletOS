@@ -164,7 +164,7 @@ The boot image carries the 1 MiB storage volume (app files, the Wi-Fi app's save
 
 ## AArch64 boot path
 
-**VioletOS runs in AArch64 on the XT2163DL (measured November 27, 2026, 23:01-23:25, unit ZY22HWZ4M5, MBM-2.1-ellis_vzw-4a0a80aa68-231214).** `make moto64` (with the same `VIOLET_STOCK_BOOT` as `make moto`) builds `build/sel4/moto-aarch64/boot.img` ([build64.py](build64.py)); `services/usb-diagnostics/host/moto-flash build/sel4/moto-aarch64/boot.img` installs it in `boot_b` like the 32-bit image, keeping the saved data. From the flash, it answers on USB Diagnostics in about 8 s with the Open Runtime's screen up, the saved `/data` read, Wi-Fi scanning and joining, and HTTPS working.
+**VioletOS runs in AArch64 on the XT2163DL (measured November 27, 2026, 23:01-23:25, unit ZY22HWZ4M5, MBM-2.1-ellis_vzw-4a0a80aa68-231214).** `make moto` (the default since November 28, 2026; `make moto64` is the same, `make moto32` the 32-bit image) builds `build/sel4/moto-aarch64/boot.img` ([build64.py](build64.py)); `services/usb-diagnostics/host/moto-flash build/sel4/moto-aarch64/boot.img` installs it in `boot_b` like the 32-bit image, keeping the saved data. From the flash, it answers on USB Diagnostics in about 8 s with the Open Runtime's screen up, the saved `/data` read, Wi-Fi scanning and joining, and HTTPS working.
 
 What the image is:
 

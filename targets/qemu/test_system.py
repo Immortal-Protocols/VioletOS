@@ -1,10 +1,11 @@
-"""The one QEMU end-to-end test of the local loop (`make test-system`; not in CI).
+"""The QEMU end-to-end tests of the local loop (not in CI): the AArch64 system by
+default (`make test-system`), the 32-bit one with `--arch aarch32` (`make test-system32`).
 
 Everything else that waves 1 and 2 checked in QEMU is a host integration test
 now (tests/integration, seconds; docs/test-map.md lists where each assertion
 went). What is here needs the real kernel, the real MMU or the boot path:
 
-Boot 1, from slot A of a model A/B bootloader (tools/ota_boot.py):
+The 32-bit system (--arch aarch32). Boot 1, from slot A of a model A/B bootloader (tools/ota_boot.py):
   - Linux ABI on the real kernel (targets/qemu/abi-test-apps): signal frames
     and register state on delivery (VFP, Thumb IT and GE state), SA_RESTART,
     timers, fork through the fork gate, execve, posix_spawn, wait statuses, a
@@ -27,15 +28,15 @@ Boot 2, from slot B as a trial: the phone is locked from the start (the
   comes up healthy and the supervisor has Storage mark the slot successful,
   read here from the disk.
 
-`--arch aarch64` checks the AArch64 build of the same system instead
-(targets/qemu64/stack.py; `make qemu64 QEMU64_STACK=1`, not in the loop):
+The default (or `--arch aarch64`) checks the AArch64 build of the same system
+(targets/qemu64/stack.py, the image `make qemu-image` builds):
 verified boot first (four short boots to the entry stub's line: the image
 starts; a changed kernel byte, a changed root task byte and a rollback floor
 above its version are refused), then one boot, the layers it reaches in order
 (AARCH64_LAYERS below), then a 64-bit program's signals and posix_spawn
 (targets/qemu64/test-apps/abi64).
 
-The image must be the one `make test-system` builds: VIOLET_SYSTEM_VERSION=2,
+The 32-bit image must be the one `make test-system32` builds: VIOLET_SYSTEM_VERSION=2,
 VIOLET_UPDATE_URL=https://updates.violet.test/latest.vota, the test CA of
 `--prepare` as VIOLET_UPDATE_TEST_ROOT, VIOLET_OPEN_LDSO=1 and the three test
 app folders in VIOLET_OPEN_EXTRA_APPS. A program whose toolchain was missing
@@ -448,7 +449,7 @@ def main():
     on_home = home_grid.apps(cpio)
     missing = {"wxprobe", "probe", "victim", "settings"} - set(on_home)
     if missing:
-        fail(f"the image lacks {sorted(missing)} on Home: build it with make test-system")
+        fail(f"the image lacks {sorted(missing)} on Home: build it with make test-system32")
     abi = [p.name for p in sorted((ROOT / "targets/qemu/abi-test-apps").iterdir()) if (p / "app.txt").exists()]
     present = [a for a in abi if f"apps/{a}" in files and a in on_home]
     if "apps/abichild" not in files:
@@ -526,8 +527,8 @@ def main():
           "a signed update staged in slot B, booted as a trial and marked successful, the passcode lock kept across the restart")
 
 
-# --arch aarch64: the same system built for AArch64 (targets/qemu64/stack.py,
-# `make qemu64 QEMU64_STACK=1`; not in test-local or CI). One boot, checked
+# The default (--arch aarch64): the system built for AArch64 (targets/qemu64/stack.py,
+# `make qemu-image`; make test-system, in test-local, not in CI). One boot, checked
 # layer by layer in the order the system comes up: the supervisor creates the
 # services, Storage serves /data, the Open Runtime unpacks /apps and draws on
 # the 720 x 1600 screen, and Home, a 64-bit program the Open Runtime loads and

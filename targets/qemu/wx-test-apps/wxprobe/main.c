@@ -1,4 +1,4 @@
-/* Memory-protection probe for `make test-system` (targets/qemu/test_system.py).
+/* Memory-protection probe for `make test-system32` (targets/qemu/test_system.py).
  *
  * Every launch first makes the calls that must be refused without harm
  * (writable+executable memory, data turned into code, system calls writing

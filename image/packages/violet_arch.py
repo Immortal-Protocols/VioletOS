@@ -64,7 +64,7 @@ def require_components(environ=None):
     if arch == "aarch64":
         if UNPORTED:
             raise SystemExit(f"VIOLET_ARCH={arch}: the components are not ported to {arch} yet:\n  " + "\n  ".join(UNPORTED)
-                             + "\nBuild the 64-bit bring-up image with: make qemu64-image")
+                             + "\nBuild the 64-bit bring-up image with: make qemu64-image, or the 32-bit system with VIOLET_ARCH=aarch32")
         for line in APP_ABI_UNPORTED:
             print(f"VIOLET_ARCH={arch}: not ported yet: {line}", file=sys.stderr)
     return arch

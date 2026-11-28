@@ -3,7 +3,7 @@
 Waves 1 and 2 of the security work added eleven QEMU suites. Each built its own image and booted it, one after another: about 15 minutes for the seven slowest alone (887 s measured). They are gone. This page maps every assertion they made to where it is checked now, so nothing was dropped without a line here.
 
 - **Host**: a test in [tests/integration](../tests/integration/README.md) (`make test-integration`, seconds, parallel, part of `make test-unit` and so of CI). It runs the shipped sources against in-memory fakes of the kernel and hardware.
-- **QEMU**: [targets/qemu/test_system.py](../targets/qemu/test_system.py) (`make test-system`): one image, two boots.
+- **QEMU**: [targets/qemu/test_system.py](../targets/qemu/test_system.py): `make test-system32` (the 32-bit system: one image, two boots; the rows below) and `make test-system` (the AArch64 system, the default: four verified-boot boots and one boot; last section).
 - **Stand-in only**: a host test, but the property rests on code in `tests/integration/open/` or `tests/integration/world.rs` that copies shipped code which cannot be built for a host. The test checks the copy; the shipped code is not checked by the loop for this property unless a **QEMU** entry is in the same row.
 - **Dropped**: no longer checked by the local loop, with the reason and what still covers it.
 
@@ -62,7 +62,7 @@ What the host does run unchanged: policy.rs, manifest.rs, fs.rs, shield.rs, scor
 | cdyn: a dynamically linked program run by `/lib/ld-musl-armhf.so.1` | **QEMU** (cdyn). The shipped loader's checks: `runtime/open/tests/abi_host.rs` |
 | rsig: Rust std, a handler, `std::process::Command` | **QEMU** (rsig) |
 | goabi: Go with asynchronous preemption, `os/signal`, a recovered nil dereference, `os/exec`, three rounds | **QEMU** (goabi), **one round**. Dropped: the two more rounds (they looked for a rare preemption race; run `make test-system` again to repeat) |
-| The shipped loader passes `abi_host.rs the_shipped_loader` with `VIOLET_ABI_REQUIRE_LIBC=1` | Kept: `make test-system` runs it after its image build, before QEMU |
+| The shipped loader passes `abi_host.rs the_shipped_loader` with `VIOLET_ABI_REQUIRE_LIBC=1` | Kept: `make test-system32` runs it after its image build, before QEMU |
 | New on the host: SIGKILL and SIGSTOP cannot be caught; a handler that never fixes its fault is stopped after `FAULT_LIMIT` | Host `abi::sigkill_and_sigstop_cannot_be_caught`; Host (stand-in) `a_handler_that_never_fixes_the_fault_is_stopped` |
 
 ## test_lifecycle.py and test_idle.py (`make test-lifecycle`, `make test-idle`)
@@ -155,12 +155,12 @@ Main's app-drawn lock was replaced by the trusted UI's when the branches merged;
 
 | Assertion | Now |
 | --- | --- |
-| A short press of the power key turns the screen off; the next turns it on | **QEMU** `make test-system` trial boot (`power key: screen off locks, the next press turns it on`); Host `lock::short_press_acts_on_release_while_on`, `press_wakes_at_once_while_off`, `counted_press_between_samples`, `key_held_since_start_is_ignored` |
+| A short press of the power key turns the screen off; the next turns it on | **QEMU** `make test-system32` trial boot (`power key: screen off locks, the next press turns it on`); Host `lock::short_press_acts_on_release_while_on`, `press_wakes_at_once_while_off`, `counted_press_between_samples`, `key_held_since_start_is_ignored` |
 | The screen is black while off; a tap does not wake it | **Dropped** (QEMU): power.rs fills the frame black and the viewer drops touches while paused; not asserted |
 | Without a passcode nothing locks | Host `sysui::record_round_trip_and_damage` (`Pass::lock` is false with no record) |
-| A passcode set in Settings; a mismatched second entry starts over | The trusted UI's own keypad: Host sysui tests (`set_lock_unlock_with_backoff`); **QEMU** `make test-system` boot 1 sets one |
-| With a passcode the power key locks; the lock screen refuses a wrong passcode and an app icon, opens with the right one | **QEMU** `make test-system` trial boot (screen off locks); locked-at-boot, a refused tap and wrong/right passcodes are already there; Host sysui tests |
-| The phone starts locked on the next boot | **QEMU** `make test-system` trial boot |
+| A passcode set in Settings; a mismatched second entry starts over | The trusted UI's own keypad: Host sysui tests (`set_lock_unlock_with_backoff`); **QEMU** `make test-system32` boot 1 sets one |
+| With a passcode the power key locks; the lock screen refuses a wrong passcode and an app icon, opens with the right one | **QEMU** `make test-system32` trial boot (screen off locks); locked-at-boot, a refused tap and wrong/right passcodes are already there; Host sysui tests |
+| The phone starts locked on the next boot | **QEMU** `make test-system32` trial boot |
 | Holding the key shows the power sheet; Cancel closes it; Power off stops the machine | Host `lock::hold_is_long_once` and Home's `sheet::tests::sheet_buttons`. **Dropped** (QEMU): the sheet and an actual power off, which would end the consolidated run's boot |
 | New: a passcode saved by main's lock (`1 SALT HASH [WRONG]`) still unlocks and is rewritten as a VPL1 record | Host `sysui::an_earlier_locks_passcode_still_unlocks_and_is_upgraded` |
 
@@ -172,17 +172,17 @@ These came before the waves, or are host-only, and stay as separate local target
 
 ## The AArch64 build (`--arch aarch64`)
 
-The AArch64 handset build (`make moto64`) has one QEMU check, in the existing handset script: `python3 targets/moto-g-pure/test_boot.py --arch aarch64` (local, about 5 s: the 64-bit loader entered at EL2, the supervisor's four stages, Home, Radio's memory IPC). Its host side is in `make test-unit`: `tools/test_phone_image.py` (the 64-bit boot header and storage layout), `targets/moto-g-pure/test_history.rs` (stages 21-23), `kernel/sel4/aarch64/test_delta64.py` (the Wi-Fi extension and handset options in the manifest) and the board check (the handset kernels' timer).
+The AArch64 handset build (`make moto`, the default) has one QEMU check, in the existing handset script: `python3 targets/moto-g-pure/test_boot.py --arch aarch64` (local, about 5 s: the 64-bit loader entered at EL2, the supervisor's four stages, Home, Radio's memory IPC). Its host side is in `make test-unit`: `tools/test_phone_image.py` (the 64-bit boot header and storage layout), `targets/moto-g-pure/test_history.rs` (stages 21-23), `kernel/sel4/aarch64/test_delta64.py` (the Wi-Fi extension and handset options in the manifest) and the board check (the handset kernels' timer).
 
-No QEMU assertion moved or was dropped for the AArch64 port: the AArch32 rows above are unchanged, and `make test-system`, `make test-ci` and `make test-local` still boot only the AArch32 image. The AArch64 system has its checks in the same scripts, run by `make qemu64 QEMU64_STACK=1` and by hand, outside the loop and CI ([targets/qemu64](../targets/qemu64/README.md#the-violetos-system-on-aarch64)): `test_system.py --arch aarch64` (one boot: the layers in order, then a 64-bit program's signal handlers and posix_spawn), `test_open_apps.py --arch aarch64` and `test_ladybird.py --arch aarch64`. The host side is in `make test-unit`: `runtime/arch/tests/host.rs` (`enter64`, `widen`, `memory_args`, `signal64`, `compat`), `runtime/open/tests/abi_host.rs` (AArch64 programs below 4 GiB or refused, sigreturn's alternate stack) and the integration scenario `an_aarch64_program_meets_the_same_policy_through_its_own_numbers` (through the shipped `enter64::translate` and `widen`).
+Since AArch64 became the default (November 28, 2026) no assertion was dropped: the AArch32 rows above are `make test-system32`'s, unchanged, and still in `make test-local`. `make test-system` is now the AArch64 system ([targets/qemu64](../targets/qemu64/README.md#the-violetos-system-on-aarch64)): verified boot (four short boots), then one boot (the layers in order, a 64-bit program's signal handlers and posix_spawn, fork and the 47-bit layout in c64, the timekeeper's timer trapping for apps). `make test-ci` (and CI) boots the AArch64 image: `test_guest.py` (all eight touch-fault modes of `make test-emulator` pass on it) and `test_open_apps.py`; `test_ladybird.py` defaults to it. The suites whose test programs or fixtures exist only for the 32-bit image (isolation probes, audio, test-open, memory, Wi-Fi app, packages, agent, Shield, the handset diagnostics) build and boot it with `qemu32`/`moto32`. The host side is in `make test-unit`: `runtime/arch/tests/host.rs` (`enter64`, `widen`, `memory_args`, `signal64`, `compat`), `runtime/open/tests/abi_host.rs` (AArch64 programs below 4 GiB or refused, sigreturn's alternate stack) and the integration scenario `an_aarch64_program_meets_the_same_policy_through_its_own_numbers` (through the shipped `enter64::translate` and `widen`).
 
 What `test_system.py` checks on AArch32 and has **no AArch64 counterpart yet**:
 
 | AArch32 check | On AArch64 |
 | --- | --- |
-| Linux ABI apps (cdyn, cfault, charden, cproc, csig, goabi, rsig) | Not built: they need an AArch64 musl C toolchain. A 64-bit Rust program (`targets/qemu64/test-apps/abi64`) covers signals, siginfo, a fault's handler and posix_spawn. fork without `CLONE_VM` answers ENOSYS. |
+| Linux ABI apps (cdyn, cfault, charden, cproc, csig, goabi, rsig) | Not built for AArch64. A 64-bit Rust program (`targets/qemu64/test-apps/abi64`) covers signals, siginfo, a fault's handler and posix_spawn; a 64-bit C program (`test-apps/c64`) covers fork without `CLONE_VM`. |
 | W^X and layout randomization on real page tables (wxprobe) | `test_system.py --arch aarch64` runs test-apps/c64 twice: every part above 4 GiB and moved between launches, W^X refusals, a high address's low 32 bits EFAULT. Host `memprot_host` `layout64_addresses_are_never_cut_to_32_bits` and `memory::*` cover the decisions. |
 | The policy probe (boot 1) | Not run. Host `policy::*` and the integration scenario above cover the decisions. |
 | Verified boot | `test_system.py --arch aarch64`: the image starts; a changed kernel or root task byte and a floor above its version are refused. |
-| The timekeeper | Absent on AArch64. Printed as an absent layer from `differences.json`, never as a pass. |
+| The timekeeper | Present (the per-thread timer grant): an app's reads and writes of the timer trap and its sleep ends on time. A kernel without the grant is printed as an absent layer from `differences.json`, never as a pass. |
 | The trusted UI's lock kept across a restart (boot 2) | Not run on AArch64. |

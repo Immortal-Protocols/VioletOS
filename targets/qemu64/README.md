@@ -1,13 +1,13 @@
-# qemu64: the AArch64 bring-up target
+# qemu64: the AArch64 QEMU target
 
-VioletOS ships as an AArch32 system. This target moves it to AArch64 on QEMU `virt`, built beside the default one and changing nothing in it. It has two images: the bring-up image (a bootstrap task and two test programs, the first sections below), and the whole VioletOS system ([The VioletOS system on AArch64](#the-violetos-system-on-aarch64)). `make qemu64` builds the first and boots it in `qemu-system-aarch64`; `make qemu64 QEMU64_STACK=1` also builds, boots and checks the second. CI and `make test-local` neither build nor boot either.
+VioletOS's default QEMU system is AArch64 on QEMU `virt` (the 32-bit one is `make qemu32-image`). This target has two images: the bring-up image (a bootstrap task and two test programs, the first sections below), and the whole VioletOS system ([The VioletOS system on AArch64](#the-violetos-system-on-aarch64)), which `make qemu-image` builds and `make emulator`, `make test-system`, `make test-ci` (in CI too), `make test-open-apps` and `make test-ladybird` boot. `make qemu64` builds the first and boots it in `qemu-system-aarch64`.
 
 ```sh
 make qemu64-image     # build/sel4/qemu64/qemu64.bin
 make qemu64           # build, boot, and check the console lines below
 ```
 
-It needs what `make qemu-image` needs, plus the Rust target `aarch64-unknown-none` (`rustup target add aarch64-unknown-none`).
+It needs the Rust targets `aarch64-unknown-none` and, for the open apps, `aarch64-unknown-linux-musl` (`rustup target add ...`, or `python3 targets/qemu64/toolchain.py`), and the AArch64 musl sysroot, which `make qemu-image` builds (`VIOLET_ARCH=aarch64 python3 tools/build_python.py musl`).
 
 ## What runs in the bring-up image
 
@@ -53,14 +53,14 @@ qemu64: done
 
 ## The VioletOS system on AArch64
 
-[stack.py](stack.py) builds the real system for this machine, beside the bring-up image: `make qemu64-image QEMU64_STACK=1` (or `python3 tools/build_sel4.py qemu-aarch64`) writes `build/sel4/qemu-aarch64`, and `VIOLET_ARCH=aarch64 python3 tools/run.py VIEWER` boots it with the AArch32 emulator's devices, fixtures and blobs (the same addresses: both kernels use the same device trees). It is the QEMU half of `platform/sel4/loader/build.py` with `VIOLET_ARCH=aarch64`:
+[stack.py](stack.py) builds the real system for this machine, beside the bring-up image: `make qemu-image` (or `python3 tools/build_sel4.py qemu`) writes `build/sel4/qemu-aarch64`, and `make emulator` (`python3 tools/run.py VIEWER`) boots it with the AArch32 emulator's devices, fixtures and blobs (the same addresses: both kernels use the same device trees). It is the QEMU half of `platform/sel4/loader/build.py` with `VIOLET_ARCH=aarch64`:
 
 - the same delta-checked kernel and entry stub as above ([build.py](build.py) `build_kernel`, `boot_image`), with the supervisor as the root task, entered at [root64.S](../../platform/sel4/loader/root64.S) with x0 = BootInfo and its stack at the top of its 1.5 MiB window;
 - the services, Open Runtime and Sentinel from [image/packages/build.py](../../image/packages/build.py) for `aarch64-unknown-none`, linked with 4 KiB pages, each package's signed ABI word marked AArch64 so neither supervisor loads the other's;
 - C built with `-mgeneral-regs-only -mstrict-align` (the supervisor reads catalogs and keys in windows mapped as device memory);
 - the open apps from [tools/build_initfs.py](../../tools/build_initfs.py) for `aarch64-unknown-linux-musl`, Go `linux/arm64` and an AArch64 musl and Python from [tools/build_python.py](../../tools/build_python.py) (`build/open-toolchain/aarch64`), all ARMv8.0 (no LSE atomics).
 
-`make qemu64 QEMU64_STACK=1` then boots it and checks it layer by layer (`python3 targets/qemu/test_system.py --arch aarch64`, about 5 s): the supervisor starts every service, Storage serves `/data`, the Open Runtime reads the installed apps and the policy manifests, unpacks `/apps`, seeds its random generator, starts Home as a 64-bit program, Home shows, the screen is drawn and the Sentinel answers; then Home opens [test-apps/abi64](test-apps/abi64/main.rs), a 64-bit Rust program whose signal handlers run through the A64 gate (a handler by `signal`, an `SA_SIGINFO` handler's 64-bit siginfo, a SIGSEGV handler that makes the page writable and returns to the faulting write with the SIMD registers intact) and which starts itself with `std::process::Command` (posix_spawn: clone with `CLONE_VM|CLONE_VFORK`, execve, pipes, wait4). stack.py puts that test program in this development image, as the AArch32 test image has its own. It then runs `targets/qemu/test_open_apps.py --arch aarch64` (two boots, about 20 s): Home's Settings icon opens Settings, Date & Time picks Tokyo, the Wi-Fi page scans, Agent Apps opens, Music starts, and after a restart Settings still has Tokyo. `targets/qemu/test_ladybird.py --arch aarch64` (about 40 s) drives the browser: HTTP links, a linked style sheet, back, scrolling, a typed address and HTTPS. What it reaches today:
+`make test-system` then boots it and checks it layer by layer (`python3 targets/qemu/test_system.py`, under a minute with its verified-boot boots): the supervisor starts every service, Storage serves `/data`, the Open Runtime reads the installed apps and the policy manifests, unpacks `/apps`, seeds its random generator, starts Home as a 64-bit program, Home shows, the screen is drawn and the Sentinel answers; then Home opens [test-apps/abi64](test-apps/abi64/main.rs), a 64-bit Rust program whose signal handlers run through the A64 gate (a handler by `signal`, an `SA_SIGINFO` handler's 64-bit siginfo, a SIGSEGV handler that makes the page writable and returns to the faulting write with the SIMD registers intact) and which starts itself with `std::process::Command` (posix_spawn: clone with `CLONE_VM|CLONE_VFORK`, execve, pipes, wait4). stack.py puts that test program in this development image, as the AArch32 test image has its own. It then runs `targets/qemu/test_open_apps.py --arch aarch64` (two boots, about 20 s): Home's Settings icon opens Settings, Date & Time picks Tokyo, the Wi-Fi page scans, Agent Apps opens, Music starts, and after a restart Settings still has Tokyo. `targets/qemu/test_ladybird.py --arch aarch64` (about 40 s) drives the browser: HTTP links, a linked style sheet, back, scrolling, a typed address and HTTPS. What it reaches today:
 
 | Layer | AArch64 |
 | --- | --- |
@@ -89,7 +89,7 @@ Idle measurement (November 28, 2026, Apple Silicon Mac, `VIOLET_ARCH=aarch64 pyt
 - Randomness: before the first program, the bootstrap task seeds the Open Runtime's HMAC_DRBG ([runtime/open/entropy.rs](../../runtime/open/entropy.rs), with Storage's SHA-256) from timer jitter, credited as conservatively as the Open Runtime does. Each program then gets its own 16 AT_RANDOM bytes (musl's stack-protector canary and pointer guard), a stack top at a random page in the 128 MiB below 2 GiB, and anonymous mappings from a random page in a 1 GiB window. Unseeded: no program starts. Static programs (ET_EXEC) still load at their link address; there is no hardware entropy source on this machine model, so the seed is only as good as the jitter.
 - A program's only capability is a badged endpoint through which the kernel delivers its faults; with a native `svc #1` it can send its own messages there. The bootstrap task trusts the fault label of what arrives; a real runtime must not.
 - Executable pages are cache-synchronised (`seL4_ARM_Page_Unify_Instruction`) after loading, when made executable by mprotect, and when mapped executable. Plain QEMU does not model caches, so the boot test cannot show this is needed or sufficient; it is unverified on hardware.
-- No device tree is passed to the kernel. The handset has its own AArch64 image now (`make moto64`, [targets/moto-g-pure](../moto-g-pure/README.md#aarch64-boot-path)): it reuses this target's boot page tables and the same kernel source built for the handset, with a 64-bit loader of its own.
+- No device tree is passed to the kernel. The handset has its own AArch64 image, the default (`make moto`, [targets/moto-g-pure](../moto-g-pure/README.md#aarch64-boot-path)): it reuses this target's boot page tables and the same kernel source built for the handset, with a 64-bit loader of its own.
 
 ## Tests
 

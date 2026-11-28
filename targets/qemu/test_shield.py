@@ -285,7 +285,7 @@ def main():
     args = ap.parse_args()
     original = ROOT / "build/sel4/qemu"
     if not (original / "zImage").exists():
-        raise SystemExit("Build the QEMU image first (make qemu-image).")
+        raise SystemExit("Build the 32-bit QEMU image first (make qemu32-image).")
     record = Path(args.record).resolve() if args.record else None
     if record:
         record.mkdir(parents=True, exist_ok=True)

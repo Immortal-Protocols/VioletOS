@@ -1,6 +1,6 @@
 /* A dynamically linked program: musl's loader (/lib/ld-musl-armhf.so.1, the
  * PT_INTERP the Open Runtime accepts) relocates it, its thread-local storage
- * and its calls into libc.so (make test-system). */
+ * and its calls into libc.so (make test-system32). */
 #include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>

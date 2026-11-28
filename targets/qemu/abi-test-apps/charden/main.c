@@ -1,4 +1,4 @@
-/* The Open Runtime's process and signal limits (make test-system): fork keeps
+/* The Open Runtime's process and signal limits (make test-system32): fork keeps
  * the caller's VFP registers (d8 is kept across calls) and FPSCR, a 1 us
  * interval timer fires at most once a millisecond, an unaligned LDRD is
  * SIGBUS with BUS_ADRALN, SIGKILL ends a vfork child that sleeps or spins

@@ -7,7 +7,7 @@ starts (when the image has it). Second boot on the same disk: Settings starts
 with Tokyo still chosen.
 
 `--arch aarch64` runs the same two boots on the AArch64 build of the system
-(targets/qemu64/stack.py, `make qemu64 QEMU64_STACK=1`); not in CI.
+(targets/qemu64/stack.py, `make qemu-image`).
 """
 
 from pathlib import Path
