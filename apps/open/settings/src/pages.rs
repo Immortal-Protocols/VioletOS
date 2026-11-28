@@ -12,13 +12,14 @@ pub enum Section {
     Time,
     AgentApps,
     Passcode,
+    Power,
     About,
     /// Settings › Updates (updates.rs), drawn by its own module like Wi-Fi.
     Updates,
 }
 
 /// The menu, in order (Passcode last but one, so the rows above keep their places).
-pub const MENU: [(Section, &str); 8] = [
+pub const MENU: [(Section, &str); 9] = [
     (Section::Wifi, "Wi-Fi"),
     (Section::Bluetooth, "Bluetooth"),
     (Section::PhoneLink, "Phone Link"),
@@ -27,6 +28,7 @@ pub const MENU: [(Section, &str); 8] = [
     (Section::Passcode, "Passcode"),
     (Section::About, "About"),
     (Section::Updates, "Updates"),
+    (Section::Power, "Power"),
 ];
 
 /// Something under the finger, drawn pressed.
@@ -42,6 +44,8 @@ pub enum Hit {
     /// Set or change the passcode, or turn it off: the runtime's own keypad asks.
     PassSet,
     PassOff,
+    /// Power: power off (tapped twice).
+    PowerOff,
 }
 
 /// An app Violet Agent installed.
@@ -134,6 +138,9 @@ pub fn delete_rect(i: usize) -> Rect {
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
 pub const PASS_SET: Rect = Rect::new(40, 1010, W as i32 - 40, 1110);
 pub const PASS_OFF: Rect = Rect::new(40, 1140, W as i32 - 40, 1240);
+pub const POWER_OFF: Rect = Rect::new(40, 540, W as i32 - 40, 650);
+/// Confirming Power off (View::confirm).
+pub const CONFIRM_POWER: usize = usize::MAX - 1;
 
 pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
     if HOME_BOX.contains(x, y) {
@@ -160,6 +167,7 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
         }
         Section::Passcode if PASS_SET.contains(x, y) => Some(Hit::PassSet),
         Section::Passcode if v.status.passcode && PASS_OFF.contains(x, y) => Some(Hit::PassOff),
+        Section::Power => POWER_OFF.contains(x, y).then_some(Hit::PowerOff),
         _ => None,
     }
 }
@@ -226,11 +234,11 @@ pub fn menu_value(s: &Status, section: Section) -> (String, bool) {
             (if parts.is_empty() { "Not linked".into() } else { parts.join(" · ") }, s.shield_linked || s.relay == "online")
         }
         Section::Time => (CITIES[s.city.min(CITIES.len() - 1)].into(), false),
+        Section::Passcode => ((if s.passcode { "On" } else { "Off" }).into(), s.passcode),
         Section::AgentApps => {
             let n = s.installed.len();
             (if n == 0 { "None".into() } else { format!("{n} installed") }, false)
         }
-        Section::Passcode => ((if s.passcode { "On" } else { "Off" }).into(), s.passcode),
         _ => (String::new(), false),
     }
 }
@@ -383,6 +391,19 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             }
             if !v.note.is_empty() {
                 f.regular(26.0).centered(c, v.note, 0, W as i32, 1290, ALERT);
+            }
+        }
+        Section::Power => {
+            header(c, f, v, "‹ Settings", "Power");
+            let card = Rect::new(40, 230, W as i32 - 40, 500);
+            slab(c, card, 30.0, PAPER_RAISED);
+            f.medium(36.0).draw(c, if s.battery >= 0 { format!("Battery {}%", s.battery) } else { "Power button".into() }.as_str(), 80, 300, CREAM);
+            paragraph(c, &f.regular(28.0), "Press the power button to turn the screen off, and again to turn it on. Hold it on any screen to power off.", 80, 360, card.width() - 80, MUTED);
+            let confirm = v.confirm == Some(CONFIRM_POWER);
+            let bg = if v.pressed == Some(Hit::PowerOff) { PAPER_PRESSED } else if confirm { ALERT } else { PAPER_RAISED };
+            violet::button(c, &f.medium(34.0), POWER_OFF, if confirm { "Tap again to power off" } else { "Power off" }, bg, if confirm { PAPER } else { ALERT });
+            if !v.note.is_empty() {
+                f.regular(26.0).centered(c, v.note, 0, W as i32, 720, ALERT);
             }
         }
         Section::About => {

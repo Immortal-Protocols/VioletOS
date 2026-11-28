@@ -158,7 +158,7 @@ pub const ACCENT: u32 = 0xffd1b0fe;
 pub const ALERT: u32 = 0xffff5a5f;
 pub const OK_GREEN: u32 = 0xff6ee7a8;
 
-fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
+pub(super) fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
     // Scanout is mapped cached, so plain stores (written back by the clean
     // below or by the caller) are as visible as volatile ones, and a row is
     // one fill instead of a store per pixel: the app list used to take long
@@ -1195,6 +1195,8 @@ impl Runtime {
                 String::from("ok\n")
             }
             // The list of every program in /apps.
+            // "power off" (power.rs); plain "power" is Power's state (powerctl.rs, below).
+            Some("power") if line.split_whitespace().nth(1) == Some("off") => self.power_command(i, &mut words),
             Some("apps") => {
                 self.set_foreground(None);
                 self.shell.dirty = true;
@@ -1235,6 +1237,45 @@ impl Runtime {
             Some("frames") => alloc::format!("{} {}", super::touch::describe(), self.frames.report(sys::now_ns())),
             // `bench tap X Y N`: N synthetic presses on the app in front;
             // `bench drag X Y DY N`: N drags of DY pixels over 250 ms each.
+            // The agent's eyes and finger, for the owner's requests ("open my timer and start it"):
+            // "screenshot" writes what the panel shows, at half size (360 x 800 RGB), to
+            // /tmp/.agent-screen; "gesture X1 Y1 X2 Y2 MS" touches the screen (a tap when the
+            // points are the same). Only the agent (/apps/agent) may use them.
+            Some(verb @ ("screenshot" | "gesture")) => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                if path != super::appstore::INSTALLER {
+                    return String::from("error only the agent sees and touches the screen\n");
+                }
+                if !self.focused {
+                    return String::from("error the open apps are not on screen\n");
+                }
+                if verb == "screenshot" {
+                    let mut rgb = Vec::with_capacity(360 * 800 * 3);
+                    for y in (0..HEIGHT).step_by(2) {
+                        let row = unsafe { core::slice::from_raw_parts((FRAMEBUFFER as *const u32).add(y * WIDTH), WIDTH) };
+                        for &p in row.iter().step_by(2) {
+                            rgb.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+                        }
+                    }
+                    if let Some(f) = self.fs.writable("/tmp/.agent-screen", true, true, 0) {
+                        *f = rgb;
+                    }
+                    let front = self.foreground.and_then(|f| self.apps[f].as_ref()).map_or("apps", |a| a.name.as_str());
+                    return alloc::format!("ok 360 800 {} {} {}\n", WIDTH, HEIGHT, front);
+                }
+                let v: Vec<i32> = words.map(|w| w.parse::<i32>().unwrap_or(-1)).collect();
+                let inside = |x: i32, y: i32| (0..WIDTH as i32).contains(&x) && (0..HEIGHT as i32).contains(&y);
+                match v.as_slice() {
+                    &[x1, y1, x2, y2, ms] if inside(x1, y1) && inside(x2, y2) && (0..=3000).contains(&ms) => {
+                        if self.gesture.is_some() {
+                            return String::from("error a gesture is in progress\n");
+                        }
+                        self.gesture = Some(super::frames::Gesture { from: (x1, y1), to: (x2, y2), ms: ms.max(60) as u64, start_ns: 0 });
+                        String::from("ok\n")
+                    }
+                    _ => String::from("error usage: gesture X1 Y1 X2 Y2 MS\n"),
+                }
+            }
             Some("bench") => {
                 let verb = words.next();
                 let (drag, release) = (verb == Some("drag"), verb == Some("press"));

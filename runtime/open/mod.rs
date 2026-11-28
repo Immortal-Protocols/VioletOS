@@ -49,6 +49,8 @@ pub mod powerctl;
 pub mod sntp;
 pub mod timesync;
 pub mod update;
+pub mod lock;
+pub mod power;
 
 use crate::protocol::*;
 use alloc::rc::Rc;
@@ -270,6 +272,8 @@ pub struct Runtime {
     pub wifi: wifi::Wifi,
     /// Present cost, input-to-frame latency and touch polling (frames.rs).
     pub frames: frames::Frames,
+    /// The agent's finger in progress (frames.rs Gesture).
+    pub gesture: Option<frames::Gesture>,
     /// The panel's scan line and frame count (scanout.rs).
     pub beam: scanout::Beam,
     /// Reports Touch reads on its interrupt (touch.rs, handset).
@@ -280,6 +284,8 @@ pub struct Runtime {
     pub app_limit: usize,
     /// Memory pressure and the apps closed for memory (lifecycle.rs).
     pub life: lifecycle::Book,
+    /// The power key: screen off and on, the power sheet (power.rs).
+    pub power: power::Power,
 }
 
 /// A request to Runtime, waiting for its ticket like the app SDK does.
@@ -398,9 +404,11 @@ impl Runtime {
             last_sentinel: 0,
             wifi: wifi::Wifi::default(),
             frames: frames::Frames::default(),
+            gesture: None,
             beam: scanout::Beam::default(),
             ring: touch::Ring::default(),
             tiered: None,
+            power: power::Power::default(),
             // Requests made before this boot are not repeated.
             usb_serial: if cfg!(moto_board) { unsafe { (0x0900_1000 as *const u32).read_volatile() } } else { 0 },
         })
@@ -1090,6 +1098,11 @@ impl Runtime {
                 self.refresh(i);
                 self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
             }
+            // Runtime turned the microphone off with the screen: an agent
+            // listening from the background hears again.
+            if self.audio && self.background_listener().is_some() {
+                device::mic::resume();
+            }
         }
         if !focused && self.focused {
             // Under system UI it was told already (trusted_ui.rs ui_switch).
@@ -1189,6 +1202,32 @@ impl Runtime {
 
     /// Synthetic presses from `bench tap`: a touch down on the app in front,
     /// then, 150 ms later, focus handed back so it drops the press.
+    /// Move the agent's finger: down, a sample every 16 ms along the line, then up.
+    fn gesture_tick(&mut self, now: u64) {
+        let Some(mut g) = self.gesture else { return };
+        if !self.focused {
+            self.gesture = None;
+            return;
+        }
+        if g.start_ns == 0 {
+            g.start_ns = now;
+            self.touch(g.from.0, g.from.1, true);
+            self.gesture = Some(g);
+            return;
+        }
+        let t = ((now - g.start_ns) / 1_000_000).min(g.ms);
+        let at = |a: i32, b: i32| a + ((b - a) as i64 * t as i64 / g.ms.max(1) as i64) as i32;
+        let (x, y) = (at(g.from.0, g.to.0), at(g.from.1, g.to.1));
+        if t >= g.ms {
+            self.touch(g.to.0, g.to.1, true);
+            self.touch(g.to.0, g.to.1, false);
+            self.gesture = None;
+        } else {
+            self.touch(x, y, true);
+            self.gesture = Some(g);
+        }
+    }
+
     fn bench_tick(&mut self, now: u64) {
         let Some(mut b) = self.frames.bench else { return };
         // Never onto system UI, and never under it (trusted_ui.rs).
@@ -1320,11 +1359,13 @@ impl Runtime {
                 self.poll_runtime();
                 self.stats.slowest_poll = self.stats.slowest_poll.max(sys::now_ns().wrapping_sub(now));
             }
+            self.power_tick(now);
             self.drain_touch();
             // The band, prompts, the passcode pad and the lock screen.
             self.ui_tick(now);
             self.set_tiers();
             self.bench_tick(now);
+            self.gesture_tick(now);
             self.beam.tick();
             self.flush_presents();
             // Before the waiters: an app back in front runs again this pass.

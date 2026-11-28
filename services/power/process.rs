@@ -173,6 +173,7 @@ pub fn run() -> ! {
             (3,POWER,GET) if m.value == POWER_INFO => info(manager, &board, now),
             (3,POWER,GET) if m.value & !0xff == POWER_LOCKS => locks(manager, (m.value & 0xff) as usize, m.arg != 0, now),
             (3,POWER,GET) => power_backend::read(),
+            (3,POWER_KEY,GET) => power_backend::key(),
             // Runtime has blanked the screen. With a wake lock held the
             // screen stays off and the suspend waits: arg names the kinds.
             // Sleep and wake are refused (OFFLINE) once Power has commanded a

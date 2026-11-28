@@ -31,7 +31,7 @@ fn service(key: u32) -> u32 {
         SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         PRESENT => 5,
         SCAN | NETWORK | PROFILE | RADIO | RADIO_TEST | RELAY => 7,
-        POWER => 8,
+        POWER | POWER_KEY => 8,
         CATALOG | INBOX | INSTALL | REMOVE => 9,
         _ => 0,
     }
@@ -45,7 +45,7 @@ const STREAM_KEYS: [u32; STREAMS] = [CONTACT, RADIO, POWER, VOLUME, PLAYBACK, MI
 fn component(key: u32) -> u32 {
     match key {
         RADIO | NETWORK | PROFILE | RADIO_TEST | SCAN | RELAY => 7,
-        POWER => 8,
+        POWER | POWER_KEY => 8,
         SAVE | FILE_LIST..=FILE_DELETE | APPSTORE => 6,
         VOLUME | PLAYBACK | MICROPHONE => AUDIO_COMPONENT,
         _ => 0,
@@ -303,7 +303,11 @@ impl Runtime {
             // Volume is shared. Only the app on screen may change it, make sound
             // or listen.
             (EXECUTE, VOLUME | PLAYBACK | MICROPHONE) if who == self.focus && !self.asleep => audio(m),
-            (EXECUTE, POWER) if who == LAUNCHER && m.value <= 2 => {
+            (GET, POWER_KEY) if who == OPEN_APPS => self.forward(who, 8, m),
+            // Sleep (1), wake (0) and power off (2): the launcher, or the Open
+            // Runtime when the power key is pressed or Home's power sheet is
+            // confirmed (runtime/open/power.rs).
+            (EXECUTE, POWER) if (who == LAUNCHER || who == OPEN_APPS) && m.value <= 2 => {
                 if m.value == 1 {
                     self.sleep();
                 } else {
@@ -640,13 +644,17 @@ mod tests {
     fn power_radio_and_store_controls_are_not_for_apps() {
         for who in EVERYONE {
             let mut rt = runtime(ALL, who);
-            // Sleep, wake and shut down: the launcher. (Values past 2 are nobody's.)
+            // Sleep, wake and shut down: the launcher, and the Open Runtime for
+            // the power key and power off. (Values past 2 are nobody's.)
             for value in 0..=2 {
-                assert_eq!(lane_of(&mut rt, who, EXECUTE, POWER, value) == Some(8), who == LAUNCHER, "POWER {value} by {who}");
+                assert_eq!(lane_of(&mut rt, who, EXECUTE, POWER, value) == Some(8), who == LAUNCHER || who == OPEN_APPS, "POWER {value} by {who}");
                 // (A sleep locks: start the next check unlocked and awake.)
                 (rt.asleep, rt.locked, rt.slept, rt.focus) = (false, false, false, who);
             }
             assert!(denied(&mut rt, who, EXECUTE, POWER, 3));
+            // The power key: the Open Runtime polls it.
+            assert_eq!(lane_of(&mut rt, who, GET, POWER_KEY, 0) == Some(8), who == OPEN_APPS, "POWER_KEY by {who}");
+            (rt.asleep, rt.locked, rt.slept, rt.focus) = (false, false, false, who);
             // Wake locks: the Open Runtime, on behalf of the app it names.
             for value in [POWER_LOCK, POWER_LOCK | POWER_LOCK_FULL, POWER_LOCK | 0xff] {
                 assert_eq!(lane_of(&mut rt, who, EXECUTE, POWER, value) == Some(8), who == OPEN_APPS, "wake lock by {who}");

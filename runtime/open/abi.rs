@@ -138,6 +138,9 @@ pub const EVENT_LIFECYCLE: u16 = 7;  // value = FOCUS_GAINED / FOCUS_LOST / SLEE
 pub const KEY_VOL_UP: u16 = 1;
 pub const KEY_VOL_DOWN: u16 = 2;
 pub const KEY_HOME: u16 = 3;
+/// Sent to Home alone, with value 1, when the power key is held: it shows the
+/// power sheet. Short presses turn the screen off and on and reach no app.
+pub const KEY_POWER: u16 = 4;
 
 pub const LIFECYCLE_FOCUS_GAINED: i32 = 1;
 pub const LIFECYCLE_FOCUS_LOST: i32 = 2;
@@ -163,3 +166,4 @@ pub struct InputEvent {
 //   write "volume 12\n"     -> sets hardware volume 0..15
 //   write "launch /apps/music/main.py\n" -> opens another app
 //   write "wakelock 1\n"    -> keeps CPU awake while streaming in background
+//   write "lock\n"          -> read "locked=0 set=1 wait=0\n" (the screen lock: runtime/open/power.rs)

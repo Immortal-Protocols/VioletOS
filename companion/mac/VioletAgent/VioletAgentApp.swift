@@ -1,13 +1,28 @@
-// Violet Agent for macOS: pairs with the VioletOS phone by its QR code,
-// listens through the phone, answers and builds apps with Codex, and installs
-// them on the phone. See companion/mac/README.md.
+// Violet Agent for macOS: pairs with the VioletOS phone by its QR code and
+// runs its agent, Rose (RoseAgent.swift), who hears the phone, talks, and has
+// the apps she is asked for built and installed. See companion/mac/README.md.
 import SwiftUI
+
+/// Starts the agent when the app launches, whether or not a window appears
+/// (macOS may not show one, for example while another copy is running).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// One model for the app and its window (the window observes it for the Locomo tab).
+    static let shared = AgentModel()
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared.start()
+    }
+}
 
 @main
 struct VioletAgentApp: App {
-    @StateObject private var model = AgentModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @ObservedObject private var model: AgentModel
     @State private var tab = Tab.agent
     private enum Tab { case agent, shield, locomo, add }
+
+    init() {
+        model = AppDelegate.shared
+    }
 
     var body: some Scene {
         WindowGroup("Violet Agent") {
@@ -48,7 +63,6 @@ struct VioletAgentApp: App {
             }
                 .environmentObject(model)
                 .frame(minWidth: 560, minHeight: 640)
-                .onAppear { model.start() }
                 .onChange(of: model.locomoApp) { _, app in
                     if app != nil && tab == .add { tab = .locomo }
                 }
@@ -135,8 +149,11 @@ struct ContentView: View {
                         Pill(ok: model.directPath != nil, text: model.directPath.map { "Direct path to the phone (\($0))" } ?? "Through the relay (no direct path)")
                     }
                 }
-                Pill(ok: model.codexState.hasPrefix("Codex ready"), text: model.codexState)
-                Pill(ok: model.speechState.hasPrefix("Speech recognition on"), text: model.speechState)
+                Pill(ok: model.speechState.hasPrefix("Rose is listening"), text: model.speechState)
+                if let url = model.dashboard.flatMap(URL.init(string:)) {
+                    Link("Rose's dashboard: her life, journal, tasks and transcripts", destination: url).font(.callout)
+                }
+                Pill(ok: model.codexState.hasPrefix("Builder ready"), text: model.codexState)
                 Pill(ok: model.workspaceState.hasPrefix("App workspace ready"), text: model.workspaceState)
                 if let t = model.lastTiming { Pill(ok: true, text: t) }
             }

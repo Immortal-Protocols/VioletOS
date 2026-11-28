@@ -62,6 +62,8 @@ pub struct State {
     pub shield: Shield,
     /// The voice agent is listening (in front or in the background).
     pub listening: bool,
+    /// The power sheet is up (the power key was held).
+    pub sheet: Option<crate::sheet::Sheet>,
 }
 
 /// What a press landed on: an app, the Shield pill, or Lock.
@@ -163,6 +165,13 @@ pub fn draw_clipped(c: &mut Canvas, f: &Fonts, art: &Art, s: &State, r: Rect) {
 
 pub fn draw(c: &mut Canvas, f: &Fonts, art: &Art, s: &State) {
     c.copy_rows(&art.wallpaper, 0, H as i32);
+    grid(c, f, art, s);
+    if let Some(sheet) = &s.sheet {
+        crate::sheet::draw_sheet(c, f, sheet);
+    }
+}
+
+fn grid(c: &mut Canvas, f: &Fonts, art: &Art, s: &State) {
     let date = s.now.as_ref().map(|t| t.date()).unwrap_or_else(|| "VioletOS".to_string());
     let date_face = f.regular(55.0);
     let date_width = pill_rect().x0 - if s.listening { 94 } else { 64 };

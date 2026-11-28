@@ -139,6 +139,25 @@ if STAGE == "trial":
     print("lock: the passcode survived the restart; locked at boot, a tap opened nothing, the right passcode unlocked", file=sys.stderr)
     until("the supervisor marks the slot successful", lambda: control().slot(slot)["successful"], 90)
     print("update: slot B marked successful after a healthy boot", file=sys.stderr)
+    # The power key (runtime/open/power.rs; was targets/qemu/test_lock.py): a
+    # short press turns the screen off and, with a passcode set, locks; the
+    # next turns it on to the lock screen.
+    low = mmap.mmap(ram.fileno(), 0x4000, offset=0x49000000 - 0x40000000)
+    def power():
+        # targets/qemu/power.rs words 17 (held) and 18 (presses); 13 bit 0 the wake line.
+        struct.pack_into("<I", low, 0x2000 + 17 * 4, 1)
+        struct.pack_into("<I", low, 0x2000 + 18 * 4, struct.unpack_from("<I", low, 0x2000 + 18 * 4)[0] + 1)
+        struct.pack_into("<I", low, 0x2000 + 13 * 4, struct.unpack_from("<I", low, 0x2000 + 13 * 4)[0] | 1)
+        time.sleep(0.15)
+        struct.pack_into("<I", low, 0x2000 + 17 * 4, 0)
+    before = everything().count("screen off, locked")
+    power()
+    until("the power key turns the screen off and locks", lambda: everything().count("screen off, locked") > before, 15)
+    before = everything().count("screen on")
+    time.sleep(0.5)
+    power()
+    until("the power key turns the screen on", lambda: everything().count("screen on") > before, 15)
+    print("power key: screen off locks, the next press turns it on", file=sys.stderr)
     sys.exit(0)
 
 if "entropy: seeded" not in everything() and "too little timer jitter" in everything():

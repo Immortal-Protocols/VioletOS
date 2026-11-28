@@ -5,7 +5,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 - **System components** (the boot [launcher](apps/launcher/README.md)) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
 - **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The phone ships with [Home](apps/open/home), [Ladybird Browser](apps/open/ladybird/README.md), [Bitchat](apps/open/bitchat/README.md), [Violet Agent](apps/open/agent/README.md), Locomo Music and [Settings](apps/open/settings/README.md), all open apps written in Rust. Apps Violet Agent builds get their own icons on Home after these. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
-The look is dark layered paper with cream icons pressed into it ([paper.rs](apps/lib/violet/src/paper.rs)). Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone Internet), the clock's city, deleting Agent-built apps and the passcode are all in Settings. The top 32 rows of the screen are the system's: a band no app can draw over says which app is in front, and turns violet with `VIOLET SYSTEM` for the runtime's own permission prompts, passcode keypad and lock screen ([Open Runtime](runtime/open/README.md), Trusted system UI).
+The look is dark layered paper with cream icons pressed into it ([paper.rs](apps/lib/violet/src/paper.rs)). Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone Internet), the clock's city, deleting Agent-built apps and the passcode are all in Settings. The top 32 rows of the screen are the system's: a band no app can draw over says which app is in front, and turns violet with `VIOLET SYSTEM` for the runtime's own permission prompts, passcode keypad and lock screen ([Open Runtime](runtime/open/README.md), Trusted system UI). The power button turns the screen off, which locks the phone when a passcode is set, and turns it on again; holding it offers to power off.
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -13,7 +13,7 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 
 | Command | What you get |
 | --- | --- |
-| `make emulator` | A clickable seL4 window that boots straight to Home. Sound plays through the Mac's speakers; the arrow keys are the volume buttons and **H** plugs in headphones. Close the window or press Escape to quit. |
+| `make emulator` | A clickable seL4 window that boots straight to Home. Sound plays through the Mac's speakers; the arrow keys are the volume buttons, **H** plugs in headphones and **P** is the power button (tap to turn the screen off or on, hold to power off). Close the window or press Escape to quit. |
 | `make sim` | The original native SDL simulator, including its clock and system screens. Use it for quick layout and interaction experiments. |
 | `make test-emulator` | Eight QEMU scenarios covering touch transfer failures, controller recovery and watchdog handling; where touch works, a tap on Home must open Settings. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
@@ -26,8 +26,10 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 | `make test-wifi-app` | Drives Settings › Wi-Fi by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
 | `make test-wpa` | Host only, no QEMU: the handset's WPA2 client against an independent authenticator, PSK and PSK-SHA256, with and without 802.11w protected management frames (fetches hostap's sources once). |
 | `make test-open-apps` | Drives Home, Settings (a chosen city kept in `/data` across a restart, Wi-Fi, Agent Apps) and Music. |
+| `make test-lock` | The power key, the screen lock and power off: the key turns the screen off and on, Settings sets a passcode, the key then locks, the passcode unlocks, the phone starts locked after a restart, and the power sheet powers off. See [Power](services/power/README.md). |
 | `make test-shield` | Violet Shield end to end in QEMU with the Python companion simulator. Signed warnings appear on Home while the demo apps keep running. See [the proof of concept](docs/violet-shield-poc.md). |
 | `make test-agent` | The voice agent in QEMU with the real Mac app: QR pairing through a local relay, an encrypted install that survives a restart and gets a Home icon, Python installed as a package with a Python app, listening from the background, deleting an app from Settings, reconnect and unpair. See [the agent](apps/open/agent/README.md) and [Violet Agent for macOS](companion/mac/README.md). |
+| `make test-rose` | Rose as the agent, in QEMU with the real Mac app: a typed request becomes her build task, the app is built and installed on the phone, she talks during the build and announces it. Needs Codex signed in and `companion/mac/violet_rose/setup.sh`. |
 | `make test-locomo` | Generates a Cool Jazz track in the signed Locomo Music release, transfers it over the paired connection and checks audio in QEMU. See [Locomo Music](companion/mac/README.md#locomo-music). |
 | `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
@@ -68,7 +70,7 @@ From the bottom up:
 
 USB Diagnostics runs only on the handset and serves developer tools on a connected Mac. The [iPhone companion](companion/ios/README.md) relays the handset's traffic over cellular data (Phone Internet).
 
-**The voice agent.** [Agent](apps/open/agent/README.md) on the phone pairs with [Violet Agent for macOS](companion/mac/README.md) by a one-time QR code and then meets it through a relay (a [Chariot](tools/chariot-relay/relay.py)) from any network, encrypted end to end ([protocol](docs/agent-protocol.md)). You talk to the phone; the Mac hears and speaks with RoseOS's voice models and answers with Codex, which builds the apps you ask for and installs them on the phone, where they stay. Say "Make me a simple scorekeeper" and it is on the phone in under 20 seconds; apps can be Rust or Python ("make it in Python"). It keeps listening when you leave the Agent app, and keeps talking with you while an app builds.
+**The voice agent.** [Agent](apps/open/agent/README.md) on the phone pairs with [Violet Agent for macOS](companion/mac/README.md) by a one-time QR code and then meets it through a relay (a [Chariot](tools/chariot-relay/relay.py)) from any network, encrypted end to end ([protocol](docs/agent-protocol.md)). You talk to the phone, and the agent you talk to is Rose, RoseOS's voice agent, running on the Mac whole: her voice, her Codex conversation, her tasks, her name and voices, and her life and journal ([companion/mac/roseos](companion/mac/roseos), kept in step with `tools/sync_rose.py`). She has the apps you ask for built and installed on the phone, where they stay. Say "Make me a simple scorekeeper" and it is on the phone in under 20 seconds; apps can be Rust or Python ("make it in Python"). It keeps listening when you leave the Agent app, and keeps talking with you while an app builds.
 
 ### Components
 
@@ -82,7 +84,7 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 5 | [Display](services/display/README.md) | The [compositor](system/compositor/README.md): clips, scales and presents built-in apps' surfaces, with damage tracking and a measured frame budget. The Open Runtime still draws to scanout itself while an open app is in front. |
 | 6 | [Storage](services/storage/README.md) | Checkpoints, per-app files and the package catalog on disk (virtio in QEMU, eMMC on the handset). |
 | 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets and, on the handset, Bluetooth HCI. |
-| 8 | [Power](services/power/README.md) | Battery, sleep and shutdown, wake locks, the thermal and frequency governors (emulator only so far); brokers the PMIC for Audio and Camera. |
+| 8 | [Power](services/power/README.md) | Battery, the power key, sleep and shutdown, wake locks, the thermal and frequency governors (emulator only so far); brokers the PMIC for Audio and Camera. |
 | 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
 | 15–20 | Runtime workers | Runtime's per-service request threads. |
 | 21 | [USB Diagnostics](services/usb-diagnostics/README.md) | Handset only: status, package staging, flashing and test requests from the Mac. |
@@ -161,6 +163,7 @@ Code that differs between QEMU and the handset lives under `targets/` behind a c
 | Wi-Fi, TCP and TLS on the handset | [radio.rs](targets/moto-g-pure/radio.rs) (Radio's event loop), [wlan_axi.rs](targets/moto-g-pure/wlan_axi.rs) (the chip), [wpa.rs](targets/moto-g-pure/wpa.rs), and lwIP glue in [ip/](targets/moto-g-pure/ip/) ([sockets.c](targets/moto-g-pure/ip/sockets.c) serves open apps). | Moto |
 | Bluetooth on the handset | [bt.rs](targets/moto-g-pure/bt.rs) (the controller and the HCI pages) and [wmt.rs](targets/moto-g-pure/wmt.rs) (STP and WMT); [hci.rs](runtime/open/hci.rs) is `/dev/violet/hci`. | Moto |
 | Networking in QEMU | [services/radio](services/radio/README.md) with the Mac-side [emulator_endpoint.py](tools/emulator_endpoint.py) and, for open apps' sockets, [net_relay.py](tools/net_relay.py). | QEMU and the Mac |
+| The power key, the screen lock and power off | [power.rs](runtime/open/power.rs) and its rules in [lock.rs](runtime/open/lock.rs); Home's lock screen is [lock.rs](apps/open/home/src/lock.rs); the key itself comes from [Power](services/power/README.md). | Moto and QEMU |
 | Sound and the microphone | [services/audio](services/audio/README.md) and the board backend under `targets/`. | Moto and QEMU |
 | Watchdog behavior | [watchdog.c](platform/sel4/board/watchdog.c) | Moto and QEMU |
 | Where seL4 comes from and how it boots | [kernel/sel4/build.py](kernel/sel4/build.py), the [board configuration](platform/sel4/board/) and the [loader](boot/loader/). | Build host and early ARM boot |
@@ -172,7 +175,7 @@ For example, change a label in `apps/open/settings/src/pages.rs` to update both 
 
 ## Try it in QEMU
 
-`make emulator` boots to Home: the date, the Violet Shield pill, and an icon for each app. Tap an icon to open it; every app has a **‹ Home** button, and holding the top edge for a second also comes back. Tap **Settings** for Wi-Fi (the emulator offers three virtual networks), Bluetooth, Phone Link, Date & Time (the city whose date Home shows), Agent Apps and About. **Ladybird Browser** opens a start page of links; tap the address bar to type any address.
+`make emulator` boots to Home: the date, the Violet Shield pill, and an icon for each app. Tap an icon to open it; every app has a **‹ Home** button, and holding the top edge for a second also comes back. Tap **Settings** for Wi-Fi (the emulator offers three virtual networks), Bluetooth, Phone Link, Date & Time (the city whose date Home shows), Agent Apps, Passcode, Power and About. Press **P** to turn the screen off and again to turn it on; once a passcode is set, that locks the phone. **Ladybird Browser** opens a start page of links; tap the address bar to type any address.
 
 ### Persistence
 

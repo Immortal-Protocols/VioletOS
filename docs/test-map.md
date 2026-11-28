@@ -149,6 +149,21 @@ sysui.rs (every rule: the passcode, its back-off, consent, the pad, the band's r
 | `/apps/home` is unchanged; Home was not contained and still answers | Host, same test |
 | The image starts in strict mode | Host `shield::image_apps_are_contained_only_in_strict_mode_and_nothing_in_monitor`, `the_saved_mode_can_only_make_a_build_stricter`. **Dropped**: a strict-mode image build and the demo apps' own code in QEMU. `make test-shield` (older, local) still runs the demo apps end to end with the companion; the recorded traces replay in `make test-unit` |
 
+## test_lock.py (`make test-lock`, from main's power-key branch)
+
+Main's app-drawn lock was replaced by the trusted UI's when the branches merged; its QEMU suite went with it.
+
+| Assertion | Now |
+| --- | --- |
+| A short press of the power key turns the screen off; the next turns it on | **QEMU** `make test-system` trial boot (`power key: screen off locks, the next press turns it on`); Host `lock::short_press_acts_on_release_while_on`, `press_wakes_at_once_while_off`, `counted_press_between_samples`, `key_held_since_start_is_ignored` |
+| The screen is black while off; a tap does not wake it | **Dropped** (QEMU): power.rs fills the frame black and the viewer drops touches while paused; not asserted |
+| Without a passcode nothing locks | Host `sysui::record_round_trip_and_damage` (`Pass::lock` is false with no record) |
+| A passcode set in Settings; a mismatched second entry starts over | The trusted UI's own keypad: Host sysui tests (`set_lock_unlock_with_backoff`); **QEMU** `make test-system` boot 1 sets one |
+| With a passcode the power key locks; the lock screen refuses a wrong passcode and an app icon, opens with the right one | **QEMU** `make test-system` trial boot (screen off locks); locked-at-boot, a refused tap and wrong/right passcodes are already there; Host sysui tests |
+| The phone starts locked on the next boot | **QEMU** `make test-system` trial boot |
+| Holding the key shows the power sheet; Cancel closes it; Power off stops the machine | Host `lock::hold_is_long_once` and Home's `sheet::tests::sheet_buttons`. **Dropped** (QEMU): the sheet and an actual power off, which would end the consolidated run's boot |
+| New: a passcode saved by main's lock (`1 SALT HASH [WRONG]`) still unlocks and is rewritten as a VPL1 record | Host `sysui::an_earlier_locks_passcode_still_unlocks_and_is_upgraded` |
+
 ## Kept as they were
 
 These came before the waves, or are host-only, and stay as separate local targets outside the loop: `test-emulator`, `test-isolation`, `test-audio`, `test-open`, `test-memory`, `test-ladybird`, `test-wifi-app`, `test-agent`, `test-locomo`, `test-open-apps`, `test-shield`, `test-shield-proxy`, `test-shield-unit`, the handset targets, and from wave 1 the host-only `test-net-lwip`, `test-radio-tls`, `test-storage-long`, `test-wpa`, `test-sae`.

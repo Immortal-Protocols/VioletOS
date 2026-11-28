@@ -2,13 +2,14 @@
 //! app: the ones that ship with the phone, then the ones installed since. It
 //! stays running; "home" in /dev/violet/sys brings it back to the front.
 mod clock;
+mod sheet;
 mod ui;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clock::Glance;
-use violet::{device::{TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen};
+use violet::{device::{KEY_DOWN, KEY_POWER, TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen};
 
 use violet::CITIES;
 
@@ -44,7 +45,7 @@ fn main() {
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut art = ui::Art::new();
-    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, notice: None, can_lock: false, shield: Default::default(), listening: false };
+    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, notice: None, can_lock: false, shield: Default::default(), listening: false, sheet: None };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
     let refresh = move || {
@@ -97,7 +98,45 @@ fn main() {
                     refresh();
                 }
             }
-            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => focused = false,
+            Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => {
+                focused = false;
+                s.sheet = None;
+            }
+            // The power key was held: offer to power off.
+            Ok(e) if e.kind == KEY_DOWN && e.code == KEY_POWER => {
+                println!("home: power sheet");
+                s.pressed = None;
+                s.sheet = Some(sheet::Sheet::default());
+                draw(&mut c, &mut s, &art, &glance, &mut screen);
+            }
+            Ok(e) if e.kind == TOUCH_DOWN && s.sheet.is_some() => {
+                let hit = sheet::sheet_hit(e.x, e.y);
+                if hit.is_none() && !sheet::CARD.contains(e.x, e.y) {
+                    s.sheet = None;
+                } else if let Some(sheet) = &mut s.sheet {
+                    sheet.pressed = hit;
+                }
+                draw(&mut c, &mut s, &art, &glance, &mut screen);
+            }
+            Ok(e) if e.kind == TOUCH_UP && s.sheet.is_some() => {
+                match s.sheet.as_mut().and_then(|sheet| sheet.pressed.take()) {
+                    Some(sheet::SheetHit::Off) => {
+                        s.sheet = Some(sheet::Sheet { pressed: None, going: true });
+                        draw(&mut c, &mut s, &art, &glance, &mut screen);
+                        println!("home: powering off");
+                        let answer = violet::sys("power off");
+                        // Still here: the phone did not go down.
+                        println!("home: power off -> {answer}");
+                        if answer != "ok" {
+                            s.sheet = None;
+                            s.launch_error = Some("Couldn’t power off".into());
+                        }
+                    }
+                    Some(sheet::SheetHit::Cancel) => s.sheet = None,
+                    None => {}
+                }
+                draw(&mut c, &mut s, &art, &glance, &mut screen);
+            }
             Ok(e) if e.kind == TOUCH_DOWN => {
                 // Only the pressed icon is redrawn.
                 s.pressed = ui::hit(&s, e.x, e.y);
@@ -184,7 +223,7 @@ mod preview {
         }
         ui::State {
             now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None, notice: None, can_lock: true,
-            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true,
+            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true, sheet: None,
         }
     }
 
@@ -254,7 +293,12 @@ mod preview {
         let art = art(&s);
         println!("home preview: art in {:?}", t.elapsed());
         ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
-        let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
-        std::fs::write(out, bytes).unwrap();
+        let rgba = |c: &violet::Canvas| -> Vec<u8> { c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect() };
+        std::fs::write(&out, rgba(&c)).unwrap();
+        // Beside it: the power sheet over Home.
+        let mut s = s;
+        s.sheet = Some(crate::sheet::Sheet::default());
+        ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
+        std::fs::write(format!("{out}.sheet"), rgba(&c)).unwrap();
     }
 }

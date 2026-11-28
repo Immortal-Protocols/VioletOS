@@ -148,29 +148,35 @@ def main(viewer):
             inputs.register(window.stdout,selectors.EVENT_READ)
             asleep=False
             waiting_for_wake=False
+            presses=0
             pending=b""
 
             try:
                 while window.poll() is None and guest.poll() is None:
+                    # The Power fixture (targets/qemu/power.rs): its command word,
+                    # then the power key's level and press count, which the viewer writes.
                     with ram.open("rb") as mem:
                         mem.seek(0x09002004)
                         power=int.from_bytes(mem.read(4),"little")
+                        mem.seek(0x09002048)
+                        pressed=int.from_bytes(mem.read(4),"little")
                     if power==2:
                         monitor.command("quit")
                         guest.wait(timeout=3)
                         return 0
                     if power==0:waiting_for_wake=False
+                    # Asleep, the guest is paused until the power key is pressed
+                    # again; it then sees the press and turns the screen back on.
                     if power==1 and not asleep and not waiting_for_wake:
-                        monitor.command("stop");asleep=True
+                        monitor.command("stop");asleep=True;presses=pressed
+                    elif asleep and pressed!=presses:
+                        monitor.command("cont");asleep=False;waiting_for_wake=True
                     if inputs.select(.015):
                         pending+=os.read(window.stdout.fileno(),256)
                         while len(pending)>=6:
                             event,pending=pending[:6],pending[6:]
-                            if asleep:
-                                if not event[0]:continue
-                                monitor.command("cont");asleep=False;waiting_for_wake=True
-                                # Release the contact that initiated suspend before the wake press.
-                                guest.stdin.write(bytes(6));guest.stdin.flush();time.sleep(.075)
+                            # Touches do not reach a screen that is off.
+                            if asleep:continue
                             guest.stdin.write(event);guest.stdin.flush()
                     if selected:
                         with ram.open("rb") as mem:

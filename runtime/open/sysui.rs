@@ -11,6 +11,9 @@
 //! - The passcode: PBKDF2-HMAC-SHA-256 over the digits with a random salt,
 //!   the attempt counter saved before an attempt is checked, and a delay
 //!   that doubles after FREE_ATTEMPTS failures (`backoff_secs`).
+//! - A passcode saved by the earlier, app-drawn lock (`Legacy`, main's
+//!   runtime/open/lock.rs: "1 SALT HASH [WRONG]") still unlocks: the first
+//!   right entry rewrites it as a PBKDF2 record under the same salt.
 //! - Which /dev/violet/sys commands an app may give (`may`).
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -289,6 +292,83 @@ impl Record {
     }
 }
 
+/// A passcode record written by the earlier lock (before the trusted UI):
+/// text "1 SALTHEX HASHHEX [WRONG]\n", the hash a salted SHA-256 repeated
+/// LEGACY_ROUNDS times over salt | previous digest | digits. Only read: the
+/// first right entry replaces it with a `Record` (Job::Upgrade).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Legacy {
+    pub salt: [u8; 16],
+    pub hash: [u8; 32],
+    pub failures: u32,
+}
+pub const LEGACY_ROUNDS: u32 = 4096;
+fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let s = s.as_bytes();
+    if s.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, pair) in s.chunks(2).enumerate() {
+        let digit = |c: u8| char::from(c).to_digit(16);
+        out[i] = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Some(out)
+}
+fn hex(out: &mut String, bytes: &[u8]) {
+    for b in bytes {
+        out.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
+        out.push(char::from(b"0123456789abcdef"[(b & 15) as usize]));
+    }
+}
+impl Legacy {
+    pub fn decode(b: &[u8]) -> Option<Legacy> {
+        let text = core::str::from_utf8(b).ok()?;
+        let mut words = text.split_whitespace();
+        let (Some("1"), Some(salt), Some(hash)) = (words.next(), words.next(), words.next()) else { return None };
+        let failures = match words.next() {
+            None => 0,
+            Some(w) => w.parse().ok()?,
+        };
+        if words.next().is_some() {
+            return None;
+        }
+        Some(Legacy { salt: unhex(salt)?, hash: unhex(hash)?, failures })
+    }
+    /// The same text, with the current count of wrong entries.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut s = String::from("1 ");
+        hex(&mut s, &self.salt);
+        s.push(' ');
+        hex(&mut s, &self.hash);
+        if self.failures != 0 {
+            s.push(' ');
+            s.push_str(&dec(self.failures as u64));
+        }
+        s.push('\n');
+        s.into_bytes()
+    }
+    /// The old lock took 4 to 8 digits.
+    pub fn matches(&self, code: &[u8], sha: Sha) -> bool {
+        if !(4..=8).contains(&code.len()) || !code.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let mut block = [0u8; 16 + 32 + 8];
+        block[..16].copy_from_slice(&self.salt);
+        block[48..48 + code.len()].copy_from_slice(code);
+        let n = 48 + code.len();
+        let mut h = sha(&block[..n]);
+        for _ in 1..LEGACY_ROUNDS {
+            block[16..48].copy_from_slice(&h);
+            h = sha(&block[..n]);
+        }
+        for b in block.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        same(&h, &self.hash)
+    }
+}
+
 /// data.rs `load`'s verdict, after retries: `failed` of Storage's `slots`
 /// files could not be listed or read, `offline` of them because Storage
 /// answered OFFLINE. Complete if none failed, or if every slot was OFFLINE:
@@ -306,6 +386,8 @@ pub enum Stored {
     /// phone stays locked (fail closed).
     Damaged,
     Set(Record),
+    /// The earlier lock's record (`Legacy`), until the next right entry.
+    Legacy(Legacy),
 }
 
 /// What the pad is asking for.
@@ -352,6 +434,8 @@ pub const REDRAW: u8 = 16;
 enum Job {
     Verify,
     Derive,
+    /// A right entry of a Legacy passcode: the same digits under PBKDF2.
+    Upgrade,
 }
 
 pub struct Pass {
@@ -395,10 +479,17 @@ impl Pass {
         self.stored = match file {
             None if listed => Stored::None,
             None => Stored::Damaged,
-            Some(b) => Record::decode(b).map_or(Stored::Damaged, Stored::Set),
+            Some(b) => match (Record::decode(b), Legacy::decode(b)) {
+                (Some(r), _) => Stored::Set(r),
+                (None, Some(l)) => Stored::Legacy(l),
+                _ => Stored::Damaged,
+            },
         };
-        if let Stored::Set(r) = self.stored {
-            self.not_before = now + backoff_secs(r.failures) * 1_000_000_000;
+        match self.stored {
+            Stored::Set(Record { failures, .. }) | Stored::Legacy(Legacy { failures, .. }) => {
+                self.not_before = now + backoff_secs(failures) * 1_000_000_000;
+            }
+            _ => {}
         }
         self.lock();
         if file.is_none() && !listed {
@@ -482,6 +573,21 @@ impl Pass {
                     self.note = "WAIT";
                     return REDRAW;
                 }
+                if let Stored::Legacy(ref mut l) = self.stored {
+                    // Checked here and now: the old hash is quick. A right
+                    // entry is then stretched again into a Record.
+                    l.failures = l.failures.saturating_add(1);
+                    if l.matches(self.digits.get(), sha) {
+                        self.job = Some((Pbkdf2::start(sha, self.digits.get(), &l.salt, ITERATIONS), Job::Upgrade));
+                        self.digits.clear();
+                        self.note = "CHECKING";
+                        return REDRAW;
+                    }
+                    self.not_before = now + backoff_secs(l.failures) * 1_000_000_000;
+                    self.digits.clear();
+                    self.note = "WRONG PASSCODE";
+                    return SAVE | REDRAW;
+                }
                 let Stored::Set(ref mut r) = self.stored else {
                     self.digits.clear();
                     self.note = "PASSCODE FILE DAMAGED";
@@ -536,6 +642,10 @@ impl Pass {
             self.end();
             return SAVE | DONE | REDRAW;
         }
+        if what == Job::Upgrade {
+            let Stored::Legacy(l) = self.stored else { return REDRAW };
+            self.stored = Stored::Set(Record { iterations: ITERATIONS, failures: 0, salt: l.salt, hash: out });
+        }
         let Stored::Set(ref mut r) = self.stored else { return REDRAW };
         if !same(&out, &r.hash) {
             self.not_before = now + backoff_secs(r.failures) * 1_000_000_000;
@@ -581,6 +691,16 @@ impl Pass {
     }
     pub fn saved(&mut self) {
         self.backup = None;
+    }
+
+    /// What LOCK_FILE should hold after SAVE or ERASE (`erase`): None removes it.
+    pub fn file(&self, erase: bool) -> Option<Vec<u8>> {
+        match self.stored {
+            _ if erase => None,
+            Stored::Set(r) => Some(r.encode().to_vec()),
+            Stored::Legacy(l) => Some(l.encode()),
+            _ => None,
+        }
     }
 
     pub fn title(&self) -> &'static str {
@@ -756,6 +876,8 @@ pub fn may(verb: &str, arg: Option<&str>, c: &Caller) -> Result<(), &'static str
         // Where the agent connects: the developer or a system app only.
         ("set", Some("relay" | "stun")) => SYSTEM | USB,
         ("set", _) => FRONT | SYSTEM | USB,
+        // Power off (power.rs): from the app on screen, never past the lock screen.
+        ("power", Some("off")) => FRONT | NOT_LOCKED,
         // Anyone may ask whether a passcode is set; only Settings in front changes it.
         ("passcode", None) => return Ok(()),
         ("passcode", _) => return if c.settings && c.front { Ok(()) } else { Err("error not allowed\n") },

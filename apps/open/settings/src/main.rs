@@ -1,5 +1,6 @@
 //! Settings: Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone
-//! Internet), the clock's city, the apps Violet Agent built, and About.
+//! Internet), the clock's city, the apps Violet Agent built, the passcode,
+//! power off, and About.
 mod pages;
 mod wifi;
 mod wifi_ui;
@@ -117,6 +118,17 @@ impl App {
             // Release this screen's memory when the user returns to Home.
             Hit::Back if self.section == Section::Menu => std::process::exit(0),
             Hit::Back => self.go(Section::Menu),
+            Hit::PowerOff if self.confirm == Some(pages::CONFIRM_POWER) => {
+                self.confirm = None;
+                println!("settings: powering off");
+                let answer = violet::sys("power off");
+                // Still here: the phone did not go down.
+                println!("settings: power off -> {answer}");
+                if answer != "ok" {
+                    self.note = "Couldn’t power off".into();
+                }
+            }
+            Hit::PowerOff => self.confirm = Some(pages::CONFIRM_POWER),
             Hit::Row(i) => self.go(MENU[i].0),
             Hit::Relay => {
                 let answer = if self.relay_on { violet::sys("relay off") } else { violet::sys(&format!("relay on {}", self.code)) };
@@ -338,7 +350,7 @@ mod preview {
         let s = status();
         let mut c = Canvas::new(violet::W, violet::H);
         for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth), ("phone", Section::PhoneLink),
-                                ("time", Section::Time), ("apps", Section::AgentApps), ("passcode", Section::Passcode), ("about", Section::About)] {
+                                ("time", Section::Time), ("apps", Section::AgentApps), ("passcode", Section::Passcode), ("about", Section::About), ("power", Section::Power)] {
             let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
             pages::draw(&mut c, &fonts, &v);
             let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();

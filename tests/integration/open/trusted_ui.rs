@@ -176,12 +176,9 @@ impl Runtime {
     /// written before the check it counts begins.
     pub fn ui_apply(&mut self, acts: u8) {
         if acts & (SAVE | ERASE) != 0 {
-            let record = with(|s| match s.ui.pass.stored {
-                sysui::Stored::Set(r) if acts & ERASE == 0 => Some(r.encode()),
-                _ => None,
-            });
+            let record = with(|s| s.ui.pass.file(acts & ERASE != 0));
             let saved = match record {
-                Some(r) => self.fs.writable(LOCK_FILE, true, true, 0).map(|f| *f = r.to_vec()).is_some(),
+                Some(r) => self.fs.writable(LOCK_FILE, true, true, 0).map(|f| *f = r).is_some(),
                 None => self.fs.unlink(LOCK_FILE, false).is_ok() || self.fs.stat(LOCK_FILE).is_none(),
             };
             with(|s| {

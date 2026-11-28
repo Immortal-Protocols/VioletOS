@@ -25,6 +25,9 @@
 //   word 15 guest  the last wake's sources (bits as word 13, bit 2 the alarm)
 //                  in the low byte, the number of suspends above
 //   word 16 guest  what Power asks of the screen: 0 nothing, 1 wake, 2 sleep
+//   word 17 host   1 while the power key is held (the viewer's P key)
+//   word 18 host   power key presses, counted by the host, so a press
+//                  shorter than the Open Runtime's poll is still seen
 use crate::process::policy::{Board, DvfsStep, Opp, Reading, Snapshot, Zone};
 use crate::protocol::*;
 
@@ -64,6 +67,13 @@ const WAKE_PROCESSES: u32 = 1 << 3 | 1 << 4 | 1 << 7 | 1 << 24;
 /// every process's timers are held and released twice a second, and the
 /// machine runs on, so the wake sources work. Without the timekeeper it is
 /// the old register that tools/run.py answers by pausing the machine.
+/// The host's power key for the Open Runtime (runtime/open/power.rs): word
+/// 17 is set while it is held, word 18 counts presses.
+pub fn key() -> Message {
+    let mut r = Message::result(get(17) & 1);
+    r.arg = get(18);
+    r
+}
 pub fn command(value: u32) -> Message {
     let idle = unsafe { crate::process::timekeeper_live() } != 0;
     match value {

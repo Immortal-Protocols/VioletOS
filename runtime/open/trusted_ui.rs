@@ -377,11 +377,8 @@ impl Runtime {
     fn ui_apply(&mut self, acts: u8) {
         let s = st();
         if acts & (SAVE | ERASE) != 0 {
-            let record = match s.ui.pass.stored {
-                sysui::Stored::Set(r) if acts & ERASE == 0 => Some(r.encode()),
-                _ => None,
-            };
-            if self.ui_save(record.as_ref().map(|r| &r[..])) {
+            let record = s.ui.pass.file(acts & ERASE != 0);
+            if self.ui_save(record.as_deref()) {
                 s.ui.pass.saved();
                 if acts & DONE != 0 {
                     note(if s.ui.pass.is_set() { "passcode set" } else { "passcode off" });

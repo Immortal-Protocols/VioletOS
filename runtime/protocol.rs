@@ -118,6 +118,10 @@ pub const TIMER_BADGE: u32 = 1 << 27;
 // an app asked with the screen off (a new lock, or past its allowance).
 pub const POWER_LOCK_FULL: u32 = 1;
 pub const POWER_LOCK_SCREEN_OFF: u32 = 2;
+/// The power key, for the Open Runtime (runtime/open/power.rs). GET: value bit 0
+/// is set while the key is held; arg counts presses where the board latches them
+/// (QEMU), so a press shorter than a poll is still seen.
+pub const POWER_KEY: u32 = 34;
 pub const CATALOG: u32 = 9;
 pub const QUIT: u32 = 10;
 pub fn serve(mut dispatch: impl FnMut(Message) -> Message) -> ! {

@@ -391,6 +391,11 @@ fn sys_command_table() {
     assert!(may("open", None, &front).is_ok());
     assert!(may("open", None, &opener).is_ok());
     assert!(may("open", None, &Caller { locked: true, ..home }).is_err());
+    // Power off: the app on screen, and not while locked.
+    assert!(may("power", Some("off"), &front).is_ok());
+    assert!(may("power", Some("off"), &app).is_err());
+    assert!(may("power", Some("off"), &Caller { locked: true, ..front }).is_err());
+    assert!(may("power", None, &app).is_ok(), "plain power (the state) is anyone's");
     assert!(may("open", None, &Caller { covered: true, ..opener }).is_err());
     assert!(may("home", None, &app).is_err());
     assert!(may("home", None, &front).is_ok());
@@ -586,4 +591,86 @@ fn band_key_and_marked_notifications() {
     let lines = n.lines();
     assert!(lines.starts_with("INSTALLED VIOLET-SYSTEM\tPasscode expired\n"), "{lines}");
     assert!(lines.ends_with("SETTINGS\tWi-Fi joined\n"));
+}
+
+/// The earlier lock's record ("1 SALT HASH [WRONG]", main's runtime/open/lock.rs
+/// `record`), written the way that lock wrote it.
+fn legacy_record(code: &str, salt: [u8; 16], wrong: u32) -> Vec<u8> {
+    let mut block = [0u8; 16 + 32 + 8];
+    block[..16].copy_from_slice(&salt);
+    block[48..48 + code.len()].copy_from_slice(code.as_bytes());
+    let n = 48 + code.len();
+    let mut h = sha256(&block[..n]);
+    for _ in 1..4096 {
+        block[16..48].copy_from_slice(&h);
+        h = sha256(&block[..n]);
+    }
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    let mut s = format!("1 {} {}", hex(&salt), hex(&h));
+    if wrong != 0 {
+        s += &format!(" {}", wrong);
+    }
+    s.push('\n');
+    s.into_bytes()
+}
+
+/// A phone that set its passcode with the earlier lock is not locked out:
+/// that passcode unlocks, wrong ones are counted and throttled as usual,
+/// and the first right entry rewrites the file as a PBKDF2 record.
+#[test]
+fn an_earlier_locks_passcode_still_unlocks_and_is_upgraded() {
+    let file = legacy_record("2580", [7; 16], 0);
+    let mut p = Pass::new();
+    p.boot(Some(&file), true, 0);
+    assert!(p.locked && p.step == Some(Step::Unlock));
+    let Stored::Legacy(l) = p.stored else { panic!("not read as the earlier record: {:?}", p.stored) };
+    assert_eq!((l.salt, l.failures), ([7; 16], 0));
+    assert_eq!(p.file(false).as_deref(), Some(&file[..]), "rewritten byte for byte until upgraded");
+
+    // Wrong entries: refused, counted in the saved file, then throttled.
+    for n in 1..=FREE_ATTEMPTS {
+        let acts = enter(&mut p, "1111", 0);
+        assert_eq!(acts & SAVE, SAVE, "a wrong entry is saved");
+        assert!(p.locked && !p.busy());
+        let Stored::Legacy(l) = p.stored else { panic!() };
+        assert_eq!(l.failures, n);
+    }
+    assert_eq!(p.not_before, backoff_secs(FREE_ATTEMPTS) * S);
+    let saved = p.file(false).unwrap();
+    assert_eq!(saved, legacy_record("2580", [7; 16], FREE_ATTEMPTS));
+    enter(&mut p, "2580", 0);
+    assert!(p.locked && p.note == "WAIT", "the right passcode waits out the delay too");
+
+    // A restart keeps the count and the delay.
+    let mut p = Pass::new();
+    p.boot(Some(&saved), true, 0);
+    assert_eq!(p.not_before, backoff_secs(FREE_ATTEMPTS) * S);
+
+    // The right passcode after the delay unlocks and upgrades the record.
+    let later = p.not_before;
+    let acts = enter(&mut p, "2580", later) | drive(&mut p, later);
+    assert_eq!(acts & (SAVE | UNLOCKED), SAVE | UNLOCKED);
+    assert!(!p.locked);
+    let Stored::Set(r) = p.stored else { panic!("not upgraded") };
+    assert_eq!((r.iterations, r.failures, r.salt), (ITERATIONS, 0, [7; 16]));
+    assert_eq!(r.hash, pbkdf2(b"2580", &[7; 16], ITERATIONS));
+    let upgraded = p.file(false).unwrap();
+    assert_eq!(&upgraded[..4], b"VPL1");
+
+    // The upgraded file opens with the same passcode after a restart.
+    let mut p = Pass::new();
+    p.boot(Some(&upgraded), true, 0);
+    assert!(matches!(p.stored, Stored::Set(_)) && p.locked);
+    let acts = enter(&mut p, "2580", 0) | drive(&mut p, 0);
+    assert_eq!(acts & UNLOCKED, UNLOCKED);
+
+    // Broken or foreign text is still Damaged (fail closed).
+    for bad in [&b"1 zz 00\n"[..], b"2 0707 0707\n", b"1\n", &file[..file.len() - 4]] {
+        let mut q = Pass::new();
+        q.boot(Some(bad), true, 0);
+        assert_eq!(q.stored, Stored::Damaged);
+    }
+    // The earlier lock took 4 to 8 digits; longer entries never match.
+    let l = Legacy::decode(&file).unwrap();
+    assert!(l.matches(b"2580", sha256) && !l.matches(b"025800000", sha256) && !l.matches(b"258", sha256));
 }

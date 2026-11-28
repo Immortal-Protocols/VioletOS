@@ -9,6 +9,7 @@ One app for the phone's settings, opened from its icon on Home:
 - **Agent Apps**: every app Violet Agent installed, with its size; **Delete** (tap twice to confirm) removes one, **Delete all** removes them all.
 - **Updates** (last row): the running system's version and slot, and **Download and install**, which fetches a signed system update over HTTPS from the server the image was built with (`VIOLET_UPDATE_URL`; without one the page says so) and stages it in the other boot slot; the next start tries it ([updates.rs](src/updates.rs), [fetch.rs](src/fetch.rs); what is checked where is in the [package manager](../../../system/package-manager/README.md#full-system-updates-ota)). TLS trusts the Mozilla roots, plus a test CA only in an image built with `VIOLET_UPDATE_TEST_ROOT` (`make test-ota`).
 - **Passcode**: **Set passcode**, **Change passcode** and **Turn off**. Settings only asks the Open Runtime (`passcode set`, `passcode off`); the runtime takes the screen (the band at the top turns violet and says `VIOLET SYSTEM`) and asks for the digits on its own keypad, so Settings never sees them. The phone then asks for the passcode at start and when the screen wakes ([Trusted system UI](../../../runtime/open/README.md)). No fingerprint or face unlock.
+- **Power**: **Power off** (tap twice to confirm). Holding the power button offers the same from Home's power sheet.
 - **About**: the system, battery, volume and network.
 
 `SETTINGS_PREVIEW=dir cargo test -p settings` (in `apps/`) draws every page as raw 720 × 1600 RGBA, `WIFI_PREVIEW=dir` the Wi-Fi pages.

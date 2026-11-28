@@ -16,6 +16,11 @@ enum { WIDTH = 720, HEIGHT = 1600, PITCH = WIDTH * 4 };
 enum { SOUND_PAGE = 0x49204000 - 0x40000000, SOUND_BYTES = 11 * 4096, SOUND_MAGIC = 0x31445541,
        MIC_OFFSET = 9 * 4096, MIC_SAMPLES = 4096 };
 static volatile uint32_t *sound;
+// The Power fixture's page (targets/qemu/power.rs): word 17 is set while the
+// power key is held and word 18 counts its presses; word 13 bit 0 is the
+// power key's wake line for a suspend to idle.
+enum { POWER_MAP = 0x49000000 - 0x40000000, POWER_WORD = 0x2000 / 4 };
+static volatile uint32_t *power;
 static uint32_t heard;
 // Captured samples go into the guest's ring; word 13 counts them.
 static void capture_microphone(void *unused, Uint8 *stream, int bytes) {
@@ -79,8 +84,11 @@ int main(int argc, char **argv) {
     const size_t length = PITCH * HEIGHT + 4096;
     void *frame = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
     sound = mmap(NULL, SOUND_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, SOUND_PAGE);
+    void *low = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, POWER_MAP);
     close(fd);
-    if (frame == MAP_FAILED || sound == MAP_FAILED) { perror("guest memory"); return 1; }
+    if (frame == MAP_FAILED || sound == MAP_FAILED || low == MAP_FAILED) { perror("guest memory"); return 1; }
+    power = (volatile uint32_t *)low + POWER_WORD;
+    power[17] = 0;
     sound[0] = 0;
     heard = sound[5];
     if (SDL_Init(SDL_INIT_VIDEO)) goto fail;
@@ -138,6 +146,11 @@ int main(int argc, char **argv) {
                              : (k == SDLK_DOWN || k == SDLK_MINUS) ? 2 : 0;
                 if (bit) sound[0] = e.type == SDL_KEYDOWN ? sound[0] | bit : sound[0] & ~bit;
                 if (k == SDLK_h && e.type == SDL_KEYDOWN) { sound[1] ^= 1; title(window); }
+                // P is the power button: tap to turn the screen off or on, hold for the power sheet.
+                if (k == SDLK_p) {
+                    power[17] = e.type == SDL_KEYDOWN;
+                    if (e.type == SDL_KEYDOWN) { power[18]++; __atomic_or_fetch(&power[13], 1u, __ATOMIC_SEQ_CST); }
+                }
             }
             if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT &&
                 e.button.x >= 0 && e.button.x < WIDTH && e.button.y >= 0 && e.button.y < HEIGHT) {

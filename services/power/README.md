@@ -39,7 +39,7 @@ Wake sources, each a bit in the reason Power reports:
 
 After any wake the system stays up five seconds and then suspends again unless a wake lock is held or Runtime has been told to wake. Power cannot turn the screen on: Runtime blanks and unblanks it, and takes that only from the boot launcher, so the launcher asks Power ten times a second what it wants and passes it on ([apps/launcher/process.rs](../../apps/launcher/process.rs)). The same path makes the power key a sleep button while the screen is on (`POWER_INFO_WANT_SLEEP`), which is the first thing in the image that asks for sleep; the Open Runtime locks when Runtime reports the screen off, as it already did. A process the suspend names may also end it directly (`system_wake` in runtime/transport.c: Runtime, Touch, Radio, the Open Runtime), which is immediate; none of them calls it yet, so in QEMU a wake comes only from Power reading the fixture's wake lines (taken and cleared in one atomic swap, so a line the host sets meanwhile is not lost). While suspended, waits shorter than 3 ms are not held, so a process polling a device (the Open Runtime while apps are busy, Audio while playing) keeps its pace and the CPU is not near zero then.
 
-On the handset `Board::SUSPENDS` is false: sleep still only blanks the screen, Power watches no wake line and never suspends again by itself, and the launcher does not poll. Nothing reads the power key there. Freezing timers on the phone is held back until Radio's and Touch's drivers have been run under it on hardware.
+On the handset `Board::SUSPENDS` is false: sleep still only blanks the screen, Power watches no wake line and never suspends again by itself, and the launcher does not poll. The Open Runtime reads the power key there (below), through `GET POWER_KEY`. Freezing timers on the phone is held back until Radio's and Touch's drivers have been run under it on hardware.
 
 ## Idle
 
@@ -79,8 +79,13 @@ Everything is under the `POWER` key ([runtime/protocol.rs](../../runtime/protoco
 | `GET POWER 0` | any client, through Runtime | The battery: percent in QEMU, millivolts on the handset. |
 | `GET POWER POWER_INFO` | any client | Thermal level, flags (sensor present, sensor failed, frequency scaling present, suspend postponed, screen off, suspended, wake wanted, sleep wanted), temperature, operating point, lock kinds held, lock count, battery percent, the last wake's sources and the number of suspends. |
 | `GET POWER POWER_LOCKS\|n` | any client | The nth held lock, or with `arg` 1 the nth owner's totals. |
-| `EXECUTE POWER 0\|1\|2` | the boot launcher | Wake, sleep, power off. |
+| `GET POWER_KEY` | the Open Runtime | Bit 0 of `value` is set while the power key is held; `arg` counts presses where the board latches them (QEMU: fixture words 17 and 18), so a press shorter than a poll is still seen. |
+| `EXECUTE POWER 0\|1\|2` | the boot launcher; the Open Runtime (power key, power off) | Wake, sleep, power off. |
 | `EXECUTE POWER POWER_LOCK\|…` | the Open Runtime for its apps; Radio, Audio, Camera directly | Take, release, or drop everything an owner held. |
+
+## The power key
+
+The [Open Runtime](../../runtime/open/README.md) polls the key every 40 ms and decides what a press means ([power.rs](../../runtime/open/power.rs), [lock.rs](../../runtime/open/lock.rs)). A short press turns the screen off and the next turns it on; with a passcode set, screen off locks the phone (the trusted UI's lock screen). Holding the key (0.8 s) brings Home's power sheet, **Power off** or **Cancel**; Settings › Power has **Power off** too. Before power off the Open Runtime writes every changed `/data` file back to Storage. On the handset the key is MT6357 TOPSTATUS bit 1 (untested on hardware); in QEMU it is the viewer's P key, which also raises wake line 0.
 
 ## Tests
 

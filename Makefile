@@ -102,6 +102,11 @@ test-agent:
 	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
 	$(PYTHON) targets/qemu/test_agent.py
 
+# Rose as the agent, end to end (needs Codex signed in and companion/mac/violet_rose/setup.sh).
+test-rose:
+	VIOLET_AGENT_RELAY=http://violet-relay.test VIOLET_AGENT_STUN=violet-relay.test:3478 VIOLET_OPEN_NO_PYTHON=1 $(MAKE) qemu-image
+	$(PYTHON) targets/qemu/test_rose.py
+
 # Uses the downloaded Mac app and its installed models. Runs locally only.
 LOCOMO_APP ?= /Applications/Locomo Music.app
 .PHONY: test-locomo
@@ -180,6 +185,10 @@ test-unit:
 	@mkdir -p build/tests/display
 	"$(HOST_RUSTC)" --edition=2021 --test -O system/compositor/tests/host.rs -o build/tests/display/host
 	build/tests/display/host
+	@mkdir -p build/tests/power-key
+	@printf '#![no_std]\nextern crate alloc;\nextern crate std;\n#[path = "../../../runtime/open/lock.rs"]\nmod lock;\n' > build/tests/power-key/lock_test.rs
+	"$(HOST_RUSTC)" --edition=2021 --test -O -A dead_code build/tests/power-key/lock_test.rs -o build/tests/power-key/lock
+	build/tests/power-key/lock
 	python3 apps/lib/python/test_violet.py
 	HOST_RUSTC="$(HOST_RUSTC)" targets/qemu/test_shield_host.sh
 	HOST_RUSTC="$(HOST_RUSTC)" tools/shield-trainer/test_shield_data.sh
