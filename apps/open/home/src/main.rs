@@ -2,14 +2,14 @@
 //! app: the ones that ship with the phone, then the ones installed since. It
 //! stays running; "home" in /dev/violet/sys brings it back to the front.
 mod clock;
-mod lock;
+mod sheet;
 mod ui;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clock::Glance;
-use violet::{device::{KEY_DOWN, KEY_POWER, TOUCH_DOWN, TOUCH_UP}, keypad, Canvas, Fonts, Screen};
+use violet::{device::{KEY_DOWN, KEY_POWER, TOUCH_DOWN, TOUCH_UP}, Canvas, Fonts, Screen};
 
 use violet::CITIES;
 
@@ -33,13 +33,19 @@ fn fetch(name: &str) -> Result<Glance, String> {
     })
 }
 
+/// "TITLE<TAB>TEXT" lines from "notifications": the newest, as "Title · text".
+fn latest_notice(lines: &str) -> Option<String> {
+    let (title, text) = lines.lines().filter_map(|l| l.split_once('\t')).last()?;
+    Some(format!("{title} · {text}"))
+}
+
 fn main() {
     let mut screen = Screen::open().expect("no screen");
     let events = violet::events().expect("no events");
     let fonts = Fonts::load();
     let mut c = screen.canvas();
     let mut art = ui::Art::new();
-    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, shield: Default::default(), listening: false, lock: None, sheet: None };
+    let mut s = ui::State { now: None, apps: Vec::new(), running: Default::default(), pressed: None, launch_error: None, notice: None, can_lock: false, shield: Default::default(), listening: false, sheet: None };
     let mut glance: Option<Glance> = None;
     let (tx, glances) = mpsc::channel::<Result<Glance, String>>();
     let refresh = move || {
@@ -51,15 +57,10 @@ fn main() {
     let status = |s: &mut ui::State, art: &mut ui::Art| {
         s.apps = ui::apps(&std::fs::read_to_string("/apps/.home").unwrap_or_default());
         art.prepare(&fonts, &s.apps);
-        // The runtime says whether the phone is locked; Home only shows it.
-        let (locked, wait) = lock::Lock::state();
-        if !locked {
-            s.lock = None;
-        } else {
-            s.lock.get_or_insert_with(Default::default).set_wait(wait);
-        }
         s.listening = violet::fields(&violet::sys("status")).get("listening").is_some_and(|v| v == "1");
         s.running = violet::sys("running").split_whitespace().map(String::from).collect();
+        s.notice = latest_notice(&violet::sys("notifications"));
+        s.can_lock = violet::fields(&violet::sys("passcode")).get("set").is_some_and(|v| v == "1");
         let sh = violet::fields(&violet::sys("shield"));
         s.shield = ui::Shield {
             known: sh.contains_key("linked"),
@@ -80,7 +81,6 @@ fn main() {
     let mut last_fetch = Instant::now();
     let mut last_status = Instant::now();
     let mut shown_day = None;
-    let mut shown_minute = None;
     // Home polls and draws only while it is in front.
     let mut focused = true;
     loop {
@@ -101,21 +101,17 @@ fn main() {
             Ok(e) if e.kind == violet::device::LIFECYCLE && e.value == violet::device::FOCUS_LOST => {
                 focused = false;
                 s.sheet = None;
-                if let Some(l) = &mut s.lock {
-                    l.typed.clear();
-                    l.pressed = None;
-                }
             }
             // The power key was held: offer to power off.
             Ok(e) if e.kind == KEY_DOWN && e.code == KEY_POWER => {
                 println!("home: power sheet");
                 s.pressed = None;
-                s.sheet = Some(lock::Sheet::default());
+                s.sheet = Some(sheet::Sheet::default());
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
             }
             Ok(e) if e.kind == TOUCH_DOWN && s.sheet.is_some() => {
-                let hit = lock::sheet_hit(e.x, e.y);
-                if hit.is_none() && !lock::CARD.contains(e.x, e.y) {
+                let hit = sheet::sheet_hit(e.x, e.y);
+                if hit.is_none() && !sheet::CARD.contains(e.x, e.y) {
                     s.sheet = None;
                 } else if let Some(sheet) = &mut s.sheet {
                     sheet.pressed = hit;
@@ -124,8 +120,8 @@ fn main() {
             }
             Ok(e) if e.kind == TOUCH_UP && s.sheet.is_some() => {
                 match s.sheet.as_mut().and_then(|sheet| sheet.pressed.take()) {
-                    Some(lock::SheetHit::Off) => {
-                        s.sheet = Some(lock::Sheet { pressed: None, going: true });
+                    Some(sheet::SheetHit::Off) => {
+                        s.sheet = Some(sheet::Sheet { pressed: None, going: true });
                         draw(&mut c, &mut s, &art, &glance, &mut screen);
                         println!("home: powering off");
                         let answer = violet::sys("power off");
@@ -136,33 +132,10 @@ fn main() {
                             s.launch_error = Some("Couldn’t power off".into());
                         }
                     }
-                    Some(lock::SheetHit::Cancel) => s.sheet = None,
+                    Some(sheet::SheetHit::Cancel) => s.sheet = None,
                     None => {}
                 }
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
-            }
-            Ok(e) if e.kind == TOUCH_DOWN && s.lock.is_some() => {
-                let key = keypad::key_at(e.x, e.y);
-                if let (Some(l), Some(k)) = (&mut s.lock, key) {
-                    l.pressed = Some(k);
-                    let r = keypad::key_rect(k).inset(-16);
-                    ui::draw_clipped(&mut c, &fonts, &art, &s, r);
-                    screen.show(&c, r);
-                }
-            }
-            Ok(e) if e.kind == TOUCH_UP && s.lock.is_some() => {
-                let Some(k) = s.lock.as_mut().and_then(|l| l.pressed.take()) else { continue };
-                if s.lock.as_mut().is_some_and(|l| l.key(k)) {
-                    println!("home: unlocked");
-                    s.lock = None;
-                    status(&mut s, &mut art);
-                    draw(&mut c, &mut s, &art, &glance, &mut screen);
-                } else {
-                    for r in [keypad::key_rect(k).inset(-16), lock::entry_rect(), keypad::key_rect(keypad::PadKey::Ok).inset(-16)] {
-                        ui::draw_clipped(&mut c, &fonts, &art, &s, r);
-                        screen.show(&c, r);
-                    }
-                }
             }
             Ok(e) if e.kind == TOUCH_DOWN => {
                 // Only the pressed icon is redrawn.
@@ -178,6 +151,11 @@ fn main() {
                     let r = ui::region(&s, i);
                     ui::draw_clipped(&mut c, &fonts, &art, &s, r);
                     screen.show(&c, r);
+                    // Lock: the runtime's lock screen comes up at once.
+                    if i == ui::LOCK {
+                        println!("home: lock -> {}", violet::sys("lock").trim());
+                        continue;
+                    }
                     // The pill opens Settings, where the phone's links are.
                     let (name, path) = match s.apps.get(i) {
                         Some(a) => (a.name.clone(), a.path()),
@@ -219,20 +197,13 @@ fn main() {
             last_fetch = Instant::now();
             refresh();
         }
-        // Once a second while a wait counts down, otherwise every two.
-        let waiting = s.lock.as_ref().is_some_and(|l| l.wait > 0);
-        if last_status.elapsed() > Duration::from_secs(if waiting { 1 } else { 2 }) {
+        if last_status.elapsed() > Duration::from_secs(2) {
             last_status = Instant::now();
-            let (apps, running, shield, listening) = (s.apps.clone(), s.running.clone(), s.shield.clone(), s.listening);
-            let lock = s.lock.as_ref().map(|l| l.wait);
+            let (apps, running, shield, listening, notice, can_lock) = (s.apps.clone(), s.running.clone(), s.shield.clone(), s.listening, s.notice.clone(), s.can_lock);
             status(&mut s, &mut art);
-            let now = glance.as_ref().and_then(|g| g.now());
-            let (day, minute) = (now.as_ref().map(|t| t.day), now.as_ref().map(|t| t.minute).filter(|_| s.lock.is_some()));
-            if day != shown_day || minute != shown_minute || lock != s.lock.as_ref().map(|l| l.wait)
-                || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening
-            {
+            let day = glance.as_ref().and_then(|g| g.now()).map(|t| t.day);
+            if day != shown_day || apps != s.apps || running != s.running || shield != s.shield || listening != s.listening || notice != s.notice || can_lock != s.can_lock {
                 shown_day = day;
-                shown_minute = minute;
                 draw(&mut c, &mut s, &art, &glance, &mut screen);
             }
         }
@@ -251,8 +222,8 @@ mod preview {
             listing += &format!("{n}\t{t}\n");
         }
         ui::State {
-            now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None,
-            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true, lock: None, sheet: None,
+            now: g.now(), apps: ui::apps(&listing), running: ["/apps/music".to_string()].into_iter().collect(), pressed: None, launch_error: None, notice: None, can_lock: true,
+            shield: ui::Shield { known: true, linked: true, warnings: 0 }, listening: true, sheet: None,
         }
     }
 
@@ -260,6 +231,29 @@ mod preview {
         let mut a = ui::Art::new();
         a.prepare(&violet::Fonts::load(), &s.apps);
         a
+    }
+
+    /// The newest notification, and nothing for a refusal (locked: "error not allowed").
+    #[test]
+    fn notices() {
+        assert_eq!(super::latest_notice("DICE\trolled 6\nCHAT\tnew message\n").as_deref(), Some("CHAT · new message"));
+        assert_eq!(super::latest_notice("error not allowed"), None);
+        assert_eq!(super::latest_notice(""), None);
+    }
+
+    /// Lock (shown only with a passcode set) is hit on its own, apart from the pill and every tile.
+    #[test]
+    fn lock_button() {
+        let mut s = state(3);
+        let r = ui::lock_rect();
+        let (x, y) = ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2);
+        assert_eq!(ui::hit(&s, x, y), Some(ui::LOCK));
+        assert!(r.y0 >= ui::pill_rect().y1, "below the pill");
+        for i in 0..s.apps.len() {
+            assert!(ui::tile_rect(i, &s.apps).y0 >= r.y1, "above tile {i}");
+        }
+        s.can_lock = false;
+        assert_eq!(ui::hit(&s, x, y), None, "no passcode: no Lock");
     }
 
     /// The built-in apps come first, in their order; installed apps follow; Home is not listed.
@@ -301,13 +295,9 @@ mod preview {
         ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
         let rgba = |c: &violet::Canvas| -> Vec<u8> { c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect() };
         std::fs::write(&out, rgba(&c)).unwrap();
-        // Beside it: the lock screen, and the power sheet over Home.
+        // Beside it: the power sheet over Home.
         let mut s = s;
-        s.lock = Some(crate::lock::Lock { typed: "25".into(), pressed: None, note: "Wrong passcode".into(), wait: 0 });
-        ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
-        std::fs::write(format!("{out}.lock"), rgba(&c)).unwrap();
-        s.lock = None;
-        s.sheet = Some(crate::lock::Sheet::default());
+        s.sheet = Some(crate::sheet::Sheet::default());
         ui::draw(&mut c, &violet::Fonts::load(), &art, &s);
         std::fs::write(format!("{out}.sheet"), rgba(&c)).unwrap();
     }

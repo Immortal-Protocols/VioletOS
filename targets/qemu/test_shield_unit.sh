@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Host tests for Violet Shield's policy and the Sentinel's VSH1 verifier, with
-# the real BearSSL built for the Mac and envelopes signed by tools/shield-trainer/vsh1.py.
+# Host tests for Violet Shield's policy, on-device scorer and the Sentinel's
+# VSH1 verifier, with the real BearSSL built for the Mac and envelopes signed by
+# tools/shield-trainer/vsh1.py. (The policy and scorer tests alone need none of
+# that and also run in `make test-unit`.)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 PY="${SHIELD_PYTHON:-build/shield/venv/bin/python}"
@@ -25,6 +27,9 @@ extern crate alloc;
 extern crate std;
 #[path = "../../../runtime/open/policy.rs"] mod policy;
 #[path = "../../../runtime/open/shield.rs"] mod shield;
+#[path = "../../../runtime/open/scorer_model.rs"] mod scorer_model;
+#[path = "../../../runtime/open/scorer.rs"] mod scorer;
+#[path = "../../../runtime/open/scorer_replay.rs"] mod scorer_replay;
 #[path = "../../../services/sentinel/mod.rs"] mod sentinel;
 RS
 "$RUSTC" --edition=2021 --test -O -A dead_code "$out/shield_test.rs" -o "$out/shield_test" \

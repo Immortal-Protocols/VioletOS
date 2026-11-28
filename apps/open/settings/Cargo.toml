@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 violet.workspace = true
+# Settings › Updates streams a bundle over HTTPS itself (src/fetch.rs), with
+# the same TLS stack and roots as violet::http.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"

@@ -1,9 +1,6 @@
 //! The Settings pages other than Wi-Fi. Everything is drawn from `View`, so a
 //! preview can be drawn without the devices.
-use violet::keypad::{self, PadKey};
 use violet::paper::{slab, ALERT, CREAM, GOOD, MUTED, PAPER, PAPER_PRESSED, PAPER_RAISED, VIOLET};
-
-use crate::passcode::{Passcode, Step};
 use violet::{Canvas, Fonts, Rect, CITIES, HOME_BOX, W};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -17,18 +14,21 @@ pub enum Section {
     Passcode,
     Power,
     About,
+    /// Settings › Updates (updates.rs), drawn by its own module like Wi-Fi.
+    Updates,
 }
 
-/// The menu, in order.
-pub const MENU: [(Section, &str); 8] = [
+/// The menu, in order (Passcode last but one, so the rows above keep their places).
+pub const MENU: [(Section, &str); 9] = [
     (Section::Wifi, "Wi-Fi"),
     (Section::Bluetooth, "Bluetooth"),
     (Section::PhoneLink, "Phone Link"),
     (Section::Time, "Date & Time"),
     (Section::AgentApps, "Agent Apps"),
     (Section::Passcode, "Passcode"),
-    (Section::Power, "Power"),
     (Section::About, "About"),
+    (Section::Updates, "Updates"),
+    (Section::Power, "Power"),
 ];
 
 /// Something under the finger, drawn pressed.
@@ -41,10 +41,10 @@ pub enum Hit {
     City(usize),
     Delete(usize),
     DeleteAll,
-    /// Passcode: choose or change it, turn it off, a pad key.
-    PasscodeSet,
-    PasscodeOff,
-    Pad(PadKey),
+    /// Set or change the passcode, or turn it off: the runtime's own keypad asks.
+    PassSet,
+    PassOff,
+    /// Power: power off (tapped twice).
     PowerOff,
 }
 
@@ -86,8 +86,12 @@ pub struct Status {
     pub battery: i32,
     pub volume: i32,
     pub city: usize,
+    /// The system clock was set from the network ("time" in /dev/violet/sys).
+    pub clock_set: bool,
+    /// The system clock in minutes since 1970, so the page redraws as it turns.
+    pub minute: i64,
     pub installed: Vec<Installed>,
-    /// A passcode locks the phone.
+    /// A passcode is set ("passcode" in /dev/violet/sys).
     pub passcode: bool,
 }
 
@@ -101,7 +105,6 @@ pub struct View<'a> {
     /// The app whose Delete was tapped once (usize::MAX: Delete all).
     pub confirm: Option<usize>,
     pub note: &'a str,
-    pub passcode: &'a Passcode,
 }
 
 const MENU_TOP: i32 = 250;
@@ -133,8 +136,8 @@ pub fn delete_rect(i: usize) -> Rect {
     Rect::new(r.x1 - 196, r.y0 + 20, r.x1 - 20, r.y1 - 20)
 }
 pub const DELETE_ALL: Rect = Rect::new(40, 1300, W as i32 - 40, 1400);
-pub const PASSCODE_SET: Rect = Rect::new(40, 540, W as i32 - 40, 650);
-pub const PASSCODE_OFF: Rect = Rect::new(40, 680, W as i32 - 40, 790);
+pub const PASS_SET: Rect = Rect::new(40, 1010, W as i32 - 40, 1110);
+pub const PASS_OFF: Rect = Rect::new(40, 1140, W as i32 - 40, 1240);
 pub const POWER_OFF: Rect = Rect::new(40, 540, W as i32 - 40, 650);
 /// Confirming Power off (View::confirm).
 pub const CONFIRM_POWER: usize = usize::MAX - 1;
@@ -162,16 +165,8 @@ pub fn hit(v: &View, x: i32, y: i32) -> Option<Hit> {
             }
             (0..n).find(|&i| delete_rect(i).contains(x, y)).map(Hit::Delete)
         }
-        Section::Passcode if v.passcode.step == Step::Overview => {
-            if PASSCODE_SET.contains(x, y) {
-                Some(Hit::PasscodeSet)
-            } else if v.passcode.set && PASSCODE_OFF.contains(x, y) {
-                Some(Hit::PasscodeOff)
-            } else {
-                None
-            }
-        }
-        Section::Passcode => keypad::key_at(x, y).map(Hit::Pad),
+        Section::Passcode if PASS_SET.contains(x, y) => Some(Hit::PassSet),
+        Section::Passcode if v.status.passcode && PASS_OFF.contains(x, y) => Some(Hit::PassOff),
         Section::Power => POWER_OFF.contains(x, y).then_some(Hit::PowerOff),
         _ => None,
     }
@@ -210,6 +205,18 @@ fn paragraph(c: &mut Canvas, f: &violet::Face, text: &str, x: i32, mut y: i32, w
         y += (f.size() * 1.4) as i32;
     }
     y
+}
+
+/// The Date & Time page's two status lines: the local time in the chosen
+/// city, and where the clock came from.
+pub fn time_lines(s: &Status) -> (String, &'static str) {
+    if !s.clock_set {
+        return ("Clock not set".into(), "Join Wi-Fi and the network sets it");
+    }
+    match violet::time::local(violet::time::zone(s.city), s.minute * 60) {
+        Some(l) => (format!("{} · {} · {}", l.time(), l.date(), l.zone()), "Set from the network"),
+        None => ("—".into(), ""),
+    }
 }
 
 pub fn menu_value(s: &Status, section: Section) -> (String, bool) {
@@ -254,7 +261,7 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
                 chevron(c, (r.x1 - 34) as f32, (r.y0 + r.height() / 2) as f32);
             }
         }
-        Section::Wifi => {}
+        Section::Wifi | Section::Updates => {}
         Section::Bluetooth => {
             header(c, f, v, "‹ Settings", "Bluetooth");
             let card = Rect::new(40, 230, W as i32 - 40, 390);
@@ -320,6 +327,11 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
         Section::Time => {
             header(c, f, v, "‹ Settings", "Date & Time");
             f.regular(26.0).draw(c, "Home shows the date where you are", 44, 228, MUTED);
+            // The time there now, from the system clock and the city's
+            // daylight-saving rule (violet::time); nothing is fetched.
+            let (now, note) = time_lines(s);
+            f.medium(30.0).draw(c, &now, 44, 1476, if s.clock_set { CREAM } else { MUTED });
+            f.regular(24.0).draw(c, note, 44, 1516, MUTED);
             let face = f.medium(28.0);
             for (i, city) in CITIES.iter().enumerate() {
                 let r = city_rect(i);
@@ -364,38 +376,21 @@ pub fn draw(c: &mut Canvas, f: &Fonts, v: &View) {
             }
         }
         Section::Passcode => {
-            let p = v.passcode;
             header(c, f, v, "‹ Settings", "Passcode");
-            if p.step == Step::Overview {
-                let card = Rect::new(40, 230, W as i32 - 40, 500);
-                slab(c, card, 30.0, PAPER_RAISED);
-                f.medium(36.0).draw(c, if p.set { "On" } else { "Off" }, 80, 300, if p.set { VIOLET } else { CREAM });
-                let about = if p.set {
-                    "The power button locks the phone, and it starts locked. Your passcode unlocks it."
-                } else {
-                    "With a passcode, the power button locks the phone and it starts locked. A passcode is 4 to 8 digits."
-                };
-                paragraph(c, &f.regular(28.0), about, 80, 360, card.width() - 80, MUTED);
-                let bg = if v.pressed == Some(Hit::PasscodeSet) { PAPER_PRESSED } else if p.set { PAPER_RAISED } else { VIOLET };
-                violet::button(c, &f.medium(34.0), PASSCODE_SET, if p.set { "Change passcode" } else { "Set a passcode" }, bg, if p.set { CREAM } else { PAPER });
-                if p.set {
-                    let bg = if v.pressed == Some(Hit::PasscodeOff) { PAPER_PRESSED } else { PAPER_RAISED };
-                    violet::button(c, &f.medium(34.0), PASSCODE_OFF, "Turn off passcode", bg, ALERT);
-                }
-                if !p.note.is_empty() {
-                    f.regular(30.0).centered(c, &p.note, 0, W as i32, 880, if p.good { GOOD } else { ALERT });
-                }
-            } else {
-                f.regular(36.0).centered(c, p.prompt(), 0, W as i32, 560, CREAM);
-                keypad::dots(c, 650, p.typed.len());
-                if !p.note.is_empty() {
-                    f.regular(30.0).centered(c, &p.note, 0, W as i32, 740, ALERT);
-                }
-                let pressed = match v.pressed {
-                    Some(Hit::Pad(k)) => Some(k),
-                    _ => None,
-                };
-                keypad::draw(c, f, p.typed.len(), pressed);
+            let card = Rect::new(40, 230, W as i32 - 40, 400);
+            slab(c, card, 30.0, PAPER_RAISED);
+            f.medium(36.0).draw(c, if s.passcode { "On" } else { "Off" }, 80, 300, if s.passcode { VIOLET } else { CREAM });
+            let line = if s.passcode { "Asked for at start and when the screen wakes" } else { "Anyone holding the phone can use it" };
+            f.regular(27.0).draw(c, line, 80, 346, MUTED);
+            paragraph(c, &f.regular(28.0), "You type the passcode on the phone's own keypad, drawn by the system with the band at the top saying VIOLET SYSTEM: no app, Settings included, sees the digits. Five wrong tries in a row and the phone makes you wait, longer each time. There is no fingerprint or face unlock.", 44, 470, W as i32 - 88, MUTED);
+            let bg = if v.pressed == Some(Hit::PassSet) { PAPER_PRESSED } else { VIOLET };
+            violet::button(c, &f.medium(34.0), PASS_SET, if s.passcode { "Change passcode" } else { "Set passcode" }, bg, PAPER);
+            if s.passcode {
+                let bg = if v.pressed == Some(Hit::PassOff) { PAPER_PRESSED } else { PAPER_RAISED };
+                violet::button(c, &f.medium(30.0), PASS_OFF, "Turn off", bg, ALERT);
+            }
+            if !v.note.is_empty() {
+                f.regular(26.0).centered(c, v.note, 0, W as i32, 1290, ALERT);
             }
         }
         Section::Power => {

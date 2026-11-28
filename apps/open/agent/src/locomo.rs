@@ -5,11 +5,11 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use std::{fs, io::Write};
 
-const REQUEST: &str = "/tmp/locomo-make";
-const BROWSE: &str = "/tmp/locomo-browse";
-const LIBRARY: &str = "/tmp/locomo-library";
-const STATUS: &str = "/tmp/locomo-status";
-const TRACK: &str = "/tmp/locomo-track";
+const REQUEST: &str = "/tmp/.locomo.make";
+const BROWSE: &str = "/tmp/.locomo.browse";
+const LIBRARY: &str = "/tmp/.locomo.library";
+const STATUS: &str = "/tmp/.locomo.status";
+const TRACK: &str = "/tmp/.locomo.track";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Default)]
@@ -124,8 +124,8 @@ impl Locomo {
             return;
         }
         let data = value.to_string();
-        if data.len() <= 16 * 1024 && fs::write("/tmp/locomo-library.next", data).is_ok() {
-            let _ = fs::rename("/tmp/locomo-library.next", LIBRARY);
+        if data.len() <= 16 * 1024 && fs::write("/tmp/.locomo.library.next", data).is_ok() {
+            let _ = fs::rename("/tmp/.locomo.library.next", LIBRARY);
         }
     }
 
@@ -137,8 +137,8 @@ impl Locomo {
 
     pub fn status(&self, text: &str) {
         let message: String = text.chars().take(180).collect();
-        if fs::write("/tmp/locomo-status.next", message).is_ok() {
-            let _ = fs::rename("/tmp/locomo-status.next", STATUS);
+        if fs::write("/tmp/.locomo.status.next", message).is_ok() {
+            let _ = fs::rename("/tmp/.locomo.status.next", STATUS);
         }
     }
 
@@ -223,7 +223,7 @@ impl Transfer {
             return false;
         }
         let manifest = json!({"id": id, "title": self.title, "duration_ms": self.duration_ms, "station": self.station});
-        let staged = "/tmp/locomo-track.next";
+        let staged = "/tmp/.locomo.track.next";
         let result = (|| {
             let mut file = fs::File::create(staged)?;
             writeln!(file, "{manifest}")?;

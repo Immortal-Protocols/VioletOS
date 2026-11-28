@@ -3,6 +3,7 @@
 //! a line-oriented system control file. Also the app list ("shell") the Open
 //! Runtime draws when no app is in front.
 use super::abi::*;
+use super::policy::Cap;
 use super::sys::{self, FRAMEBUFFER, PAGE};
 use super::{request, Runtime, Wait, MAX_APPS};
 use crate::protocol::*;
@@ -15,7 +16,12 @@ use core::cell::RefCell;
 pub const WIDTH: usize = 720;
 pub const HEIGHT: usize = 1600;
 pub const STRIDE: usize = WIDTH * 4;
-pub const BUFFER_BYTES: usize = (STRIDE * HEIGHT + PAGE - 1) & !(PAGE - 1);
+/// A screen buffer, rounded up to 64 KiB (apps map the second one at this offset).
+pub const BUFFER_BYTES: usize = (STRIDE * HEIGHT + 0xffff) & !0xffff;
+/// The most one read or write of a file moves (1 MiB): a longer one comes
+/// back short, as POSIX allows, so a huge copy is many calls, each served in
+/// turn with the other apps' calls, and its buffer cannot exhaust the heap.
+pub const RW_SLICE: u32 = 1 << 20;
 
 pub enum Kind {
     File { path: String },
@@ -27,8 +33,9 @@ pub enum Kind {
     Camera { seen: u32 },
     /// The microphone stream (16 kHz s16 mono); `seen` counts samples read.
     Mic { seen: u32 },
-    /// The Bluetooth controller's HCI (hci.rs): one H4 packet per read or write.
-    Hci,
+    /// The Bluetooth controller's HCI (hci.rs): one H4 packet per read or
+    /// write; `client` is this app's place in the multiplexer (hcimux.rs).
+    Hci { client: u8 },
     Events,
     Sys { pending: Vec<u8> },
     Log,
@@ -39,13 +46,16 @@ pub enum Kind {
     Epoll { interest: Vec<(i32, u32, u64)>, reported: Vec<(i32, u32)> },
     EventFd { count: u64 },
     Pipe { buffer: Rc<RefCell<VecDeque<u8>>>, write: bool, peer_open: Rc<RefCell<u32>> },
-    /// A TCP socket: its slot once connect was called, and the peer.
-    Tcp { slot: Option<usize>, peer: (u32, u16) },
+    /// A TCP socket: its slot once connect (or a network listen) was called,
+    /// the peer, the address it is bound to, whether it is AF_INET6, and, for
+    /// a listener or a loopback connection, its loopback.rs side (sockets.rs).
+    Tcp { slot: Option<usize>, peer: (u32, u16), local: (u32, u16), v6: bool, lo: Option<super::loopback::Lo> },
     /// A UDP socket: DNS questions to the runtime's resolver are answered here;
     /// anything else goes through a Radio slot, opened on first use. `replies`
     /// holds datagrams (source, payload) ready to read; `allowed` the
-    /// destinations the Shield has passed.
-    Udp { peer: Option<(u32, u16)>, replies: VecDeque<((u32, u16), Vec<u8>)>, slot: Option<usize>, allowed: Vec<(u32, u16)> },
+    /// destinations the Shield has passed; `local` the address it is bound to
+    /// (loopback datagrams to that port come here).
+    Udp { peer: Option<(u32, u16)>, replies: VecDeque<((u32, u16), Vec<u8>)>, slot: Option<usize>, allowed: Vec<(u32, u16)>, local: (u32, u16), v6: bool },
 }
 
 pub struct OpenFile {
@@ -71,10 +81,14 @@ impl Drop for OpenFile {
         if let Kind::Mic { .. } = self.kind {
             mic::close();
         }
-        if let Kind::Hci = self.kind {
-            super::hci::close();
+        if let Kind::Hci { client } = self.kind {
+            super::hci::close(client);
         }
         if let Kind::Tcp { slot: Some(slot), .. } | Kind::Udp { slot: Some(slot), .. } = self.kind {
+            super::net::close(slot);
+        }
+        // A network connection a listener was taking from Radio.
+        if let Kind::Tcp { lo: Some(super::loopback::Lo::Listen(super::loopback::Listener { accepting: Some(slot), .. })), .. } = self.kind {
             super::net::close(slot);
         }
     }
@@ -101,6 +115,14 @@ impl Shell {
         self.armed = !finger_down;
         self.held = finger_down;
     }
+    /// The trusted UI covered the screen: forget the press in progress
+    /// (trusted_ui.rs). Whether a finger was down.
+    pub fn forget_finger(&mut self) -> bool {
+        let held = self.held;
+        self.held = false;
+        self.down_at = None;
+        held
+    }
 }
 
 #[derive(Default)]
@@ -108,6 +130,8 @@ pub struct Shell {
     pub dirty: bool,
     /// A touch counts only after the finger has been lifted since coming to the front.
     pub armed: bool,
+    /// The press began on the band (trusted_ui.rs): the app never sees it.
+    in_band: bool,
     held: bool,
     down_at: Option<(i32, i32, u64)>,
     /// Where the finger was last reported, so a contact that has not moved
@@ -122,7 +146,7 @@ mod font {
         (ALPHABET, GLYPHS)
     }
 }
-fn glyph(c: u8) -> Option<&'static [u8; 5]> {
+pub fn glyph(c: u8) -> Option<&'static [u8; 5]> {
     let (alphabet, glyphs) = font::tables();
     let c = c.to_ascii_uppercase();
     alphabet.iter().position(|&a| a == c).map(|i| &glyphs[i])
@@ -139,6 +163,14 @@ pub(super) fn fill(x: usize, y: usize, w: usize, h: usize, color: u32) {
     // below or by the caller) are as visible as volatile ones, and a row is
     // one fill instead of a store per pixel: the app list used to take long
     // enough to draw that a short tap during it went unseen.
+    // While system UI is up nothing else draws (trusted_ui.rs); the band is
+    // redrawn after anything else drew on its rows.
+    if super::trusted_ui::covers() {
+        return;
+    }
+    if y < super::sysui::BAND_H as usize {
+        super::trusted_ui::band_damaged();
+    }
     let (x0, x1) = (x.min(WIDTH), (x + w).min(WIDTH));
     for row in y..(y + h).min(HEIGHT) {
         let line = unsafe { core::slice::from_raw_parts_mut((FRAMEBUFFER as *mut u32).add(row * WIDTH + x0), x1 - x0) };
@@ -176,6 +208,10 @@ pub mod camera {
     pub fn want(on: bool) {
         unsafe { PAGE.write_volatile(on as u32) }
     }
+    /// An app has the camera on (the band's CAM).
+    pub fn wanted() -> bool {
+        get(0) != 0
+    }
     pub fn frames() -> u32 {
         get(10)
     }
@@ -207,12 +243,20 @@ pub mod mic {
     pub fn open() -> u32 {
         READERS.fetch_add(1, Ordering::Relaxed);
         unsafe { HEADER.add(16).write_volatile(1) };
-        request(EXECUTE, MICROPHONE, MIC_LISTEN);
+        // Not under system UI (a prompt, the passcode pad, the lock screen):
+        // it resumes when that goes (trusted_ui.rs ui_switch).
+        if !super::super::trusted_ui::covers() {
+            request(EXECUTE, MICROPHONE, MIC_LISTEN);
+        }
         written()
+    }
+    /// Some app has the microphone open (the band's MIC).
+    pub fn active() -> bool {
+        READERS.load(Ordering::Relaxed) > 0
     }
     /// The microphone again after the app in front changed (it turns off then).
     pub fn resume() {
-        if READERS.load(Ordering::Relaxed) > 0 {
+        if READERS.load(Ordering::Relaxed) > 0 && !super::super::trusted_ui::covers() {
             request(EXECUTE, MICROPHONE, MIC_LISTEN);
         }
     }
@@ -290,7 +334,7 @@ pub fn row_height(n: usize) -> usize {
 }
 
 /// Shared settings (see "get" and "set" in /dev/violet/sys).
-const SETTINGS: &str = "/data/settings";
+const SETTINGS: &str = super::manifest::SETTINGS;
 
 fn setting_key(k: &str) -> bool {
     (1..=24).contains(&k.len()) && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
@@ -326,7 +370,9 @@ impl Runtime {
     }
 
     /// Start the Home app, if there is one. It stays running; "home" shows it.
-    pub fn start_home(&mut self) {
+    /// `agent`: also the paired agent behind it (at first focus; not after a
+    /// contained fault, mod.rs `recover`, where it may be running still).
+    pub fn start_home(&mut self, agent: bool) {
         if self.fs.stat(super::HOME_APP).is_none() {
             return;
         }
@@ -339,7 +385,7 @@ impl Runtime {
         }
         // A paired voice agent starts behind Home, so it hears the user without
         // being opened first (its state is /data/agent; "peer" once paired).
-        let paired = self.fs.contents("/data/agent").is_some_and(|d| d.split(|&b| b == b'\n').any(|l| l.starts_with(b"peer ")));
+        let paired = agent && self.fs.contents("/data/agent").is_some_and(|d| d.split(|&b| b == b'\n').any(|l| l.starts_with(b"peer ")));
         if paired && self.fs.stat(super::appstore::INSTALLER).is_some() {
             match self.launch(super::appstore::INSTALLER, &[], None) {
                 Ok(_) => crate::log!("started the agent in the background"),
@@ -418,10 +464,6 @@ impl Runtime {
     }
 
     fn shell_tap(&mut self, x: i32, y: i32) {
-        // Locked, the list starts nothing (power.rs brings Home back).
-        if self.power.locked {
-            return;
-        }
         let y = y as usize;
         if (HOME_Y..HOME_Y + 150).contains(&y) {
             if self.home.is_some() {
@@ -460,6 +502,12 @@ impl Runtime {
 
     /// A touch change from Runtime or the interrupt ring, in screen pixels.
     pub fn touch(&mut self, x: i32, y: i32, down: bool) {
+        // A prompt, the passcode pad or the lock screen takes every touch.
+        // Not a touch of the app under it, for Violet Shield's in_front, so
+        // this comes before last_touch_ns (the idle lock counts it itself).
+        if self.ui_touch(x, y, down) {
+            return;
+        }
         // A finger on the glass (the idle samples between touches do not count).
         if down {
             self.last_touch_ns = sys::now_ns();
@@ -480,6 +528,7 @@ impl Runtime {
         let now = sys::now_ns();
         if down && !self.shell.held {
             self.shell.down_at = Some((x, y, now));
+            self.shell.in_band = (y as u32) < super::sysui::BAND_H;
         }
         // Touch is sampled continuously; only changes reach the app: a press,
         // a finger that moved, a release. (Every idle sample used to arrive
@@ -491,18 +540,28 @@ impl Runtime {
             (false, true) => EVENT_TOUCH_UP,
             (false, false) => return,
         };
+        // A lift is where the finger last was: the controller's release
+        // sample need not carry a position (QEMU's is 0, 0).
+        let (x, y) = if kind == EVENT_TOUCH_UP { self.shell.last_xy } else { (x, y) };
         self.shell.last_xy = (x, y);
         if let (false, Some((_, sy, t))) = (down, self.shell.down_at) {
             if sy < 48 && now - t > 1_000_000_000 {
                 self.shell.held = false;
                 self.shell.down_at = None;
-                self.lifecycle(i, LIFECYCLE_FOCUS_LOST);
-                self.foreground = None;
+                // Through set_foreground, so the app's grace counts from now (lifecycle.rs).
+                if self.foreground != Some(i) {
+                    self.lifecycle(i, LIFECYCLE_FOCUS_LOST);
+                }
+                self.set_foreground(None);
                 self.show_home();
                 return;
             }
         }
         self.shell.held = down;
+        // A press that began on the band is the system's (holding it goes Home).
+        if self.shell.in_band {
+            return;
+        }
         self.event(i, InputEvent { timestamp_us: now / 1000, kind, code: 0, x, y, value: 0 });
     }
 
@@ -538,15 +597,11 @@ impl Runtime {
         self.foreground = next;
     }
     /// App memory in KiB: the pool left, and per running app its pages plus its
-    /// screen surface, and its page tables.
-    pub fn memory_report(&self) -> String {
-        let mut out = alloc::format!("free={} total={}", self.pool.available() * 64, self.pool.total * 64);
-        for a in self.apps.iter().flatten() {
-            let (pages, tables) = a.space.usage();
-            let surface = a.surface.as_ref().map_or(0, |s| s.pages.len());
-            out += &alloc::format!(" {}={}+{}(t{})", a.name, pages * 64, surface * 64, tables);
-        }
-        out
+    /// screen surface, its page tables and lifecycle state (mod.rs). Every
+    /// app's only for an app with the system capability (and "@sys memory"
+    /// over USB); any other app sees its own.
+    pub fn memory_report(&self, i: usize) -> String {
+        self.lifecycle_report((!self.holds(i, Cap::System)).then_some(i))
     }
     fn holds_mic(&self, i: usize) -> bool {
         self.apps[i].as_ref().is_some_and(|a| a.fds.iter().flatten().any(|f| matches!(f.borrow().kind, Kind::Mic { .. })))
@@ -554,7 +609,8 @@ impl Runtime {
     /// The app allowed to keep the microphone when it is not in front (the
     /// voice agent), while it holds it.
     pub fn background_listener(&self) -> Option<usize> {
-        (0..MAX_APPS).find(|&n| self.apps[n].as_ref().is_some_and(|a| a.path == super::appstore::INSTALLER) && self.holds_mic(n))
+        // The microphone from behind other apps takes the system capability too (policy.rs).
+        (0..MAX_APPS).find(|&n| self.apps[n].is_some() && self.holds(n, Cap::System) && self.holds(n, Cap::Mic) && self.holds_mic(n))
     }
     pub fn lifecycle(&mut self, i: usize, value: i32) {
         let now = sys::now_ns() / 1000;
@@ -628,6 +684,11 @@ impl Runtime {
             s.pending = None;
             return true;
         }
+        // Never the band's rows, and nothing while system UI is up (sysui.rs).
+        let Some((y0, y1)) = super::sysui::app_rows(y0, y1, super::trusted_ui::covers()) else {
+            s.pending = None;
+            return true;
+        };
         let start = sys::now_ns();
         if !self.beam.clear_of(y0, y1) && start - since < super::scanout::MAX_WAIT_NS {
             return false;
@@ -720,7 +781,14 @@ impl Runtime {
     /// Whether a wait can finish now, and with what result.
     pub fn ready(&mut self, i: usize, wait: &Wait) -> Option<i32> {
         match wait {
-            Wait::Futex { .. } | Wait::Sleep | Wait::Frozen => None,
+            Wait::Futex { .. } | Wait::Sleep | Wait::Frozen | Wait::Signal => None,
+            // Answered while its app was frozen (mod.rs `wake`); check_waiters skips frozen apps.
+            Wait::Held { result } => Some(*result),
+            // The prompt was answered or withdrawn: the call runs again, and policy has the answer.
+            Wait::Consent { cap } => {
+                let pid = self.apps[i].as_ref().map_or(0, |a| a.pid);
+                (!super::trusted_ui::pending(pid, *cap)).then_some(super::trusted_ui::RESTART)
+            }
             Wait::Present { result } => (!self.present_pending(i)).then_some(*result),
             Wait::Vsync { after, ptr } => {
                 if self.beam.frame <= *after {
@@ -748,6 +816,10 @@ impl Runtime {
             }
             Wait::RecvFrom { fd, buf, len, name, name_len } => {
                 let r = self.recv_from(i, *fd, *buf, *len, *name, *name_len);
+                (r != super::syscall::EAGAIN).then_some(r)
+            }
+            Wait::Accept { fd, addr, len, flags } => {
+                let r = self.accept_now(i, *fd, *addr, *len, *flags);
                 (r != super::syscall::EAGAIN).then_some(r)
             }
             Wait::Poll { fds, ptr, time64: _ } => {
@@ -800,12 +872,31 @@ impl Runtime {
                 let b = buffer.borrow();
                 (!b.is_empty()) as u32 | if *peer_open.borrow() == 0 { 0x11 } else { 0 }
             }
-            Kind::Pipe { write: true, .. } => 4,
+            // Writable while a PIPE_BUF write fits (lifecycle.rs `pipe_room`); POLLERR with no reader.
+            Kind::Pipe { buffer, write: true, .. } if Rc::strong_count(buffer) < 2 => 0xc,
+            Kind::Pipe { buffer, write: true, .. } => {
+                let room = super::lifecycle::pipe_room(buffer.borrow().len(), super::pipe_bytes(app), super::lifecycle::PIPE_BUF);
+                if room > 0 { 4 } else { 0 }
+            }
             Kind::Audio { .. } => if pcm_space() > 0 { 4 } else { 0 },
-            Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i)) as u32,
+            Kind::Camera { seen } => (camera::frames() != *seen && self.focused && self.foreground == Some(i) && !super::trusted_ui::covers()) as u32,
             Kind::Mic { seen } => (mic::written() != *seen) as u32,
-            Kind::Hci => super::hci::readable() as u32 | if super::hci::space() >= 1028 { 4 } else { 0 },
+            Kind::Hci { client } => super::hci::readable(*client) as u32 | if super::hci::writable(*client) { 4 } else { 0 },
             Kind::Udp { replies, slot, .. } => 4 | (!replies.is_empty() || slot.is_some_and(|s| self.net.rx_ready(s) > 0)) as u32,
+            // A listener or a loopback connection (sockets.rs): a listener is
+            // readable when a connection waits here or in Radio.
+            Kind::Tcp { lo: Some(lo), slot, .. } => {
+                let accepting = match lo {
+                    super::loopback::Lo::Listen(l) => l.accepting,
+                    _ => None,
+                };
+                // While Radio is handing one over, readable once it has.
+                let net = match accepting {
+                    Some(s) => self.net.state(s).0 != super::net::CONNECTING,
+                    None => slot.is_some_and(|s| self.net.waiting(s) > 0),
+                };
+                lo.poll(net)
+            }
             Kind::Tcp { slot: None, .. } => 4,
             Kind::Tcp { slot: Some(slot), .. } => {
                 let net = &self.net;
@@ -905,23 +996,23 @@ impl Runtime {
         };
         let mut f = f.borrow_mut();
         let offset = f.offset;
+        // Violet Shield judged a write-only open as a write only: it cannot read.
+        let write_only = !super::shield::fd_reads(f.flags);
         let data: Vec<u8> = match &mut f.kind {
+            Kind::File { .. } if write_only => return EBADF,
             Kind::File { path } => {
                 let Some(c) = self.fs.contents(path) else { return EIO };
                 let start = (offset as usize).min(c.len());
-                let end = (start + len as usize).min(c.len());
+                let end = (start + len.min(RW_SLICE) as usize).min(c.len());
                 c[start..end].to_vec()
             }
             Kind::Dir { .. } => return EISDIR,
             Kind::Null | Kind::Log => Vec::new(),
             Kind::Random => {
-                let mut v = Vec::with_capacity(len as usize);
-                let mut x = sys::counter() | 1;
-                while v.len() < len as usize {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    v.push((x >> 24) as u8);
+                // The same generator as getrandom (entropy.rs); at most 64 KiB a read.
+                let mut v = alloc::vec![0u8; (len as usize).min(65536)];
+                if !self.entropy.fill(&mut v) {
+                    return EIO;
                 }
                 v
             }
@@ -945,6 +1036,11 @@ impl Runtime {
                 let n = pending.len().min(len as usize);
                 pending.drain(..n).collect()
             }
+            // A loopback connection (a listener: ENOTCONN).
+            Kind::Tcp { lo: Some(lo), .. } => match lo.read(len as usize) {
+                Ok(v) => v,
+                Err(e) => return e,
+            },
             Kind::Tcp { slot: None, .. } => return -107, // ENOTCONN
             Kind::Tcp { slot: Some(slot), .. } => {
                 let slot = *slot;
@@ -985,11 +1081,11 @@ impl Runtime {
                 let n = b.len().min(len as usize);
                 b.drain(..n).collect()
             }
-            Kind::Hci => {
+            Kind::Hci { client } => {
                 if !super::hci::up() {
                     return ENETDOWN;
                 }
-                match super::hci::take(len as usize) {
+                match super::hci::take(*client, len as usize) {
                     Some(v) => v,
                     None => return EAGAIN,
                 }
@@ -1004,7 +1100,7 @@ impl Runtime {
             Kind::Camera { seen } => {
                 // Only the app on screen sees frames (not while the phone
                 // sleeps or another screen is up); reading keeps the camera on.
-                if !self.focused || self.foreground != Some(i) || len < 32 {
+                if !self.focused || self.foreground != Some(i) || super::trusted_ui::covers() || len < 32 {
                     return if len < 32 { EINVAL } else { EAGAIN };
                 }
                 camera::want(true);
@@ -1073,28 +1169,34 @@ impl Runtime {
 
     /// A command written to /dev/violet/sys. Answers are read back from it.
     pub fn system(&mut self, i: usize, line: &str) -> String {
+        // The capability each command needs (policy.rs `sys_cap`).
+        if let Some(refused) = self.sys_refused(i, line) {
+            return refused;
+        }
+        // Who may give it, in front or not, locked or not (trusted_ui.rs, sysui.rs `may`).
+        if let Err(refused) = self.ui_may(i, line) {
+            return String::from(refused);
+        }
         let mut words = line.split_whitespace();
         match words.next() {
             // Back to the Home app (or, without one, the classic launcher).
             Some("home") => {
+                // set_foreground: the app leaving hears FOCUS_LOST and its grace counts from now.
                 if self.home.is_some() && self.home != Some(i) {
-                    if self.foreground == Some(i) {
-                        self.lifecycle(i, LIFECYCLE_FOCUS_LOST);
-                    }
-                    self.foreground = None;
+                    self.set_foreground(None);
                     self.show_home();
                     return String::from("ok\n");
                 }
                 if self.foreground == Some(i) {
-                    self.foreground = None;
+                    self.set_foreground(None);
                     self.shell.dirty = true;
                 }
                 request(EXECUTE, OPEN, LAUNCHER);
                 String::from("ok\n")
             }
             // The list of every program in /apps.
-            Some("apps" | "open") if self.power.locked => String::from("error locked\n"),
-            Some(verb @ ("lock" | "unlock" | "passcode" | "power")) => self.power_command(i, verb, &mut words),
+            // "power off" (power.rs); plain "power" is Power's state (powerctl.rs, below).
+            Some("power") if line.split_whitespace().nth(1) == Some("off") => self.power_command(i, &mut words),
             Some("apps") => {
                 self.set_foreground(None);
                 self.shell.dirty = true;
@@ -1104,8 +1206,8 @@ impl Runtime {
             Some("bluetooth") => alloc::format!("on={} open={}\n", super::hci::up() as u32, super::hci::is_open() as u32),
             // Phone Internet (runtime/open/wifi.rs).
             Some("relay") => {
-                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
-                self.wifi.relay(&path, &mut words)
+                let admin = self.holds(i, Cap::WifiAdmin);
+                self.wifi.relay(admin, &mut words)
             }
             // Bring an app to the front, starting it if it is not running.
             Some("open") => match words.next() {
@@ -1113,6 +1215,7 @@ impl Runtime {
                     if let Some(n) = (0..MAX_APPS).find(|&n| self.apps[n].as_ref().map_or(false, |a| a.path == path)) {
                         if self.foreground != Some(n) {
                             self.set_foreground(Some(n));
+                            self.shield_fronted(i, n); // Violet Shield: who put it in front
                             self.refresh(n);
                             self.lifecycle(n, LIFECYCLE_FOCUS_GAINED);
                         }
@@ -1121,6 +1224,7 @@ impl Runtime {
                     match self.launch(path, &[], Some(i)) {
                         Ok(n) => {
                             self.set_foreground(Some(n));
+                            self.shield_fronted(i, n); // Violet Shield: who put it in front
                             fill(0, 0, WIDTH, HEIGHT, 0xff000000);
                             String::from("ok\n")
                         }
@@ -1191,21 +1295,17 @@ impl Runtime {
             // The programs running now, as paths.
             // Installed apps (runtime/open/appstore.rs): "install NAME TITLE" keeps
             // the staged program as /apps/NAME across restarts and lists it under
-            // TITLE; "uninstall NAME" removes it; "installed" lists them. Only the
-            // agent (/apps/agent), which takes installs from the paired Mac, may
-            // install them; the agent and Settings may remove them.
+            // TITLE; "uninstall NAME" removes it; "installed" lists them. Only an
+            // app with the system capability (the agent, which takes installs from
+            // the paired Mac and alone may write the staged program, and Settings)
+            // gives them (checked above, policy.rs `sys_cap`).
             Some(verb @ ("install" | "uninstall")) => {
-                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
-                let allowed = path == super::appstore::INSTALLER || (verb == "uninstall" && path == super::wifi::SETTINGS_APP);
-                if !allowed {
-                    return String::from("error only the agent installs apps\n");
-                }
                 let Some(name) = words.next().filter(|n| super::appstore::valid_name(n)) else {
                     return alloc::format!("error usage: {} NAME{}\n", verb, if verb == "install" { " TITLE" } else { "" });
                 };
                 let installed = alloc::format!("/apps/{}", name);
                 let image = self.fs.stat(&installed).is_some() && !self.fs.from_layer(&installed);
-                if image || installed == super::appstore::INSTALLER {
+                if image || installed == super::appstore::INSTALLER || self.book.reserved(name) {
                     return String::from("error a built-in app has that name\n");
                 }
                 let title: Vec<&str> = words.collect();
@@ -1218,6 +1318,8 @@ impl Runtime {
                         if let Some(n) = running {
                             self.reap(n);
                         }
+                        // A new program under this name is asked afresh (its /data stays).
+                        self.forget_consent(name);
                         alloc::format!("ok {}\n", bytes)
                     })
                 } else {
@@ -1225,7 +1327,11 @@ impl Runtime {
                     if let Some(n) = running {
                         self.reap(n);
                     }
-                    self.store.remove(&mut self.fs, name).map(|_| String::from("ok\n"))
+                    // Its answers and /data go too, so a later app of that name starts afresh.
+                    self.store.remove(&mut self.fs, name).map(|_| {
+                        self.forget_app(name);
+                        String::from("ok\n")
+                    })
                 };
                 self.shell.dirty = true;
                 match r {
@@ -1237,9 +1343,14 @@ impl Runtime {
                 }
             }
             Some("installed") => self.store.list(),
+            // Full-system updates into the inactive boot slot (update.rs), for Settings and the agent.
+            Some("update") => {
+                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
+                super::update::command(&path, &mut self.fs, words)
+            }
             // App memory: the pool left, and what each running app holds (its pages,
             // its screen surface), in KiB. "@sys memory" over USB.
-            Some("memory") => alloc::format!("{}\n", self.memory_report()),
+            Some("memory") => alloc::format!("{}\n", self.memory_report(i)),
             Some("running") => {
                 let paths: Vec<&str> = self.apps.iter().flatten().map(|a| a.path.as_str()).collect();
                 alloc::format!("{}\n", paths.join(" "))
@@ -1267,7 +1378,7 @@ impl Runtime {
                 }
                 _ => String::from("error\n"),
             },
-            Some("shield-agent") if self.apps[i].as_ref().is_some_and(|app| app.path == super::appstore::INSTALLER) =>
+            Some("shield-agent") =>
             {
                 match words.next() {
                     Some("pull") => self.sentinel.agent_pull(sys::now_ns(), false),
@@ -1276,6 +1387,9 @@ impl Runtime {
                     _ => String::from("error"),
                 }
             }
+            // Violet Shield's own enforcement (guard.rs): "shield-local" reports the mode,
+            // quarantined apps and counts; Settings sets "shield-mode" and "shield-release NAME".
+            Some(verb @ ("shield-local" | "shield-mode" | "shield-release")) => self.shield_sys(i, verb, words.next()),
             // Violet Shield: the companion link, live rules and frozen apps, for Home.
             Some("shield") => {
                 let frozen: Vec<&str> = self.apps.iter().flatten().filter(|a| a.frozen.is_some()).map(|a| a.name.as_str()).collect();
@@ -1373,6 +1487,7 @@ impl Runtime {
                 Some(path) => match self.launch(path, &[], Some(i)) {
                     Ok(n) => {
                         self.set_foreground(Some(n));
+                        self.shield_fronted(i, n); // Violet Shield: who put it in front
                         String::from("ok\n")
                     }
                     Err(e) => alloc::format!("error {}\n", e),
@@ -1381,14 +1496,22 @@ impl Runtime {
             },
             // Wi-Fi: scan, list, join and leave (runtime/open/wifi.rs).
             Some("wifi") => {
-                let path = self.apps[i].as_ref().map_or(String::new(), |a| a.path.clone());
-                self.wifi.command(&path, &mut words)
+                let admin = self.holds(i, Cap::WifiAdmin);
+                self.wifi.command(admin, &mut words)
             }
+            // Wake locks and Power's governors (powerctl.rs); the wall clock (timesync.rs).
+            Some("wakelock" | "wakelocks" | "power") => {
+                let (pid, path) = self.apps[i].as_ref().map_or((0, ""), |a| (a.pid, a.path.as_str()));
+                super::powerctl::command(pid, path, line)
+            }
+            Some("time") if words.next().is_none() => super::timesync::command(sys::now_ns()),
             Some("log") => {
                 let rest: Vec<&str> = words.collect();
                 crate::log!("{}", rest.join(" "));
                 String::from("ok\n")
             }
+            // The passcode, locking, secure prompts and notifications (trusted_ui.rs).
+            Some(verb @ ("passcode" | "lock" | "consent" | "notify" | "notifications")) => self.ui_sys(i, verb, line),
             _ => String::from("error unknown command\n"),
         }
     }

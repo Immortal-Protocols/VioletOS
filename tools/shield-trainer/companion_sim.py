@@ -113,6 +113,9 @@ class Companion:
             except OSError:
                 c.sendall(b"\x05\x05\x00\x01" + bytes(6))
                 return c.close()
+            # The 8 seconds are for the connect only: a quiet server (the sink
+            # never answers an upload) must not end the connection.
+            up.settimeout(None)
             c.sendall(b"\x05\x00\x00\x01" + bytes(6))
             self.pipe(c, up, flow)
         except (ConnectionError, OSError):
@@ -256,7 +259,12 @@ class Companion:
         print(f"companion_sim: {d['tier']} {t.name} pid {t.pid}: {d['verdict']} p_mal={d['p_malicious']:.2f}"
               f"{' WARNED' if d['warned'] else ''}", flush=True)
         self.decisions.insert(0, d)
-        del self.decisions[30:]
+        self.trim()
+
+    def trim(self):
+        # The newest 30, and every older one that sent a warning (one app that
+        # keeps running must not push another's warning out of the status).
+        self.decisions = self.decisions[:30] + [d for d in self.decisions[30:] if d.get("warned")]
 
     def warn(self, pid):
         now = time.time()
@@ -279,7 +287,7 @@ class Companion:
             self.decisions.insert(0, {"time": now, "pid": 0, "app": "unattributed", "tier": "relay", "verdict": "exfil_or_c2", "p_malicious": 1.0,
                                       "action": "block_host", "tags": ["socks_sentinel_mismatch"], "hosts": [f["target"]], "contained": False,
                                       "warned": self.warn(0), "note": "relay saw a connection the Sentinel never reported"})
-            del self.decisions[30:]
+            self.trim()
             print(f"companion_sim: UNREPORTED connection {f['target']} flagged", flush=True)
 
     def write_status(self):

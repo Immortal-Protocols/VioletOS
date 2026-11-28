@@ -1,29 +1,94 @@
 # Power service
 
-Power owns the battery reading, the power key, sleep and power off. On the handset it also owns the PMIC, and performs the few PMIC accesses [Audio](../audio/README.md), Camera and Radio need.
+Power answers for the battery, sleep and shutdown, keeps the wake locks, runs the thermal and frequency governors, and switches the supplies other services share. [process.rs](process.rs) is the request loop. Every decision is made in [policy.rs](policy.rs), which touches no hardware and is tested on the host by `make test-unit`. The registers belong to the board: [targets/qemu/power.rs](../../targets/qemu/power.rs) and [targets/moto-g-pure/power.rs](../../targets/moto-g-pure/power.rs).
 
-| Request (from Runtime) | Answer |
-| --- | --- |
-| `GET POWER` | The battery: a percentage in QEMU, millivolts on the handset (`arg` has `POWER_MILLIVOLTS`). |
-| `GET POWER_KEY` | Bit 0 of `value` is set while the power key is held. In QEMU `arg` counts presses, so a press shorter than a poll is still seen. |
-| `EXECUTE POWER 1` / `0` | Sleep and wake. Runtime has Display blank the screen first and reports no app in front until wake. |
-| `EXECUTE POWER 2` | Power off. |
+Power runs when a request arrives and, where the supervisor's timekeeper serves it (see Idle), on a deadline of its own whenever something is pending: a held lock that can lapse, a sensor to sample, a postponed suspend, the wake lines while suspended (`policy::Manager::next_tick`). With nothing pending it sleeps until the next request. Without the timekeeper it runs only on requests (Home asks for the battery every two seconds while it is in front), as before; every delay in the policy is measured in real time, so uneven calls only make a decision later.
 
-The [Open Runtime](../../runtime/open/README.md) polls the key every 40 ms and decides what a press means ([power.rs](../../runtime/open/power.rs), [lock.rs](../../runtime/open/lock.rs)):
+## Wake locks
 
-- **A short press** turns the screen off; the next one turns it on. Touches do not reach a screen that is off. With a passcode set in Settings › Passcode, turning the screen off also locks the phone, and the phone starts locked.
-- **Holding the key** (0.8 s) brings Home's power sheet on any screen, the lock screen included: **Power off** or **Cancel**. Settings › Power has **Power off** too.
+A holder asks Power to keep the CPU awake after the screen goes off. Open apps write `wakelock 1` and `wakelock 0` to `/dev/violet/sys`; Audio and Camera can take one under their own component ID over their Power endpoint (neither does yet, so that path is unused). Radio cannot: it has no endpoint of its own at Power (badge 7 is Runtime's worker for Radio's requests, which only switches the Wi-Fi rails).
 
-Before power off, the Open Runtime writes every changed `/data` file back to Storage.
+- One lock per owner and kind. Taking it again renews it and is not a second lock.
+- Only the owner that took a lock can release it. An app's lock ends when the app exits.
+- An app's lock lapses ten minutes after it was last taken, so an app that forgets or hangs cannot keep the phone awake for ever. Lapses are counted against the owner.
+- Any open app may take a lock; there is no permission for it. What bounds an app that renews for ever is the screen: once it is off, no app is given a new lock, and a held one ends at most thirty minutes after the screen went off however often it is renewed (`error screen-off`). Turning the screen on starts the allowance again. Services' locks have no such limit.
+- A full table (16 locks) is refused as `DENIED` with `POWER_LOCK_FULL` in `arg`, which apps read as `error busy`. It is not sent as `BUSY`: Runtime uses that for a request still running, and the client would ask again and lose the answer.
+- Sixteen locks at most. A request beyond that is refused (`error busy`), never dropped silently.
+- Power keeps, per owner, how many locks it took, how many lapsed, and the total and longest time held. `wakelocks` in `/dev/violet/sys` prints who holds what now and those totals; any app can read it, and on the handset `build/moto-package "open-run=@sys wakelocks"` puts it in the open log. Power knows an app only by its pid (`pid:N`); the Open Runtime's log has a line with the program's path when a lock is taken, released, lost with the screen off, or left held at exit, which ties a pid to an app. The table is not written to the log by itself, and no Settings page shows it.
 
-## QEMU
+When Runtime asks for sleep while a lock is held, the screen stays off and Power postpones the suspend. Its answer names the kinds of lock in the way, and the suspend follows when the last one is released, lapses or its owner exits. With the timekeeper Power looks again every second while a lock is held, so a lapse is acted on within a second (not ten times a second: a release is a request and is acted on at once); without it, at the next request that reaches Power. With no lock held, sleep behaves as it did before.
 
-The [fixture](../../targets/qemu/power.rs) is one page shared with the Mac: the battery level, the command word, the key's level and its press count. In `make emulator`, **P** is the power button. While the screen is off, [run.py](../../tools/run.py) pauses the guest and resumes it on the next press of **P**; power off ends the emulator.
+A held lock also keeps its holder running behind ([runtime/open/powerctl.rs](../../runtime/open/powerctl.rs) `facts`, [lifecycle.rs](../../runtime/open/lifecycle.rs)): without one an app is frozen fifteen seconds after it leaves the screen. It keeps the app Cached, not Visible: taking a lock needs no capability, so it gives no rank for memory. Under Low pressure the holder is frozen like any cached app, and under Critical pressure, or for a background app's page fault, it can be closed. Power's OK to a take carries the lock's expiry (arg, in ms: ten minutes, or the screen-off bound if that is sooner), and the Open Runtime's record ends then, with no further request. It also ends when the app releases the lock, when Power refuses a renewal, or when the app exits. Any app can still keep itself running behind while it renews with the screen on; `wakelocks` shows who does and for how long. A capability for `wakelock 1` would be the policy engine's to add.
 
-`make test-lock` covers all of it across two boots: the key turns the screen off and on, Settings sets a passcode, the key locks, a wrong passcode and an app's icon are refused, the right passcode unlocks, the phone starts locked after a restart, and the power sheet powers the machine off.
+What this does not do: the handset has no suspend at all (its sleep command only blanks the screen), so on the handset a wake lock keeps the app running but saves no power. Time is counted, not energy. Audio streams and downloads do not take a lock by themselves.
 
-## Handset
+## Suspend to idle
 
-The [backend](../../targets/moto-g-pure/power.rs) reads the key from the MT6357's TOPSTATUS register (`0x0024` bit 1, `PWRKEY_DEB`, 0 while pressed, as in Linux's `mtk-pmic-keys`) and powers off by releasing the PMIC's power-hold bit.
+In the emulator, with the timekeeper running. Untested in QEMU as of this change (host tests only); not enabled on the handset.
 
-On November 27, 2026 the owner checked all of it on the XT2163DL: a short press turned the screen off and on, the passcode locked the phone, and power off worked. The screen going "off" is a black frame with touch ignored: the backlight stays lit, since nothing drives the panel's power or backlight yet.
+When Power decides to suspend it freezes the supervisor's timekeeper: every other process's timer deadlines are held and released together twice a second, so the idle loops (the launcher, Audio, Camera, the supervisor's health check, the Open Runtime's own timer) run in one batch and the CPU sits in the kernel's idle thread in between. A wait shorter than three milliseconds is not held: that is a driver polling a device in the middle of work. Nothing is powered down and no state is lost; a process that is woken by a message or an interrupt runs at once, as always. The machine keeps running, which is what lets the wake sources work (the older behaviour, a register that tools/run.py answers by pausing the whole machine, remains for an image without the timekeeper).
+
+Wake sources, each a bit in the reason Power reports:
+
+| Source | Emulator | Effect |
+| --- | --- | --- |
+| Power key | fixture word 13 bit 0, written by the host | The CPU resumes and Power asks for the screen (`POWER_INFO_WANT_WAKE`). |
+| Touch | fixture word 13 bit 1 (a wake line set by the host; the Touch service does not raise it itself yet) | As the power key. |
+| Timer | an alarm: fixture word 14, milliseconds from now (`Manager::set_alarm`; no request sets one yet) | The CPU resumes; the screen stays off. |
+| Network | fixture word 13 bit 3 (set by the host; Radio does not raise it itself yet) | As the timer. |
+
+After any wake the system stays up five seconds and then suspends again unless a wake lock is held or Runtime has been told to wake. Power cannot turn the screen on: Runtime blanks and unblanks it, and takes that only from the boot launcher, so the launcher asks Power ten times a second what it wants and passes it on ([apps/launcher/process.rs](../../apps/launcher/process.rs)). The same path makes the power key a sleep button while the screen is on (`POWER_INFO_WANT_SLEEP`), which is the first thing in the image that asks for sleep; the Open Runtime locks when Runtime reports the screen off, as it already did. A process the suspend names may also end it directly (`system_wake` in runtime/transport.c: Runtime, Touch, Radio, the Open Runtime), which is immediate; none of them calls it yet, so in QEMU a wake comes only from Power reading the fixture's wake lines (taken and cleared in one atomic swap, so a line the host sets meanwhile is not lost). While suspended, waits shorter than 3 ms are not held, so a process polling a device (the Open Runtime while apps are busy, Audio while playing) keeps its pace and the CPU is not near zero then.
+
+On the handset `Board::SUSPENDS` is false: sleep still only blanks the screen, Power watches no wake line and never suspends again by itself, and the launcher does not poll. The Open Runtime reads the power key there (below), through `GET POWER_KEY`. Freezing timers on the phone is held back until Radio's and Touch's drivers have been run under it on hardware.
+
+## Idle
+
+A process that waits used to spin: `delay_ms` in [runtime/transport.c](../../runtime/transport.c) was a loop of yields, and the supervisor polled for faults the same way, so one core was always busy (QEMU used 100% of a host core at Home: 20.07 s of CPU in 20.0 s, `make test-idle` at the previous commit).
+
+Now the supervisor runs a timekeeper ([platform/sel4/include/timekeeper.h](../../platform/sel4/include/timekeeper.h) for the decisions, [system/supervisor/timekeeper_thread.h](../../system/supervisor/timekeeper_thread.h) for the thread): one thread that owns the user timer. A process writes how long it wants to sleep to a page it shares with the timekeeper, kicks it and blocks on a notification; the supervisor blocks on its lifecycle endpoint and is woken for its health check every 100 ms; the Open Runtime's timer goes through the same thread. With every process blocked the kernel's idle thread runs. Audio's loop, which woke every millisecond, now runs every four while nothing plays and the microphone is off.
+
+If the timer does not fire at start-up, the guard thread cannot be made, the Open Runtime cannot be attached, or the image was built with `VIOLET_TIMEKEEPER=0`, the timekeeper is off: every process is started without it and keeps its yield loop, and the Open Runtime takes the timer's interrupt itself. That is not exactly the previous commit: the launcher's 10 Hz `POWER_INFO` poll and the power key's sleep path are built in either way. The timekeeper is on by default on both targets; on the handset none of it has run on hardware. Radio's delays still spin while it holds the CPU for the connectivity chip's UART, and the Open Runtime polls its own work every 0.5 to 2 ms while apps are busy.
+
+**The timer is not the timekeeper's alone.** The kernel exports the nonsecure physical timer to every user thread (`KernelArmExportPTMRUser`, [kernel/sel4/build.py](../../kernel/sel4/build.py)), so any open app can stop it, mask it or move it. On its own that would leave every sleeper and the supervisor's health check waiting for good. A guard thread in the supervisor, at priority 100 like every process and app thread, checks on each turn whether the timer is overdue (more than 2 ms past when the timekeeper programmed it) and kicks the timekeeper itself; a spinning app cannot starve it, because the kernel's time slice gives it a turn. So an app that stops the timer delays sleepers by up to a time slice (10 ms), and the guard counts each catch (`tk_watch.late`). With nothing else to run the guard waits for an interrupt (WFI), so the CPU still idles; it wakes on the kernel's 2 ms tick as the kernel's idle thread does. If WFI traps at user level on a board (SCTLR.nTWI clear), the guard dies in its first WFI; the supervisor sees that after three health checks and restarts it yielding only, which keeps the protection and costs the idle CPU. Not fixed here: an app that re-arms the timer to fire at once makes the timekeeper scan more often, within the app's own CPU share. Removing the exposure needs a kernel change (export the timer to the supervisor's threads only, switching `CNTKCTL.PL0PTEN` per thread), which is the kernel's owners' to make.
+
+Not measured yet: this was written without running QEMU, so the idle figure after the change is unknown until `make test-idle` is run on a new image. What still wakes the CPU at Home: the Open Runtime's loop (up to 620 passes a second, its own business), Audio 250 times a second, the launcher 50 times, Camera 50 times, the supervisor 10 times, and the kernel's own 2 ms tick. On the handset the same code runs but has never been on hardware; how deep the SoC sleeps in the idle thread is the firmware's choice.
+
+## Thermal and frequency governors
+
+Tested as pure code; functional in QEMU against an emulated sensor; **not active on the handset**.
+
+- Thermal: four levels (normal, warm, hot, critical) from three trip points. A level rises at once. It falls one level at a time, only after five seconds at the level and only once the temperature is below the trip by the hysteresis. A sensor that fails three readings in a row, or reads outside −40 to 150 °C, is treated as hot, never as cool, and never powers the phone off by itself. Critical powers the phone off. Once the board has accepted that power-off, Power refuses sleep and wake and postpones no suspend, so a later command cannot replace it (in QEMU all three are one fixture word).
+- Frequency: picks the slowest operating point with a quarter more capacity than the load needs, goes up at once, comes down after the load has stayed low for half a second, and obeys the thermal cap at once. A change raises the supply before the frequency and lowers the frequency before the supply; if a step fails, the governor stays at a point whose supply is at least what the running frequency needs.
+- QEMU: the sensor, the load and the operating points are words of the fixture page (the table is at the top of the QEMU backend). The operating points change nothing about how fast QEMU runs. `make test-power` (local, not in CI) drives them.
+- Handset: the phone's operating points (sixteen per cluster: 900 to 2301 MHz at 0.6 to 1.11875 V for the four cores VioletOS runs on) and its seven PSCI idle states are now in the tree as data, generated from the factory device tree by [tools/power_tables.py](../../tools/power_tables.py) into [targets/moto-g-pure/power_tables.rs](../../targets/moto-g-pure/power_tables.rs) and checked by `make test-unit` against the governor (valid, rising, on the regulator's grid, every step safe in both directions). They are in no package and nothing applies them: switching a point needs the PLL and VPROC sequence, which is not written, an idle state needs PSCI calls the kernel does not pass on, and none of it has been near hardware. The factory tree has no thermal trip points (it names a thermal controller and four thermistor channels, nothing more), so the trip points stay a placeholder, and its table for the bus between the clusters is inconsistent as written (four frequencies a tenth of their neighbours'), so it is left out. The tree names clocks by index, not by gate bit, so no clock-gate table could be derived from it either. The handset backend therefore still reports no sensor and no operating points and Power neither throttles nor scales there. `power` in `/dev/violet/sys` says so (`sensor=0 dvfs=0`) instead of showing a made-up temperature. There is no charger control and no low-battery shutdown beyond the PMIC's own.
+
+`power` also gives `battery=`: a percentage. In QEMU it is the fixture's. On the handset it is estimated from the cell voltage with a generic lithium-ion curve, uncorrected for load or temperature and not measured on this battery (untested on hardware). `status` is unchanged and still reports millivolts there.
+
+## Shared supplies
+
+`policy::Gates` counts the users of a supply, so it is switched on by the first request and off by the last release. `policy::Sequence` is the ordered power-up of masked PMIC fields: it saves what each field held, verifies each write, and restores in reverse, so a rail the bootloader left on stays on. The handset's Wi-Fi rails now run through both, with the same register accesses in the same order as before (a host test records them); that port is untested on hardware. Radio is still the only user, and a repeated enable from it is refused and the rails restored, as before. Camera and Audio still switch their own PMIC fields through the allow-lists in the handset backend.
+
+When the screen goes off Power calls the board's `screen_peripherals(false)`. QEMU records it; on the handset it does nothing, because no clock gate or supply is known to be safe to switch with the screen off.
+
+## Requests
+
+Everything is under the `POWER` key ([runtime/protocol.rs](../../runtime/protocol.rs)).
+
+| Request | From | Answer |
+| --- | --- | --- |
+| `GET POWER 0` | any client, through Runtime | The battery: percent in QEMU, millivolts on the handset. |
+| `GET POWER POWER_INFO` | any client | Thermal level, flags (sensor present, sensor failed, frequency scaling present, suspend postponed, screen off, suspended, wake wanted, sleep wanted), temperature, operating point, lock kinds held, lock count, battery percent, the last wake's sources and the number of suspends. |
+| `GET POWER POWER_LOCKS\|n` | any client | The nth held lock, or with `arg` 1 the nth owner's totals. |
+| `GET POWER_KEY` | the Open Runtime | Bit 0 of `value` is set while the power key is held; `arg` counts presses where the board latches them (QEMU: fixture words 17 and 18), so a press shorter than a poll is still seen. |
+| `EXECUTE POWER 0\|1\|2` | the boot launcher; the Open Runtime (power key, power off) | Wake, sleep, power off. |
+| `EXECUTE POWER POWER_LOCK\|…` | the Open Runtime for its apps; Radio, Audio, Camera directly | Take, release, or drop everything an owner held. |
+
+## The power key
+
+The [Open Runtime](../../runtime/open/README.md) polls the key every 40 ms and decides what a press means ([power.rs](../../runtime/open/power.rs), [lock.rs](../../runtime/open/lock.rs)). A short press turns the screen off and the next turns it on; with a passcode set, screen off locks the phone (the trusted UI's lock screen). Holding the key (0.8 s) brings Home's power sheet, **Power off** or **Cancel**; Settings › Power has **Power off** too. Before power off the Open Runtime writes every changed `/data` file back to Storage. On the handset the key is MT6357 TOPSTATUS bit 1 (untested on hardware); in QEMU it is the viewer's P key, which also raises wake line 0.
+
+## Tests
+
+- `make test-unit` (CI) also runs the timekeeper's decisions on the host ([system/supervisor/tests/timekeeper_test.c](../../system/supervisor/tests/timekeeper_test.c): a deadline is signalled once and never early, the freeze holds and releases, only Power freezes, only a named process wakes, a hostile page delays nobody else, an app that stops the timer after every reprogram delays every sleeper by at most the guard's slack and a turn and never hangs one, the guard never acts on a half-written deadline, the Sentinel gets no page), the wake sources, the linger and the alarm in policy.rs, in powerctl_host.rs a wake lock keeping its holder running but Cached and closable (through the same `powerctl::facts` mod.rs calls) and ending at Power's screen-off bound, and the handset tables. The thread, the timer and the notifications themselves run only in an image.
+- `make test-unit` (CI) runs policy.rs's tests on the host: lock ownership, renewal, lapse, a full table, an owner's exit, accounting; the postponed suspend; thermal hysteresis, dwell and sensor failure; operating-point choice and step order, including failed steps; user counting; the Wi-Fi rail sequence access by access; the screen-off limit on app locks; a power-off that sleep and wake cannot cancel. It also runs [runtime/open/tests/powerctl_host.rs](../../runtime/open/tests/powerctl_host.rs): the real `wakelock` command against the real policy, joined by a stand-in for Runtime's tickets (a full table reads `error busy`, the log names the program).
+- `make test-power` (local) boots QEMU with the Power Test program and checks the same through the running system, ending with a critical temperature powering the machine off. It does not drive sleep (nothing in the image can ask for it), so the postponed suspend is only tested on the host.

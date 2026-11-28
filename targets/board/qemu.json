@@ -1,0 +1,598 @@
+{
+  "name": "qemu",
+  "title": "QEMU virt with the handset's memory map (AArch32, the default test target)",
+  "arch": "aarch32",
+  "cpu": "cortex-a53",
+  "cores": 1,
+  "kernel": {
+    "platform": "ellis",
+    "build": "kernel/sel4/build.py",
+    "timer_hz": 62500000,
+    "interrupt_controller": "gic-v3",
+    "device_tree": "platform/sel4/board/qemu.dts"
+  },
+  "memory": {
+    "ram": {
+      "pa": "0x40000000",
+      "size": "0x40000000",
+      "what": "RAM QEMU gives the machine (-m 1G)"
+    },
+    "kernel_ram": [
+      {
+        "pa": "0x40000000",
+        "size": "0x01000000"
+      },
+      {
+        "pa": "0x41300000",
+        "size": "0x00d00000"
+      },
+      {
+        "pa": "0x42700000",
+        "size": "0x01500000"
+      }
+    ],
+    "regions": {
+      "kernel": {
+        "pa": "0x40000000",
+        "size": "0x00100000",
+        "what": "kernel image"
+      },
+      "root": {
+        "pa": "0x40200000",
+        "size": "0x00180000",
+        "va": "0x00100000",
+        "what": "the supervisor's image and stack"
+      },
+      "staging": {
+        "pa": "0x45000000",
+        "size": "0x02000000",
+        "what": "where QEMU loads the boot image before the entry stub copies it"
+      },
+      "initfs": {
+        "pa": "0x4a000000",
+        "size": "0x06000000",
+        "what": "open apps' file system image"
+      },
+      "app_pool_low": {
+        "pa": "0x50000000",
+        "size": "0x08000000",
+        "what": "open-app memory pool, first block"
+      },
+      "app_pool_high": {
+        "pa": "0x60000000",
+        "size": "0x10000000",
+        "what": "open-app memory pool, second block"
+      },
+      "camera": {
+        "pa": "0x78000000",
+        "size": "0x00400000",
+        "what": "camera frame memory"
+      },
+      "framebuffer": {
+        "pa": "0x79450000",
+        "size": "0x00fb0000",
+        "what": "the screen, read by the tests from guest memory"
+      }
+    }
+  },
+  "devices": {
+    "touch_fixture": {
+      "kind": "pl011 (touch SPI fixture)",
+      "pa": "0x09000000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "touch",
+          "va": "0x09003000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "storage": {
+      "kind": "virtio-mmio block",
+      "pa": "0x0a000000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "storage",
+          "va": "0x0a000000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "network": {
+      "kind": "virtio-mmio net",
+      "pa": "0x0a001000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "radio",
+          "va": "0x09001000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    }
+  },
+  "supervisor_windows": [
+    {
+      "owner": "radio",
+      "pa": "0x09010000",
+      "va": "0x09004000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x0a002000",
+      "va": "0x09003000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x0a003000",
+      "va": "0x0a003000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "touch",
+      "pa": "0x49000000",
+      "va": "0x09005000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x49001000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "power",
+      "pa": "0x49002000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "storage",
+      "pa": "0x49003000",
+      "va": "0x0b004000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "storage",
+      "pa": "0x49200000",
+      "va": "0x0b000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x49201000",
+      "va": "0x09002000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x49202000",
+      "va": "0x09005000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49203000",
+      "va": "0x0b003000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x49204000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x49205000",
+      "va": "0x09001000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x49206000",
+      "va": "0x09002000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x49207000",
+      "va": "0x09003000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x49208000",
+      "va": "0x09004000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x49209000",
+      "va": "0x09005000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x4920a000",
+      "va": "0x09006000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x4920b000",
+      "va": "0x09007000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x4920c000",
+      "va": "0x09008000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x4920d000",
+      "va": "0x09009000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "audio",
+      "pa": "0x4920e000",
+      "va": "0x0900a000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49220000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49230000",
+      "va": "0x09400000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49240000",
+      "va": "0x09410000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49250000",
+      "va": "0x09420000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49260000",
+      "va": "0x09430000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49270000",
+      "va": "0x09440000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49271000",
+      "va": "0x09441000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49273000",
+      "va": "0x09443000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49274000",
+      "va": "0x09444000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49275000",
+      "va": "0x09445000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49276000",
+      "va": "0x09446000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49277000",
+      "va": "0x09447000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49278000",
+      "va": "0x09448000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49279000",
+      "va": "0x09449000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x4927a000",
+      "va": "0x0944a000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x4927b000",
+      "va": "0x0944b000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x4927c000",
+      "va": "0x0944c000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x4927d000",
+      "va": "0x0944d000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x4927e000",
+      "va": "0x0944e000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x4927f000",
+      "va": "0x0944f000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49280000",
+      "va": "0x09450000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x49290000",
+      "va": "0x09460000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x492a0000",
+      "va": "0x09470000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x492b0000",
+      "va": "0x09480000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x492c0000",
+      "va": "0x09490000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x492d0000",
+      "va": "0x094a0000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x492e0000",
+      "va": "0x094b0000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "open_rt",
+      "pa": "0x492f0000",
+      "va": "0x094c0000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49300000",
+      "va": "0x09100000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49400000",
+      "va": "0x09400000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49500000",
+      "va": "0x09500000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49600000",
+      "va": "0x09600000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49700000",
+      "va": "0x09700000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x49800000",
+      "va": "0x09800000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x4a000000",
+      "va": "0x10000000",
+      "bits": 24,
+      "frames": 6,
+      "rights": "r"
+    },
+    {
+      "owner": "camera",
+      "pa": "0x78000000",
+      "va": "0x0b000000",
+      "bits": 20,
+      "frames": 4,
+      "rights": "rw"
+    },
+    {
+      "owner": "display",
+      "pa": "0x79450000",
+      "va": "0x08000000",
+      "bits": 16,
+      "frames": 71,
+      "rights": "rw"
+    }
+  ],
+  "emulator": {
+    "binary": "qemu-system-arm",
+    "machine": "virt,gic-version=3,virtualization=on",
+    "memory": "1G"
+  }
+}

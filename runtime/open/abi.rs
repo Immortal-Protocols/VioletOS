@@ -145,6 +145,8 @@ pub const KEY_POWER: u16 = 4;
 pub const LIFECYCLE_FOCUS_GAINED: i32 = 1;
 pub const LIFECYCLE_FOCUS_LOST: i32 = 2;
 pub const LIFECYCLE_QUIT: i32 = 3;
+/// App memory is low: free what you can (caches, buffers); sent once to apps behind (lifecycle.rs).
+pub const LIFECYCLE_LOW_MEMORY: i32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

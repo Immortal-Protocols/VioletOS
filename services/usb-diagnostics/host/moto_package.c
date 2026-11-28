@@ -32,11 +32,16 @@ static int status(libusb_device_handle *h,unsigned char b[24]) {
 static int stage(libusb_device_handle *h,const char *file) {
     FILE *f=fopen(file,"rb");
     if(!f){perror(file);return 1;}
-    unsigned char bytes[0x3e000+25];
+    // A VPK2 record: 24-byte header, the image, then the 80-byte signature
+    // trailer ("VSG1", key, version, target, signature). The handset verifies it.
+    static unsigned char bytes[0x80000+24+80+1];
     size_t n=fread(bytes,1,sizeof bytes,f);
     int bad=ferror(f);fclose(f);
-    if(bad || n<24 || n==sizeof bytes || memcmp(bytes,"VPK1",4) || word(bytes+16)!=n-24
-       || word(bytes+20)!=crc(bytes+24,n-24)) {
+    if(!bad && n>=4 && !memcmp(bytes,"VPK1",4)) {
+        fprintf(stderr,"Unsigned VPK1 package: rebuild it to get a signed VPK2\n");return 1;
+    }
+    if(bad || n<24+80 || n==sizeof bytes || memcmp(bytes,"VPK2",4) || word(bytes+16)!=n-24-80
+       || word(bytes+20)!=crc(bytes+24,n-24-80) || memcmp(bytes+n-80,"VSG1",4)) {
         fprintf(stderr,"Invalid VioletOS package\n");return 1;
     }
     uint32_t sum=crc(bytes,n);

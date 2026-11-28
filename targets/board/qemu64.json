@@ -1,0 +1,38 @@
+{
+  "name": "qemu64",
+  "title": "QEMU virt, AArch64 kernel (bring-up)",
+  "arch": "aarch64",
+  "cpu": "cortex-a53",
+  "cores": 1,
+  "kernel": {
+    "platform": "ellis",
+    "build": "kernel/sel4/aarch64/build.py",
+    "timer_hz": 62500000,
+    "interrupt_controller": "gic-v3"
+  },
+  "memory": {
+    "ram": {"pa": "0x40000000", "size": "0x40000000", "what": "RAM QEMU gives the machine (-m 1G)"},
+    "kernel_ram": [
+      {"pa": "0x40000000", "size": "0x01000000"},
+      {"pa": "0x41300000", "size": "0x00d00000"},
+      {"pa": "0x42700000", "size": "0x01500000"}
+    ],
+    "regions": {
+      "kernel": {"pa": "0x40000000", "size": "0x00400000", "what": "kernel image and its zeroed data"},
+      "root": {"pa": "0x40400000", "size": "0x00400000", "va": "0x00100000", "what": "the bootstrap task's image and stack"},
+      "loader": {"pa": "0x40800000", "size": "0x00010000", "what": "the entry stub and its boot page tables"},
+      "staging": {"pa": "0x48000000", "size": "0x01000000", "what": "where QEMU loads the image before the stub copies it to the start of RAM"}
+    }
+  },
+  "devices": {
+    "uart": {"kind": "pl011", "pa": "0x09000000", "size": "0x1000", "what": "serial console"},
+    "gic_distributor": {"kind": "gic-v3", "pa": "0x08000000", "size": "0x10000", "owner": "kernel"},
+    "gic_redistributor": {"kind": "gic-v3", "pa": "0x080a0000", "size": "0x20000", "owner": "kernel"}
+  },
+  "absent": ["display", "touch", "storage", "radio", "audio", "camera", "power"],
+  "emulator": {
+    "binary": "qemu-system-aarch64",
+    "machine": "virt,gic-version=3",
+    "memory": "1G"
+  }
+}

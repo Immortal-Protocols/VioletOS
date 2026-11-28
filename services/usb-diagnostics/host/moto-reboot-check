@@ -28,7 +28,7 @@ def snapshot():
 
 def install_radio(package, before):
     data = package.read_bytes()
-    if len(data) < 24 or data[:4] != b"VPK1" or struct.unpack_from("<I", data, 8)[0] != 7:
+    if len(data) < 104 or data[:4] != b"VPK2" or struct.unpack_from("<I", data, 8)[0] != 7:
         raise SystemExit("Expected a Moto Radio VPK")
     expected = f"{struct.unpack_from('<I', data, 20)[0]:08x}"
     if expected == before[0][0]:

@@ -14,7 +14,12 @@
 //! - Verifies `VSH1` envelopes: magic, version, signing tier, TTL bounds,
 //!   anti-replay sequence number, and a P-256 ECDSA signature by the pinned
 //!   companion key (BearSSL, as the supervisor verifies catalogs). Only then
-//!   does it hand the runtime a `Command`.
+//!   does it hand the runtime a `Command`. While the Shield is monitoring
+//!   (shield.rs `Mode::Monitor`) a verified command that would change an
+//!   app's behaviour is refused; while it is enforcing they are carried out.
+//!
+//! The phone's own enforcement (built-in rules, rate limits, quarantine, the
+//! on-device scorer) does not pass through here and needs no companion.
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
@@ -23,7 +28,8 @@ use alloc::vec::Vec;
 #[cfg(not(test))]
 use super::net::{self, Net};
 use super::policy::AppId;
-use super::shield::{EventKind, RuleMatcher, ShieldRule, ShieldVerdict, TelemetryEvent};
+pub use super::shield::{record_line, AppInfo};
+use super::shield::{RuleMatcher, ShieldRule, ShieldVerdict, TelemetryEvent, FIRST_COMPANION_ID};
 
 extern "C" {
     fn sentinel_sha256(data: *const u8, len: usize, out: *mut u8);
@@ -72,6 +78,8 @@ pub enum Op {
     Kill = 4,
     Freeze = 5,
     Warning = 6,
+    /// Cut `target_pid` off from the network and other apps' files for `ttl_secs`.
+    Quarantine = 7,
 }
 
 /// Parsed `VSH1` header (little endian):
@@ -135,6 +143,7 @@ pub enum Command {
     Unfreeze { pid: u32 },
     Kill { pid: u32, shield_id: u32 },
     Warning,
+    Quarantine { pid: u32, secs: u32, shield_id: u32 },
 }
 
 pub fn parse_header(b: &[u8]) -> Result<SignedShieldHeader, SentinelErr> {
@@ -177,6 +186,10 @@ pub fn parse_rule(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result
     let text = core::str::from_utf8(&payload[4..]).map_err(|_| SentinelErr::BadRule)?;
     let app = if h.target_pid == 0 { None } else { Some(AppId(h.target_pid)) };
     let id = h.shield_id;
+    // Ids below this are the phone's built-in Shields; a signed rule cannot take one.
+    if id < FIRST_COMPANION_ID {
+        return Err(SentinelErr::BadRule);
+    }
     let on_match = match payload[1] {
         1 => ShieldVerdict::LogAlert { shield_id: id },
         2 => ShieldVerdict::Deny { shield_id: id },
@@ -225,6 +238,8 @@ pub const MEASURE_EXEC: u8 = 2;
 pub const MEASURE_SHIELD_LOAD: u8 = 3;
 pub const MEASURE_SHIELD_UNLOAD: u8 = 4;
 pub const MEASURE_KEY: u8 = 5;
+/// The Shield's mode changed (digest of the new mode's number).
+pub const MEASURE_MODE: u8 = 6;
 
 impl MeasurementChain {
     pub fn new(boot_id: [u8; 16]) -> MeasurementChain {
@@ -262,7 +277,7 @@ impl Verifier {
         match h.tier {
             t if t == SigningTier::CompanionAuto as u8 => {
                 if h.ttl_secs == 0 || h.ttl_secs > MAX_AUTO_TTL_SECS {
-                    if matches!(h.op, 1 | 5) {
+                    if matches!(h.op, 1 | 5 | 7) {
                         return Err(SentinelErr::TtlRequiredForAutoTier);
                     }
                 }
@@ -282,21 +297,33 @@ impl Verifier {
 pub fn command_for(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result<Command, SentinelErr> {
     Ok(match h.op {
         1 => Command::Install(parse_rule(h, payload, now_ns)?),
-        2 => Command::Revoke(h.shield_id),
+        2 if h.shield_id >= FIRST_COMPANION_ID => Command::Revoke(h.shield_id),
         3 => Command::Unfreeze { pid: h.target_pid },
-        4 => Command::Kill { pid: h.target_pid, shield_id: h.shield_id },
-        5 => Command::Freeze { pid: h.target_pid, until_ns: now_ns + u64::from(h.ttl_secs) * 1_000_000_000, shield_id: h.shield_id },
+        // A signed command acts under a companion id, never one of the phone's own (below 16).
+        4 => Command::Kill { pid: h.target_pid, shield_id: h.shield_id.max(FIRST_COMPANION_ID) },
+        5 => Command::Freeze { pid: h.target_pid, until_ns: now_ns + u64::from(h.ttl_secs) * 1_000_000_000, shield_id: h.shield_id.max(FIRST_COMPANION_ID) },
         6 if payload.is_empty() && h.ttl_secs == 0 => Command::Warning,
+        7 if payload.is_empty() && h.target_pid != 0 => Command::Quarantine { pid: h.target_pid, secs: h.ttl_secs, shield_id: h.shield_id.max(FIRST_COMPANION_ID) },
         _ => return Err(SentinelErr::BadOp),
     })
 }
 
-/// Older companions can still report telemetry and revoke a rule, but their
-/// signed enforcement commands cannot change an app's behavior.
+/// While the Shield is monitoring, a companion can still report telemetry,
+/// warn and release, but its signed enforcement commands cannot change an
+/// app's behavior.
 fn monitoring_command_for(h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result<Command, SentinelErr> {
     match command_for(h, payload, now_ns)? {
         cmd @ (Command::Warning | Command::Revoke(_) | Command::Unfreeze { .. }) => Ok(cmd),
         _ => Err(SentinelErr::MonitoringOnly),
+    }
+}
+
+/// The command a verified envelope becomes under the Shield's current mode.
+pub fn policy_command_for(enforce: bool, h: &SignedShieldHeader, payload: &[u8], now_ns: u64) -> Result<Command, SentinelErr> {
+    if enforce {
+        command_for(h, payload, now_ns)
+    } else {
+        monitoring_command_for(h, payload, now_ns)
     }
 }
 
@@ -336,65 +363,6 @@ pub fn take_frames(buf: &mut Vec<u8>) -> Vec<(u8, Vec<u8>)> {
         buf.drain(..5 + len);
     }
     out
-}
-
-/// What the Sentinel knows about a running program, for its records.
-#[derive(Clone, Debug)]
-pub struct AppInfo {
-    pub name: String,
-    pub sha8: String,
-}
-
-/// One `violet-log-v1` record line, tab separated:
-/// `t_ms pid app sha8 kind flags idle_s detail target`.
-pub fn record_line(ev: &TelemetryEvent, info: Option<&AppInfo>, idle_s: u32) -> String {
-    let kind = kind_from(ev.kind).map(|k| k.name()).unwrap_or("?");
-    let (name, sha) = info.map_or(("?", "00000000"), |i| (i.name.as_str(), i.sha8.as_str()));
-    let detail = ev.detail_str();
-    let target = match kind_from(ev.kind) {
-        Some(EventKind::NetConnect) => format!("{}:{}", detail, ev.port),
-        _ => String::new(),
-    };
-    let detail = match kind_from(ev.kind) {
-        Some(EventKind::NetConnect) => target.clone(),
-        Some(EventKind::NetTxSummary) => format!("{}B", ev.aux_u32),
-        _ => String::from(detail),
-    };
-    let target = match kind_from(ev.kind) {
-        Some(EventKind::NetTxSummary) => format!("{}:{}", ev.detail_str(), ev.port),
-        _ => target,
-    };
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        ev.timestamp_us / 1000,
-        ev.app_id,
-        name,
-        sha,
-        kind,
-        ev.flags,
-        idle_s,
-        detail.replace('\t', " ").replace('\n', " "),
-        target
-    )
-}
-
-pub fn kind_from(k: u8) -> Option<EventKind> {
-    use EventKind::*;
-    Some(match k {
-        1 => Exec,
-        2 => OpenRead,
-        3 => NetConnect,
-        4 => NetTxSummary,
-        5 => MemoryWx,
-        6 => SpawnThread,
-        7 => SysControl,
-        8 => Exit,
-        9 => ShieldTriggered,
-        10 => OpenWrite,
-        11 => Frozen,
-        12 => Thawed,
-        _ => return None,
-    })
 }
 
 const OFFLINE_CAPACITY: usize = 1024;
@@ -497,6 +465,10 @@ pub struct Sentinel {
     pub frozen_apps: u16,
     pub warnings: u32,
     pub connected_once: bool,
+    /// The Shield is enforcing: verified Install, Freeze, Kill and Quarantine are carried out.
+    pub enforce: bool,
+    /// The phone's own counts for the heartbeat: calls refused, quarantines, things only reported.
+    pub local: [u32; 3],
 }
 
 #[cfg(not(test))]
@@ -520,6 +492,8 @@ impl Sentinel {
             frozen_apps: 0,
             warnings: 0,
             connected_once: false,
+            enforce: false,
+            local: [0; 3],
         }
     }
 
@@ -616,7 +590,8 @@ impl Sentinel {
             if kind != FRAME_SHIELD {
                 continue;
             }
-            match self.verifier.verify(&payload).and_then(|(h, body)| Ok((h, monitoring_command_for(&h, body, now_ns)?))) {
+            let enforce = self.enforce;
+            match self.verifier.verify(&payload).and_then(|(h, body)| Ok((h, policy_command_for(enforce, &h, body, now_ns)?))) {
                 Ok((h, cmd)) => {
                     self.accepted += 1;
                     if cmd != Command::Warning {
@@ -659,7 +634,9 @@ impl Sentinel {
             let through = self.offline.front().and_then(|line| line.split_once('\t'))
                 .and_then(|(ms, _)| ms.parse::<u64>().ok()).map(|ms| ms.saturating_sub(1))
                 .unwrap_or(now_ns / 1_000_000);
-            let hb = format!("{} {}", heartbeat, through);
+            // After the nine fields older companions read: the phone's own
+            // enforcement (mode 0 monitor / 1 enforcing, refused, quarantines, reported).
+            let hb = format!("{} {} {} {} {} {}", heartbeat, through, self.enforce as u8, self.local[0], self.local[1], self.local[2]);
             self.tx.extend_from_slice(&frame(FRAME_HEARTBEAT, hb.as_bytes()));
         }
     }
@@ -721,6 +698,11 @@ impl Sentinel {
         commands
     }
 
+    /// The Shield's mode changed; the companion sees it in the measurement chain.
+    pub fn note_mode(&mut self, mode: u8) {
+        self.chain.extend(MEASURE_MODE, &sha256(&[mode]));
+    }
+
     pub fn note_unload(&mut self, shield_id: u32) {
         self.chain.extend(MEASURE_SHIELD_UNLOAD, &sha256(&shield_id.to_le_bytes()));
     }
@@ -773,10 +755,13 @@ mod tests {
     fn monitoring_accepts_warnings_and_rejects_enforcement() {
         let (key, cases) = fixtures();
         let mut v = Verifier { companion_key: key.try_into().unwrap(), last_seq: 0 };
+        let mut enforced = 0;
         for (_, env) in &cases {
             let Ok((h, body)) = v.verify(env) else { continue };
-            if matches!(command_for(&h, body, 1_000), Ok(Command::Install(_) | Command::Freeze { .. } | Command::Kill { .. })) {
-                assert_eq!(monitoring_command_for(&h, body, 1_000), Err(SentinelErr::MonitoringOnly));
+            if matches!(command_for(&h, body, 1_000), Ok(Command::Install(_) | Command::Freeze { .. } | Command::Kill { .. } | Command::Quarantine { .. })) {
+                assert_eq!(policy_command_for(false, &h, body, 1_000), Err(SentinelErr::MonitoringOnly));
+                assert_eq!(policy_command_for(true, &h, body, 1_000), command_for(&h, body, 1_000));
+                enforced += 1;
             }
         }
         let warning = SignedShieldHeader {
@@ -785,6 +770,22 @@ mod tests {
         };
         assert_eq!(monitoring_command_for(&warning, &[], 1_000), Ok(Command::Warning));
         assert_eq!(monitoring_command_for(&warning, b"unexpected", 1_000), Err(SentinelErr::BadOp));
+        assert!(enforced >= 4, "install, path rule, freeze and quarantine fixtures: {}", enforced);
+        // A signed quarantine names a process and never borrows a built-in id.
+        let q = SignedShieldHeader { op: Op::Quarantine as u8, shield_id: 4, ttl_secs: 60, target_pid: 107, ..warning };
+        assert_eq!(command_for(&q, &[], 0), Ok(Command::Quarantine { pid: 107, secs: 60, shield_id: FIRST_COMPANION_ID }));
+        assert_eq!(command_for(&SignedShieldHeader { target_pid: 0, ..q }, &[], 0), Err(SentinelErr::BadOp));
+        // Nor can a signed rule take one of the phone's own ids.
+        let rule = SignedShieldHeader { op: Op::Install as u8, shield_id: 1, ttl_secs: 60, ..warning };
+        assert_eq!(command_for(&rule, &[3, 2, 0, 0], 0), Err(SentinelErr::BadRule));
+        assert!(matches!(command_for(&SignedShieldHeader { shield_id: 16, ..rule }, &[3, 2, 0, 0], 0), Ok(Command::Install(_))));
+        // A signed freeze or end acts under a companion id too, and the
+        // phone's own Shields (the scorer's freeze, say) cannot be revoked.
+        let f = SignedShieldHeader { op: Op::Freeze as u8, shield_id: 8, ttl_secs: 60, target_pid: 107, ..warning };
+        assert_eq!(command_for(&f, &[], 0), Ok(Command::Freeze { pid: 107, until_ns: 60_000_000_000, shield_id: FIRST_COMPANION_ID }));
+        assert_eq!(command_for(&SignedShieldHeader { op: Op::Kill as u8, ..f }, &[], 0), Ok(Command::Kill { pid: 107, shield_id: FIRST_COMPANION_ID }));
+        assert_eq!(command_for(&SignedShieldHeader { op: Op::Revoke as u8, ..f }, &[], 0), Err(SentinelErr::BadOp));
+        assert_eq!(command_for(&SignedShieldHeader { op: Op::Revoke as u8, shield_id: 40, ..f }, &[], 0), Ok(Command::Revoke(40)));
     }
 
     #[test]

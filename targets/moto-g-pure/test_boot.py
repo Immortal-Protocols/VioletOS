@@ -33,6 +33,25 @@ def layout(board):
     return (board / layout_path).read_text().split("avail_p_regs[] = {", 1)[1].split("};", 1)[0]
 
 assert layout(moto) == layout(qemu), "kernel memory reservations differ"
+
+
+def image_end(blob):
+    # A VPK2 record is header[24] | image[size] | signature trailer[80].
+    return 24 + struct.unpack_from("<I", blob, 16)[0]
+
+
+def signed(blob):
+    """An edited package made valid again: its checksum, and its signature by this
+    build's developer key (the supervisor runs nothing a pinned key did not sign)."""
+    sys.path.insert(0, str(repo / "image/packages"))
+    import sign
+    signer = sign.config(repo, "moto")
+    target, pinned = sign.load_keys(moto / "package-keys.json")
+    assert target == "moto" and pinned.get(signer.key_id) == signer.keys[signer.key_id], \
+        "build/sel4/moto was not built with this developer key: run make moto again"
+    return bytearray(sign.resign(bytes(blob), signer))
+
+
 with TemporaryDirectory() as tmp:
     out = Path(tmp)
     # Relink the Moto loader with a kernel built for the virtual GIC.
@@ -63,23 +82,22 @@ with TemporaryDirectory() as tmp:
             code = (out / "confirm.bin").read_bytes()
             assert len(code) <= struct.unpack_from("<I", trial, 12)[0]
             struct.pack_into("<I", trial, 12, len(code))
-            trial[24:] = code.ljust(len(trial) - 24, b"\0")
+            trial[24:image_end(trial)] = code.ljust(image_end(trial) - 24, b"\0")
             sys.path.insert(0, str(repo / "image/packages"))
-            from package_format import pack, unpack
+            from package_format import HANDSET_LIMIT, pack, unpack
             catalog = (moto / "catalog.bin").read_bytes()
-            packages = unpack(catalog)
+            packages = unpack(catalog, HANDSET_LIMIT)
             storage = bytearray(packages[6])
             assert len(code) <= struct.unpack_from("<I", storage, 12)[0]
             struct.pack_into("<I", storage, 12, len(code))
-            storage[24:] = code.ljust(len(storage) - 24, b"\0")
-            struct.pack_into("<I", storage, 20, binascii.crc32(storage[24:]))
-            packages[6] = bytes(storage)
+            storage[24:image_end(storage)] = code.ljust(image_end(storage) - 24, b"\0")
+            packages[6] = bytes(signed(storage))
             assert root.count(catalog) == 1
-            root = root.replace(catalog, pack(packages.values()))
+            root = root.replace(catalog, pack(packages.values(), limit=HANDSET_LIMIT))
         else:
             instruction = 0xe7f000f0 if args.diagnostics_trial == "fault" else 0xeafffffe
             struct.pack_into("<I", trial, 24, instruction)
-        struct.pack_into("<I", trial, 20, binascii.crc32(trial[24:]))
+        trial = signed(trial)
         (out / "trial.vpk").write_bytes(trial)
         if args.diagnostics_trial == "timeout":
             offset = root_offset("usb_trial_timeout_ms")
@@ -87,22 +105,21 @@ with TemporaryDirectory() as tmp:
             struct.pack_into("<I", root, offset, 5)
         struct.pack_into("<I", root, root_offset("usb_trial_bytes"), len(trial))
         (out / "root.bin").write_bytes(root)
-        extra_devices = ["-device", f"loader,file={out}/trial.vpk,addr=0x43d00000,force-raw=on"]
+        extra_devices = ["-device", f"loader,file={out}/trial.vpk,addr=0x43d40000,force-raw=on"]
     elif args.stall_services or args.radio_package:
         sys.path.insert(0, str(repo / "image/packages"))
-        from package_format import pack, unpack
+        from package_format import HANDSET_LIMIT, pack, unpack
         catalog = (moto / "catalog.bin").read_bytes()
-        packages = unpack(catalog)
+        packages = unpack(catalog, HANDSET_LIMIT)
         if args.radio_package:
             packages[7] = args.radio_package.read_bytes()
         for identity in ((4, 6) if args.stall_services else ()):
             blob = bytearray(packages[identity])
             struct.pack_into("<I", blob, 24, 0xeafffffe)  # ARM branch to self
-            struct.pack_into("<I", blob, 20, binascii.crc32(blob[24:]))
-            packages[identity] = bytes(blob)
+            packages[identity] = bytes(signed(blob))
         root = (moto / "root.bin").read_bytes()
         assert root.count(catalog) == 1
-        candidate = pack(packages.values())
+        candidate = pack(packages.values(), limit=HANDSET_LIMIT)
         if len(candidate) != len(catalog):
             raise ValueError("Fixture substitution requires an equal-sized catalog")
         (out / "root.bin").write_bytes(root.replace(catalog, candidate))
@@ -120,7 +137,16 @@ with TemporaryDirectory() as tmp:
     size = (out / "zImage").stat().st_size
     run(*asm, f"-DIMAGE_BYTES={size}", repo / "platform/sel4/loader/qemu-entry.S", "-o", "entry.o")
     run(objcopy, "-O", "binary", "-j", ".text", "entry.o", "entry.bin")
-    (out / "handoff.dtb").symlink_to(qemu / "handoff.dtb")
+    # The handset's bootloader hands the loader the boot image's ramdisk (the
+    # open apps' file system image) with its start and end; without the end
+    # the loader stages nothing and the Open Runtime, and so Home, cannot start.
+    dts = (repo / "platform/sel4/board/qemu.dts").read_text()
+    start = "linux,initrd-start = <0x51b00000>;"
+    assert dts.count(start) == 1
+    end = 0x51b00000 + (moto / "initfs.cpio").stat().st_size
+    (out / "handoff.dts").write_text(dts.replace(start, start + f" linux,initrd-end = <{end:#x}>;"))
+    run("dtc", "-q", "-I", "dts", "-O", "dtb", "-o", "handoff.dtb", "handoff.dts")
+    extra_devices += ["-device", f"loader,file={moto}/initfs.cpio,addr=0x51b00000,force-raw=on"]
     stage_va = int(next(line.split()[0] for line in symbols.splitlines() if line.endswith(" boot_stages")), 16)
     stage_pa = 0x40200000 + stage_va - 0x100000
     # The handset has 3 GiB; open apps use memory at 0xc0000000.
@@ -160,7 +186,9 @@ with TemporaryDirectory() as tmp:
         # This guest has no Moto eMMC or touch controller. Check the first
         # displayed Home frame itself, past the supervisor's start marker.
         if args.diagnostics_trial != "confirm":
-            for x, y, color in [(0, 0, 0xff191620), (160 * 3, 55 * 4, 0xff302a39)]:
+            # (Home is an open app: the runtime's trusted band over its top
+            # rows, runtime/open/trusted_ui.rs, and Home's paper mid-screen.)
+            for x, y, color in [(0, 0, 0xff0c0a10), (160 * 3, 55 * 4, 0xff2b2a27)]:
                 address = 0x79450000 + 4 * (720 * y + x)
                 while True:
                     value = command("human-monitor-command", {"command-line": f"xp /1wx {address:#x}"})
@@ -199,7 +227,7 @@ with TemporaryDirectory() as tmp:
                 assert read_root("volume_bank") == 1 and read_root("source") == 3
                 saved = out / "active-catalog.bin"
                 command("human-monitor-command", {"command-line": f'pmemsave 0x43c00000 {len(catalog)} "{saved}"'})
-                assert unpack(saved.read_bytes())[21] == trial
+                assert unpack(saved.read_bytes(), HANDSET_LIMIT)[21] == trial
                 print("Supervisor confirmed Diagnostics and loaded the replacement from the committed catalog.")
             else:
                 reason = read_root("usb_last_failure") & 0xff

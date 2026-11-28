@@ -1,0 +1,157 @@
+{
+  "about": "Every difference between the AArch64 QEMU kernel (kernel/sel4/aarch64/build.py) and upstream seL4. Same rules as kernel/sel4/delta.json; a source hash written as \"shared\" is the one recorded there. After a deliberate change run python3 kernel/sel4/aarch64/build.py --update.",
+  "upstream": {
+    "name": "seL4-17.0.0",
+    "sha256": "cda7844ba516ba8920ba1f24ec8ab98302f0527007c1ec0cfe294aa46443b0fe"
+  },
+  "verified_configuration": false,
+  "nearest_verified": {
+    "config": "configs/AARCH64_imx8mm_verified.cmake",
+    "includes": [
+      "configs/include/AARCH64_verified_include.cmake"
+    ],
+    "why": "No verified configuration matches. The nearest is AARCH64_imx8mm_verified: the same architecture, core (Cortex-A53) and interrupt controller family. The build's CMakeCache.txt must differ from it in exactly these options, the 'beyond' ones (which it leaves at upstream's default), the compiler and the source changes above.",
+    "differences": {
+      "KernelPlatform": {
+        "verified": "imx8mm-evk",
+        "violetos": "ellis",
+        "proof": "Another platform: none of the proof's platform assumptions were checked for it."
+      },
+      "KernelVerificationBuild": {
+        "verified": "ON",
+        "violetos": "OFF",
+        "proof": "The build is not restricted to what the proofs cover."
+      },
+      "KernelArmHypervisorSupport": {
+        "verified": "ON",
+        "violetos": "OFF",
+        "proof": "The verified AArch64 configurations run the kernel at EL2; this one runs at EL1, a configuration with no proof."
+      },
+      "KernelAllowSMCCalls": {
+        "verified": "ON",
+        "violetos": "OFF",
+        "proof": "Fewer kernel calls: no SMC forwarding is reachable (and the build checks no SMC instruction is present)."
+      },
+      "KernelMaxNumBootinfoUntypedCaps": {
+        "verified": "50",
+        "violetos": "230",
+        "proof": "A larger boot information array; the proofs are parametric in it, but this value was not checked."
+      },
+      "KernelNumDomains": {
+        "verified": "16",
+        "violetos": "1",
+        "proof": "The proofs are set up to be robust to this number (upstream CAVEATS.md); no domain scheduling is used."
+      }
+    },
+    "beyond": {
+      "KernelArmExportVCNTUser": "ON",
+      "KernelArmExportPTMRUser": "OFF",
+      "KernelIsMCS": "OFF",
+      "KernelDebugBuild": "OFF"
+    }
+  },
+  "changed": {
+    "src/arch/arm/64/traps.S": {
+      "from": "kernel/sel4/aarch64/linux-svc.patch",
+      "why": "svc #0 (the Linux AArch64 system call instruction) is dispatched on x8, so a Linux call is always an unknown-syscall fault for the thread's fault handler whatever x7 holds; an x8 outside 0..2^31-1 is reported as 0x10000, so no x8 selects one of seL4's own (negative) numbers either. Native seL4 calls use svc #1."
+    },
+    "libsel4/sel4_arch_include/aarch64/sel4/sel4_arch/syscalls.h": {
+      "from": "kernel/sel4/aarch64/linux-svc.patch",
+      "why": "libsel4's seven system call stubs issue svc #1 to match."
+    },
+    "src/arch/arm/machine/gic_v3.c": {
+      "from": "platform/sel4/board/gic-single-core.py",
+      "why": "On ellis the redistributor region is one 128 KiB frame per booted core instead of a fixed 1 MiB."
+    },
+    "tools/hardware.yml": {
+      "from": "platform/sel4/board/gic-single-core.py",
+      "why": "Adds the violet,ellis-boot-gic device rule: the kernel maps the distributor and four redistributor frames."
+    }
+  },
+  "added": {
+    "src/plat/ellis/config.cmake": {
+      "from": "kernel/sel4/aarch64/config.cmake",
+      "why": "The ellis platform as an AArch64 kernel on Cortex-A53 with GICv3 and the ARM generic timer, QEMU timing only. Not an upstream platform."
+    },
+    "src/plat/ellis/kernel-overlay.dts": {
+      "from": "platform/sel4/board/kernel-overlay.dts",
+      "why": "Device tree overlay: the kernel's GIC node and reserved memory."
+    },
+    "src/plat/ellis/moto-radio-memory.dts": {
+      "from": "platform/sel4/board/moto-radio-memory.dts",
+      "why": "The handset's connectivity memory reservations, so the 64-bit kernel sees the same memory map."
+    },
+    "src/plat/ellis/factory-base.dts": {
+      "from": "platform/sel4/board/qemu.dts",
+      "why": "The base device tree for QEMU virt."
+    },
+    "libsel4/sel4_plat_include/ellis/sel4/plat/api/constants.h": {
+      "why": "A copy of upstream's imx8mm-evk/sel4/plat/api/constants.h.",
+      "copy_of": "libsel4/sel4_plat_include/imx8mm-evk/sel4/plat/api/constants.h"
+    }
+  },
+  "sources": {
+    "kernel/sel4/aarch64/config.cmake": "07633d007cb36379627ec958d3e2b5247e5ee6c111b0401552dd49d240886e43",
+    "kernel/sel4/aarch64/linux-svc.patch": "0e8fc3de8d2fc133d482fbb9e276804532f5bd7413bdcd99566d068cccaa4f6d",
+    "platform/sel4/board/kernel-overlay.dts": "shared",
+    "platform/sel4/board/moto-radio-memory.dts": "shared",
+    "platform/sel4/board/qemu.dts": "shared",
+    "platform/sel4/board/gic-single-core.py": "shared"
+  },
+  "options": {
+    "CMAKE_TOOLCHAIN_FILE": {
+      "value": "upstream's llvm.cmake, in the prepared tree",
+      "expression": "str(src / 'llvm.cmake')",
+      "why": "The toolchain file seL4 ships for clang."
+    },
+    "TRIPLE": {
+      "value": "aarch64-none-elf",
+      "why": "The clang target triple llvm.cmake uses."
+    },
+    "PYTHON3": {
+      "value": "the build's own Python (build/sel4/venv)",
+      "expression": "str(py)",
+      "why": "The interpreter for the kernel's code generators."
+    },
+    "KernelPlatform": {
+      "value": "ellis",
+      "why": "The VioletOS board port; no upstream platform, so no upstream proof configuration."
+    },
+    "KernelSel4Arch": {
+      "value": "aarch64",
+      "why": "64-bit ARM kernel."
+    },
+    "KernelVerificationBuild": {
+      "value": "OFF",
+      "why": "Not a verification build."
+    },
+    "KernelDebugBuild": {
+      "value": "OFF",
+      "why": "No debug syscalls."
+    },
+    "KernelPrinting": {
+      "value": "OFF",
+      "why": "No kernel console."
+    },
+    "KernelIsMCS": {
+      "value": "OFF",
+      "why": "As the default 32-bit kernel."
+    },
+    "KernelMaxNumNodes": {
+      "value": "1",
+      "why": "One core."
+    },
+    "KernelArmExportVCNTUser": {
+      "value": "ON",
+      "why": "User level reads the virtual counter."
+    },
+    "KernelArmExportPTMRUser": {
+      "value": "OFF",
+      "why": "No user thread may program the EL0 physical timer: the kernel does not switch it between threads, so any app could cancel or move another thread's wake-up."
+    },
+    "KernelArmHypervisorSupport": {
+      "value": "OFF",
+      "why": "The kernel runs at EL1; QEMU virt without virtualization starts there."
+    }
+  }
+}

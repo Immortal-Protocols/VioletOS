@@ -1,0 +1,6 @@
+18808	105	themes	4278b34f	EXEC	1	0	/apps/themes	
+19522	105	themes	4278b34f	MEM_WX	0	0	0x0 len=65536	
+20529	105	themes	4278b34f	OPEN_W	10	1	/apps/home	
+20529	105	themes	4278b34f	OPEN_R	2	1	/apps/home	
+20529	105	themes	4278b34f	OPEN_R	2	1	/apps/home	
+20529	105	themes	4278b34f	OPEN_W	10	1	/apps/home	

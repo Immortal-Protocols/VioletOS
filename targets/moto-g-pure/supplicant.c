@@ -1,5 +1,6 @@
 // WPA2-Personal CCMP glue. hostap owns replay checks, MIC verification,
-// key unwrapping, retransmissions and key-install state.
+// key unwrapping, retransmissions and key-install state. With management
+// frame protection (802.11w) it also unwraps the IGTK; Radio checks BIP.
 #include "utils/includes.h"
 #include "utils/common.h"
 
@@ -10,6 +11,7 @@
 extern int radio_random(u8 *out, size_t n);
 extern int radio_send_eapol(void *, const u8 *, size_t);
 extern int radio_set_ccmp(void *, int, int, const u8 *, const u8 *, size_t);
+extern int radio_set_igtk(void *, int, const u8 *, const u8 *);
 extern unsigned ticks(void), ticks_per_ms;
 
 static struct {
@@ -18,6 +20,7 @@ static struct {
   void *radio;
   u8 bssid[6];
   bool failed;
+  bool mfp;
 } station_link;
 
 static void state(void *ctx, enum wpa_states s) { station_link.state = s; }
@@ -55,6 +58,14 @@ static int send_eapol(void *ctx, const u8 *dest, u16 proto, const u8 *buf,
 static int install(void *ctx, int lid, enum wpa_alg alg, const u8 *peer,
                    int key_id, int tx, const u8 *seq, size_t sn, const u8 *key,
                    size_t n, enum key_flag flags) {
+  if (alg == WPA_ALG_BIP_CMAC_128) {
+    // The integrity group key: ID 4 or 5, receive only, with its packet number.
+    if (lid != -1 || !station_link.mfp || n != 16 || sn != 6 || !seq ||
+        key_id < 4 || key_id > 5 || tx || !peer ||
+        !is_broadcast_ether_addr(peer) || (flags & KEY_FLAG_PAIRWISE))
+      return -1;
+    return radio_set_igtk(station_link.radio, key_id, key, seq);
+  }
   if (lid != -1 || alg != WPA_ALG_CCMP || n != 16 || key_id < 0 || key_id > 3 ||
       sn > 8 || !peer)
     return -1;
@@ -87,8 +98,13 @@ void station_wpa_close(void) {
 }
 int station_wpa_open(void *radio, const u8 *mac, const u8 *ap, const u8 *ssid,
                      size_t ssid_len, const u8 *ap_ie, size_t ie_len,
-                     const u8 *assoc_ie, size_t assoc_len, const u8 *pmk) {
+                     const u8 *assoc_ie, size_t assoc_len, const u8 *pmk,
+                     int akm, int mfp) {
   station_wpa_close();
+  // Key management 00-0F-AC:2 (PSK) or :6 (PSK with SHA-256); management
+  // frame protection off (0), negotiated (1) or required (2).
+  if ((akm != 2 && akm != 6) || mfp < 0 || mfp > 2)
+    return -1;
   struct wpa_sm_ctx *cb = os_zalloc(sizeof(*cb));
   if (!cb)
     return -1;
@@ -113,6 +129,7 @@ int station_wpa_open(void *radio, const u8 *mac, const u8 *ap, const u8 *ssid,
     return -1;
   }
   station_link.radio = radio;
+  station_link.mfp = mfp != 0;
   memcpy(station_link.bssid, ap, 6);
   struct rsn_supp_config conf = {0};
   conf.network_ctx = radio;
@@ -123,7 +140,11 @@ int station_wpa_open(void *radio, const u8 *mac, const u8 *ap, const u8 *ssid,
   wpa_sm_set_param(station_link.sm, WPA_PARAM_PROTO, WPA_PROTO_RSN);
   wpa_sm_set_param(station_link.sm, WPA_PARAM_PAIRWISE, WPA_CIPHER_CCMP);
   wpa_sm_set_param(station_link.sm, WPA_PARAM_GROUP, WPA_CIPHER_CCMP);
-  wpa_sm_set_param(station_link.sm, WPA_PARAM_KEY_MGMT, WPA_KEY_MGMT_PSK);
+  wpa_sm_set_param(station_link.sm, WPA_PARAM_KEY_MGMT,
+                   akm == 6 ? WPA_KEY_MGMT_PSK_SHA256 : WPA_KEY_MGMT_PSK);
+  wpa_sm_set_param(station_link.sm, WPA_PARAM_MFP, mfp);
+  wpa_sm_set_param(station_link.sm, WPA_PARAM_MGMT_GROUP,
+                   mfp ? WPA_CIPHER_AES_128_CMAC : 0);
   wpa_sm_set_param(station_link.sm, WPA_PARAM_RSN_ENABLED, 1);
   wpa_sm_set_own_addr(station_link.sm, mac);
   wpa_sm_set_pmk(station_link.sm, pmk, 32, NULL, NULL);
@@ -136,11 +157,16 @@ int station_wpa_open(void *radio, const u8 *mac, const u8 *ap, const u8 *ssid,
   station_link.state = WPA_ASSOCIATED;
   return 0;
 }
+// 1: the handshake is complete. 0: nothing to report. -2: hostap rejected
+// this frame (replayed counter, wrong MIC, malformed...) and the link is as
+// it was. -1: hostap gave the link up (its deauthenticate or reconnect
+// callback ran, now or earlier).
 int station_wpa_rx(const u8 *eapol, size_t n) {
   if (!station_link.sm || station_link.failed)
     return -1;
   int rc = wpa_sm_rx_eapol(station_link.sm, station_link.bssid, eapol, n,
                            FRAME_ENCRYPTION_UNKNOWN);
-  return station_link.failed || rc < 0 ? -1
-                                       : (station_link.state == WPA_COMPLETED);
+  if (station_link.failed)
+    return -1;
+  return rc < 0 ? -2 : (station_link.state == WPA_COMPLETED);
 }

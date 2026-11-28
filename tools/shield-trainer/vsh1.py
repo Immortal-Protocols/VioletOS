@@ -18,6 +18,7 @@ from pathlib import Path
 TIER_AUTO, TIER_OWNER = 1, 2
 OP_INSTALL, OP_REVOKE, OP_UNFREEZE, OP_KILL, OP_FREEZE = 1, 2, 3, 4, 5
 OP_WARNING = 6
+OP_QUARANTINE = 7
 MATCH_PATH, MATCH_HOST, MATCH_WX, MATCH_HASH = 1, 2, 3, 4
 VERDICT_LOG, VERDICT_DENY, VERDICT_FREEZE, VERDICT_KILL = 1, 2, 3, 4
 
@@ -27,7 +28,9 @@ def rule_payload(matcher: int, verdict: int, text: str = "", write_only: bool = 
     return bytes([matcher, verdict, (1 if write_only else 0) | (2 if cross_app_only else 0), len(raw)]) + raw
 
 
-# Pushed by the companion as soon as the Sentinel links (and renewed before they expire).
+# What companions used to push when the Sentinel linked. The phone now has
+# these built in (runtime/open/shield.rs `baseline`, as DENY, with no companion);
+# kept for reference and for signing equivalent rules in tests.
 BASELINE = [
     (MATCH_PATH, VERDICT_FREEZE, "/apps/", True, True),
     (MATCH_PATH, VERDICT_FREEZE, "/bin/", True, False),
@@ -75,23 +78,27 @@ def fixtures(key_path, out_path):
     other = ec.generate_private_key(ec.SECP256R1())
     rule = rule_payload(MATCH_HOST, VERDICT_DENY, "c2-exfil.test")
     cases = [
-        ("install_deny_host:ok", envelope(key, OP_INSTALL, 7, 10, 600, payload=rule)),
-        ("replay:replayed-sequence", envelope(key, OP_INSTALL, 7, 10, 600, payload=rule)),
-        ("older_seq:replayed-sequence", envelope(key, OP_INSTALL, 7, 9, 600, payload=rule)),
-        ("freeze_pid:ok", envelope(key, OP_FREEZE, 8, 11, 30, pid=101)),
-        ("wrong_key:bad-signature", envelope(other, OP_FREEZE, 9, 12, 30, pid=101)),
-        ("flipped_bit:bad-signature", envelope(key, OP_FREEZE, 9, 13, 30, pid=101, corrupt=True)),
-        ("no_ttl:ttl-out-of-bounds", envelope(key, OP_INSTALL, 10, 14, 0, payload=rule)),
-        ("long_ttl:ttl-out-of-bounds", envelope(key, OP_FREEZE, 10, 15, 7200, pid=101)),
-        ("owner_tier:owner-key-not-provisioned", envelope(key, OP_INSTALL, 11, 16, 0, payload=rule, tier=TIER_OWNER)),
-        ("bad_rule:bad-rule", envelope(key, OP_INSTALL, 12, 17, 60, payload=b"\x09\x02\x00\x00")),
-        ("path_rule:ok", envelope(key, OP_INSTALL, 13, 18, 60, payload=rule_payload(MATCH_PATH, VERDICT_FREEZE, "/apps/launcher/", True))),
-        ("unfreeze:ok", envelope(key, OP_UNFREEZE, 8, 19, 0, pid=101)),
-        ("revoke:ok", envelope(key, OP_REVOKE, 7, 20, 0)),
+        ("install_deny_host:ok", envelope(key, OP_INSTALL, 17, 10, 600, payload=rule)),
+        ("replay:replayed-sequence", envelope(key, OP_INSTALL, 17, 10, 600, payload=rule)),
+        ("older_seq:replayed-sequence", envelope(key, OP_INSTALL, 17, 9, 600, payload=rule)),
+        ("freeze_pid:ok", envelope(key, OP_FREEZE, 18, 11, 30, pid=101)),
+        ("wrong_key:bad-signature", envelope(other, OP_FREEZE, 19, 12, 30, pid=101)),
+        ("flipped_bit:bad-signature", envelope(key, OP_FREEZE, 19, 13, 30, pid=101, corrupt=True)),
+        ("no_ttl:ttl-out-of-bounds", envelope(key, OP_INSTALL, 20, 14, 0, payload=rule)),
+        ("long_ttl:ttl-out-of-bounds", envelope(key, OP_FREEZE, 20, 15, 7200, pid=101)),
+        ("owner_tier:owner-key-not-provisioned", envelope(key, OP_INSTALL, 21, 16, 0, payload=rule, tier=TIER_OWNER)),
+        ("bad_rule:bad-rule", envelope(key, OP_INSTALL, 22, 17, 60, payload=b"\x09\x02\x00\x00")),
+        ("path_rule:ok", envelope(key, OP_INSTALL, 23, 18, 60, payload=rule_payload(MATCH_PATH, VERDICT_FREEZE, "/apps/launcher/", True))),
+        ("unfreeze:ok", envelope(key, OP_UNFREEZE, 18, 19, 0, pid=101)),
+        ("revoke:ok", envelope(key, OP_REVOKE, 17, 20, 0)),
+        ("quarantine_pid:ok", envelope(key, OP_QUARANTINE, 24, 23, 300, pid=101)),
+        ("quarantine_no_ttl:ttl-out-of-bounds", envelope(key, OP_QUARANTINE, 24, 24, 0, pid=101)),
+        ("quarantine_no_pid:bad-op", envelope(key, OP_QUARANTINE, 24, 25, 300)),
+        ("built_in_id:bad-rule", envelope(key, OP_INSTALL, 3, 26, 600, payload=rule)),
     ]
-    trunc = envelope(key, OP_REVOKE, 7, 21, 0)
+    trunc = envelope(key, OP_REVOKE, 17, 27, 0)
     cases.append(("truncated:truncated", trunc[:-3]))
-    bad_magic = b"VSH2" + envelope(key, OP_REVOKE, 7, 22, 0)[4:]
+    bad_magic = b"VSH2" + envelope(key, OP_REVOKE, 17, 28, 0)[4:]
     cases.append(("bad_magic:bad-magic", bad_magic))
     lines = ["key " + public_point(key).hex()] + [f"{n} {b.hex()}" for n, b in cases]
     Path(out_path).write_text("\n".join(lines) + "\n")

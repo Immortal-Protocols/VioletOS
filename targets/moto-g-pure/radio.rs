@@ -13,6 +13,7 @@ mod radio_io;
 #[path = "softap.rs"]
 mod softap;
 mod station;
+mod pmf;
 #[path = "wlan_axi.rs"]
 mod wlan_axi;
 #[path = "wlan_download.rs"]

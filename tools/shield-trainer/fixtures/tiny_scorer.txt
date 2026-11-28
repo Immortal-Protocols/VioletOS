@@ -1,0 +1,1168 @@
+# feature_version 1 model 55fedf7e
+# W family / R record (tab separated) / F features / L logits / A action when eligible
+W hard_negative_file_manager
+R 0	100	gallery	e0350b45	EXEC	0	1	/apps/gallery	
+R 1600	100	gallery	e0350b45	OPEN_R	2	1	/data/podcasts/keys.txt	
+R 1604	100	gallery	e0350b45	OPEN_R	2	1	/data/news/cache.db	
+F 0 0 0 1 3 2 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1072 -808 -220 -205
+A 0
+W benign_stream
+R 0	100	recipes	a137a011	OPEN_R	0	4	/data/recipes/index.db	
+R 8	100	recipes	a137a011	SOCK_CONN	0	4	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 68	100	recipes	a137a011	SOCK_TX	0	4	6745B	feeds.podcasts.test:443
+R 70	100	recipes	a137a011	SOCK_TX	0	4	18503B	feeds.podcasts.test:443
+R 78	100	recipes	a137a011	SOCK_CONN	0	4	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 90	100	recipes	a137a011	SOCK_TX	0	4	6262B	feeds.podcasts.test:443
+F 0 0 0 3 5 0 0 0 0 0 0 2 1 0 0 15 0 0 0 3 2 0 0 0
+L 1341 44 -90 -1403
+A 0
+W hard_negative_dev_push
+R 0	100	budget	2ab2a1cf	EXEC	20	1	/bin/python3 /apps/budget/main.py	
+R 35	100	budget	2ab2a1cf	OPEN_W	20	1	/data/budget/library.db	
+R 285	100	budget	2ab2a1cf	SOCK_CONN	20	1	api.weather.test:80	api.weather.test:80
+R 293	100	budget	2ab2a1cf	SOCK_TX	20	1	4141B	api.weather.test:80
+F 0 1 1 1 4 0 0 0 0 1 0 1 1 0 0 13 0 0 0 3 1 0 0 0
+L 1015 -156 -120 -846
+A 0
+W benign_stream
+R 0	100	pysync	72aedb36	EXEC	0	17	/bin/python3 /apps/pysync/main.py	
+R 200	100	pysync	72aedb36	OPEN_R	0	17	/data/pysync/log.txt	
+R 220	100	pysync	72aedb36	SOCK_CONN	0	17	sync.notes.test:443	sync.notes.test:443
+R 232	100	pysync	72aedb36	SOCK_TX	0	17	23670B	sync.notes.test:443
+R 1732	100	pysync	72aedb36	SOCK_TX	0	17	1173B	sync.notes.test:443
+R 1736	100	pysync	72aedb36	SOCK_TX	0	17	17524B	sync.notes.test:443
+R 3236	100	pysync	72aedb36	SOCK_CONN	0	17	sync.notes.test:443	sync.notes.test:443
+R 3240	100	pysync	72aedb36	SOCK_TX	0	17	14734B	sync.notes.test:443
+R 3490	100	pysync	72aedb36	SOCK_CONN	0	17	sync.notes.test:443	sync.notes.test:443
+R 3498	100	pysync	72aedb36	SOCK_TX	0	17	39917B	sync.notes.test:443
+R 4998	100	pysync	72aedb36	SOCK_TX	0	17	9815B	sync.notes.test:443
+R 5598	100	pysync	72aedb36	SOCK_TX	0	17	6247B	sync.notes.test:443
+R 5618	100	pysync	72aedb36	SOCK_CONN	0	17	sync.notes.test:443	sync.notes.test:443
+R 5738	100	pysync	72aedb36	SOCK_TX	0	17	17950B	sync.notes.test:443
+R 5750	100	pysync	72aedb36	SOCK_TX	0	17	15956B	sync.notes.test:443
+R 5751	100	pysync	72aedb36	SOCK_TX	0	17	30086B	sync.notes.test:443
+R 5811	100	pysync	72aedb36	SOCK_CONN	0	17	sync.notes.test:443	sync.notes.test:443
+R 5819	100	pysync	72aedb36	SOCK_TX	0	17	4898B	sync.notes.test:443
+F 0 0 0 5 12 0 0 0 0 1 0 5 1 0 0 18 0 0 0 3 5 0 0 0
+L 2961 330 204 -3650
+A 0
+W benign_stream
+R 0	100	podcasts	ef6eca19	EXEC	5	846	/apps/podcasts	
+R 1600	100	podcasts	ef6eca19	OPEN_R	5	846	/data/podcasts/log.txt	
+R 1604	100	podcasts	ef6eca19	SOCK_CONN	5	846	upload.photos.test:8443	upload.photos.test:8443
+R 1612	100	podcasts	ef6eca19	SOCK_TX	5	846	25574B	upload.photos.test:8443
+R 1614	100	podcasts	ef6eca19	SOCK_CONN	5	846	upload.photos.test:8443	upload.photos.test:8443
+R 1618	100	podcasts	ef6eca19	SOCK_TX	5	846	38012B	upload.photos.test:8443
+R 1630	100	podcasts	ef6eca19	SOCK_TX	5	846	16798B	upload.photos.test:8443
+R 1638	100	podcasts	ef6eca19	SOCK_CONN	5	846	upload.photos.test:8443	upload.photos.test:8443
+R 1673	100	podcasts	ef6eca19	SOCK_TX	5	846	37377B	upload.photos.test:8443
+R 1674	100	podcasts	ef6eca19	SOCK_CONN	5	846	upload.photos.test:8443	upload.photos.test:8443
+R 1794	100	podcasts	ef6eca19	SOCK_TX	5	846	13565B	upload.photos.test:8443
+R 1914	100	podcasts	ef6eca19	SOCK_TX	5	846	7030B	upload.photos.test:8443
+F 1 1 0 10 10 0 0 0 0 1 0 4 1 0 4 18 0 0 0 3 4 0 0 18
+L 1366 405 142 -2006
+A 0
+W hard_negative_file_manager
+R 0	100	files	de5cc4c0	OPEN_R	2	5	/data/fitness/library.db	
+R 120	100	files	de5cc4c0	OPEN_R	2	5	/data/maps/keys.txt	
+F 0 0 0 3 2 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1058 -495 -252 -451
+A 0
+W benign_stream
+R 0	100	budget	0b33aba7	EXEC	0	3	/bin/python3 /apps/budget/main.py	
+R 2600	100	budget	0b33aba7	OPEN_R	0	3	/data/budget/queue.json	
+R 2608	100	budget	0b33aba7	SOCK_CONN	0	3	content.reader.test:80	content.reader.test:80
+R 7608	100	budget	0b33aba7	SOCK_TX	0	3	27567B	content.reader.test:80
+F 0 0 0 2 4 0 0 0 0 1 0 1 1 0 0 15 0 0 0 3 1 0 0 0
+L 755 -110 -186 -553
+A 0
+W hard_negative_dev_push
+R 0	100	reader	34aad751	EXEC	20	0	/bin/python3 /apps/reader/main.py	
+R 1	100	reader	34aad751	OPEN_W	20	0	/data/reader/cache.db	
+R 5001	100	reader	34aad751	SOCK_CONN	20	0	wttr.in:443	wttr.in:443
+R 5251	100	reader	34aad751	SOCK_TX	20	0	7845B	wttr.in:443
+F 0 1 1 0 4 0 0 0 0 1 0 1 1 0 0 13 0 0 0 2 1 0 0 0
+L 1076 -267 -84 -841
+A 0
+W attack_persistence
+R 0	100	gallery	f6f9d57b	OPEN_W	3	1773	/apps/launcher/__init__.py	
+F 1 0 0 11 1 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L -1 -418 -669 980
+A 3
+W hard_negative_file_manager
+R 0	100	gallery	1028971b	OPEN_R	2	1	/data/habit/wallet.db	
+R 12	100	gallery	1028971b	OPEN_R	2	1	/data/translate/state.json	
+R 32	100	gallery	1028971b	OPEN_R	2	1	/data/calendar/tokens.json	
+R 67	100	gallery	1028971b	OPEN_R	2	1	/data/journal/state.json	
+R 87	100	gallery	1028971b	OPEN_R	2	1	/data/habit/tokens.json	
+R 207	100	gallery	1028971b	OPEN_R	2	1	/data/voice/queue.json	
+R 219	100	gallery	1028971b	OPEN_R	2	1	/data/news/index.db	
+F 0 0 0 1 7 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 2084 -758 -10 -1514
+A 0
+W benign_stream
+R 0	100	scanner	e44aea55	OPEN_R	1	3964	/data/scanner/index.db	
+R 35	100	scanner	e44aea55	SOCK_CONN	1	3964	api.weather.test:8443	api.weather.test:8443
+R 36	100	scanner	e44aea55	SOCK_TX	1	3964	38250B	api.weather.test:8443
+R 71	100	scanner	e44aea55	SOCK_TX	1	3964	27353B	api.weather.test:8443
+R 91	100	scanner	e44aea55	SOCK_TX	1	3964	12110B	api.weather.test:8443
+R 211	100	scanner	e44aea55	SOCK_CONN	1	3964	api.weather.test:8443	api.weather.test:8443
+R 246	100	scanner	e44aea55	SOCK_TX	1	3964	4287B	api.weather.test:8443
+R 254	100	scanner	e44aea55	SOCK_TX	1	3964	15581B	api.weather.test:8443
+R 5254	100	scanner	e44aea55	SOCK_TX	1	3964	15712B	api.weather.test:8443
+R 10254	100	scanner	e44aea55	SOCK_CONN	1	3964	api.weather.test:8443	api.weather.test:8443
+R 15254	100	scanner	e44aea55	SOCK_TX	1	3964	26791B	api.weather.test:8443
+R 15256	100	scanner	e44aea55	SOCK_TX	1	3964	37086B	api.weather.test:8443
+R 15258	100	scanner	e44aea55	SOCK_CONN	1	3964	api.weather.test:8443	api.weather.test:8443
+R 20258	100	scanner	e44aea55	SOCK_TX	1	3964	32990B	api.weather.test:8443
+R 20262	100	scanner	e44aea55	SOCK_CONN	1	3964	api.weather.test:8443	api.weather.test:8443
+R 20266	100	scanner	e44aea55	SOCK_TX	1	3964	11951B	api.weather.test:8443
+R 20268	100	scanner	e44aea55	SOCK_TX	1	3964	6378B	api.weather.test:8443
+R 20276	100	scanner	e44aea55	SOCK_TX	1	3964	2081B	api.weather.test:8443
+R 20284	100	scanner	e44aea55	OPEN_W	1	3964	/data/scanner/index.db	
+F 1 0 0 12 12 0 0 0 0 0 0 5 1 0 5 18 0 0 0 3 5 0 0 18
+L 1743 573 415 -2833
+A 0
+W attack_wx_shellcode
+R 0	100	habit	ed4f4d01	MEM_WX	4	6955	0x2b5a0000 len=4096	
+F 0 1 0 13 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L -387 -236 -760 1308
+A 1
+W benign_stream
+R 0	100	weather	443edabc	OPEN_R	4	23	/data/weather/library.db	
+R 1	100	weather	443edabc	SOCK_CONN	4	23	agent-39868422.apps.chariots.sh:80	agent-39868422.apps.chariots.sh:80
+R 121	100	weather	443edabc	SOCK_TX	4	23	32401B	agent-39868422.apps.chariots.sh:80
+F 0 1 0 5 3 0 0 0 0 0 0 1 1 0 0 15 0 8 1 4 1 0 0 0
+L 246 23 -324 -11
+A 0
+W benign_scary_words
+R 0	100	reader	469fce52	EXEC	1	24	/apps/reader	
+R 2600	100	reader	469fce52	OPEN_W	1	24	/data/reader/exploit_tutorial.md	
+R 2602	100	reader	469fce52	OPEN_R	1	24	/data/reader/exploit_tutorial.md	
+R 2610	100	reader	469fce52	SOCK_CONN	1	24	upload.photos.test:443	upload.photos.test:443
+R 2618	100	reader	469fce52	SOCK_TX	1	24	4592B	upload.photos.test:443
+F 1 0 0 5 5 0 0 0 0 1 0 1 1 0 0 13 0 0 0 3 1 0 0 13
+L 810 95 -216 -773
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	1fce68b5	EXEC	4	1	/bin/python3 /apps/scanner/main.py	
+R 200	100	scanner	1fce68b5	OPEN_R	6	1	/data/music/cache.db	
+R 208	100	scanner	1fce68b5	OPEN_R	4	1	/data/scanner/keys.txt	
+R 1708	100	scanner	1fce68b5	OPEN_R	6	1	/data/chat/prefs.json	
+R 1720	100	scanner	1fce68b5	OPEN_R	6	1	/data/journal/wallet.db	
+R 1732	100	scanner	1fce68b5	OPEN_R	6	1	/data/radio/prefs.json	
+R 1752	100	scanner	1fce68b5	OPEN_R	4	1	/data/scanner/state.json	
+R 1772	100	scanner	1fce68b5	OPEN_R	6	1	/data/maps/wallet.db	
+R 1774	100	scanner	1fce68b5	OPEN_R	6	1	/data/habit/state.json	
+F 0 1 0 1 9 6 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 2125 -1024 -52 -1270
+A 0
+W hard_negative_dev_push
+R 0	100	camera	68592cb1	EXEC	20	1	/bin/python3 /apps/camera/main.py	
+R 2	100	camera	68592cb1	OPEN_W	20	1	/data/camera/log.txt	
+R 4	100	camera	68592cb1	SOCK_CONN	20	1	news.test:443	news.test:443
+R 16	100	camera	68592cb1	SOCK_TX	20	1	1414B	news.test:443
+R 5016	100	camera	68592cb1	SOCK_CONN	20	1	agent-39868422.apps.chariots.sh:443	agent-39868422.apps.chariots.sh:443
+F 0 1 1 1 5 0 0 0 0 1 0 2 2 0 0 11 0 8 1 4 1 0 0 0
+L 960 -361 -90 -626
+A 0
+W hard_negative_dev_push
+R 0	100	notes	2136f36b	EXEC	20	3	/bin/python3 /apps/notes/main.py	
+F 0 1 1 2 1 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 754 -613 -294 18
+A 0
+W benign_local
+R 0	100	timer	8fa0d257	EXEC	1	127	/apps/timer	
+R 1600	100	timer	8fa0d257	OPEN_R	1	127	/data/timer/queue.json	
+R 1635	100	timer	8fa0d257	OPEN_W	1	127	/tmp/timer-75.tmp	
+R 2235	100	timer	8fa0d257	OPEN_R	1	127	/tmp/timer-79.tmp	
+R 2236	100	timer	8fa0d257	OPEN_W	1	127	/tmp/timer-28.tmp	
+R 2248	100	timer	8fa0d257	OPEN_R	1	127	/data/timer/log.txt	
+R 2498	100	timer	8fa0d257	OPEN_R	1	127	/data/timer/queue.json	
+R 2506	100	timer	8fa0d257	OPEN_R	1	127	/data/timer/draft.txt	
+F 1 0 0 7 8 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1367 -795 -179 -582
+A 0
+W attack_wx_shellcode
+R 0	100	budget	07eec163	EXEC	1	1636	/apps/budget	
+R 2600	100	budget	07eec163	MEM_WX	1	1636	0x2bdc0000 len=65536	
+R 2612	100	budget	07eec163	SOCK_CONN	1	1636	185.220.101.4:443	185.220.101.4:443
+R 2672	100	budget	07eec163	SOCK_TX	1	1636	52302B	185.220.101.4:443
+F 1 0 0 11 4 0 0 0 1 1 0 1 1 1 0 16 0 10 0 4 1 0 0 16
+L -678 301 -582 946
+A 1
+W benign_stream
+R 0	100	fitness	954042f0	OPEN_R	1	3308	/data/fitness/index.db	
+R 600	100	fitness	954042f0	SOCK_CONN	1	3308	agent-39868422.apps.chariots.sh:443	agent-39868422.apps.chariots.sh:443
+R 850	100	fitness	954042f0	SOCK_TX	1	3308	21501B	agent-39868422.apps.chariots.sh:443
+F 1 0 0 12 3 0 0 0 0 0 0 1 1 0 0 15 0 8 1 4 1 0 0 15
+L -59 578 -504 -36
+A 0
+W hard_negative_file_manager
+R 0	100	gallery	b1d97394	OPEN_R	6	3	/data/mail/state.json	
+R 35	100	gallery	b1d97394	OPEN_R	6	3	/data/clock/log.txt	
+R 285	100	gallery	b1d97394	OPEN_R	6	3	/data/maps/draft.txt	
+F 0 1 0 2 3 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1213 -594 -198 -573
+A 0
+W benign_stream
+R 0	100	reader	709f6668	OPEN_R	4	5	/data/reader/prefs.json	
+R 20	100	reader	709f6668	SOCK_CONN	4	5	pypi.org:80	pypi.org:80
+R 22	100	reader	709f6668	SOCK_TX	4	5	36328B	pypi.org:80
+R 42	100	reader	709f6668	SOCK_TX	4	5	36444B	pypi.org:80
+R 5042	100	reader	709f6668	SOCK_CONN	4	5	pypi.org:80	pypi.org:80
+R 10042	100	reader	709f6668	SOCK_TX	4	5	1569B	pypi.org:80
+R 10046	100	reader	709f6668	SOCK_TX	4	5	34746B	pypi.org:80
+R 10047	100	reader	709f6668	SOCK_TX	4	5	11543B	pypi.org:80
+R 10107	100	reader	709f6668	SOCK_CONN	4	5	pypi.org:80	pypi.org:80
+F 0 1 0 3 6 0 0 0 0 0 0 3 1 0 0 17 0 0 0 2 3 0 0 0
+L 1717 92 -18 -1911
+A 0
+W benign_stream
+R 0	100	photos	c0780520	OPEN_R	1	123	/data/photos/cache.db	
+R 8	100	photos	c0780520	SOCK_CONN	1	123	feeds.podcasts.test:80	feeds.podcasts.test:80
+R 5008	100	photos	c0780520	SOCK_TX	1	123	36758B	feeds.podcasts.test:80
+R 5028	100	photos	c0780520	SOCK_TX	1	123	29666B	feeds.podcasts.test:80
+R 10028	100	photos	c0780520	SOCK_TX	1	123	12212B	feeds.podcasts.test:80
+R 10036	100	photos	c0780520	SOCK_CONN	1	123	feeds.podcasts.test:80	feeds.podcasts.test:80
+R 10038	100	photos	c0780520	SOCK_TX	1	123	39664B	feeds.podcasts.test:80
+R 10046	100	photos	c0780520	SOCK_CONN	1	123	feeds.podcasts.test:80	feeds.podcasts.test:80
+R 10106	100	photos	c0780520	SOCK_TX	1	123	5142B	feeds.podcasts.test:80
+R 10108	100	photos	c0780520	SOCK_TX	1	123	18908B	feeds.podcasts.test:80
+R 15108	100	photos	c0780520	SOCK_TX	1	123	2456B	feeds.podcasts.test:80
+R 15110	100	photos	c0780520	SOCK_CONN	1	123	feeds.podcasts.test:80	feeds.podcasts.test:80
+R 15130	100	photos	c0780520	SOCK_TX	1	123	18326B	feeds.podcasts.test:80
+R 15380	100	photos	c0780520	SOCK_TX	1	123	19835B	feeds.podcasts.test:80
+R 16880	100	photos	c0780520	SOCK_CONN	1	123	feeds.podcasts.test:80	feeds.podcasts.test:80
+R 16940	100	photos	c0780520	SOCK_TX	1	123	14796B	feeds.podcasts.test:80
+R 16942	100	photos	c0780520	SOCK_TX	1	123	29277B	feeds.podcasts.test:80
+R 16950	100	photos	c0780520	SOCK_TX	1	123	20385B	feeds.podcasts.test:80
+F 1 0 0 7 11 0 0 0 0 0 0 5 1 0 0 18 0 0 0 3 5 0 0 18
+L 2638 409 418 -3608
+A 0
+W attack_wx_shellcode
+R 0	100	fitness	a5e8382d	EXEC	1	6141	/apps/fitness	
+R 1600	100	fitness	a5e8382d	MEM_WX	1	6141	0x2dc90000 len=4096	
+R 1604	100	fitness	a5e8382d	SOCK_CONN	1	6141	198.51.100.66:4444	198.51.100.66:4444
+R 6604	100	fitness	a5e8382d	SOCK_TX	1	6141	41397B	198.51.100.66:4444
+F 1 0 0 13 4 0 0 0 1 1 0 1 1 1 1 16 0 10 0 4 1 0 0 16
+L -728 453 -624 897
+A 1
+W hard_negative_file_manager
+R 0	100	files	55e00a82	OPEN_R	2	2	/data/maps/log.txt	
+R 4	100	files	55e00a82	OPEN_R	2	2	/data/photos/queue.json	
+R 24	100	files	55e00a82	OPEN_R	2	2	/data/pysync/queue.json	
+R 26	100	files	55e00a82	OPEN_R	2	2	/data/recipes/draft.txt	
+R 38	100	files	55e00a82	OPEN_R	2	2	/data/journal/state.json	
+R 1538	100	files	55e00a82	OPEN_R	2	2	/data/pysync/state.json	
+R 2138	100	files	55e00a82	OPEN_R	2	2	/data/stocks/queue.json	
+F 0 0 0 2 7 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 2023 -647 -46 -1519
+A 0
+W benign_scary_words
+R 0	100	photos	7c7cc97c	OPEN_W	0	28	/data/photos/malware_lab_readme.txt	
+R 12	100	photos	7c7cc97c	OPEN_R	0	28	/data/photos/malware_lab_readme.txt	
+F 0 0 0 5 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 817 -405 -358 -181
+A 0
+W attack_wx_shellcode
+R 0	100	clock	16c8f624	EXEC	1	1755	/bin/python3 /apps/clock/main.py	
+R 600	100	clock	16c8f624	MEM_WX	1	1755	0x20370000 len=65536	
+R 612	100	clock	16c8f624	SOCK_CONN	1	1755	drop.c2-exfil.test:443	drop.c2-exfil.test:443
+R 672	100	clock	16c8f624	SOCK_TX	1	1755	2780B	drop.c2-exfil.test:443
+F 1 0 0 11 4 0 0 0 1 1 0 1 1 0 0 12 0 1 1 3 1 0 0 12
+L -352 501 -552 389
+A 0
+W hard_negative_file_manager
+R 0	100	gallery	72d88ab7	EXEC	0	5	/bin/python3 /apps/gallery/main.py	
+F 0 0 0 3 1 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 668 -622 -346 166
+A 0
+W suspicious_new_host
+R 0	100	recipes	0dd38737	EXEC	1	5949	/apps/recipes	
+R 1600	100	recipes	0dd38737	SOCK_CONN	1	5949	cfg.botnet-ctl.test:80	cfg.botnet-ctl.test:80
+R 1601	100	recipes	0dd38737	SOCK_TX	1	5949	657B	cfg.botnet-ctl.test:80
+F 1 0 0 13 3 0 0 0 0 1 0 1 1 0 0 10 0 0 1 3 1 0 0 10
+L 223 614 -450 -417
+A 0
+W benign_stream
+R 0	100	scanner	30bcd43f	EXEC	1	2596	/apps/scanner	
+R 1600	100	scanner	30bcd43f	OPEN_R	1	2596	/data/scanner/cache.db	
+R 1720	100	scanner	30bcd43f	SOCK_CONN	1	2596	news.test:443	news.test:443
+R 1724	100	scanner	30bcd43f	SOCK_TX	1	2596	28789B	news.test:443
+R 1728	100	scanner	30bcd43f	SOCK_TX	1	2596	19348B	news.test:443
+R 3228	100	scanner	30bcd43f	SOCK_TX	1	2596	14017B	news.test:443
+R 3236	100	scanner	30bcd43f	SOCK_CONN	1	2596	news.test:443	news.test:443
+R 3238	100	scanner	30bcd43f	SOCK_TX	1	2596	25527B	news.test:443
+R 3838	100	scanner	30bcd43f	SOCK_TX	1	2596	4500B	news.test:443
+R 3958	100	scanner	30bcd43f	SOCK_CONN	1	2596	news.test:443	news.test:443
+R 3959	100	scanner	30bcd43f	SOCK_TX	1	2596	12984B	news.test:443
+R 4079	100	scanner	30bcd43f	SOCK_CONN	1	2596	news.test:443	news.test:443
+R 4679	100	scanner	30bcd43f	SOCK_TX	1	2596	34915B	news.test:443
+R 5279	100	scanner	30bcd43f	SOCK_CONN	1	2596	news.test:443	news.test:443
+R 5280	100	scanner	30bcd43f	SOCK_TX	1	2596	27864B	news.test:443
+R 5284	100	scanner	30bcd43f	SOCK_TX	1	2596	29346B	news.test:443
+R 6784	100	scanner	30bcd43f	SOCK_CONN	1	2596	news.test:443	news.test:443
+R 7384	100	scanner	30bcd43f	SOCK_TX	1	2596	39491B	news.test:443
+R 7504	100	scanner	30bcd43f	SOCK_TX	1	2596	9099B	news.test:443
+F 1 0 0 12 14 0 0 0 0 1 0 6 1 0 0 18 0 0 0 2 6 0 0 18
+L 3009 893 625 -4660
+A 0
+W benign_scary_words
+R 0	100	photos	33d18323	OPEN_W	0	8	/data/photos/malware_lab_readme.txt	
+R 5000	100	photos	33d18323	OPEN_R	0	8	/data/photos/malware_lab_readme.txt	
+R 5012	100	photos	33d18323	SOCK_CONN	0	8	cdn.music.test:443	cdn.music.test:443
+R 5013	100	photos	33d18323	SOCK_TX	0	8	3403B	cdn.music.test:443
+F 0 0 0 4 4 0 0 0 0 0 0 1 1 0 0 12 0 0 0 3 1 0 0 0
+L 998 119 -180 -1027
+A 0
+W attack_c2_beacon
+R 0	100	files	d35e4846	SOCK_CONN	5	5	91.199.212.52:443	91.199.212.52:443
+R 250	100	files	d35e4846	SOCK_TX	5	5	125B	91.199.212.52:443
+R 258	100	files	d35e4846	SOCK_CONN	5	5	91.199.212.52:443	91.199.212.52:443
+R 259	100	files	d35e4846	SOCK_TX	5	5	178B	91.199.212.52:443
+R 509	100	files	d35e4846	SOCK_CONN	5	5	91.199.212.52:443	91.199.212.52:443
+R 759	100	files	d35e4846	SOCK_TX	5	5	289B	91.199.212.52:443
+R 879	100	files	d35e4846	SOCK_CONN	5	5	91.199.212.52:443	91.199.212.52:443
+R 881	100	files	d35e4846	SOCK_TX	5	5	327B	91.199.212.52:443
+F 1 1 0 3 8 0 0 0 0 0 0 4 1 4 0 10 0 10 0 4 4 4 0 10
+L 305 -473 2119 -2091
+A 1
+W attack_wx_shellcode
+R 0	100	scanner	981392ba	MEM_WX	1	5	0x2e660000 len=65536	
+F 1 0 0 3 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L -82 -1183 -570 1688
+A 1
+W hard_negative_file_manager
+R 0	100	files	6a71bd08	EXEC	0	3	/apps/files	
+R 2600	100	files	6a71bd08	OPEN_R	2	3	/data/podcasts/queue.json	
+R 2602	100	files	6a71bd08	OPEN_R	2	3	/data/news/prefs.json	
+F 0 0 0 2 3 2 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1105 -685 -238 -337
+A 0
+W benign_local
+R 0	100	files	8801c1b0	EXEC	0	588	/bin/python3 /apps/files/main.py	
+R 1500	100	files	8801c1b0	OPEN_W	0	588	/data/files/draft.txt	
+F 0 0 0 10 2 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 584 80 -508 -245
+A 0
+W hard_negative_file_manager
+R 0	100	files	ca1ceec1	OPEN_R	2	4	/data/habit/wallet.db	
+R 4	100	files	ca1ceec1	OPEN_R	2	4	/data/camera/tokens.json	
+R 6	100	files	ca1ceec1	OPEN_R	2	4	/data/podcasts/prefs.json	
+F 0 0 0 3 3 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1235 -512 -210 -661
+A 0
+W benign_stream
+R 0	100	journal	ff7daf1a	OPEN_R	5	3561	/data/journal/prefs.json	
+F 1 1 0 12 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 407 97 -550 -35
+A 0
+W attack_typosquat
+R 0	100	news	484bbd43	EXEC	5	6549	/apps/news	
+R 2600	100	news	484bbd43	OPEN_R	5	6549	/data/news/prefs.json	
+R 7600	100	news	484bbd43	SOCK_CONN	5	6549	feeds.p0dcasts.test:443	feeds.p0dcasts.test:443
+R 7608	100	news	484bbd43	SOCK_TX	5	6549	197141B	feeds.p0dcasts.test:443
+F 1 1 0 13 4 0 0 0 0 1 0 1 1 0 0 18 0 1 0 3 1 0 0 18
+L 129 602 -468 -290
+A 0
+W benign_scary_words
+R 0	100	notes	2136f36b	OPEN_W	4	7	/data/notes/inject_test.py	
+R 5000	100	notes	2136f36b	OPEN_R	4	7	/data/notes/inject_test.py	
+F 0 1 0 3 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 842 -677 -332 21
+A 0
+W benign_scary_words
+R 0	100	maps	13e56aa7	OPEN_W	1	33	/data/maps/c2_notes.txt	
+F 1 0 0 6 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 662 -306 -412 -59
+A 0
+W attack_c2_beacon
+R 0	100	photos	6e465aea	SOCK_CONN	5	3	a8f3k2.duckdns.org:6667	a8f3k2.duckdns.org:6667
+R 1500	100	photos	6e465aea	SOCK_TX	5	3	277B	a8f3k2.duckdns.org:6667
+R 1502	100	photos	6e465aea	SOCK_CONN	5	3	a8f3k2.duckdns.org:6667	a8f3k2.duckdns.org:6667
+R 2102	100	photos	6e465aea	SOCK_TX	5	3	355B	a8f3k2.duckdns.org:6667
+R 2110	100	photos	6e465aea	SOCK_CONN	5	3	a8f3k2.duckdns.org:6667	a8f3k2.duckdns.org:6667
+R 2118	100	photos	6e465aea	SOCK_TX	5	3	102B	a8f3k2.duckdns.org:6667
+R 2130	100	photos	6e465aea	SOCK_CONN	5	3	a8f3k2.duckdns.org:6667	a8f3k2.duckdns.org:6667
+R 7130	100	photos	6e465aea	SOCK_TX	5	3	254B	a8f3k2.duckdns.org:6667
+R 7190	100	photos	6e465aea	SOCK_CONN	5	3	a8f3k2.duckdns.org:6667	a8f3k2.duckdns.org:6667
+R 7198	100	photos	6e465aea	SOCK_TX	5	3	120B	a8f3k2.duckdns.org:6667
+R 12198	100	photos	6e465aea	EXEC	5	3	/bin/python3 /tmp/stage2.py	
+F 1 1 0 2 11 0 0 0 0 1 1 5 1 0 5 11 0 3 0 3 5 5 0 11
+L 290 -670 2757 -2539
+A 1
+W benign_scary_words
+R 0	100	podcasts	5f3df86d	EXEC	4	8	/bin/python3 /apps/podcasts/main.py	
+R 200	100	podcasts	5f3df86d	OPEN_W	4	8	/data/podcasts/malware_lab_readme.txt	
+R 202	100	podcasts	5f3df86d	OPEN_R	4	8	/data/podcasts/malware_lab_readme.txt	
+R 237	100	podcasts	5f3df86d	SOCK_CONN	4	8	news.test:443	news.test:443
+R 837	100	podcasts	5f3df86d	SOCK_TX	4	8	3575B	news.test:443
+F 0 1 0 4 5 0 0 0 0 1 0 1 1 0 0 12 0 0 0 2 1 0 0 0
+L 987 78 -174 -983
+A 0
+W benign_local
+R 0	100	backup	2dd3e1b0	OPEN_R	0	478	/tmp/backup-59.tmp	
+R 120	100	backup	2dd3e1b0	OPEN_R	0	478	/data/backup/state.json	
+R 720	100	backup	2dd3e1b0	OPEN_W	0	478	/data/backup/cache.db	
+R 780	100	backup	2dd3e1b0	OPEN_R	0	478	/data/backup/draft.txt	
+R 792	100	backup	2dd3e1b0	OPEN_R	0	478	/tmp/backup-5.tmp	
+R 804	100	backup	2dd3e1b0	OPEN_W	0	478	/tmp/backup-87.tmp	
+F 0 0 0 9 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1277 -338 -337 -752
+A 0
+W benign_stream
+R 0	100	habit	67bd1e01	OPEN_R	5	1771	/data/habit/queue.json	
+R 600	100	habit	67bd1e01	SOCK_CONN	5	1771	sync.notes.test:443	sync.notes.test:443
+R 604	100	habit	67bd1e01	SOCK_TX	5	1771	7259B	sync.notes.test:443
+R 612	100	habit	67bd1e01	SOCK_TX	5	1771	1730B	sync.notes.test:443
+R 2112	100	habit	67bd1e01	SOCK_TX	5	1771	1919B	sync.notes.test:443
+R 2172	100	habit	67bd1e01	SOCK_CONN	5	1771	sync.notes.test:443	sync.notes.test:443
+R 2772	100	habit	67bd1e01	SOCK_TX	5	1771	33575B	sync.notes.test:443
+R 2773	100	habit	67bd1e01	SOCK_TX	5	1771	31891B	sync.notes.test:443
+R 2893	100	habit	67bd1e01	SOCK_TX	5	1771	22247B	sync.notes.test:443
+R 2928	100	habit	67bd1e01	SOCK_CONN	5	1771	sync.notes.test:443	sync.notes.test:443
+R 3178	100	habit	67bd1e01	SOCK_TX	5	1771	39272B	sync.notes.test:443
+R 3180	100	habit	67bd1e01	SOCK_CONN	5	1771	sync.notes.test:443	sync.notes.test:443
+R 3192	100	habit	67bd1e01	SOCK_TX	5	1771	2599B	sync.notes.test:443
+R 3312	100	habit	67bd1e01	SOCK_TX	5	1771	10323B	sync.notes.test:443
+R 3314	100	habit	67bd1e01	SOCK_CONN	5	1771	sync.notes.test:443	sync.notes.test:443
+R 3374	100	habit	67bd1e01	SOCK_TX	5	1771	32240B	sync.notes.test:443
+R 3394	100	habit	67bd1e01	SOCK_TX	5	1771	6599B	sync.notes.test:443
+R 3402	100	habit	67bd1e01	SOCK_TX	5	1771	23467B	sync.notes.test:443
+R 3462	100	habit	67bd1e01	SOCK_CONN	5	1771	sync.notes.test:443	sync.notes.test:443
+R 3466	100	habit	67bd1e01	SOCK_TX	5	1771	24966B	sync.notes.test:443
+R 3586	100	habit	67bd1e01	SOCK_TX	5	1771	26017B	sync.notes.test:443
+F 1 1 0 11 13 0 0 0 0 0 0 6 1 0 0 19 0 0 0 3 6 0 0 19
+L 2946 845 546 -4469
+A 0
+W benign_stream
+R 0	100	podcasts	a5b2ce92	OPEN_R	5	2182	/data/podcasts/index.db	
+R 60	100	podcasts	a5b2ce92	SOCK_CONN	5	2182	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 5060	100	podcasts	a5b2ce92	SOCK_TX	5	2182	18364B	feeds.podcasts.test:443
+R 5095	100	podcasts	a5b2ce92	SOCK_TX	5	2182	10696B	feeds.podcasts.test:443
+R 5155	100	podcasts	a5b2ce92	SOCK_CONN	5	2182	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 5175	100	podcasts	a5b2ce92	SOCK_TX	5	2182	26684B	feeds.podcasts.test:443
+R 5177	100	podcasts	a5b2ce92	SOCK_TX	5	2182	26129B	feeds.podcasts.test:443
+R 5427	100	podcasts	a5b2ce92	SOCK_TX	5	2182	34239B	feeds.podcasts.test:443
+R 5487	100	podcasts	a5b2ce92	SOCK_CONN	5	2182	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 5607	100	podcasts	a5b2ce92	SOCK_TX	5	2182	7526B	feeds.podcasts.test:443
+R 5611	100	podcasts	a5b2ce92	SOCK_CONN	5	2182	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 5861	100	podcasts	a5b2ce92	SOCK_TX	5	2182	13492B	feeds.podcasts.test:443
+R 6111	100	podcasts	a5b2ce92	SOCK_TX	5	2182	22725B	feeds.podcasts.test:443
+R 6123	100	podcasts	a5b2ce92	OPEN_W	5	2182	/data/podcasts/index.db	
+F 1 1 0 12 10 0 0 0 0 0 0 4 1 0 0 18 0 0 0 3 4 0 0 18
+L 2155 861 -5 -3104
+A 0
+W benign_stream
+R 0	100	scanner	25b59ca4	EXEC	1	2322	/bin/python3 /apps/scanner/main.py	
+R 200	100	scanner	25b59ca4	OPEN_R	1	2322	/data/scanner/queue.json	
+R 320	100	scanner	25b59ca4	SOCK_CONN	1	2322	push.chat.test:80	push.chat.test:80
+R 920	100	scanner	25b59ca4	SOCK_TX	1	2322	35470B	push.chat.test:80
+R 5920	100	scanner	25b59ca4	SOCK_TX	1	2322	15673B	push.chat.test:80
+R 5955	100	scanner	25b59ca4	SOCK_CONN	1	2322	push.chat.test:80	push.chat.test:80
+R 5957	100	scanner	25b59ca4	SOCK_TX	1	2322	34399B	push.chat.test:80
+R 6557	100	scanner	25b59ca4	SOCK_TX	1	2322	12350B	push.chat.test:80
+R 6677	100	scanner	25b59ca4	SOCK_CONN	1	2322	push.chat.test:80	push.chat.test:80
+R 11677	100	scanner	25b59ca4	SOCK_TX	1	2322	3407B	push.chat.test:80
+F 1 0 0 12 8 0 0 0 0 1 0 3 1 0 0 17 0 0 0 3 3 0 0 17
+L 1445 770 -216 -2068
+A 0
+W benign_local
+R 0	100	radio	c27d41c7	EXEC	1	394	/bin/python3 /apps/radio/main.py	
+R 600	100	radio	c27d41c7	OPEN_W	1	394	/data/radio/prefs.json	
+R 720	100	radio	c27d41c7	OPEN_R	1	394	/data/radio/queue.json	
+R 5720	100	radio	c27d41c7	OPEN_R	1	394	/data/radio/prefs.json	
+R 7220	100	radio	c27d41c7	OPEN_R	1	394	/tmp/radio-23.tmp	
+F 1 0 0 9 5 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 859 -391 -342 -264
+A 0
+W attack_persistence
+R 0	100	music	d2ace753	MEM_WX	1	3528	0x239d0000 len=65536	
+R 20	100	music	d2ace753	OPEN_W	3	3528	/apps/weather/startup.py	
+F 1 0 0 12 2 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L -677 -890 -820 2267
+A 3
+W benign_local
+R 0	100	pysync	0a3ee29a	EXEC	4	500	/bin/python3 /apps/pysync/main.py	
+F 0 1 0 9 1 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 482 65 -492 -139
+A 0
+W benign_local
+R 0	100	backup	2dd3e1b0	OPEN_R	0	478	/tmp/backup-59.tmp	
+R 120	100	backup	2dd3e1b0	OPEN_R	0	478	/data/backup/state.json	
+R 720	100	backup	2dd3e1b0	OPEN_W	0	478	/data/backup/cache.db	
+R 780	100	backup	2dd3e1b0	OPEN_R	0	478	/data/backup/draft.txt	
+R 792	100	backup	2dd3e1b0	OPEN_R	0	478	/tmp/backup-5.tmp	
+F 0 0 0 9 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1114 -242 -357 -651
+A 0
+W attack_wx_shellcode
+R 0	100	files	1ecfa04b	EXEC	4	5	/apps/files	
+R 600	100	files	1ecfa04b	MEM_WX	4	5	0x2c300000 len=4096	
+R 660	100	files	1ecfa04b	SOCK_CONN	4	5	a8f3k2.duckdns.org:1337	a8f3k2.duckdns.org:1337
+R 664	100	files	1ecfa04b	SOCK_TX	4	5	35013B	a8f3k2.duckdns.org:1337
+F 0 1 0 3 4 0 0 0 1 1 0 1 1 0 1 16 0 3 0 3 1 0 0 0
+L -301 -324 -372 932
+A 1
+W benign_stream
+R 0	100	pysync	bf9329eb	OPEN_R	1	3766	/data/pysync/index.db	
+R 20	100	pysync	bf9329eb	SOCK_CONN	1	3766	tiles.maps.test:80	tiles.maps.test:80
+F 1 0 0 12 2 0 0 0 0 0 0 1 1 0 0 0 0 0 0 3 1 0 0 0
+L 507 34 -250 -387
+A 0
+W benign_scary_words
+R 0	100	gallery	9d6f5ede	EXEC	4	4	/apps/gallery	
+R 600	100	gallery	9d6f5ede	OPEN_W	4	4	/data/gallery/c2_notes.txt	
+F 0 1 0 3 2 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 748 -689 -350 148
+A 0
+W benign_stream
+R 0	100	backup	0ce02417	OPEN_R	1	2551	/data/backup/cache.db	
+R 2	100	backup	0ce02417	SOCK_CONN	1	2551	upload.photos.test:80	upload.photos.test:80
+R 6	100	backup	0ce02417	SOCK_TX	1	2551	23652B	upload.photos.test:80
+R 7	100	backup	0ce02417	SOCK_TX	1	2551	37805B	upload.photos.test:80
+F 1 0 0 12 3 0 0 0 0 0 0 1 1 0 0 16 0 0 0 3 1 0 0 16
+L 317 626 -432 -544
+A 0
+W suspicious_new_host
+R 0	100	timer	75f65ac7	EXEC	5	1102	/apps/timer	
+R 600	100	timer	75f65ac7	SOCK_CONN	5	1102	185.220.101.4:443	185.220.101.4:443
+R 635	100	timer	75f65ac7	SOCK_TX	5	1102	1220B	185.220.101.4:443
+F 1 1 0 11 3 0 0 0 0 1 0 1 1 1 0 11 0 10 0 4 1 0 0 11
+L 96 479 -450 -158
+A 0
+W benign_stream
+R 0	100	weather	6223d045	OPEN_R	1	110	/data/weather/cache.db	
+R 2	100	weather	6223d045	SOCK_CONN	1	110	tiles.maps.test:80	tiles.maps.test:80
+R 10	100	weather	6223d045	SOCK_TX	1	110	26628B	tiles.maps.test:80
+R 610	100	weather	6223d045	SOCK_TX	1	110	24091B	tiles.maps.test:80
+F 1 0 0 7 3 0 0 0 0 0 0 1 1 0 0 16 0 0 0 3 1 0 0 16
+L 511 334 -330 -573
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	be3ec05f	OPEN_R	2	5	/data/fitness/wallet.db	
+F 0 0 0 3 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 776 -531 -306 -70
+A 0
+W attack_wx_shellcode
+R 0	100	files	e4d832bc	EXEC	0	5	/apps/files	
+R 600	100	files	e4d832bc	MEM_WX	0	5	0x28f80000 len=65536	
+R 720	100	files	e4d832bc	SOCK_CONN	0	5	91.199.212.52:1337	91.199.212.52:1337
+R 780	100	files	e4d832bc	SOCK_TX	0	5	6811B	91.199.212.52:1337
+F 0 0 0 3 4 0 0 0 1 1 0 1 1 1 1 13 0 10 0 4 1 0 0 0
+L -439 -500 -366 1235
+A 1
+W benign_scary_words
+R 0	100	photos	c0780520	OPEN_W	0	34	/data/photos/inject_test.py	
+F 0 0 0 6 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 676 -227 -390 -168
+A 0
+W hard_negative_file_manager
+R 0	100	gallery	044491e6	EXEC	0	0	/apps/gallery	
+R 600	100	gallery	044491e6	OPEN_R	2	0	/data/camera/draft.txt	
+R 635	100	gallery	044491e6	OPEN_R	2	0	/data/photos/cache.db	
+R 1235	100	gallery	044491e6	OPEN_R	2	0	/data/photos/index.db	
+R 1270	100	gallery	044491e6	OPEN_R	2	0	/data/voice/prefs.json	
+R 1520	100	gallery	044491e6	OPEN_R	2	0	/data/clock/wallet.db	
+F 0 0 0 0 6 5 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1672 -967 -92 -809
+A 0
+W attack_exfil
+R 0	100	gallery	e6dd43b1	EXEC	1	10463	/apps/gallery	
+R 200	100	gallery	e6dd43b1	OPEN_R	3	10463	/data/timer/photos.index	
+R 212	100	gallery	e6dd43b1	SOCK_CONN	1	10463	drop.c2-exfil.test:8443	drop.c2-exfil.test:8443
+R 462	100	gallery	e6dd43b1	SOCK_TX	1	10463	2899221B	drop.c2-exfil.test:8443
+R 497	100	gallery	e6dd43b1	SOCK_TX	1	10463	2976400B	drop.c2-exfil.test:8443
+R 501	100	gallery	e6dd43b1	SOCK_TX	1	10463	3173683B	drop.c2-exfil.test:8443
+F 1 0 0 14 4 1 0 0 0 1 0 1 1 0 1 24 24 1 1 3 1 0 0 24
+L -2881 238 3158 -521
+A 2
+W attack_exfil
+R 0	100	files	e973ee25	OPEN_R	5	5	/data/files/library.db	
+R 4	100	files	e973ee25	OPEN_R	7	5	/data/reader/wallet.db	
+R 8	100	files	e973ee25	SOCK_CONN	5	5	cdn-update.services-ms.net:8443	cdn-update.services-ms.net:8443
+R 20	100	files	e973ee25	SOCK_TX	5	5	300075B	cdn-update.services-ms.net:8443
+R 1520	100	files	e973ee25	SOCK_TX	5	5	2464034B	cdn-update.services-ms.net:8443
+R 2120	100	files	e973ee25	SOCK_TX	5	5	2178018B	cdn-update.services-ms.net:8443
+R 2121	100	files	e973ee25	SOCK_TX	5	5	1507401B	cdn-update.services-ms.net:8443
+F 1 1 0 3 4 1 0 0 0 0 0 1 1 0 1 23 23 0 2 3 1 0 0 23
+L -2330 -413 3286 -606
+A 2
+W benign_local
+R 0	100	wallet	6c246dce	EXEC	0	390	/apps/wallet	
+R 200	100	wallet	6c246dce	OPEN_W	0	390	/data/wallet/index.db	
+R 208	100	wallet	6c246dce	OPEN_R	0	390	/data/wallet/log.txt	
+R 5208	100	wallet	6c246dce	OPEN_R	0	390	/data/wallet/draft.txt	
+R 5243	100	wallet	6c246dce	OPEN_R	0	390	/data/wallet/library.db	
+F 0 0 0 9 5 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1020 -254 -375 -524
+A 0
+W hard_negative_dev_push
+R 0	100	camera	e86c5179	EXEC	20	1	/bin/python3 /apps/camera/main.py	
+R 120	100	camera	e86c5179	OPEN_W	20	1	/data/camera/draft.txt	
+R 720	100	camera	e86c5179	SOCK_CONN	20	1	cdn.music.test:443	cdn.music.test:443
+R 2220	100	camera	e86c5179	SOCK_TX	20	1	8816B	cdn.music.test:443
+F 0 1 1 1 4 0 0 0 0 1 0 1 1 0 0 14 0 0 0 3 1 0 0 0
+L 921 -168 -138 -719
+A 0
+W benign_stream
+R 0	100	calendar	d4b540b6	EXEC	5	2733	/apps/calendar	
+R 200	100	calendar	d4b540b6	OPEN_R	5	2733	/data/calendar/state.json	
+F 1 1 0 12 2 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 351 13 -505 54
+A 0
+W hard_negative_user_upload
+R 0	100	weather	acb1daa6	EXEC	0	6	/apps/weather	
+R 200	100	weather	acb1daa6	OPEN_R	0	6	/data/weather/queue.json	
+R 1700	100	weather	acb1daa6	SOCK_CONN	0	6	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 2300	100	weather	acb1daa6	SOCK_TX	0	6	684418B	feeds.podcasts.test:443
+R 3800	100	weather	acb1daa6	SOCK_TX	0	6	1947815B	feeds.podcasts.test:443
+R 8800	100	weather	acb1daa6	SOCK_TX	0	6	2408779B	feeds.podcasts.test:443
+F 0 0 0 3 4 0 0 0 0 1 0 1 1 0 0 23 0 0 0 3 1 0 0 0
+L 434 47 -288 -265
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	c9c56c02	OPEN_R	6	1	/data/voice/cache.db	
+R 1500	100	scanner	c9c56c02	OPEN_R	6	1	/data/maps/cache.db	
+R 6500	100	scanner	c9c56c02	OPEN_R	6	1	/data/journal/queue.json	
+R 6560	100	scanner	c9c56c02	OPEN_R	6	1	/data/wallet/queue.json	
+R 6564	100	scanner	c9c56c02	OPEN_R	6	1	/data/budget/wallet.db	
+F 0 1 0 1 5 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1625 -777 -106 -923
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	5af0f5b1	EXEC	0	5	/bin/python3 /apps/scanner/main.py	
+R 1600	100	scanner	5af0f5b1	OPEN_R	2	5	/data/backup/index.db	
+R 1601	100	scanner	5af0f5b1	OPEN_R	2	5	/data/stocks/cache.db	
+R 6601	100	scanner	5af0f5b1	OPEN_R	2	5	/data/notes/index.db	
+F 0 0 0 3 4 3 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1221 -591 -232 -552
+A 0
+W benign_local
+R 0	100	translate	3d62e67c	EXEC	0	106	/bin/python3 /apps/translate/main.py	
+R 1500	100	translate	3d62e67c	OPEN_R	0	106	/data/translate/cache.db	
+R 1560	100	translate	3d62e67c	OPEN_W	0	106	/data/translate/index.db	
+R 1595	100	translate	3d62e67c	OPEN_W	0	106	/data/translate/state.json	
+R 1603	100	translate	3d62e67c	OPEN_R	0	106	/data/translate/draft.txt	
+R 1604	100	translate	3d62e67c	OPEN_W	0	106	/tmp/translate-73.tmp	
+R 1624	100	translate	3d62e67c	OPEN_R	0	106	/tmp/translate-53.tmp	
+R 1625	100	translate	3d62e67c	OPEN_R	0	106	/data/translate/index.db	
+F 0 0 0 7 8 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1423 -711 -224 -671
+A 0
+W benign_stream
+R 0	100	translate	8052b023	EXEC	0	18	/apps/translate	
+R 200	100	translate	8052b023	OPEN_R	0	18	/data/translate/queue.json	
+R 260	100	translate	8052b023	SOCK_CONN	0	18	pypi.org:443	pypi.org:443
+R 268	100	translate	8052b023	SOCK_TX	0	18	17299B	pypi.org:443
+F 0 0 0 5 4 0 0 0 0 1 0 1 1 0 0 15 0 0 0 2 1 0 0 0
+L 749 206 -252 -778
+A 0
+W benign_local
+R 0	100	camera	8f4fe5e0	EXEC	1	441	/bin/python3 /apps/camera/main.py	
+R 600	100	camera	8f4fe5e0	OPEN_R	1	441	/data/camera/queue.json	
+R 660	100	camera	8f4fe5e0	OPEN_W	1	441	/data/camera/state.json	
+R 1260	100	camera	8f4fe5e0	OPEN_R	1	441	/tmp/camera-92.tmp	
+R 6260	100	camera	8f4fe5e0	OPEN_R	1	441	/data/camera/queue.json	
+F 1 0 0 9 5 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 859 -391 -342 -264
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	c7ca3175	OPEN_R	6	2	/data/maps/log.txt	
+R 600	100	scanner	c7ca3175	OPEN_R	6	2	/data/fitness/library.db	
+R 608	100	scanner	c7ca3175	OPEN_R	6	2	/data/habit/queue.json	
+R 616	100	scanner	c7ca3175	OPEN_R	6	2	/data/reader/draft.txt	
+F 0 1 0 2 4 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1376 -690 -178 -674
+A 0
+W hard_negative_user_upload
+R 0	100	reader	5780d63c	EXEC	4	6	/bin/python3 /apps/reader/main.py	
+R 2600	100	reader	5780d63c	OPEN_R	4	6	/data/reader/cache.db	
+R 3200	100	reader	5780d63c	SOCK_CONN	4	6	sync.notes.test:443	sync.notes.test:443
+R 8200	100	reader	5780d63c	SOCK_TX	4	6	1779884B	sync.notes.test:443
+R 8202	100	reader	5780d63c	SOCK_TX	4	6	1633750B	sync.notes.test:443
+R 8262	100	reader	5780d63c	SOCK_TX	4	6	736923B	sync.notes.test:443
+F 0 1 0 3 4 0 0 0 0 1 0 1 1 0 0 22 0 0 0 3 1 0 0 0
+L 423 6 -282 -221
+A 0
+W benign_local
+R 0	100	stocks	79d0fa4e	OPEN_R	5	292	/data/stocks/queue.json	
+R 8	100	stocks	79d0fa4e	OPEN_W	5	292	/data/stocks/index.db	
+R 9	100	stocks	79d0fa4e	OPEN_R	5	292	/tmp/stocks-68.tmp	
+R 29	100	stocks	79d0fa4e	OPEN_R	5	292	/data/stocks/cache.db	
+R 30	100	stocks	79d0fa4e	OPEN_W	5	292	/tmp/stocks-10.tmp	
+R 31	100	stocks	79d0fa4e	OPEN_W	5	292	/data/stocks/log.txt	
+F 1 1 0 9 6 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1127 -434 -310 -536
+A 0
+W attack_persistence
+R 0	100	files	9811e805	MEM_WX	1	4267	0x27590000 len=65536	
+R 8	100	files	9811e805	OPEN_W	3	4267	/apps/notes/main.py	
+R 20	100	files	9811e805	SOCK_CONN	1	4267	telemetry.app-metrics.xyz:443	telemetry.app-metrics.xyz:443
+F 1 0 0 13 3 0 1 1 1 0 0 1 1 0 0 0 0 0 1 3 1 0 0 0
+L -901 -994 -507 2276
+A 3
+W hard_negative_user_upload
+R 0	100	photos	1b5af837	OPEN_R	0	2	/data/photos/prefs.json	
+R 60	100	photos	1b5af837	SOCK_CONN	0	2	api.openweathermap.org:443	api.openweathermap.org:443
+R 95	100	photos	1b5af837	SOCK_TX	0	2	880602B	api.openweathermap.org:443
+R 215	100	photos	1b5af837	SOCK_TX	0	2	2017447B	api.openweathermap.org:443
+R 335	100	photos	1b5af837	SOCK_TX	0	2	961153B	api.openweathermap.org:443
+F 0 0 0 2 3 0 0 0 0 0 0 1 1 0 0 22 0 0 0 3 1 0 0 0
+L 495 -64 -252 -260
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	aaa28973	OPEN_R	2	2	/data/habit/tokens.json	
+R 4	100	scanner	aaa28973	OPEN_R	2	2	/data/journal/prefs.json	
+R 5	100	scanner	aaa28973	OPEN_R	2	2	/data/habit/prefs.json	
+F 0 0 0 2 3 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1213 -594 -198 -573
+A 0
+W hard_negative_dev_push
+R 0	100	wallet	d7485d05	EXEC	20	1	/bin/python3 /apps/wallet/main.py	
+R 35	100	wallet	d7485d05	OPEN_W	20	1	/data/wallet/prefs.json	
+R 285	100	wallet	d7485d05	SOCK_CONN	20	1	api.github.com:443	api.github.com:443
+F 0 1 1 1 3 0 0 0 0 1 0 1 1 0 0 0 0 0 0 3 1 0 0 0
+L 1131 -837 -11 -454
+A 0
+W benign_stream
+R 0	100	clock	7e547834	OPEN_R	0	24	/data/clock/prefs.json	
+R 12	100	clock	7e547834	SOCK_CONN	0	24	feeds.podcasts.test:443	feeds.podcasts.test:443
+R 14	100	clock	7e547834	SOCK_TX	0	24	9873B	feeds.podcasts.test:443
+F 0 0 0 5 3 0 0 0 0 0 0 1 1 0 0 14 0 0 0 3 1 0 0 0
+L 655 194 -270 -651
+A 0
+W benign_stream
+R 0	100	camera	8f4fe5e0	EXEC	0	8	/bin/python3 /apps/camera/main.py	
+R 200	100	camera	8f4fe5e0	OPEN_R	0	8	/data/camera/log.txt	
+R 1700	100	camera	8f4fe5e0	SOCK_CONN	0	8	api.github.com:8443	api.github.com:8443
+R 1702	100	camera	8f4fe5e0	SOCK_TX	0	8	33038B	api.github.com:8443
+R 1714	100	camera	8f4fe5e0	SOCK_CONN	0	8	api.github.com:8443	api.github.com:8443
+R 1716	100	camera	8f4fe5e0	SOCK_TX	0	8	6188B	api.github.com:8443
+R 1751	100	camera	8f4fe5e0	SOCK_TX	0	8	39091B	api.github.com:8443
+F 0 0 0 4 6 0 0 0 0 1 0 2 1 0 2 17 0 0 0 3 2 0 0 0
+L 976 37 -168 -939
+A 0
+W attack_typosquat
+R 0	100	radio	fbe8885f	OPEN_R	5	3193	/data/radio/index.db	
+R 35	100	radio	fbe8885f	SOCK_CONN	5	3193	example.com.login-verify.net:443	example.com.login-verify.net:443
+R 43	100	radio	fbe8885f	SOCK_TX	5	3193	53871B	example.com.login-verify.net:443
+F 1 1 0 12 3 0 0 0 0 0 0 1 1 0 0 16 0 0 1 4 1 0 0 16
+L 35 590 -486 -163
+A 0
+W attack_exfil
+R 0	100	files	7a3553b8	OPEN_R	1	0	/data/files/cache.db	
+R 35	100	files	7a3553b8	OPEN_R	3	0	/data/backup/id_ed25519	
+R 55	100	files	7a3553b8	OPEN_R	3	0	/data/backup/keys.txt	
+R 59	100	files	7a3553b8	SOCK_CONN	1	0	103.75.190.11:9001	103.75.190.11:9001
+R 71	100	files	7a3553b8	SOCK_TX	1	0	923767B	103.75.190.11:9001
+R 79	100	files	7a3553b8	SOCK_TX	1	0	3288627B	103.75.190.11:9001
+F 1 0 0 0 5 2 0 0 0 0 0 1 1 1 1 23 23 10 0 4 1 0 0 23
+L -1973 -921 3389 -601
+A 2
+W attack_wx_shellcode
+R 0	100	wallet	2d4b7baf	EXEC	0	0	/apps/wallet	
+R 600	100	wallet	2d4b7baf	MEM_WX	0	0	0x2a5d0000 len=4096	
+F 0 0 0 0 2 0 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 18 -1487 -486 1786
+A 1
+W hard_negative_dev_push
+R 0	100	voice	bfe42fd7	EXEC	20	2	/bin/python3 /apps/voice/main.py	
+R 1500	100	voice	bfe42fd7	OPEN_W	20	2	/data/voice/index.db	
+F 0 1 1 2 2 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 928 -668 -280 -127
+A 0
+W benign_stream
+R 0	100	files	99f9d0f1	OPEN_R	1	2625	/data/files/draft.txt	
+R 250	100	files	99f9d0f1	SOCK_CONN	1	2625	upload.photos.test:443	upload.photos.test:443
+R 1750	100	files	99f9d0f1	SOCK_TX	1	2625	29785B	upload.photos.test:443
+R 1752	100	files	99f9d0f1	SOCK_TX	1	2625	20552B	upload.photos.test:443
+R 1760	100	files	99f9d0f1	SOCK_TX	1	2625	16221B	upload.photos.test:443
+R 3260	100	files	99f9d0f1	SOCK_CONN	1	2625	upload.photos.test:443	upload.photos.test:443
+R 3280	100	files	99f9d0f1	SOCK_TX	1	2625	3537B	upload.photos.test:443
+R 8280	100	files	99f9d0f1	SOCK_CONN	1	2625	upload.photos.test:443	upload.photos.test:443
+R 8288	100	files	99f9d0f1	SOCK_TX	1	2625	32234B	upload.photos.test:443
+R 8888	100	files	99f9d0f1	SOCK_CONN	1	2625	upload.photos.test:443	upload.photos.test:443
+R 9008	100	files	99f9d0f1	SOCK_TX	1	2625	14518B	upload.photos.test:443
+F 1 0 0 12 9 0 0 0 0 0 0 4 1 0 0 17 0 0 0 3 4 0 0 17
+L 2019 844 44 -2997
+A 0
+W benign_stream
+R 0	100	calendar	c725ada8	EXEC	1	962	/apps/calendar	
+R 600	100	calendar	c725ada8	OPEN_R	1	962	/data/calendar/cache.db	
+R 2100	100	calendar	c725ada8	SOCK_CONN	1	962	api.github.com:80	api.github.com:80
+R 2112	100	calendar	c725ada8	SOCK_TX	1	962	37580B	api.github.com:80
+R 2124	100	calendar	c725ada8	SOCK_TX	1	962	34361B	api.github.com:80
+R 7124	100	calendar	c725ada8	SOCK_CONN	1	962	api.github.com:80	api.github.com:80
+R 7724	100	calendar	c725ada8	SOCK_TX	1	962	23976B	api.github.com:80
+R 8324	100	calendar	c725ada8	SOCK_TX	1	962	1186B	api.github.com:80
+R 8326	100	calendar	c725ada8	SOCK_CONN	1	962	api.github.com:80	api.github.com:80
+R 8361	100	calendar	c725ada8	SOCK_TX	1	962	26696B	api.github.com:80
+R 8396	100	calendar	c725ada8	SOCK_CONN	1	962	api.github.com:80	api.github.com:80
+R 9896	100	calendar	c725ada8	SOCK_TX	1	962	38018B	api.github.com:80
+R 9956	100	calendar	c725ada8	SOCK_TX	1	962	2242B	api.github.com:80
+R 9958	100	calendar	c725ada8	OPEN_W	1	962	/data/calendar/queue.json	
+F 1 0 0 10 11 0 0 0 0 1 0 4 1 0 0 18 0 0 0 3 4 0 0 18
+L 2152 663 110 -3031
+A 0
+W hard_negative_file_manager
+R 0	100	files	6b17b8da	EXEC	0	3	/apps/files	
+R 2600	100	files	6b17b8da	OPEN_R	0	3	/data/files/keys.txt	
+R 2850	100	files	6b17b8da	OPEN_R	2	3	/data/backup/prefs.json	
+R 3100	100	files	6b17b8da	OPEN_R	2	3	/data/weather/library.db	
+F 0 0 0 2 4 2 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1174 -793 -236 -311
+A 0
+W attack_c2_beacon
+R 0	100	gallery	f799b84f	EXEC	5	1	/apps/gallery	
+R 600	100	gallery	f799b84f	SOCK_CONN	5	1	91.199.212.52:8080	91.199.212.52:8080
+R 608	100	gallery	f799b84f	SOCK_TX	5	1	141B	91.199.212.52:8080
+R 620	100	gallery	f799b84f	SOCK_CONN	5	1	91.199.212.52:8080	91.199.212.52:8080
+R 680	100	gallery	f799b84f	SOCK_TX	5	1	184B	91.199.212.52:8080
+R 740	100	gallery	f799b84f	SOCK_CONN	5	1	91.199.212.52:8080	91.199.212.52:8080
+R 5740	100	gallery	f799b84f	SOCK_TX	5	1	183B	91.199.212.52:8080
+R 5860	100	gallery	f799b84f	SOCK_CONN	5	1	91.199.212.52:8080	91.199.212.52:8080
+R 5880	100	gallery	f799b84f	SOCK_TX	5	1	304B	91.199.212.52:8080
+F 1 1 0 1 9 0 0 0 0 1 0 4 1 4 4 10 0 10 0 4 4 4 0 10
+L -307 -946 2308 -1203
+A 1
+W benign_scary_words
+R 0	100	podcasts	5f3df86d	EXEC	4	8	/bin/python3 /apps/podcasts/main.py	
+R 200	100	podcasts	5f3df86d	OPEN_W	4	8	/data/podcasts/malware_lab_readme.txt	
+R 202	100	podcasts	5f3df86d	OPEN_R	4	8	/data/podcasts/malware_lab_readme.txt	
+F 0 1 0 4 3 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 850 -674 -366 42
+A 0
+W benign_stream
+R 0	100	timer	43c62a8e	EXEC	1	515	/apps/timer	
+R 1600	100	timer	43c62a8e	OPEN_R	1	515	/data/timer/state.json	
+R 1620	100	timer	43c62a8e	SOCK_CONN	1	515	example.com:443	example.com:443
+R 1622	100	timer	43c62a8e	SOCK_TX	1	515	34517B	example.com:443
+R 1624	100	timer	43c62a8e	SOCK_TX	1	515	23404B	example.com:443
+R 1644	100	timer	43c62a8e	SOCK_TX	1	515	35843B	example.com:443
+R 2244	100	timer	43c62a8e	SOCK_CONN	1	515	example.com:443	example.com:443
+F 1 0 0 10 5 0 0 0 0 1 0 2 1 0 0 17 0 0 0 2 2 0 0 17
+L 859 616 -312 -1218
+A 0
+W attack_c2_beacon
+R 0	100	pysync	1cf9974b	SOCK_CONN	5	23	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 600	100	pysync	1cf9974b	SOCK_TX	5	23	310B	a8f3k2.duckdns.org:4444
+R 5600	100	pysync	1cf9974b	SOCK_CONN	5	23	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 5602	100	pysync	1cf9974b	SOCK_TX	5	23	320B	a8f3k2.duckdns.org:4444
+R 10602	100	pysync	1cf9974b	SOCK_CONN	5	23	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 12102	100	pysync	1cf9974b	SOCK_TX	5	23	71B	a8f3k2.duckdns.org:4444
+F 1 1 0 5 6 0 0 0 0 0 0 3 1 0 3 10 0 3 0 3 3 3 0 10
+L 249 -167 1293 -1481
+A 1
+W hard_negative_user_upload
+R 0	100	music	1a05ee0b	EXEC	0	8	/apps/music	
+R 1600	100	music	1a05ee0b	OPEN_R	0	8	/data/music/library.db	
+R 1620	100	music	1a05ee0b	SOCK_CONN	0	8	api.openweathermap.org:443	api.openweathermap.org:443
+R 1632	100	music	1a05ee0b	SOCK_TX	0	8	540825B	api.openweathermap.org:443
+R 1692	100	music	1a05ee0b	SOCK_TX	0	8	2192502B	api.openweathermap.org:443
+R 1812	100	music	1a05ee0b	SOCK_TX	0	8	1134015B	api.openweathermap.org:443
+R 1816	100	music	1a05ee0b	SOCK_TX	0	8	1062960B	api.openweathermap.org:443
+R 3316	100	music	1a05ee0b	SOCK_TX	0	8	1760992B	api.openweathermap.org:443
+F 0 0 0 4 4 0 0 0 0 1 0 1 1 0 0 23 0 0 0 3 1 0 0 0
+L 362 117 -318 -226
+A 0
+W attack_exfil
+R 0	100	files	a95e973e	EXEC	1	15	/apps/files	
+R 200	100	files	a95e973e	OPEN_R	1	15	/data/files/index.db	
+R 260	100	files	a95e973e	OPEN_R	3	15	/data/chat/2fa_seeds.json	
+R 510	100	files	a95e973e	OPEN_R	3	15	/data/chat/session.cookie	
+R 514	100	files	a95e973e	OPEN_R	3	15	/data/chat/passwords.kdbx	
+R 534	100	files	a95e973e	SOCK_CONN	1	15	91.199.212.52:1337	91.199.212.52:1337
+R 554	100	files	a95e973e	SOCK_TX	1	15	2364091B	91.199.212.52:1337
+F 1 0 0 4 7 3 0 0 0 1 0 1 1 1 1 22 22 10 0 4 1 0 0 22
+L -1824 -503 3250 -1009
+A 2
+W benign_stream
+R 0	100	mail	020fdcf0	EXEC	1	1520	/apps/mail	
+R 2600	100	mail	020fdcf0	OPEN_R	1	1520	/data/mail/index.db	
+R 2604	100	mail	020fdcf0	SOCK_CONN	1	1520	example.com:8443	example.com:8443
+R 2724	100	mail	020fdcf0	SOCK_TX	1	1520	1279B	example.com:8443
+R 2725	100	mail	020fdcf0	SOCK_TX	1	1520	4021B	example.com:8443
+R 3325	100	mail	020fdcf0	SOCK_CONN	1	1520	example.com:8443	example.com:8443
+R 3445	100	mail	020fdcf0	SOCK_TX	1	1520	21690B	example.com:8443
+R 3446	100	mail	020fdcf0	SOCK_TX	1	1520	32438B	example.com:8443
+R 3448	100	mail	020fdcf0	SOCK_CONN	1	1520	example.com:8443	example.com:8443
+R 3450	100	mail	020fdcf0	SOCK_TX	1	1520	10994B	example.com:8443
+R 3451	100	mail	020fdcf0	SOCK_TX	1	1520	6578B	example.com:8443
+R 3459	100	mail	020fdcf0	SOCK_TX	1	1520	29145B	example.com:8443
+R 3709	100	mail	020fdcf0	SOCK_CONN	1	1520	example.com:8443	example.com:8443
+R 3717	100	mail	020fdcf0	SOCK_TX	1	1520	2088B	example.com:8443
+F 1 0 0 11 10 0 0 0 0 1 0 4 1 0 4 17 0 0 0 2 4 0 0 17
+L 1399 528 124 -2138
+A 0
+W benign_stream
+R 0	100	gallery	d1162c1d	EXEC	1	2090	/apps/gallery	
+R 2600	100	gallery	d1162c1d	OPEN_R	1	2090	/data/gallery/queue.json	
+R 2612	100	gallery	d1162c1d	SOCK_CONN	1	2090	feeds.podcasts.test:8443	feeds.podcasts.test:8443
+R 2614	100	gallery	d1162c1d	SOCK_TX	1	2090	19107B	feeds.podcasts.test:8443
+R 2634	100	gallery	d1162c1d	SOCK_TX	1	2090	5002B	feeds.podcasts.test:8443
+R 2694	100	gallery	d1162c1d	SOCK_TX	1	2090	30236B	feeds.podcasts.test:8443
+R 2814	100	gallery	d1162c1d	SOCK_CONN	1	2090	feeds.podcasts.test:8443	feeds.podcasts.test:8443
+R 2934	100	gallery	d1162c1d	SOCK_TX	1	2090	34170B	feeds.podcasts.test:8443
+R 3184	100	gallery	d1162c1d	SOCK_CONN	1	2090	feeds.podcasts.test:8443	feeds.podcasts.test:8443
+R 3204	100	gallery	d1162c1d	SOCK_TX	1	2090	33635B	feeds.podcasts.test:8443
+R 3212	100	gallery	d1162c1d	SOCK_TX	1	2090	37929B	feeds.podcasts.test:8443
+R 3214	100	gallery	d1162c1d	SOCK_TX	1	2090	37955B	feeds.podcasts.test:8443
+R 3249	100	gallery	d1162c1d	SOCK_CONN	1	2090	feeds.podcasts.test:8443	feeds.podcasts.test:8443
+R 3261	100	gallery	d1162c1d	SOCK_TX	1	2090	8719B	feeds.podcasts.test:8443
+R 3861	100	gallery	d1162c1d	OPEN_W	1	2090	/data/gallery/draft.txt	
+F 1 0 0 12 11 0 0 0 0 1 0 4 1 0 4 18 0 0 0 3 4 0 0 18
+L 1379 605 179 -2246
+A 0
+W benign_stream
+R 0	100	backup	7b41c21e	OPEN_R	4	30	/data/backup/prefs.json	
+R 5000	100	backup	7b41c21e	SOCK_CONN	4	30	api.openweathermap.org:443	api.openweathermap.org:443
+R 5600	100	backup	7b41c21e	SOCK_TX	4	30	30485B	api.openweathermap.org:443
+R 5602	100	backup	7b41c21e	SOCK_TX	4	30	29685B	api.openweathermap.org:443
+R 6202	100	backup	7b41c21e	SOCK_TX	4	30	3558B	api.openweathermap.org:443
+R 6237	100	backup	7b41c21e	SOCK_CONN	4	30	api.openweathermap.org:443	api.openweathermap.org:443
+R 6257	100	backup	7b41c21e	SOCK_TX	4	30	20182B	api.openweathermap.org:443
+R 6269	100	backup	7b41c21e	SOCK_TX	4	30	12034B	api.openweathermap.org:443
+R 6519	100	backup	7b41c21e	SOCK_CONN	4	30	api.openweathermap.org:443	api.openweathermap.org:443
+R 6520	100	backup	7b41c21e	SOCK_TX	4	30	24187B	api.openweathermap.org:443
+R 6540	100	backup	7b41c21e	SOCK_CONN	4	30	api.openweathermap.org:443	api.openweathermap.org:443
+R 11540	100	backup	7b41c21e	SOCK_TX	4	30	34920B	api.openweathermap.org:443
+R 11548	100	backup	7b41c21e	SOCK_CONN	4	30	api.openweathermap.org:443	api.openweathermap.org:443
+R 11549	100	backup	7b41c21e	SOCK_TX	4	30	2268B	api.openweathermap.org:443
+R 13049	100	backup	7b41c21e	SOCK_CONN	4	30	api.openweathermap.org:443	api.openweathermap.org:443
+R 13061	100	backup	7b41c21e	SOCK_TX	4	30	16001B	api.openweathermap.org:443
+R 13069	100	backup	7b41c21e	SOCK_TX	4	30	32076B	api.openweathermap.org:443
+R 13089	100	backup	7b41c21e	SOCK_TX	4	30	27016B	api.openweathermap.org:443
+F 0 1 0 5 13 0 0 0 0 0 0 6 1 0 0 18 0 0 0 3 6 0 0 0
+L 3514 361 318 -4368
+A 0
+W hard_negative_file_manager
+R 0	100	scanner	912f68fe	EXEC	4	1	/apps/scanner	
+R 1600	100	scanner	912f68fe	OPEN_R	6	1	/data/fitness/keys.txt	
+R 1612	100	scanner	912f68fe	OPEN_R	6	1	/data/calendar/wallet.db	
+R 1732	100	scanner	912f68fe	OPEN_R	6	1	/data/timer/library.db	
+R 1734	100	scanner	912f68fe	OPEN_R	6	1	/data/notes/cache.db	
+R 1738	100	scanner	912f68fe	OPEN_R	6	1	/data/budget/index.db	
+R 1750	100	scanner	912f68fe	OPEN_R	6	1	/data/maps/draft.txt	
+R 1770	100	scanner	912f68fe	OPEN_R	6	1	/data/radio/tokens.json	
+F 0 1 0 1 8 7 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 2070 -837 -32 -1405
+A 0
+W attack_typosquat
+R 0	100	news	27a6fd05	EXEC	1	1789	/apps/news	
+R 2600	100	news	27a6fd05	OPEN_R	1	1789	/data/news/prefs.json	
+R 2635	100	news	27a6fd05	SOCK_CONN	1	1789	xnews.test:443	xnews.test:443
+R 2636	100	news	27a6fd05	SOCK_TX	1	1789	150331B	xnews.test:443
+F 1 0 0 11 4 0 0 0 0 1 0 1 1 0 0 18 0 0 0 2 1 0 0 18
+L 317 626 -432 -544
+A 0
+W hard_negative_dev_push
+R 0	100	podcasts	868892b4	EXEC	20	1	/bin/python3 /apps/podcasts/main.py	
+R 8	100	podcasts	868892b4	OPEN_W	20	1	/data/podcasts/queue.json	
+R 43	100	podcasts	868892b4	SOCK_CONN	20	1	wttr.in:80	wttr.in:80
+R 47	100	podcasts	868892b4	SOCK_TX	20	1	1001B	wttr.in:80
+F 0 1 1 1 4 0 0 0 0 1 0 1 1 0 0 10 0 0 0 2 1 0 0 0
+L 1098 -185 -96 -929
+A 0
+W attack_slow_drip_exfil
+R 0	100	maps	1212cbb7	EXEC	1	14	/bin/python3 /apps/maps/main.py	
+R 1600	100	maps	1212cbb7	OPEN_R	1	14	/data/maps/queue.json	
+R 3100	100	maps	1212cbb7	OPEN_R	3	14	/data/notes/session.cookie	
+R 3135	100	maps	1212cbb7	SOCK_CONN	1	14	a8f3k2.duckdns.org:8443	a8f3k2.duckdns.org:8443
+R 3136	100	maps	1212cbb7	SOCK_TX	1	14	4462B	a8f3k2.duckdns.org:8443
+R 3196	100	maps	1212cbb7	SOCK_TX	1	14	26905B	a8f3k2.duckdns.org:8443
+R 3197	100	maps	1212cbb7	SOCK_TX	1	14	7343B	a8f3k2.duckdns.org:8443
+R 3205	100	maps	1212cbb7	SOCK_TX	1	14	21576B	a8f3k2.duckdns.org:8443
+R 3455	100	maps	1212cbb7	SOCK_TX	1	14	29091B	a8f3k2.duckdns.org:8443
+R 3467	100	maps	1212cbb7	SOCK_TX	1	14	25647B	a8f3k2.duckdns.org:8443
+R 4067	100	maps	1212cbb7	SOCK_TX	1	14	4028B	a8f3k2.duckdns.org:8443
+R 4317	100	maps	1212cbb7	SOCK_TX	1	14	12609B	a8f3k2.duckdns.org:8443
+R 4329	100	maps	1212cbb7	SOCK_TX	1	14	21929B	a8f3k2.duckdns.org:8443
+R 4364	100	maps	1212cbb7	SOCK_TX	1	14	7016B	a8f3k2.duckdns.org:8443
+F 1 0 0 4 5 1 0 0 0 1 0 1 1 0 1 18 18 3 0 3 1 0 0 18
+L -1405 -291 2611 -993
+A 2
+W benign_local
+R 0	100	news	6523a01e	EXEC	0	149	/bin/python3 /apps/news/main.py	
+R 2600	100	news	6523a01e	OPEN_R	0	149	/tmp/news-80.tmp	
+R 2850	100	news	6523a01e	OPEN_W	0	149	/data/news/state.json	
+R 3450	100	news	6523a01e	OPEN_R	0	149	/data/news/state.json	
+R 3570	100	news	6523a01e	OPEN_R	0	149	/data/news/queue.json	
+R 4170	100	news	6523a01e	OPEN_R	0	149	/tmp/news-52.tmp	
+F 0 0 0 8 6 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1161 -432 -343 -537
+A 0
+W suspicious_new_host
+R 0	100	recipes	2725195e	SOCK_CONN	1	1848	185.220.101.4:443	185.220.101.4:443
+R 12	100	recipes	2725195e	SOCK_TX	1	1848	2831B	185.220.101.4:443
+F 1 0 0 11 2 0 0 0 0 0 0 1 1 1 0 12 0 10 0 4 1 0 0 12
+L 2 467 -468 -31
+A 0
+W attack_slow_drip_exfil
+R 0	100	music	01955962	OPEN_R	1	2253	/data/music/state.json	
+R 4	100	music	01955962	OPEN_R	3	2253	/data/camera/session.cookie	
+R 254	100	music	01955962	OPEN_R	3	2253	/data/camera/messages.sqlite	
+R 854	100	music	01955962	OPEN_R	3	2253	/data/camera/2fa_seeds.json	
+R 1454	100	music	01955962	SOCK_CONN	1	2253	relay.tor-gate.test:80	relay.tor-gate.test:80
+R 1466	100	music	01955962	SOCK_TX	1	2253	28283B	relay.tor-gate.test:80
+R 1474	100	music	01955962	SOCK_TX	1	2253	19536B	relay.tor-gate.test:80
+R 1475	100	music	01955962	SOCK_TX	1	2253	23862B	relay.tor-gate.test:80
+R 2975	100	music	01955962	SOCK_TX	1	2253	29005B	relay.tor-gate.test:80
+R 2979	100	music	01955962	SOCK_TX	1	2253	15075B	relay.tor-gate.test:80
+R 3014	100	music	01955962	SOCK_TX	1	2253	25687B	relay.tor-gate.test:80
+R 3134	100	music	01955962	SOCK_TX	1	2253	9160B	relay.tor-gate.test:80
+R 8134	100	music	01955962	SOCK_TX	1	2253	14100B	relay.tor-gate.test:80
+F 1 0 0 12 6 3 0 0 0 0 0 1 1 0 0 18 18 0 1 3 1 0 0 18
+L -1259 440 2418 -1638
+A 2
+W hard_negative_file_manager
+R 0	100	scanner	c9c56c02	OPEN_R	6	1	/data/voice/cache.db	
+R 1500	100	scanner	c9c56c02	OPEN_R	6	1	/data/maps/cache.db	
+R 6500	100	scanner	c9c56c02	OPEN_R	6	1	/data/journal/queue.json	
+R 6560	100	scanner	c9c56c02	OPEN_R	6	1	/data/wallet/queue.json	
+R 6564	100	scanner	c9c56c02	OPEN_R	6	1	/data/budget/wallet.db	
+R 6576	100	scanner	c9c56c02	OPEN_R	6	1	/data/fitness/wallet.db	
+R 6578	100	scanner	c9c56c02	OPEN_R	6	1	/data/weather/cache.db	
+F 0 1 0 1 7 7 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 2084 -758 -10 -1514
+A 0
+W benign_stream
+R 0	100	stocks	c38a2b70	OPEN_R	1	3595	/data/stocks/state.json	
+R 250	100	stocks	c38a2b70	SOCK_CONN	1	3595	example.com:80	example.com:80
+R 500	100	stocks	c38a2b70	SOCK_TX	1	3595	30672B	example.com:80
+R 501	100	stocks	c38a2b70	SOCK_TX	1	3595	36751B	example.com:80
+R 502	100	stocks	c38a2b70	SOCK_CONN	1	3595	example.com:80	example.com:80
+R 506	100	stocks	c38a2b70	SOCK_TX	1	3595	18607B	example.com:80
+F 1 0 0 12 5 0 0 0 0 0 0 2 1 0 0 17 0 0 0 2 2 0 0 17
+L 881 698 -324 -1306
+A 0
+W benign_stream
+R 0	100	calendar	684ae38d	EXEC	1	3787	/bin/python3 /apps/calendar/main.py	
+R 600	100	calendar	684ae38d	OPEN_R	1	3787	/data/calendar/log.txt	
+R 604	100	calendar	684ae38d	SOCK_CONN	1	3787	quotes.stocks.test:443	quotes.stocks.test:443
+R 664	100	calendar	684ae38d	SOCK_TX	1	3787	20065B	quotes.stocks.test:443
+F 1 0 0 12 4 0 0 0 0 1 0 1 1 0 0 15 0 0 0 3 1 0 0 15
+L 317 626 -432 -544
+A 0
+W benign_scary_words
+R 0	100	budget	8a5a3e8a	OPEN_W	1	40	/data/budget/c2_notes.txt	
+R 250	100	budget	8a5a3e8a	OPEN_R	1	40	/data/budget/c2_notes.txt	
+R 252	100	budget	8a5a3e8a	SOCK_CONN	1	40	quotes.stocks.test:443	quotes.stocks.test:443
+R 372	100	budget	8a5a3e8a	SOCK_TX	1	40	3799B	quotes.stocks.test:443
+F 1 0 0 6 4 0 0 0 0 0 0 1 1 0 0 12 0 0 0 3 1 0 0 12
+L 843 218 -234 -905
+A 0
+W benign_local
+R 0	100	habit	90cbcc56	OPEN_R	1	35	/data/habit/index.db	
+R 120	100	habit	90cbcc56	OPEN_R	1	35	/tmp/habit-65.tmp	
+R 5120	100	habit	90cbcc56	OPEN_R	1	35	/tmp/habit-39.tmp	
+F 1 0 0 6 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 863 -474 -329 -198
+A 0
+W benign_local
+R 0	100	files	19cd764e	OPEN_R	0	472	/tmp/files-51.tmp	
+R 20	100	files	19cd764e	OPEN_R	0	472	/data/files/state.json	
+R 22	100	files	19cd764e	OPEN_R	0	472	/data/files/prefs.json	
+R 57	100	files	19cd764e	OPEN_R	0	472	/tmp/files-59.tmp	
+R 92	100	files	19cd764e	OPEN_W	0	472	/data/files/queue.json	
+F 0 0 0 9 5 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1114 -242 -357 -651
+A 0
+W hard_negative_file_manager
+R 0	100	files	d8fef862	OPEN_R	2	4	/data/wallet/keys.txt	
+R 1	100	files	d8fef862	OPEN_R	2	4	/data/chat/state.json	
+F 0 0 0 3 2 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 1058 -495 -252 -451
+A 0
+W attack_slow_drip_exfil
+R 0	100	budget	99b73993	EXEC	1	2529	/apps/budget	
+R 600	100	budget	99b73993	OPEN_R	1	2529	/data/budget/draft.txt	
+R 604	100	budget	99b73993	OPEN_R	3	2529	/data/mail/id_ed25519	
+R 612	100	budget	99b73993	SOCK_CONN	1	2529	ingest.datahoard.ru:443	ingest.datahoard.ru:443
+R 614	100	budget	99b73993	SOCK_TX	1	2529	24832B	ingest.datahoard.ru:443
+R 674	100	budget	99b73993	SOCK_TX	1	2529	19099B	ingest.datahoard.ru:443
+R 678	100	budget	99b73993	SOCK_TX	1	2529	10809B	ingest.datahoard.ru:443
+R 738	100	budget	99b73993	SOCK_TX	1	2529	2656B	ingest.datahoard.ru:443
+R 773	100	budget	99b73993	SOCK_TX	1	2529	3330B	ingest.datahoard.ru:443
+R 1023	100	budget	99b73993	SOCK_TX	1	2529	22288B	ingest.datahoard.ru:443
+R 2523	100	budget	99b73993	SOCK_TX	1	2529	21245B	ingest.datahoard.ru:443
+F 1 0 0 12 5 1 0 0 0 1 0 1 1 0 0 17 17 0 0 3 1 0 0 17
+L -1269 438 2266 -1471
+A 2
+W hard_negative_dev_push
+R 0	100	wallet	7ac3f3d9	EXEC	20	3	/bin/python3 /apps/wallet/main.py	
+R 2	100	wallet	7ac3f3d9	OPEN_W	20	3	/data/wallet/index.db	
+R 22	100	wallet	7ac3f3d9	SOCK_CONN	20	3	feeds.podcasts.test:443	feeds.podcasts.test:443
+F 0 1 1 2 3 0 0 0 0 1 0 1 1 0 0 0 0 0 0 3 1 0 0 0
+L 1070 -726 -47 -459
+A 0
+W suspicious_new_host
+R 0	100	reader	2332497b	EXEC	1	15407	/apps/reader	
+R 200	100	reader	2332497b	SOCK_CONN	1	15407	drop.c2-exfil.test:80	drop.c2-exfil.test:80
+R 212	100	reader	2332497b	SOCK_TX	1	15407	160B	drop.c2-exfil.test:80
+F 1 0 0 14 3 0 0 0 0 1 0 1 1 0 0 8 0 1 1 3 1 1 0 8
+L -81 577 -133 -390
+A 0
+W benign_scary_words
+R 0	100	gallery	42f9bfc6	OPEN_W	0	32	/data/gallery/inject_test.py	
+R 60	100	gallery	42f9bfc6	OPEN_R	0	32	/data/gallery/inject_test.py	
+F 0 0 0 6 2 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 839 -323 -370 -269
+A 0
+W attack_exfil
+R 0	100	wallet	7a67937f	EXEC	5	3	/apps/wallet	
+R 200	100	wallet	7a67937f	OPEN_R	5	3	/data/wallet/index.db	
+R 260	100	wallet	7a67937f	OPEN_R	7	3	/data/calendar/keys.txt	
+R 5260	100	wallet	7a67937f	SOCK_CONN	5	3	paste.exfil-bin.test:8443	paste.exfil-bin.test:8443
+R 5380	100	wallet	7a67937f	SOCK_TX	5	3	1225386B	paste.exfil-bin.test:8443
+R 5392	100	wallet	7a67937f	SOCK_TX	5	3	3792375B	paste.exfil-bin.test:8443
+F 1 1 0 2 5 1 0 0 0 1 0 1 1 0 1 23 23 0 1 3 1 0 0 23
+L -2079 -502 3366 -863
+A 2
+W attack_c2_beacon
+R 0	100	files	fac8b746	SOCK_CONN	5	0	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 20	100	files	fac8b746	SOCK_TX	5	0	84B	a8f3k2.duckdns.org:4444
+R 80	100	files	fac8b746	SOCK_CONN	5	0	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 115	100	files	fac8b746	SOCK_TX	5	0	357B	a8f3k2.duckdns.org:4444
+R 235	100	files	fac8b746	SOCK_CONN	5	0	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 255	100	files	fac8b746	SOCK_TX	5	0	375B	a8f3k2.duckdns.org:4444
+R 290	100	files	fac8b746	SOCK_CONN	5	0	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 325	100	files	fac8b746	SOCK_TX	5	0	82B	a8f3k2.duckdns.org:4444
+R 329	100	files	fac8b746	SOCK_CONN	5	0	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 337	100	files	fac8b746	SOCK_TX	5	0	169B	a8f3k2.duckdns.org:4444
+R 345	100	files	fac8b746	SOCK_CONN	5	0	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+R 465	100	files	fac8b746	SOCK_TX	5	0	178B	a8f3k2.duckdns.org:4444
+R 1965	100	files	fac8b746	EXEC	5	0	/bin/python3 /tmp/x.py	
+F 1 1 0 0 13 0 0 0 0 1 1 6 1 0 6 11 0 3 0 3 6 6 0 11
+L 399 -930 3510 -3173
+A 1
+W attack_wx_shellcode
+R 0	100	podcasts	86d7e8a7	EXEC	1	1847	/apps/podcasts	
+R 600	100	podcasts	86d7e8a7	MEM_WX	1	1847	0x20a10000 len=65536	
+F 1 0 0 11 2 0 0 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L -374 -428 -713 1423
+A 1
+W attack_persistence
+R 0	100	todo	ca676a5b	EXEC	1	1	/bin/python3 /apps/todo/main.py	
+R 200	100	todo	ca676a5b	OPEN_W	3	1	/apps/clock/__init__.py	
+R 220	100	todo	ca676a5b	SOCK_CONN	1	1	a8f3k2.duckdns.org:4444	a8f3k2.duckdns.org:4444
+F 1 0 0 1 3 0 1 1 0 1 0 1 1 0 1 0 0 3 0 3 1 0 0 0
+L 163 -1658 1 1294
+A 3
+W benign_stream
+R 0	100	calendar	81bd2c1d	EXEC	0	14	/apps/calendar	
+R 200	100	calendar	81bd2c1d	OPEN_R	0	14	/data/calendar/library.db	
+R 450	100	calendar	81bd2c1d	SOCK_CONN	0	14	sync.notes.test:80	sync.notes.test:80
+R 485	100	calendar	81bd2c1d	SOCK_TX	0	14	28853B	sync.notes.test:80
+R 505	100	calendar	81bd2c1d	SOCK_TX	0	14	7660B	sync.notes.test:80
+R 513	100	calendar	81bd2c1d	SOCK_CONN	0	14	sync.notes.test:80	sync.notes.test:80
+F 0 0 0 4 5 0 0 0 0 1 0 2 1 0 0 16 0 0 0 3 2 0 0 0
+L 1092 131 -162 -1154
+A 0
+W benign_scary_words
+R 0	100	timer	2f2f8b86	OPEN_W	1	23	/data/timer/c2_notes.txt	
+F 1 0 0 5 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+L 629 -429 -394 73
+A 0

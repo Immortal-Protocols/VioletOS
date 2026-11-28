@@ -1,0 +1,4 @@
+# What the Violet Agent may use (runtime/open/policy.rs; packed into /apps/.manifests by tools/build_initfs.py).
+caps: net mic camera audio-out system
+# /tmp/.locomo.*: the requests and tracks it exchanges with Music (src/locomo.rs).
+tmp: .locomo

@@ -4,6 +4,12 @@
 //! and to pick up Wi-Fi jobs the Mac sends over USB on the handset (Radio
 //! takes those only through here). Phone Internet is restored by the Open
 //! Runtime from Settings' saved choice.
+//!
+//! It is also the one client Runtime takes sleep and wake from, so it carries
+//! out what Power asks for (services/power): sleep when the power key is
+//! pressed with the screen on, wake when the key or a touch ends a suspend.
+//! Runtime blanks and unblanks the screen and tells Power; Power decides when
+//! the system then suspends to idle.
 use crate::{drawing::*, protocol::*, sdk::*};
 
 pub fn run() -> ! {
@@ -23,7 +29,19 @@ pub fn run() -> ! {
     let mut scan_ticket: Option<Ticket> = None;
     let mut usb_request = 0;
     let mut usb_poll = unsafe { ticks() };
+    #[cfg(not(moto_board))]
+    let mut power_poll = usb_poll;
     loop {
+        // Ten times a second, so a key press is acted on within a tenth.
+        // Not on the handset: its Power never asks (no key or suspend there
+        // yet), and each query would have it sample the battery.
+        #[cfg(not(moto_board))]
+        if unsafe { ticks().wrapping_sub(power_poll) >= ticks_per_ms * 100 } {
+            power_poll = unsafe { ticks() };
+            if let Some(command) = power_wants(&request(GET, POWER, POWER_INFO)) {
+                request(EXECUTE, POWER, command);
+            }
+        }
         if open_apps && !handed_over {
             handed_over = request(EXECUTE, OPEN, OPEN_APPS).op == OK;
         }
@@ -65,5 +83,18 @@ pub fn run() -> ! {
         unsafe {
             delay_ms(20);
         }
+    }
+}
+
+/// What Power's state asks Runtime for: Some(0) wake, Some(1) sleep.
+fn power_wants(info: &Message) -> Option<u32> {
+    if info.op != OK {
+        None
+    } else if info.arg & POWER_INFO_WANT_WAKE != 0 {
+        Some(0)
+    } else if info.arg & POWER_INFO_WANT_SLEEP != 0 {
+        Some(1)
+    } else {
+        None
     }
 }

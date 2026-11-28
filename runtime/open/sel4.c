@@ -24,10 +24,15 @@ unsigned open_object_type(unsigned which) {
   default: return ~0u;
   }
 }
-int open_page_map(unsigned frame, unsigned pd, unsigned va, int writable, int cached) {
+/* Map a frame, or change the rights of one already mapped at `va` (the
+   kernel rewrites the entries in place and flushes the address space's TLB).
+   Read-only unless `writable`; Execute-Never unless `exec`. The callers never
+   ask for both (W^X); if one did, the mapping would still not be executable. */
+int open_page_map(unsigned frame, unsigned pd, unsigned va, int writable, int cached, int exec) {
   seL4_CapRights_t rights = writable ? seL4_AllRights : seL4_CanRead;
-  return seL4_ARM_Page_Map(frame, pd, va, rights,
-                           cached ? seL4_ARM_Default_VMAttributes : seL4_ARM_ExecuteNever);
+  unsigned attributes = cached ? seL4_ARM_Default_VMAttributes : 0;
+  if (!exec || writable) attributes |= seL4_ARM_ExecuteNever;
+  return seL4_ARM_Page_Map(frame, pd, va, rights, (seL4_ARM_VMAttributes)attributes);
 }
 int open_page_unmap(unsigned frame) { return seL4_ARM_Page_Unmap(frame); }
 int open_page_unify(unsigned frame, unsigned bytes) {
@@ -183,16 +188,24 @@ void open_copy(void *dst, const void *src, unsigned n) {
 
 /* The Open Runtime's timer (see sys.rs): the nonsecure physical timer, which
    the kernel exports to user mode, counting down `ticks` of the counter. */
+/* With the supervisor's timekeeper (runtime/transport.c, timekeeper.h) the
+   timer is the timekeeper's: a deadline is written to the shared page and
+   signalled on the same notification with the same badge, and there is no
+   interrupt to acknowledge (the timer slot then holds the kick). */
+extern unsigned tk_on;
+extern void timekeeper_arm_ticks(unsigned ticks);
 void open_timer_arm(unsigned ticks) {
+  if (tk_on) return timekeeper_arm_ticks(ticks);
   __asm__ volatile("mcr p15, 0, %0, c14, c2, 0" ::"r"(ticks)); /* CNTP_TVAL */
   __asm__ volatile("mcr p15, 0, %0, c14, c2, 1" ::"r"(1u));    /* CNTP_CTL: enabled */
   __asm__ volatile("isb");
 }
 void open_timer_stop(void) {
+  if (tk_on) return timekeeper_arm_ticks(0);
   __asm__ volatile("mcr p15, 0, %0, c14, c2, 1" ::"r"(0u));
   __asm__ volatile("isb");
 }
-int open_irq_ack(unsigned handler) { return seL4_IRQHandler_Ack(handler); }
+int open_irq_ack(unsigned handler) { return tk_on ? 0 : seL4_IRQHandler_Ack(handler); }
 /* Wait on the notification alone (app faults stay queued on the endpoint). */
 unsigned open_wait(unsigned notification) {
   seL4_Word badge = 0;

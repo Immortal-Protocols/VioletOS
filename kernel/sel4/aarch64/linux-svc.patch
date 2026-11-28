@@ -1,0 +1,94 @@
+--- a/libsel4/sel4_arch_include/aarch64/sel4/sel4_arch/syscalls.h
++++ b/libsel4/sel4_arch_include/aarch64/sel4/sel4_arch/syscalls.h
+@@ -69,7 +69,7 @@
+     /* Perform the system call. */
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : "+r"(destptr), "+r"(msg0), "+r"(msg1), "+r"(msg2),
+         "+r"(msg3), "+r"(info)
+         : "r"(scno)
+@@ -91,7 +91,7 @@
+     /* Perform the system call. */
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : "+r"(msg0), "+r"(msg1), "+r"(msg2), "+r"(msg3),
+         "+r"(info)
+         : "r"(scno)
+@@ -107,7 +107,7 @@
+     /* Perform the system call. */
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : "+r"(destptr), "+r"(info)
+         : "r"(scno)
+     );
+@@ -129,7 +129,7 @@
+     /* Perform the system call. */
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : "=r"(msg0), "=r"(msg1), "=r"(msg2), "=r"(msg3),
+         "=r"(info), "+r"(src_and_badge)
+         : "r"(scno) MCS_PARAM
+@@ -160,7 +160,7 @@
+     /* Perform the system call. */
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : "+r"(msg0), "+r"(msg1), "+r"(msg2), "+r"(msg3),
+         "+r"(info), "+r"(destptr)
+         : "r"(scno) MCS_PARAM
+@@ -195,7 +195,7 @@
+     /* Perform the system call. */
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : "+r"(msg0), "+r"(msg1), "+r"(msg2), "+r"(msg3),
+         "+r"(src_and_badge), "+r"(info)
+         : "r"(scno), "r"(reply_reg), "r"(dest_reg)
+@@ -215,7 +215,7 @@
+ {
+     register seL4_Word scno asm("x7") = sys;
+     asm volatile(
+-        "svc #0"
++        "svc #1"
+         : /* no outputs */
+         : "r"(scno)
+     );
+--- a/src/arch/arm/64/traps.S
++++ b/src/arch/arm/64/traps.S
+@@ -228,6 +228,26 @@
+ 
+     lsp_i   x19
+ 
++    /* VioletOS: "svc #0" is the Linux AArch64 system call instruction, whose
++     * number is in x8 and whose x7 is an ordinary scratch register. It never
++     * selects a kernel call by x7: the kernel is given x8 as the number, so
++     * every Linux number (zero or more) is an unknown-syscall fault delivered
++     * to the thread's fault handler. Native seL4 calls use "svc #1" (libsel4
++     * is changed to match). x25 holds ESR_EL1; its low 16 bits are the
++     * instruction's immediate. c_handle_syscall takes the number as an int,
++     * and seL4's own numbers are negative: an x8 outside 0..2^31-1 (negative,
++     * or with a negative low half) is passed as 0x10000, no Linux number and
++     * none of the kernel's, so it is an unknown-syscall fault too. */
++    tst     x25, #0xffff
++    b.ne    1f
++    mov     x2, x8
++    lsr     x9, x8, #31
++    cbz     x9, 2f
++    mov     x2, #0x10000
++2:
++    b       c_handle_syscall
++1:
++
+ #ifdef CONFIG_FASTPATH
+     cmp     x7, #SYSCALL_CALL
+     b.eq    c_handle_fastpath_call

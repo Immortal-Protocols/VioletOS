@@ -25,7 +25,11 @@ objcopy = cc.with_name("llvm-objcopy")
 common = [cc,"--target=arm-none-eabi","-mcpu=cortex-a53","-marm","-mfloat-abi=soft","-Oz","-ffreestanding","-fno-builtin","-fno-stack-protector","-fno-unwind-tables","-fno-pic","-mno-unaligned-access","-ffunction-sections","-fdata-sections"]
 incs = [a for a in args if a.startswith("-I") and ("libsel4" in a or "autoconf" in a or "gen_config" in a)]
 # Cores the kernel boots (kernel/sel4/build.py); the loader starts the others.
-defines = ["-DNDEBUG", "-DROOT_BYTES=0x100000", "-DVIOLET_CORES=" + os.environ.get("VIOLET_CORES", "1")]
+# The root task's window: its image (the supervisor and, on the handset, the
+# built-in catalog) with its stack above. 1.5 MiB at 0x40200000 physical; the
+# loader proves 0x40000000-0x44000000 holds no firmware reservation.
+ROOT_BYTES = 0x180000
+defines = ["-DNDEBUG", f"-DROOT_BYTES={ROOT_BYTES:#x}", "-DVIOLET_CORES=" + os.environ.get("VIOLET_CORES", "1")]
 if probe: defines.append("-DVIOLET_TEST_ISOLATION")
 defines.append("-DVIOLET_QEMU" if variant=="qemu" else "-DVIOLET_MOTO")
 sys.path.insert(0,str(repo / "services/touch"))
@@ -53,39 +57,40 @@ for source in [repo/"services/touch/events.c", repo/"services/storage/storage_ip
     run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
     shims.append(obj)
 only=os.environ.get("VIOLET_COMPONENT_ONLY")
-selected=None if variant=="qemu" else {"launcher","runtime","touch","display","storage","power","radio","usb-diagnostics","audio","open","camera"}
+selected=None if variant=="qemu" else {"launcher","runtime","touch","display","storage","power","radio","usb-diagnostics","audio","open","camera","sentinel"}
 storage_backend=repo/"targets/moto-g-pure/emmc.rs" if variant=="moto" else None
 components(repo,out,cc,common,incs,rustc,shims,only,selected,storage_backend,variant)
 if only or (variant=="qemu" and os.environ.get("VIOLET_APP_DIR")): sys.exit(0)
 (out/"catalog.S").write_text('.section .rodata.catalog,"a"\n.balign 4\n.global builtin_catalog,builtin_catalog_end\nbuiltin_catalog: .incbin "catalog.bin"\nbuiltin_catalog_end:\n.balign 4\n.global recovery_manager\nrecovery_manager: .incbin "packages/package_manager.vpk"\n')
 run(common+["-c",out/"catalog.S","-o","catalog.o"])
-signing_objects = []
-if variant == "moto":
-    # Only the public key enters the image. Reuse the private key on this Mac.
-    from tempfile import TemporaryDirectory
-    key = out / "developer-signing.pem"
-    if not key.exists():
-        with TemporaryDirectory(dir=out) as directory:
-            temporary = Path(directory) / "key.pem"
-            run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", temporary])
-            temporary.chmod(0o600)
-            temporary.replace(key)
-    public = subprocess.check_output(["openssl", "ec", "-in", key, "-pubout", "-outform", "DER",
-                                      "-conv_form", "uncompressed"], stderr=subprocess.DEVNULL)
-    prefix = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
-    if len(public) != len(prefix) + 65 or not public.startswith(prefix + b"\x04"):
-        sys.exit("Expected a P-256 developer key")
+# Package signatures. The supervisor verifies every VPK2 (system/package-manager/
+# verify.rs, with BearSSL's SHA-256 and P-256) against the keys pinned here:
+# the per-build developer key, or only the release root when VIOLET_RELEASE=1
+# (image/packages/sign.py). Only public keys enter the image.
+from sign import config as signing_config, write_keys, summary as sign_summary, DEVELOPER_KEY_ID
+package_signer = signing_config(repo, variant)
+os.environ["VIOLET_PACKAGE_KEYS_RS"] = str(write_keys(package_signer, out))
+sys.path.insert(0, str(repo / "services/radio"))
+from build_tls import build as build_crypto
+crypto_incs = ["-I", build / "bearssl-0.6/inc", "-I", repo / "services/radio/freestanding"]
+run(common + crypto_incs + ["-c", repo/"system/package-manager/verify_crypto.c", "-o", "verify-crypto.o"])
+# An object, not a second staticlib: core comes from the root's one Rust archive.
+run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=lib", "--emit=obj", "-Cpanic=abort",
+     "-Copt-level=s", "-Ccodegen-units=1", repo/"system/package-manager/verify.rs", "-o", "package-verify.o"])
+signing_objects = ["package-verify.o", "verify-crypto.o", build_crypto(repo, out, common)[1]]
+if variant == "moto" and DEVELOPER_KEY_ID in package_signer.keys:
+    # Developer images also accept a detached signature by the developer key to
+    # activate a Radio or USB Diagnostics package over USB without a tap. A
+    # release image has no developer key, so it has no such path.
     (out / "developer-key.h").write_text("static unsigned char developer_key[] = {" +
-        ",".join(map(str, public[len(prefix):])) + "};\n")
-    sys.path.insert(0, str(repo / "services/radio"))
-    from build_tls import build as build_crypto
-    signing_objects = [build_crypto(repo, out, common)[1]]
-    incs += ["-I", build / "bearssl-0.6/inc", "-I", repo / "services/radio/freestanding"]
+        ",".join(map(str, package_signer.keys[DEVELOPER_KEY_ID])) + "};\n")
+    defines.append("-DVIOLET_DEVELOPER_KEY")
 run(common+incs+defines+["-I",out,"-I",platform_include,"-std=gnu11","-c",repo/"system/supervisor/supervisor.c","-o","supervisor.o"])
 root_objects=["root.S.o","supervisor.o","strings.c.o","catalog.o"]
 if variant=="qemu":
     run([rustc,"--edition=2021","--target=armv7a-none-eabi","--crate-type=staticlib","--cfg","package_volume","-Cpanic=abort","-Copt-level=s",repo/"system/package-manager/volume.rs","-o","volume.a"])
     root_objects.insert(2,"volume.a")
+    root_objects.extend(signing_objects)
 else:
     run(common+incs+defines+["-I",platform_include,"-c",board_spi,"-o","board-map.o"])
     root_objects.append("board-map.o")
@@ -97,7 +102,14 @@ else:
 (out/"root.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; .image : { *(.entry) *(.text*) *(.rodata*) . = ALIGN(4096); writable_start = .; *(.data*) *(.bss*) image_end = .; } /DISCARD/ : { *(.ARM.exidx*) } }")
 run([ld,"--gc-sections","-T","root.ld",*root_objects,"-o","root.elf"])
 run([objcopy,"-O","binary","root.elf","root.bin"])
-assert (out/"root.bin").stat().st_size < 0xfe000
+# The root task's stack is what is left of its window (root.S), and
+# package signatures are checked on it (SHA-256 and P-256: a few KiB).
+root_bytes = (out/"root.bin").stat().st_size
+print(f"root.bin: {root_bytes} bytes, {ROOT_BYTES - root_bytes} left for the root stack (at least 8192 required)")
+if root_bytes > ROOT_BYTES - 8192:
+    sys.exit(f"root.bin is {root_bytes} bytes: under 8192 bytes would be left for the root task's stack")
+# Say which keys this image trusts: a developer image must never pass for a release.
+print(sign_summary(package_signer))
 elf = (abi/"kernel.elf").read_bytes()
 assert elf[:6] == b"\x7fELF\x01\x01" and struct.unpack_from("<I",elf,24)[0] == 0xe0000000
 phoff, = struct.unpack_from("<I",elf,28)
@@ -124,6 +136,33 @@ if variant == "moto":
     prepare_wifi(Path(stock_path).parent, out/"wifi-firmware.bin")
     with (out/"payload.S").open("a") as payload:
         payload.write('.balign 4\n.global radio_firmware,radio_firmware_end\nradio_firmware: .incbin "wifi-firmware.bin"\nradio_firmware_end:\n')
+verified_boot = []
+if variant == "qemu":
+    # Verified boot (boot/loader/verified.rs, docs/verified-boot.md): the loader
+    # starts the kernel and the root task only if they match a manifest signed
+    # by a key this image pins. The /apps image is bound too in a release, or
+    # with VIOLET_BOOT_BIND_APPS=1; a developer image leaves it unbound because
+    # the local tests swap it without relinking the loader. The handset loader
+    # carries no manifest: its bootloader is unlocked and verifies nothing.
+    from boot_manifest import build as boot_manifest, verify as check_boot_manifest, system_version, check_loader
+    bind_apps = package_signer.release or os.environ.get("VIOLET_BOOT_BIND_APPS") == "1"
+    boot_images = [(out/"kernel.bin").read_bytes(), (out/"root.bin").read_bytes(),
+                   (out/"initfs.cpio").read_bytes() if bind_apps else None]
+    # The signed version is the root task's own (its VIOLETSYSVER note), never a re-read of the environment.
+    try:
+        boot_version = system_version(boot_images[1], os.environ.get("VIOLET_SYSTEM_VERSION"), package_signer.release)
+    except ValueError as e:
+        sys.exit(f"verified boot: {e}")
+    signed_manifest = boot_manifest(package_signer, boot_version, *boot_images)
+    check_boot_manifest(signed_manifest, package_signer.keys, variant, *boot_images, require_apps=package_signer.release)
+    (out/"boot-manifest.bin").write_bytes(signed_manifest)
+    with (out/"payload.S").open("a") as payload:
+        payload.write('.balign 4\n.global boot_manifest,boot_manifest_end\nboot_manifest: .incbin "boot-manifest.bin"\nboot_manifest_end:\n')
+    run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib", "-Cpanic=abort",
+         "-Copt-level=s", "-Ccodegen-units=1", repo/"boot/loader/verified_lib.rs", "-o", "loader-verified.a"])
+    defines.append("-DVIOLET_VERIFIED_BOOT")
+    verified_boot = ["loader-verified.a", *signing_objects[1:]]
+    print("Verified boot: the loader checks the kernel and the root task" + (" and the /apps image." if bind_apps else "; the /apps image is NOT bound (developer image)."))
 fdt = build/"dtc-1.7.2/libfdt"
 ndk = cc.parent.parent/"sysroot/usr/include"
 headers = ["-I"+str(fdt),"-isystem",ndk/"arm-linux-androideabi","-isystem",ndk]
@@ -133,11 +172,17 @@ for source in [repo/"boot/loader/loader.S", repo/"boot/loader/loader.c", here/"s
     run(common+defines+headers+["-c",source,"-o",obj])
     objects.append(obj)
 if variant == "moto": objects.append("loader-history.a")
+objects.extend(verified_boot)
 run([ld,"--gc-sections","-T",repo/"boot/loader/loader.ld",*objects,"-o","loader.elf"])
 run([objcopy,"-O","binary","loader.elf","zImage"])
 z=(out/"zImage").read_bytes()
 assert struct.unpack_from("<3I",z,36)==(0x016f2818,0,len(z))
 if variant=="qemu":
+    # A QEMU loader that dropped the check (no VIOLET_VERIFIED_BOOT, or no call) fails the build.
+    try:
+        check_loader(z, signed_manifest)
+    except ValueError as e:
+        sys.exit(f"verified boot: {e}")
     run(common+["-DIMAGE_BYTES="+str(len(z)),"-c",here/"qemu-entry.S","-o","qemu-entry.o"])
     run([objcopy,"-O","binary","-j",".text","qemu-entry.o","entry.bin"])
 if variant=="moto":
@@ -153,7 +198,12 @@ if variant=="moto":
     marker=b"VioletOS XT2163DL boot_b storage v1\n".ljust(512,b"\0")
     image=image.ljust(marker_offset,b"\0")+marker+bytes(1024**2)
     image += b"VioletOS boot history v1\n".ljust(512,b"\0") + bytes(1024)
-    image += b"VioletOS catalog banks v1\n".ljust(512,b"\0") + bytes(4098*512)
+    # Two catalog banks (catalog_volume.rs BANK sectors each, 1.25 MiB of
+    # catalog), all before the installed apps' extent at 20 MiB.
+    import package_format
+    banks = 2 * (1 + package_format.HANDSET_LIMIT // 512)
+    image += b"VioletOS catalog banks v1\n".ljust(512,b"\0") + bytes(banks*512)
+    if len(image) > 20*1024**2:raise ValueError("catalog banks overlap the installed apps (storage_volume.rs APPS)")
     (out/"boot.img").write_bytes(image)
     page, = struct.unpack_from("<I", stock, 36)
     assert image[page:page+len(z)]==z

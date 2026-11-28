@@ -1,8 +1,20 @@
 //! MT6765 MSDC0. Reuse the bootloader's selected, tuned, sector-addressed eMMC
 //! and execute one 512-byte programmed-I/O transfer at a time. No DMA or erase.
+//!
+//! Not done here, and what it costs the data volume (services/storage/
+//! volume.rs): no multi-block transfers (CMD18/CMD25) and no DMA, so about
+//! 100 KiB a second; no TRIM (`BlockDev::discard` is not passed on, so the
+//! card's wear levelling is not told which blocks are free); no reliable
+//! write and no health report (EXT_CSD life-time estimates); any error
+//! retires the disk until the restart. Each of these needs the handset to
+//! get right: a wrong erase range or transfer length destroys data that is
+//! not VioletOS's, and none can be tried in QEMU, which has no MSDC.
 use crate::journal::Sector;
 #[path = "storage_volume.rs"]
 mod volume;
+#[allow(dead_code)]
+#[path = "../../services/storage/extent.rs"]
+pub mod extent;
 use core::ptr::{read_volatile, write_volatile};
 #[cfg(not(loader_trace))]
 const BASE: usize = 0x0a000000;
@@ -129,6 +141,15 @@ pub struct Disk {
     /// The installed apps' extent: the end of boot_b, or userdata once claimed.
     apps_first: u32,
     apps_count: usize,
+    /// Where a data volume would go this boot (services/storage/extent.rs):
+    /// sectors of the storage volume in boot_b, or of userdata (`raw`) once
+    /// claimed and read. Storage holds it to the recorded place (mount.rs)
+    /// and sets `data`, the extent served, which is nothing until then.
+    offer: extent::Place,
+    data: extent::Place,
+    /// The slot geometry once looked up (slot_geometry), for `slot_ota` builds.
+    #[cfg(slot_ota)]
+    slots: Option<Option<(u32, [u32; 2], u32)>>,
 }
 impl Disk {
     pub fn open_checked() -> Result<Self, &'static [u8]> {
@@ -154,6 +175,12 @@ impl Disk {
             userdata,
             apps_first: volume::APPS,
             apps_count: volume::APP_SECTORS,
+            // Until userdata is claimed: the end of the storage volume that
+            // the flat files never used (extent.rs).
+            offer: extent::small(volume::SECTORS),
+            data: extent::NOWHERE,
+            #[cfg(slot_ota)]
+            slots: None,
         })
     }
     fn finish<T>(&mut self, r: Result<T, ()>) -> Result<T, ()> {
@@ -223,7 +250,47 @@ impl Disk {
         }
         self.apps_first = start;
         self.apps_count = (last + 1 - start) as usize;
+        // The installed apps keep the first gibibyte, which is more than the
+        // app store can ever reach; the data volume takes the next one
+        // (extent.rs has the arithmetic and why).
+        if let Some((apps, first, count)) = extent::userdata(start, last) {
+            self.apps_count = apps as usize;
+            self.offer = extent::Place { first, count, raw: true };
+        }
         b"APPS IN USERDATA"
+    }
+    #[allow(dead_code)]
+    pub fn data_offer(&self) -> extent::Place {
+        self.offer
+    }
+    #[allow(dead_code)]
+    pub fn use_data(&mut self, p: extent::Place) {
+        self.data = p;
+    }
+    /// The data volume's extent, and nothing outside it.
+    #[allow(dead_code)]
+    pub fn data_sectors(&self) -> usize {
+        self.data.count as usize
+    }
+    fn data_lba(&self, i: usize) -> Result<u32, ()> {
+        if self.retired || i >= self.data.count as usize {
+            return Err(());
+        }
+        if self.data.raw {
+            Ok(self.data.first + i as u32)
+        } else {
+            volume::sector(self.data.first as usize + i)
+        }
+    }
+    #[allow(dead_code)]
+    pub fn data_read(&mut self, i: usize) -> Result<Sector, ()> {
+        let lba = self.data_lba(i)?;
+        self.finish(read_card(17, lba))
+    }
+    #[allow(dead_code)]
+    pub fn data_write(&mut self, i: usize, s: &mut Sector) -> Result<(), ()> {
+        let lba = self.data_lba(i)?;
+        self.finish(transfer(24, lba, s))
     }
     /// The installed apps' extent: the end of boot_b, or userdata once claimed.
     #[allow(dead_code)]
@@ -254,6 +321,64 @@ impl Disk {
     }
 }
 
+// Full-system updates into boot_a / boot_b and the A/B metadata in misc
+// (services/storage/slotwrite.rs, slot.rs). NOT ENABLED: no build sets
+// `slot_ota`, because what Motorola's bootloader does with the record has
+// not been seen on a handset and the running slot is not passed by the
+// loader yet (slot.rs lists what is unknown). When enabled, every address
+// comes from the live CRC-checked GPT and only these sectors can be reached:
+// misc + 4 and the first 16 MiB of boot_a and boot_b (in boot_b that ends
+// exactly at the storage marker). Nothing is offered while Android may still
+// be on slot A: only once `moto-flash --take-userdata` has claimed userdata.
+#[cfg(slot_ota)]
+#[path = "slot.rs"]
+mod slot;
+#[cfg(slot_ota)]
+impl Disk {
+    pub const SLOT_SECTORS: u32 = 16 * 1024 * 1024 / 512;
+    /// (bootloader_control sector, first sector of boot_a and boot_b, sectors per slot).
+    pub fn slot_geometry(&mut self) -> Option<(u32, [u32; 2], u32)> {
+        if self.retired || self.apps_first == volume::APPS {
+            return None;
+        }
+        if let Some(known) = self.slots {
+            return known;
+        }
+        let found = self.find_slots();
+        self.slots = Some(found);
+        found
+    }
+    fn find_slots(&mut self) -> Option<(u32, [u32; 2], u32)> {
+        let ext = read_card(8, 0).ok()?;
+        let capacity = u32::from_le_bytes(ext[212..216].try_into().ok()?);
+        let mut found = [None; 3];
+        slot::gpt_find(|lba| read_card(17, lba), capacity, &[b"misc", b"boot_a", b"boot_b"], &mut found).ok()?;
+        let (misc, a, b) = (found[0]?, found[1]?, found[2]?);
+        if b.0 != volume::BOOT_B || volume::MARKER != b.0 + Self::SLOT_SECTORS
+            || a.1 - a.0 + 1 < Self::SLOT_SECTORS || misc.1 - misc.0 < slot::MISC_SECTOR
+        {
+            return None;
+        }
+        Some((misc.0 + slot::MISC_SECTOR, [a.0, b.0], Self::SLOT_SECTORS))
+    }
+    fn slot_lba(&mut self, lba: u32) -> Result<u32, ()> {
+        let (control, first, sectors) = self.slot_geometry().ok_or(())?;
+        if lba == control || first.iter().any(|&f| (f..f + sectors).contains(&lba)) {
+            Ok(lba)
+        } else {
+            Err(())
+        }
+    }
+    pub fn slot_read(&mut self, lba: u32) -> Result<Sector, ()> {
+        let at = self.slot_lba(lba)?;
+        self.finish(read_card(17, at))
+    }
+    pub fn slot_write(&mut self, lba: u32, s: &mut Sector) -> Result<(), ()> {
+        let at = self.slot_lba(lba)?;
+        self.finish(transfer(24, at, s))
+    }
+}
+
 // These two records sit beyond the filesystem and require their own provisioned
 // marker. Only loader/supervisor code is built with this interface.
 #[cfg(boot_trace)]
@@ -278,7 +403,8 @@ pub struct PackageDisk { disk: Disk, pub sectors: usize }
 #[cfg(package_catalog)]
 impl PackageDisk {
     const HEADER: u32 = volume::MARKER + volume::SECTORS as u32 + 4;
-    const COUNT: usize = 4098;
+    /// Two banks of system/package-manager/catalog_volume.rs BANK (1 + 2560) sectors.
+    const COUNT: usize = 2 * (1 + 0x140000 / 512);
     pub fn open() -> Option<Self> {
         let disk = Disk::open_checked().ok()?;
         let h = read_card(17, Self::HEADER).ok()?;

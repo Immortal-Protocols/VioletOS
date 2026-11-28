@@ -152,9 +152,57 @@ static unsigned radio_profile(const void *dt) {
     return 0;
 }
 #endif
+#ifdef VIOLET_VERIFIED_BOOT
+// Verified boot (verified.rs): nothing is copied or started unless the boot
+// manifest, signed by a key pinned in this loader, matches the kernel, the
+// root task and, when the manifest binds it, the open apps' image.
+struct images {
+    const void *manifest; size_t manifest_bytes;
+    const void *kernel; size_t kernel_bytes;
+    const void *root; size_t root_bytes;
+    const void *apps; size_t apps_room;
+    unsigned floor[3];
+};
+extern unsigned verified_boot(const struct images *images, unsigned *version);
+extern char boot_manifest[], boot_manifest_end[];
+static void say(const char *s) {
+    volatile uint32_t *uart = (void *)0x09000000;  // QEMU's PL011
+    while (*s) *uart = (unsigned char)*s++;
+}
+static void say_number(unsigned v) {
+    char text[11], *p = text + 10;
+    *p = 0;
+    do *--p = '0' + v % 10; while (v /= 10);
+    say(p);
+}
+static int verified(void) {
+    // The bootloader's stored rollback floor (tools/boot_manifest.py FLOOR_ADDRESS).
+    const volatile unsigned *floor = (void *)0x47870000;
+    const struct images images = {
+        boot_manifest, boot_manifest_end - boot_manifest, kernel, kernel_end - kernel,
+        root, root_end - root, (void *)0x4a000000, 0x06000000, {floor[0], floor[1], floor[2]}};
+    unsigned version = 0, why = verified_boot(&images, &version);
+    if (!why) {
+        say("VioletOS loader: verified boot, system version ");
+        say_number(version);
+        say("\n");
+        return 1;
+    }
+    say("VioletOS loader: boot refused, reason ");
+    say_number(why);
+    say("\n");
+    volatile uint32_t *pixels = (volatile uint32_t *)fb;
+    for (unsigned y = 32; y < 64; ++y)
+        for (unsigned x = 0; x < 720; ++x) pixels[y * 720 + x] = 0xffff0000;
+    return 0;
+}
+#endif
 void prepare(const void *dt)
 {
     if (!layout_ok(dt)) return;
+#ifdef VIOLET_VERIFIED_BOOT
+    if (!verified()) return;
+#endif
 #ifdef VIOLET_MOTO
     unsigned hz;
     __asm__ volatile("mrc p15,0,%0,c14,c0,0" : "=r"(hz));

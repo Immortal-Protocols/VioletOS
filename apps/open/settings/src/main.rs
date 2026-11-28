@@ -2,9 +2,10 @@
 //! Internet), the clock's city, the apps Violet Agent built, the passcode,
 //! power off, and About.
 mod pages;
-mod passcode;
 mod wifi;
 mod wifi_ui;
+mod fetch;
+mod updates;
 
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
@@ -44,8 +45,10 @@ fn status() -> Status {
         battery: st.get("battery").and_then(|v| v.parse().ok()).filter(|b| (0..=100).contains(b)).unwrap_or(-1),
         volume: st.get("volume").and_then(|v| v.parse().ok()).unwrap_or(-1),
         city: violet::sys("get time.city").parse().ok().filter(|&n: &usize| n < CITIES.len()).unwrap_or(0),
+        clock_set: violet::time::network_time().is_some(),
+        minute: violet::time::now_utc() / 60,
         installed: pages::parse_installed(&violet::sys("installed")),
-        passcode: violet::fields(&violet::sys("lock")).get("set").is_some_and(|v| v == "1"),
+        passcode: violet::fields(&violet::sys("passcode")).get("set").is_some_and(|v| v == "1"),
     }
 }
 
@@ -59,13 +62,13 @@ struct App {
     section: Section,
     status: Status,
     wifi: wifi::App,
+    updates: updates::App,
     code: String,
     relay_on: bool,
     pressed: Option<Hit>,
     down: Option<(i32, i32)>,
     confirm: Option<usize>,
     note: String,
-    passcode: passcode::Passcode,
 }
 
 impl App {
@@ -78,7 +81,6 @@ impl App {
             pressed: self.pressed,
             confirm: self.confirm,
             note: &self.note,
-            passcode: &self.passcode,
         }
     }
 
@@ -95,9 +97,11 @@ impl App {
         self.confirm = None;
         self.note.clear();
         self.refresh();
-        self.passcode = passcode::Passcode::new(self.status.passcode);
         if section == Section::Wifi {
             self.wifi.enter();
+        }
+        if section == Section::Updates {
+            self.updates.enter();
         }
     }
 
@@ -113,18 +117,7 @@ impl App {
             // Saved settings and Phone Internet are managed by the runtime.
             // Release this screen's memory when the user returns to Home.
             Hit::Back if self.section == Section::Menu => std::process::exit(0),
-            // Out of the number pad, back to the Passcode page.
-            Hit::Back if self.section == Section::Passcode && self.passcode.step != passcode::Step::Overview => self.go(Section::Passcode),
             Hit::Back => self.go(Section::Menu),
-            Hit::PasscodeSet => self.passcode.begin(false),
-            Hit::PasscodeOff => self.passcode.begin(true),
-            Hit::Pad(key) => {
-                self.passcode.key(key, &mut |line| violet::sys(line));
-                if self.passcode.good {
-                    println!("settings: {}", self.passcode.note);
-                    self.status.passcode = self.passcode.set;
-                }
-            }
             Hit::PowerOff if self.confirm == Some(pages::CONFIRM_POWER) => {
                 self.confirm = None;
                 println!("settings: powering off");
@@ -171,6 +164,13 @@ impl App {
             }
             Hit::Delete(i) => self.confirm = Some(i),
             Hit::DeleteAll => self.confirm = Some(usize::MAX),
+            // The runtime takes the screen and asks for the digits itself;
+            // Settings hears FOCUS_GAINED when it is done, and refreshes.
+            Hit::PassSet | Hit::PassOff => {
+                let answer = violet::sys(if hit == Hit::PassSet { "passcode set" } else { "passcode off" });
+                println!("settings: passcode {} -> {}", if hit == Hit::PassSet { "set" } else { "off" }, answer);
+                self.note = if answer == "ok" { String::new() } else { "Couldn't start. Try again.".into() };
+            }
         }
     }
 
@@ -188,6 +188,13 @@ impl App {
 
     /// True when the screen needs drawing.
     fn touch(&mut self, kind: u16, x: i32, y: i32) -> bool {
+        if self.section == Section::Updates {
+            self.updates.touch(kind, x, y);
+            if self.updates.exit {
+                self.go(Section::Menu);
+            }
+            return true;
+        }
         if self.section == Section::Wifi {
             self.wifi.touch(kind, x, y);
             if self.wifi.exit {
@@ -233,13 +240,13 @@ fn main() {
         section: Section::Menu,
         status: status(),
         wifi: wifi::App::new(),
+        updates: updates::App::new(),
         code,
         relay_on,
         pressed: None,
         down: None,
         confirm: None,
         note: String::new(),
-        passcode: passcode::Passcode::default(),
     };
     if saved.is_empty() {
         app.save_relay();
@@ -249,6 +256,8 @@ fn main() {
     let draw = |c: &mut Canvas, app: &App| {
         if app.section == Section::Wifi {
             app.wifi.draw(c, &fonts);
+        } else if app.section == Section::Updates {
+            app.updates.draw(c, &fonts);
         } else {
             pages::draw(c, &fonts, &app.view());
         }
@@ -262,7 +271,8 @@ fn main() {
             screen.show_all(&c);
             dirty = false;
         }
-        let animating = app.section == Section::Wifi && app.wifi.animating();
+        let animating = (app.section == Section::Wifi && app.wifi.animating())
+            || (app.section == Section::Updates && app.updates.animating());
         let timeout = if animating { Duration::from_millis(120) } else { Duration::from_secs(1) };
         let mut next = match events.recv_timeout(timeout) {
             Ok(e) => Some(e),
@@ -281,7 +291,10 @@ fn main() {
             }
             next = events.try_recv().ok();
         }
-        if app.section == Section::Wifi {
+        if app.section == Section::Updates {
+            // The download runs in its own thread; follow its progress.
+            dirty = true;
+        } else if app.section == Section::Wifi {
             dirty |= app.wifi.tick(&mut wifi_poll);
         } else if last_poll.elapsed() >= Duration::from_secs(if app.section == Section::PhoneLink { 1 } else { 3 }) {
             last_poll = Instant::now();
@@ -300,6 +313,7 @@ mod preview {
         Status {
             wifi: "LouieDog".into(), bt_on: true, bt_open: false, shield_known: true, shield_linked: true, shield_rules: 3,
             frozen: vec![], relay: "off".into(), relay_failure: 0, battery: 82, volume: 8, city: 1,
+            clock_set: true, minute: 29_924_807, // 2026-11-24 02:47 UTC
             installed: pages::parse_installed("scorekeeper\t412345\tScorekeeper\ntips\t300000\tTip Calculator\n"),
             passcode: true,
         }
@@ -313,6 +327,21 @@ mod preview {
         assert_eq!(a[1].title, "raw");
     }
 
+    #[test]
+    fn time_page_lines() {
+        let mut s = status();
+        // Oakland, the evening before in Pacific standard time.
+        assert_eq!(pages::time_lines(&s), ("18:47 · Nov 23, Mon · PST (UTC-8)".into(), "Set from the network"));
+        s.city = 18; // Mumbai
+        assert_eq!(pages::time_lines(&s).0, "8:17 · Nov 24, Tue · IST (UTC+5:30)");
+        s.city = 13; // London, in July: summer time
+        s.minute = 29_704_800; // 2026-06-24 08:00 UTC
+        assert_eq!(pages::time_lines(&s).0, "9:00 · Jun 24, Wed · BST (UTC+1)");
+        // Before the network has answered, the build-time clock is not shown as the time.
+        s.clock_set = false;
+        assert_eq!(pages::time_lines(&s).0, "Clock not set");
+    }
+
     /// SETTINGS_PREVIEW=dir cargo test -p settings writes each page as raw 720x1600 RGBA.
     #[test]
     fn preview() {
@@ -320,15 +349,9 @@ mod preview {
         let fonts = Fonts::load();
         let s = status();
         let mut c = Canvas::new(violet::W, violet::H);
-        let overview = passcode::Passcode::new(true);
-        let mut entry = passcode::Passcode::new(true);
-        entry.begin(false);
-        entry.key(violet::keypad::PadKey::Digit(2), &mut |_| String::new());
         for (name, section) in [("menu", Section::Menu), ("bluetooth", Section::Bluetooth), ("phone", Section::PhoneLink),
-                                ("time", Section::Time), ("apps", Section::AgentApps), ("about", Section::About),
-                                ("passcode", Section::Passcode), ("passcode-entry", Section::Passcode), ("power", Section::Power)] {
-            let passcode = if name == "passcode-entry" { &entry } else { &overview };
-            let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "", passcode };
+                                ("time", Section::Time), ("apps", Section::AgentApps), ("passcode", Section::Passcode), ("about", Section::About), ("power", Section::Power)] {
+            let v = pages::View { section, status: &s, code: "3FA94C0B17DE", relay_on: false, pressed: None, confirm: Some(1), note: "" };
             pages::draw(&mut c, &fonts, &v);
             let bytes: Vec<u8> = c.px.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
             std::fs::write(format!("{dir}/{name}.rgba"), bytes).unwrap();

@@ -13,12 +13,20 @@ example once so later builds reuse the compiled violet crate. `build` works
 offline and writes only inside DIR, so it runs inside Codex's workspace-write
 sandbox. It prints a JSON line: the program's path, size and build time.
 
+An app's manifest.txt (next to its app.txt) says what it may use on the
+phone ("caps: net mic camera audio-out hci"; runtime/open/policy.rs). The
+program at `path` then ends with it (the manifest, its length, "VMF1"),
+which the phone splits off at install. Without one the app gets only its
+own /data, the screen and touch. Net, the microphone and the camera are
+asked of the user the first time the app uses them.
+
 A folder python/NAME with main.py is a Python app: `build` checks it with this Mac's
 Python 3.12, runs it once against a fake screen with taps across it (errors
 fail the build), and writes it as one #!/bin/python3 file.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build_initfs  # noqa: E402
+import elf_check  # noqa: E402
 
 DEFAULT = ROOT / "build/agent-workspace"
 TEMPLATE = ROOT / "tools/agent-workspace"
@@ -50,7 +59,8 @@ def environment(work):
         f"AR_{key}": str(bins[0] / "llvm-ar"),
         f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *build_initfs.CPU_FLAGS]),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *build_initfs.CPU_FLAGS,
+                                                               *map(str, build_initfs.pie_flags(rustc))]),
         "CARGO_TARGET_DIR": str(work / "target"),
         "CARGO_HOME": str(work / ".cargo-home"),
         "RUSTC": str(rustc),
@@ -148,14 +158,28 @@ def build_python(work, name):
     out = out_dir / name
     if not source.startswith("#!"):
         source = "#!/bin/python3\n" + source
-    out.write_text(source)
+    try:
+        out.write_bytes(with_manifest(app, source.encode()))
+    except SystemExit as e:
+        return fail(f"{e}\n")
     seconds = round(time.monotonic() - start, 1)
     print(json.dumps({"ok": True, "name": name, "title": title, "path": str(out), "bytes": out.stat().st_size,
                       "seconds": seconds, "language": "python", "check": checked}))
     return 0
 
 
+def with_manifest(app, program):
+    """The program as the phone installs it: with the app's manifest at the end, if it has one."""
+    manifest = app / build_initfs.MANIFEST
+    if not manifest.exists():
+        return program
+    return build_initfs.envelope(manifest.read_text(), program)
+
+
 def build(work, name):
+    # runtime/open/appstore.rs NEW_NAME: /data/NAME.KEY must fit Storage's 16 characters.
+    if not re.fullmatch(r"[a-z0-9_-]{1,12}", name):
+        raise SystemExit(f"app name {name!r}: up to 12 of a-z 0-9 _ - (the phone keeps /data/NAME.KEY in 16 characters)")
     if (work / "python" / name / "main.py").exists():
         return build_python(work, name)
     app = work / "apps" / name
@@ -171,6 +195,25 @@ def build(work, name):
         print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
         return 1
     out = work / "target" / build_initfs.TARGET / "agent" / name
+    # The same gate as the system image: a position-independent program the
+    # phone's loader takes (W^X, code in its own pages, relocations it can apply).
+    try:
+        elf_check.check({name: out.read_bytes()}, allow_fixed=elf_check.fixed_allowed())
+    except SystemExit as e:
+        sys.stderr.write(f"{e}\n")
+        print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
+        return 1
+    if (app / build_initfs.MANIFEST).exists():
+        # Cargo's own output stays as it is; the phone gets the program with its manifest.
+        packed = work / "target/agent-out" / name
+        packed.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            packed.write_bytes(with_manifest(app, out.read_bytes()))
+        except SystemExit as e:
+            sys.stderr.write(f"{e}\n")
+            print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
+            return 1
+        out = packed
     title = (app / "app.txt").read_text().strip() if (app / "app.txt").exists() else name.title()
     print(json.dumps({"ok": True, "name": name, "title": title, "path": str(out), "bytes": out.stat().st_size, "seconds": seconds}))
     return 0

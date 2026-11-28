@@ -104,6 +104,14 @@ def archive():
     binary = PYTHON_ROOT / "bin/python3"
     if not binary.exists():
         raise SystemExit("Build Python for the phone first: python3 tools/build_python.py python")
+    # The image's release gate, for the one place the phone's python3 ships
+    # (the handset image leaves it out): position-independent, RELRO sealed,
+    # loadable. A python3 linked before these rules is refused, not packed.
+    import elf_check
+    try:
+        elf_check.check({"bin/python3": binary.read_bytes()}, allow_fixed=elf_check.fixed_allowed())
+    except SystemExit as e:
+        raise SystemExit(f"{e}\nrelink it with python3 tools/build_python.py python")
     stdlib = stdlib_zip()
     files = {
         "bin/python3": (binary.read_bytes(), 0o100755),

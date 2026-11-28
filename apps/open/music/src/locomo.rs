@@ -5,10 +5,10 @@ use serde_json::{json, Value};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 
-const REQUEST: &str = "/tmp/locomo-make";
-const BROWSE: &str = "/tmp/locomo-browse";
-const LIBRARY: &str = "/tmp/locomo-library";
-pub const TRACK: &str = "/tmp/locomo-track";
+const REQUEST: &str = "/tmp/.locomo.make";
+const BROWSE: &str = "/tmp/.locomo.browse";
+const LIBRARY: &str = "/tmp/.locomo.library";
+pub const TRACK: &str = "/tmp/.locomo.track";
 
 #[derive(Deserialize)]
 pub struct Song {
@@ -90,7 +90,7 @@ pub fn library() -> Option<Library> {
 }
 
 pub fn status() -> String {
-    fs::read_to_string("/tmp/locomo-status")
+    fs::read_to_string("/tmp/.locomo.status")
         .unwrap_or_else(|_| "Connect Violet Agent to the Mac to make songs.".into())
 }
 

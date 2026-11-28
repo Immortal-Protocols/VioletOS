@@ -1,0 +1,3 @@
+# What the memory pressure test app may use (runtime/open/policy.rs): "memory" on
+# /dev/violet/sys shows every app only to a holder of the system capability.
+caps: system

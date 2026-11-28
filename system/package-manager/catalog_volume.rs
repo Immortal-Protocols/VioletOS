@@ -1,6 +1,14 @@
 use super::Disk;
-const BANK: usize = 2049;
-const LIMIT: usize = 1024 * 1024;
+/// The largest catalog a bank holds: 1 MiB on QEMU's catalog volume, 1.25 MiB
+/// on the handset (package_catalog), whose built-in catalog no longer fits in
+/// one MiB (image/packages/package_format.py HANDSET_LIMIT, supervisor.c
+/// CATALOG_LIMIT, emmc.rs PackageDisk::COUNT = 2 * BANK).
+#[cfg(package_catalog)]
+pub const LIMIT: usize = 0x140000;
+#[cfg(not(package_catalog))]
+pub const LIMIT: usize = 1024 * 1024;
+/// A bank: its descriptor sector, then LIMIT bytes of sectors.
+pub const BANK: usize = 1 + LIMIT / 512;
 fn sum(b: &[u8]) -> u32 { crate::journal::crc32(b) }
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[i..i + 4].try_into().unwrap())

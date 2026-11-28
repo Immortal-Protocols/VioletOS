@@ -1,0 +1,8 @@
+2782	103	notes	3725b1af	EXEC	1	2	/apps/notes	
+3362	103	notes	3725b1af	OPEN_W	0	3	/data/notes	
+3363	103	notes	3725b1af	OPEN_W	0	3	/data/notes/keys.txt	
+3363	103	notes	3725b1af	OPEN_W	0	3	/data/notes/todo.txt	
+3364	103	notes	3725b1af	OPEN_R	0	3	/data/notes/todo.txt	
+3375	103	notes	3725b1af	SOCK_CONN	0	3	sync.notes.test:80	sync.notes.test:80
+3389	103	notes	3725b1af	SOCK_TX	0	3	85B	sync.notes.test:80
+5426	103	notes	3725b1af	EXIT	0	5	status 0	

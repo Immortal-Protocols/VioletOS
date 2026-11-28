@@ -40,7 +40,7 @@ The app is a small Bluetooth LE host of its own, over `/dev/violet/hci` (one H4 
 - **Peripheral role only.** Peers connect to the phone; it doesn't connect to them, and it doesn't relay. It is a leaf of the mesh. Phones in range connect on their own, so chat works, but packets don't hop through VioletOS.
 - **Public channel only.** There are no private messages (Noise XX), favourites, files or location channels.
 - **Messages are at most 99 bytes.** iOS re-encodes a packet before checking its signature, and compresses payloads of 100 bytes or more. A longer message would have to match Apple's DEFLATE output byte for byte, so the app doesn't send one. Received messages of any length are fine.
-- Only one app at a time can open `/dev/violet/hci`.
+- Other apps may use Bluetooth at the same time (the runtime shares the controller), but only one app at a time can advertise: a second bitchat reports `command 2005 failed with 0c`.
 
 ## Testing
 

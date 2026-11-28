@@ -1,0 +1,3 @@
+1000	100	weather	47f55262	EXEC	1	0	/apps/weather	
+3557	100	weather	47f55262	SOCK_CONN	0	0	wttr.in:443	wttr.in:443
+4126	100	weather	47f55262	SOCK_TX	0	0	455B	wttr.in:443

@@ -5,10 +5,11 @@ One app for the phone's settings, opened from its icon on Home:
 - **Wi-Fi** (below).
 - **Bluetooth**: whether the controller is on, and whether Bitchat is using it.
 - **Phone Link**: Violet Shield's link to your iPhone, and Phone Internet: a pairing code to type into Violet Relay, **Turn on**/**Turn off** and **New code**. The choice and code are kept in `/data/relay`, and the Open Runtime turns Phone Internet back on after a restart.
-- **Date & Time**: the city whose date Home shows (the shared setting `time.city`).
+- **Date & Time**: the city whose date Home shows (the shared setting `time.city`), and the time there now. That time is the system clock, once the network has set it, shifted by the city's own rule ([violet::time](../../lib/violet/src/time.rs): a POSIX TZ string per city, daylight saving included, checked against tzdata 2026f for 2026 to 2031); nothing is fetched. Until the clock is set the page says so instead of showing the build time. Home still takes its own time from wttr.in.
 - **Agent Apps**: every app Violet Agent installed, with its size; **Delete** (tap twice to confirm) removes one, **Delete all** removes them all.
-- **Passcode**: set, change or turn off the passcode (4 to 8 digits) that locks the phone. With one set, the power button locks the phone and it starts locked. Changing it or turning it off asks for the one in use. The Open Runtime keeps and checks it; Settings never stores the digits.
-- **Power**: **Power off** (tap twice to confirm). Holding the power button offers the same on any screen.
+- **Updates** (last row): the running system's version and slot, and **Download and install**, which fetches a signed system update over HTTPS from the server the image was built with (`VIOLET_UPDATE_URL`; without one the page says so) and stages it in the other boot slot; the next start tries it ([updates.rs](src/updates.rs), [fetch.rs](src/fetch.rs); what is checked where is in the [package manager](../../../system/package-manager/README.md#full-system-updates-ota)). TLS trusts the Mozilla roots, plus a test CA only in an image built with `VIOLET_UPDATE_TEST_ROOT` (`make test-ota`).
+- **Passcode**: **Set passcode**, **Change passcode** and **Turn off**. Settings only asks the Open Runtime (`passcode set`, `passcode off`); the runtime takes the screen (the band at the top turns violet and says `VIOLET SYSTEM`) and asks for the digits on its own keypad, so Settings never sees them. The phone then asks for the passcode at start and when the screen wakes ([Trusted system UI](../../../runtime/open/README.md)). No fingerprint or face unlock.
+- **Power**: **Power off** (tap twice to confirm). Holding the power button offers the same from Home's power sheet.
 - **About**: the system, battery, volume and network.
 
 `SETTINGS_PREVIEW=dir cargo test -p settings` (in `apps/`) draws every page as raw 720 × 1600 RGBA, `WIFI_PREVIEW=dir` the Wi-Fi pages.

@@ -29,7 +29,13 @@ pub struct AccessPoint {
     pub channel: u8,
     pub rates: [u8; 16],
     pub rate_count: usize,
+    /// Joinable with a passphrase: CCMP-128 with `akm`, and `mfp` when not 0.
     pub wpa2_psk_ccmp: bool,
+    /// Key management this station uses here: 2 (PSK) or 6 (PSK with SHA-256).
+    pub akm: u8,
+    /// Management frame protection (802.11w) on this link: 0 none, 1 negotiated,
+    /// 2 negotiated because the access point requires it.
+    pub mfp: u8,
     /// No security: no RSN or WPA element and the privacy bit clear.
     pub open: bool,
     pub rsne: [u8; 257],
@@ -46,6 +52,8 @@ impl Default for AccessPoint {
             rates: [0; 16],
             rate_count: 0,
             wpa2_psk_ccmp: false,
+            akm: 0,
+            mfp: 0,
             open: false,
             rsne: [0; 257],
             rsne_len: 0,
@@ -70,23 +78,60 @@ fn suites<'a>(fields: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(list)
 }
 
-fn psk_ccmp(rsn: &[u8]) -> Option<bool> {
+/// Management frame protection is negotiated only with the access points that
+/// require it (the ones that cannot be joined at all without it), until it has
+/// been seen working on the handset's firmware. Building with
+/// VIOLET_WIFI_PMF_WHEN_OFFERED set uses it with every access point that
+/// offers it.
+pub const PMF_WHEN_OFFERED: bool = option_env!("VIOLET_WIFI_PMF_WHEN_OFFERED").is_some();
+
+/// What a WPA2-Personal station can agree with the access point that sent this
+/// RSN element: (joinable, key management 2 or 6, management frame protection
+/// 0 to 2). `when_offered`: protect frames wherever the access point can, not
+/// only where it must. None: the element is malformed.
+pub fn personal(rsn: &[u8], when_offered: bool) -> Option<(bool, u8, u8)> {
     if rsn.get(..6)? != [1, 0, 0, 15, 172, 4] {
-        return Some(false);
+        return Some((false, 0, 0));
     }
     let mut rest = &rsn[6..];
     let ccmp = suites(&mut rest)?
         .chunks_exact(4)
         .any(|s| s == [0, 15, 172, 4]);
-    let psk = suites(&mut rest)?
-        .chunks_exact(4)
-        .any(|s| s == [0, 15, 172, 2]);
-    let caps = if rest.is_empty() {
-        0
-    } else {
-        u16::from_le_bytes(rest.get(..2)?.try_into().ok()?)
+    let akms = suites(&mut rest)?;
+    let offers = |akm: u8| akms.chunks_exact(4).any(|s| s == [0, 15, 172, akm]);
+    let mut caps = 0;
+    // BIP-CMAC-128 protects group management frames unless the element names another cipher.
+    let mut bip = true;
+    if !rest.is_empty() {
+        caps = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?);
+        rest = &rest[2..];
+    }
+    if !rest.is_empty() {
+        let pmkids = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+        rest = rest.get(2 + 16 * pmkids..)?;
+    }
+    if !rest.is_empty() {
+        bip = rest.get(..4)? == [0, 15, 172, 6];
+    }
+    let (capable, required) = (caps & (1 << 7) != 0, caps & (1 << 6) != 0);
+    // Required without capable is not a valid combination; a required
+    // protection this station cannot provide leaves nothing to join.
+    if required && !(capable && bip) {
+        return Some((false, 0, 0));
+    }
+    let mfp = match (required, capable && bip && when_offered) {
+        (true, _) => 2,
+        (false, true) => 1,
+        _ => 0,
     };
-    Some(ccmp && psk && caps & (1 << 6) == 0)
+    let akm = if offers(6) && (mfp != 0 || !offers(2)) {
+        6
+    } else if offers(2) {
+        2
+    } else {
+        return Some((false, 0, 0));
+    };
+    Some((ccmp, akm, if ccmp { mfp } else { 0 }))
 }
 
 /// Access points one scan keeps. Busy buildings show dozens.
@@ -155,8 +200,11 @@ impl Results {
                     }
                     ap.rsne_len = len + 2;
                     ap.rsne[..ap.rsne_len].copy_from_slice(&tags[..ap.rsne_len]);
-                    let Some(supported) = psk_ccmp(v) else { return };
+                    let Some((supported, akm, mfp)) = personal(v, PMF_WHEN_OFFERED) else { return };
                     ap.wpa2_psk_ccmp = supported && frame[34] & 0x10 != 0;
+                    if ap.wpa2_psk_ccmp {
+                        (ap.akm, ap.mfp) = (akm, mfp);
+                    }
                 }
                 _ => {}
             }

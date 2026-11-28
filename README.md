@@ -5,7 +5,7 @@ VioletOS is a smartphone operating system built on the seL4 microkernel. It runs
 - **System components** (the boot [launcher](apps/launcher/README.md)) are small `no_std` Rust programs that talk to **Runtime**, VioletOS's own app interface.
 - **Open apps** are ordinary Linux ARM programs (Rust `std`, C, Go, or a `#!/bin/python3` script) dropped into `/apps`. The phone ships with [Home](apps/open/home), [Ladybird Browser](apps/open/ladybird/README.md), [Bitchat](apps/open/bitchat/README.md), [Violet Agent](apps/open/agent/README.md), Locomo Music and [Settings](apps/open/settings/README.md), all open apps written in Rust. Apps Violet Agent builds get their own icons on Home after these. The **Open Runtime** runs them unmodified by answering their Linux system calls. See the [Open Runtime](runtime/open/README.md) and its [RFC](docs/open-app-model-rfc.md).
 
-The look is dark layered paper with cream icons pressed into it ([paper.rs](apps/lib/violet/src/paper.rs)). Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone Internet), the clock's city, the passcode, power off and deleting Agent-built apps are all in Settings. The power button turns the screen off and locks the phone when a passcode is set; holding it offers to power off.
+The look is dark layered paper with cream icons pressed into it ([paper.rs](apps/lib/violet/src/paper.rs)). Wi-Fi, Bluetooth, the phone link (Violet Shield and Phone Internet), the clock's city, deleting Agent-built apps and the passcode are all in Settings. The top 32 rows of the screen are the system's: a band no app can draw over says which app is in front, and turns violet with `VIOLET SYSTEM` for the runtime's own permission prompts, passcode keypad and lock screen ([Open Runtime](runtime/open/README.md), Trusted system UI). The power button turns the screen off, which locks the phone when a passcode is set, and turns it on again; holding it offers to power off.
 
 **Rust is the preferred language for new VioletOS code**, including services, drivers and application logic.
 
@@ -18,8 +18,13 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 | `make test-emulator` | Eight QEMU scenarios covering touch transfer failures, controller recovery and watchdog handling; where touch works, a tap on Home must open Settings. |
 | `make test-isolation` | Boots a diagnostic image and checks that seL4 faults when the UI tries to read touch registers, disk registers or the disk transfer buffer. |
 | `make test-audio` | Holds the virtual volume buttons, plugs in headphones, plays sounds and records a tone from the Sounds test program, then checks the PCM, the recording and the on-screen volume. |
+| `make test-local` | **The loop to run before pushing**: `make test-unit` (host tests, with the integration tests), `make test-system` (the one QEMU end-to-end test) and `make test-ci` (the two QEMU tests CI runs). See [Testing](#testing). |
+| `make test-integration` | Host only, about 4 seconds: some 200 tests that run the shipped Open Runtime, Storage, Power and package-manager sources against in-memory fakes of the kernel and hardware, in parallel. The capability policy, memory protection, signals, the app lifecycle and low-memory killer, sockets, the trusted UI and passcode lock, Shield enforcement, wake locks and governors, network time and full-system updates. See [tests/integration](tests/integration/README.md). |
+| `make test-system` | The one QEMU end-to-end test, for what needs the real kernel, MMU or boot path: one image, two boots. The Linux ABI from C, Rust and Go (signals, fork, execve, the dynamic loader), W^X on real page tables, the capability policy and the Shield's side doors through the real system call dispatch, an older and a forged update refused, a signed system update staged in the other slot, booted as a trial and marked successful, and a passcode set in the first boot locking the second. See [test_system.py](targets/qemu/test_system.py). |
+| `make test-net-lwip` | Radio's socket code for open apps against lwIP itself, on this Mac (a second; needs lwIP's source from an image build): a slot reused mid-stream, connections that never finish closing, names nobody answers. |
 | `make test-open` | Runs unmodified Linux ARM programs under the Open Runtime, started from their Home icons: Rust, C, Go and Python, including drawing, touch, PCM audio and TCP. The programs live in [targets/qemu/open-test-apps](targets/qemu/open-test-apps) and only this test's image carries them. |
 | `make test-wifi-app` | Drives Settings › Wi-Fi by touch: scans, types a wrong and then the right WPA2 password on the on-screen keyboard, switches to an open network, and rejoins with the saved key after a reboot. |
+| `make test-wpa` | Host only, no QEMU: the handset's WPA2 client against an independent authenticator, PSK and PSK-SHA256, with and without 802.11w protected management frames (fetches hostap's sources once). |
 | `make test-open-apps` | Drives Home, Settings (a chosen city kept in `/data` across a restart, Wi-Fi, Agent Apps) and Music. |
 | `make test-lock` | The power key, the screen lock and power off: the key turns the screen off and on, Settings sets a passcode, the key then locks, the passcode unlocks, the phone starts locked after a restart, and the power sheet powers off. See [Power](services/power/README.md). |
 | `make test-shield` | Violet Shield end to end in QEMU with the Python companion simulator. Signed warnings appear on Home while the demo apps keep running. See [the proof of concept](docs/violet-shield-poc.md). |
@@ -57,7 +62,7 @@ The open apps in [`apps/open`](apps/open) need their own toolchains. Each is opt
 
 From the bottom up:
 
-1. **seL4 kernel** ([kernel/sel4](kernel/sel4/README.md)). A pinned upstream seL4 for AArch32, built per target with the [board configuration](platform/sel4/board/). The [loader](boot/loader/README.md) checks the handset's live memory map, stages the kernel and first task, and enters seL4.
+1. **seL4 kernel** ([kernel/sel4](kernel/sel4/README.md)). A pinned upstream seL4 for AArch32, built per target with the [board configuration](platform/sel4/board/). It is not a verified seL4 configuration; the kernel README lists every difference from upstream, and the build checks the list. The [loader](boot/loader/README.md) checks the handset's live memory map, stages the kernel and first task, and enters seL4.
 2. **Supervisor** ([system/supervisor](system/supervisor/README.md)). The first task. It reads the package catalog, builds every process's address space and capabilities, maps each device into exactly one process, starts everything, and restarts the group or rolls back to the previous catalog after a fault or stall. The [package manager](system/package-manager/README.md) installs and removes components.
 3. **Services**, one process per device or function. Only the service that owns a device can touch it.
 4. **Two app interfaces.** [Runtime](runtime/README.md) gives built-in apps Subscribe, Get and Execute operations over a 14-word IPC message, decides which app is in front, and routes requests to services through worker threads. The [Open Runtime](runtime/open/README.md) gives open apps the Linux ARM system call interface plus `/dev/violet/{screen,events,sys,audio}`, and is itself one of Runtime's clients.
@@ -76,16 +81,17 @@ Each component is a package in the [catalog](image/catalog/components.json); its
 | 1 | [Launcher](apps/launcher/README.md) | The boot process: hands the screen to the Open Runtime, restores QEMU's radio choice, and starts the handset's USB Wi-Fi jobs. |
 | 3 | [Runtime](runtime/README.md) | The built-in app interface, focus and routing. |
 | 4 | [Touch](services/touch/README.md) | Novatek touch controller over SPI. |
-| 5 | [Display](services/display/README.md) | Presents built-in apps' surfaces to the screen. The Open Runtime draws there itself while an open app is in front. |
+| 5 | [Display](services/display/README.md) | The [compositor](system/compositor/README.md): clips, scales and presents built-in apps' surfaces, with damage tracking and a measured frame budget. The Open Runtime still draws to scanout itself while an open app is in front. |
 | 6 | [Storage](services/storage/README.md) | Checkpoints, per-app files and the package catalog on disk (virtio in QEMU, eMMC on the handset). |
 | 7 | [Radio](services/radio/README.md) | Wi-Fi: scan, WPA2, DHCP, DNS, TCP and TLS; hosts the Phone Internet network; serves open apps' TCP sockets and, on the handset, Bluetooth HCI. |
-| 8 | [Power](services/power/README.md) | Battery, the power key, sleep and power off; brokers the PMIC for Audio and Camera. |
+| 8 | [Power](services/power/README.md) | Battery, the power key, sleep and shutdown, wake locks, the thermal and frequency governors (emulator only so far); brokers the PMIC for Audio and Camera. |
 | 9 | [Package manager](system/package-manager/README.md) | Installs, removes and rolls back components. Always loaded from the factory image. |
 | 15–20 | Runtime workers | Runtime's per-service request threads. |
 | 21 | [USB Diagnostics](services/usb-diagnostics/README.md) | Handset only: status, package staging, flashing and test requests from the Mac. |
 | 22 | [Audio](services/audio/README.md) | Speaker, headphones, jack, volume buttons, microphone, and open apps' PCM. |
 | 24 | [Open Runtime](runtime/open/README.md) | Runs Linux ARM programs from `/apps`. |
 | 25 | [Camera](services/camera/README.md) | The rear camera's sensor, receiver and frames, for open apps' `/dev/violet/camera` (no app uses it now). |
+| 26 | [Sentinel](system/sentinel/README.md) | Decides the Open Runtime's capability policy and paths, keeps the user's consent answers (sealed on disk) and runs the Shield's on-device scorer, in its own address space. The Open Runtime asks it and refuses without a clear yes; it does not constrain a compromised Open Runtime, which supplies every input. |
 
 Slot 23 is reserved for a Bluetooth service. Today Radio carries Bluetooth on the handset, since the controller shares the connectivity chip and its BTIF port with Wi-Fi ([bring-up notes](targets/moto-g-pure/bluetooth-bringup.md)).
 
@@ -115,9 +121,11 @@ apps/                 Built-in apps (no_std Rust) and open apps
   examples/           Sketches from the open app model RFC
 runtime/              Runtime: protocol.rs (wire format and keys), process.rs, lanes.rs (workers), sdk.rs (app side)
   open/               Open Runtime: syscalls, devices, sockets, file system, memory pool
+  arch/               What differs between AArch32 and AArch64 (used by targets/qemu64 only, so far)
 services/             One folder per service: touch, display, storage, radio, power, audio, camera, usb-diagnostics
 system/
   supervisor/         The first task (supervisor.c) and the open apps' process manager (procmgr.rs)
+  compositor/         Who owns which rows and touches, damage, software blits, the frame budget (run by Display)
   package-manager/    Catalog transactions on the device and manage.py on the Mac
 image/                Component catalog and the package format and builder
 kernel/sel4/          seL4 download, patches and build
@@ -126,7 +134,10 @@ boot/loader/          The loader that runs before seL4
 targets/
   qemu/               QEMU backends (audio, power, touch fixture) and the QEMU test suites
   moto-g-pure/        Handset backends: Wi-Fi driver, lwIP and WPA2, audio, eMMC, power; handset tests
+  board/              Board descriptions (handset, QEMU, QEMU AArch64): memory map and device windows as data
+  qemu64/             The AArch64 bring-up target: a 64-bit kernel, a bootstrap task and two Linux test programs
   mac-simulator/      The native SDL simulator
+tests/integration/    Host integration tests: the shipped sources joined by in-memory fakes of the kernel and hardware
 tools/                Build and run on the Mac: run.py, the emulator viewer, image builders, network and USB helpers
 companion/ios/        Violet Relay, the iPhone app for Phone Internet
 companion/mac/        Violet Agent, the Mac half of the voice agent
@@ -170,6 +181,10 @@ For example, change a label in `apps/open/settings/src/pages.rs` to update both 
 
 Open apps keep files in `/data`, which the Open Runtime writes back to Storage and loads on the next boot: Settings' saved networks and Phone Internet code, the shared settings, and so on. QEMU keeps them on a 1 MiB raw disk in `build/sel4/qemu`; the handset uses the same code with an MSDC0 block driver (see the [handset storage layout](targets/moto-g-pure/README.md#handset-storage)). Apps Violet Agent installs live in their own extent of the disk and survive restarts too.
 
+### AArch64 (bring-up only)
+
+Everything above is AArch32. `make qemu64` builds and boots the first step of the AArch64 port ([targets/qemu64](targets/qemu64/README.md)): the same pinned seL4 as a 64-bit kernel, a bootstrap task, and two static AArch64 Linux programs (one linked against musl) whose system calls it answers. The Supervisor, the services and the Open Runtime do not run there yet; [runtime/arch](runtime/arch/README.md) holds the shared architecture code and measures what remains. CI does not build it.
+
 ## Handset
 
 The supported handset is the **XT2163DL** (board **ellis**) with firmware **S3RHS32.20-42-13-2-3-2**, on either DJN NT36525B panel revision: the loader reads which panel the bootloader lit, and Touch loads the matching firmware. Supply the stock boot image and both panel firmware files. Next to the stock boot image, create a `wifi/` folder with the files listed in the [radio firmware manifest](targets/moto-g-pure/wifi_firmware.py), copied from the factory vendor image's firmware directory. The build checks each input against its pinned SHA-256 digest.
@@ -190,11 +205,27 @@ Useful tools on the Mac:
 
 The [handset README](targets/moto-g-pure/README.md) records the bring-up and each validation. The [handset bring-up log](spikes/sel4-ellis/) covers the first trials, and the [original architecture deck](docs/VioletOS-architecture.pdf) the earlier Linux prototype.
 
+## Testing
+
+`make test-local` is the loop to run before pushing. It has three parts, cheapest first:
+
+| Part | What | Time |
+| --- | --- | --- |
+| `make test-unit` | Every host test, starting with the [integration tests](tests/integration/README.md): the shipped sources of the Open Runtime, Storage, Power and the package manager, built for the Mac and joined by in-memory fakes of the kernel and hardware edges, twice (the shipped 4 KiB pages and the 64 KiB configuration). CI runs this. | Integration: 6 s measured (209 + 207 tests, both builds included). The whole of `test-unit`: 37 s measured. |
+| `make test-system` | The one QEMU end-to-end test: one image, two boots, for what needs the real kernel, MMU, boot path or the real system call dispatch. | 127 s measured with its two image builds, before this round added the refused updates, the Shield's side doors and the passcode lock across the restart (not re-timed). |
+| `make test-ci` | The two QEMU tests CI runs. | 38 s measured. |
+
+The target is the whole loop in under 10 minutes. The three parts were timed one after another (37 s + 127 s + 38 s, about 3.5 minutes); `make test-local` has not been timed as one command.
+
+**Write a host integration test, not a QEMU suite.** A new QEMU suite builds its own image and boots it, serially, and eleven of them had grown to about 15 minutes. A test in `tests/integration` builds its own phone in memory, runs in milliseconds beside the others and runs in CI. Use QEMU only for what a host cannot show (real page tables, real signal delivery, the boot path), and add it to [test_system.py](targets/qemu/test_system.py) within its two boots. [docs/test-map.md](docs/test-map.md) lists where every assertion of the old suites went, including the few that were dropped and why.
+
+The older suites (`test-open`, `test-audio`, `test-memory`, `test-wifi-app`, `test-ladybird`, `test-shield`, `test-agent`, `test-packages`, ...) are separate local targets outside the loop: run the one for the area you changed.
+
 ## Continuous integration
 
 [GitHub Actions](https://github.com/Immortal-Protocols/VioletOS/actions/workflows/ci.yml) runs on pull requests and pushes to `main`. The Linux job builds the QEMU image and runs the host unit tests (`make test-unit`); the macOS job builds the open apps it needs and runs two QEMU tests (`make test-ci`: one boot of the supervisor and its services, then the open apps). Every other QEMU suite (`make test-open`, `test-agent`, `test-ladybird`, `test-shield`, ...) runs locally.
 
-**Keep CI under 5 minutes.** Don't add QEMU suites to `test-ci` or new jobs to the workflow; add a local `make` target instead and run it before you push. If CI must cover something new, extend an existing test or add a host unit test that runs in seconds, and leave apps CI doesn't need out of its build (`VIOLET_OPEN_SKIP` in the workflow).
+**Keep CI under 5 minutes.** Don't add QEMU suites to `test-ci` or new jobs to the workflow. If CI must cover something new, add a host integration test (`tests/integration`, run by `make test-unit`) or another host test that runs in seconds, and leave apps CI doesn't need out of its build (`VIOLET_OPEN_SKIP` in the workflow).
 
 The handset image and handset tests need the factory files and run locally. The public HTTPS endpoint test is separate: `make test-wifi-live`.
 
@@ -202,4 +233,7 @@ The handset image and handset tests need the factory files and run locally. The 
 
 - [Open app model RFC](docs/open-app-model-rfc.md), with its implementation status.
 - [Cellular relay plan](docs/cellular-relay-plan.md) for Phone Internet.
+- [Cellular](docs/cellular.md) and [Biometrics](docs/biometrics.md): what the device does not have, and why.
+- [Shield data](docs/shield-data.md) and [Shield pairing](docs/shield-pairing.md): collecting real traces, and enrolling a companion's key.
+- [Verified boot](docs/verified-boot.md): what the loader checks on QEMU, and why the handset stays unlocked and unverified.
 - The original design-review slides: [complete lifecycle stack](docs/violetos-complete-lifecycle-stack.png), [folders and layers](docs/violetos-folders-layer-cake.png), [Runtime contract and updates](docs/violetos-runtime-contract-updates.png) and the [earlier proposed stack](docs/proposed-violetos-stack.png).

@@ -49,9 +49,19 @@ def machine(image=IMAGE, watchdog=False, scenario=0, disk=None, catalogs=(None,N
             pass
         cmd += ["-drive", f"if=none,id=packages,format=raw,file={str(volume).replace(',', ',,')}",
                 "-device", "virtio-blk-device,drive=packages,bus=virtio-mmio-bus.24"]
+        # The encrypted volume's device root key (tools/root_key.py): a blob beside
+        # the disk, never in it, in a page only Storage is given. A stand-in for a
+        # hardware key. VIOLET_ROOT_KEY names another blob.
+        import root_key
+        blob = os.environ.get("VIOLET_ROOT_KEY") or root_key.ensure(str(disk) + ".rootkey")
+        cmd += ["-device", f"loader,file={str(blob).replace(',', ',,')},addr={root_key.ADDRESS},force-raw=on"]
     for name, address, entry in [("zImage", "0x45000000", ""), ("handoff.dtb", "0x47880000", ""),
                                   ("entry.bin", "0x44000000", ",cpu-num=0")]:
         cmd += ["-device", f"loader,file={image/name},addr={address},force-raw=on{entry}"]
+    # Verified boot: the bootloader model's stored rollback floor (tools/ota_boot.py), for the loader.
+    if (image/"rollback-floor").exists():
+        from boot_manifest import floor_devices
+        cmd += floor_devices(int((image/"rollback-floor").read_text()))
     # The open apps' file system image, read by the Open Runtime.
     initfs=image/"initfs.cpio"
     if initfs.exists():
@@ -148,7 +158,7 @@ def main(viewer):
                     with ram.open("rb") as mem:
                         mem.seek(0x09002004)
                         power=int.from_bytes(mem.read(4),"little")
-                        mem.seek(0x0900200c)
+                        mem.seek(0x09002048)
                         pressed=int.from_bytes(mem.read(4),"little")
                     if power==2:
                         monitor.command("quit")

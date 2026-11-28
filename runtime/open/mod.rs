@@ -5,6 +5,7 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+pub mod contain;
 pub mod appstore;
 pub mod data;
 #[cfg(moto_board)]
@@ -15,21 +16,39 @@ pub mod fs;
 pub mod hci;
 pub mod heap;
 pub mod inflate;
+pub mod iov;
+pub mod names;
 pub mod net;
+pub mod loopback;
+pub mod sockaddr;
+pub mod slots;
 pub mod scanout;
 pub mod sockets;
 pub mod touch;
+pub mod sysui;
+pub mod trusted_ui;
 pub mod policy;
+pub mod manifest;
 pub mod shield;
+// scorer.rs and scorer_model.rs are built into the Sentinel (system/sentinel/), not here.
 pub mod guard;
 #[path = "../../services/sentinel/mod.rs"]
 pub mod sentinel;
 pub mod pool;
+pub mod cores;
+pub mod lifecycle;
+pub mod vma;
+pub mod signal;
+pub mod entropy;
 #[path = "../../system/supervisor/procmgr.rs"]
 pub mod procmgr;
 pub mod syscall;
 pub mod sys;
 pub mod wifi;
+pub mod powerctl;
+pub mod sntp;
+pub mod timesync;
+pub mod update;
 pub mod lock;
 pub mod power;
 
@@ -38,23 +57,26 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use policy::{Action, AppId, OpenPolicy, Policy};
+use policy::{Action, AppId};
 use shield::{EventKind, ShieldPolicy, TelemetryEvent};
 use pool::{Kernel, Pool};
 use procmgr::Space;
 use sys::Object;
 
-/// Apps that may run at once; each gets a slice of kernel memory for its objects.
-#[cfg(moto_board)]
-pub const MAX_APPS: usize = 6;
-#[cfg(not(moto_board))]
-pub const MAX_APPS: usize = 8;
+/// The app table: the most apps that may run at once on any board. How many
+/// actually may is `Runtime::app_limit`, set at boot from the kernel memory
+/// slices that fit and what the pool holds (lifecycle::app_limit). Socket
+/// floors (slots.rs) are kept for this many. Fault badges are app << 12.
+pub const MAX_APPS: usize = 12;
+/// Pages one more app behind the front is budgeted in the pool: its two
+/// screen buffers and 2 MiB, for `app_limit`.
+const PER_APP_PAGES: usize = 2 * device::BUFFER_BYTES / sys::PAGE + 2 * sys::MIB_PAGES;
 /// The Home app: started at boot and shown whenever no other app is in front.
 pub const HOME_APP: &str = "/apps/home";
 const APP_KERNEL_BITS: u32 = 19; // 512 KiB of kernel objects per app
 const APP_CNODE_BITS: u32 = 8;
 /// Pages of the pool kept for the runtime's own heap.
-const HEAP_PAGES: usize = 768; // 48 MiB: the runtime, pushed apps and file data
+const HEAP_PAGES: usize = sys::HEAP_PAGES; // 48 MiB: the runtime, pushed apps and file data (pages.rs)
 
 pub struct Log;
 impl Log {
@@ -66,6 +88,11 @@ impl Log {
             Self::page().add(1).write_volatile(0);
             Self::page().write_volatile(0x474f4c4f); // "OLOG"
         }
+    }
+    /// One line of the log (the `log!` macro), with its prefix.
+    #[inline(never)]
+    pub fn line(args: core::fmt::Arguments) {
+        Self::write(alloc::format!("[open] {}\n", args).as_bytes());
     }
     /// Append to the ring: word 0 magic, word 1 bytes written in total, data from byte 8.
     pub fn write(bytes: &[u8]) {
@@ -83,10 +110,10 @@ impl Log {
 }
 #[macro_export]
 macro_rules! log {
-    ($($arg:tt)*) => {{
-        let s = alloc::format!("[open] {}\n", alloc::format!($($arg)*));
-        $crate::process::Log::write(s.as_bytes());
-    }};
+    // One call per line logged; the text is put together in `Log::line`.
+    ($($arg:tt)*) => {
+        $crate::process::Log::line(format_args!($($arg)*))
+    };
 }
 
 #[derive(Clone)]
@@ -98,6 +125,8 @@ pub enum Wait {
     Read { fd: i32, buf: u32, len: u32 },
     /// recvfrom/recvmsg: a read whose source address goes to `name`.
     RecvFrom { fd: i32, buf: u32, len: u32, name: u32, name_len: u32 },
+    /// A blocking accept/accept4 on a listening socket (sockets.rs).
+    Accept { fd: i32, addr: u32, len: u32, flags: u32 },
     /// A blocking write to /dev/violet/audio waiting for room in the ring.
     Audio { fd: i32, buf: u32, len: u32 },
     /// A blocking connect, or a send waiting for room in the socket's ring.
@@ -105,11 +134,22 @@ pub enum Wait {
     Send { fd: i32, buf: u32, len: u32 },
     /// Held by a Violet Shield freeze; answered with EACCES when the app thaws.
     Frozen,
+    /// A call that finished while its app was frozen (lifecycle or Shield):
+    /// answered with `result` once the app runs again (`wake`).
+    Held { result: i32 },
     /// A present waiting for the panel to scan past its rows (scanout.rs);
     /// answers the write with `result`.
     Present { result: i32 },
     /// SCREEN_IOC_WAIT_VSYNC: until a frame after `after` starts; VsyncInfo to `ptr`.
     Vsync { after: u64, ptr: u32 },
+    /// An open or socket that needs the user's answer to the consent prompt
+    /// up for it (trusted_ui.rs `pending`): run again once it is answered
+    /// or withdrawn, when policy has the answer.
+    Consent { cap: policy::Cap },
+    /// For a signal or a child (Thread.sig.waiting says which: pause,
+    /// sigsuspend, sigtimedwait, wait4, a vfork parent); only syscall.rs
+    /// wakes it. A timeout (sigtimedwait) answers EAGAIN.
+    Signal,
 }
 
 /// The outcome of the Shield check at the choke point.
@@ -154,6 +194,8 @@ pub struct Thread {
     pub slot: u32,
     /// Its scheduling context (MCS), or 0.
     pub sc: u32,
+    /// Its signal mask, pending signals and alternate stack (signal.rs).
+    pub sig: signal::Thread<syscall::Vfork>,
 }
 
 pub type FileRef = Rc<RefCell<device::OpenFile>>;
@@ -167,7 +209,6 @@ pub struct App {
     pub threads: Vec<Thread>,
     pub fds: Vec<Option<FileRef>>,
     pub cwd: String,
-    pub stub_page: u32,
     pub events: alloc::collections::VecDeque<abi::InputEvent>,
     pub surface: Option<device::Surface>,
     pub exit_code: Option<i32>,
@@ -175,14 +216,20 @@ pub struct App {
     pub digest: [u8; 32],
     /// Not part of the boot image (written or pushed since boot).
     pub new_hash: bool,
+    /// Violet Shield: the app this program belongs to (shield.rs `owner_of`).
+    pub owner: String,
     pub frozen: Option<Frozen>,
     /// When it was last in front (ns), to close the least recently used first.
     pub used_ns: u64,
+    /// Foreground, visible, cached or frozen (lifecycle.rs).
+    pub life: lifecycle::Life,
+    /// Signal actions, the parent and children, timers (signal.rs).
+    pub sig: signal::Proc<syscall::CloseOnExec>,
 }
 
 /// Room the pool keeps for the app in front: a launch closes background apps
 /// until this much is free (32 MiB).
-const RESERVE_PAGES: usize = 512;
+const RESERVE_PAGES: usize = 32 * sys::MIB_PAGES;
 
 pub struct Runtime {
     pub k: Kernel,
@@ -192,7 +239,8 @@ pub struct Runtime {
     pub store: appstore::Store,
     pub apps: [Option<App>; MAX_APPS],
     untypeds: Vec<u32>,
-    pub policy: OpenPolicy,
+    /// The capability policy: the image's manifests and the user's answers (manifest.rs).
+    pub book: manifest::Book,
     /// Runtime has put this process in front.
     pub focused: bool,
     /// The app on screen while focused; None shows the app list.
@@ -202,7 +250,8 @@ pub struct Runtime {
     home_tried: bool,
     pub shell: device::Shell,
     next_pid: u32,
-    pub random: u64,
+    /// The random generator behind getrandom, AT_RANDOM and app layouts.
+    pub entropy: entropy::Drbg,
     contact: Option<u32>,
     last_poll: u64,
     /// Loop statistics, logged every 30 s while apps run.
@@ -214,6 +263,7 @@ pub struct Runtime {
     pub camera: bool,
     pub net: net::Net,
     pub shield: ShieldPolicy,
+    pub scorer: guard::ScoreLink,
     pub sentinel: sentinel::Sentinel,
     pub last_touch_ns: u64,
     pub tx_stats: Vec<Option<TxStat>>,
@@ -230,7 +280,11 @@ pub struct Runtime {
     pub ring: touch::Ring,
     /// The app whose threads run in the foreground tier (MCS), as last applied.
     tiered: Option<usize>,
-    /// The power key, the screen lock and its passcode (power.rs).
+    /// How many apps may run at once (at most MAX_APPS; see lifecycle::app_limit).
+    pub app_limit: usize,
+    /// Memory pressure and the apps closed for memory (lifecycle.rs).
+    pub life: lifecycle::Book,
+    /// The power key: screen off and on, the power sheet (power.rs).
     pub power: power::Power,
 }
 
@@ -263,9 +317,17 @@ impl Runtime {
         // Each step fails cleanly if the supervisor could not provide its part.
         sys::retype(sys::SLOT_KERNEL, Object::Endpoint, 0, sys::SLOT_FAULT_EP).map_err(|e| { log!("no kernel memory"); e })?;
         let (mut pool, _) = Pool::new(&mut k, HEAP_PAGES).map_err(|e| { log!("no app memory pool"); e })?;
+        // 64 KiB for Reply objects first, then as many 512 KiB app slices as
+        // kernel memory holds, up to the table: the supervisor's 8 MiB (4 MiB
+        // on an older one) less the pool's page tables.
+        k.replies = k.object(sys::SLOT_KERNEL, Object::Untyped, 16).unwrap_or(0);
         let mut untypeds = Vec::new();
-        for _ in 0..MAX_APPS {
-            untypeds.push(k.object(sys::SLOT_KERNEL, Object::Untyped, APP_KERNEL_BITS)?);
+        while untypeds.len() < MAX_APPS {
+            match k.object(sys::SLOT_KERNEL, Object::Untyped, APP_KERNEL_BITS) {
+                Ok(u) => untypeds.push(u),
+                Err(e) if untypeds.is_empty() => return Err(e),
+                Err(_) => break,
+            }
         }
         let mut image: &'static [u8] =
             unsafe { core::slice::from_raw_parts(sys::INITFS as *const u8, sys::INITFS_BYTES) };
@@ -292,10 +354,21 @@ impl Runtime {
                 }
             }
         }
+        // The pages apps may map (system/supervisor/frames.rs): the pool less
+        // the heap below and the unpacked image above. Until this, none.
+        procmgr::ledger().limit(HEAP_PAGES as u32, (HEAP_PAGES + pool.app_pages) as u32);
         let mut fs = fs::Fs::new(image);
-        data::load(&mut fs);
+        let listed = data::load(&mut fs);
         let store = appstore::Store::load(&mut fs);
+        // A saved passcode locks the phone before anything is shown (and so
+        // does a /data that could not be read: it may hold one).
+        trusted_ui::boot(&fs, listed);
+        let book = manifest::Book::load(&mut fs);
+        let app_limit = lifecycle::app_limit(MAX_APPS, untypeds.len(), pool.app_pages, RESERVE_PAGES, PER_APP_PAGES).max(1);
+        log!("apps: up to {} at once ({} kernel slices, {} MiB of pool for apps)", app_limit, untypeds.len(), pool.app_pages / sys::MIB_PAGES);
         Ok(Runtime {
+            app_limit,
+            life: lifecycle::Book::default(),
             k,
             pool,
             fs,
@@ -304,12 +377,12 @@ impl Runtime {
             home: None,
             home_tried: false,
             untypeds,
-            policy: OpenPolicy,
+            book,
             focused: false,
             foreground: None,
             shell: device::Shell::default(),
             next_pid: 100,
-            random: sys::counter() ^ 0x9e3779b97f4a7c15,
+            entropy: entropy::boot(),
             contact: None,
             last_poll: 0,
             stats: Stats::default(),
@@ -318,6 +391,7 @@ impl Runtime {
             // Radio (handset) or the emulator's host relay serves the socket pages.
             net: net::Net::new(true),
             shield: ShieldPolicy::new(),
+            scorer: guard::ScoreLink::default(),
             sentinel: {
                 let mut id = [0u8; 16];
                 let (a, b) = (sys::counter() ^ 0x5bd1e995, sys::counter().rotate_left(17) ^ 0x9e3779b97f4a7c15);
@@ -345,13 +419,12 @@ impl Runtime {
         self.next_pid - 1
     }
 
+    /// 64 bits from the random generator (entropy.rs), for the runtime's own
+    /// use. Zero if it was never seeded: then no app runs (see `start`).
     pub fn next_random(&mut self) -> u64 {
-        // xorshift64*, reseeded from the counter's low bits on every call.
-        self.random ^= sys::counter() & 0xffff;
-        self.random ^= self.random >> 12;
-        self.random ^= self.random << 25;
-        self.random ^= self.random >> 27;
-        self.random.wrapping_mul(0x2545f4914f6cdd1d)
+        let mut b = [0u8; 8];
+        self.entropy.fill(&mut b);
+        u64::from_le_bytes(b)
     }
 
     /// Start a program from the file system. Scripts name their interpreter
@@ -374,6 +447,7 @@ impl Runtime {
         let image = self.fs.contents(&program).ok_or("not a file")?;
         let digest = sentinel::sha256(image);
         let new_hash = self.fs.from_layer(&program);
+        let owner = self.shield_owner(path, &digest, caller); // Violet Shield
         let measured = program.clone();
         if image.starts_with(b"#!") {
             let line_end = image.iter().position(|&b| b == b'\n').unwrap_or(image.len());
@@ -397,17 +471,24 @@ impl Runtime {
         let image: &'static [u8] = unsafe { core::slice::from_raw_parts(image.as_ptr(), image.len()) };
 
         // A new foreground app needs both an app slot and room for its startup.
-        while (self.pool.available() < RESERVE_PAGES || self.apps.iter().all(Option::is_some))
+        let limit = self.app_limit.min(self.untypeds.len());
+        while (self.pool.available() < RESERVE_PAGES || self.apps[..limit].iter().all(Option::is_some))
             && self.reclaim(caller)
         {}
-        let index = self.apps.iter().position(|a| a.is_none()).ok_or("too many apps running")?;
+        let index = self.apps[..limit].iter().position(|a| a.is_none()).ok_or("too many apps running")?;
+        // AT_RANDOM and a random address-space layout; without a seeded
+        // generator nothing starts, rather than start predictably.
+        let mut drawn = [0u8; 40];
+        if !self.entropy.fill(&mut drawn) && !(entropy::collect(&mut self.entropy) && self.entropy.fill(&mut drawn)) {
+            return Err(String::from("no entropy to start an app"));
+        }
         let mut random = [0u8; 16];
-        let (a, b) = (self.next_random(), self.next_random());
-        random[..8].copy_from_slice(&a.to_le_bytes());
-        random[8..].copy_from_slice(&b.to_le_bytes());
+        random.copy_from_slice(&drawn[..16]);
+        let layout = procmgr::Layout::random(&drawn[16..]);
         let untyped = self.untypeds[index];
         let k = &mut self.k;
         let mut space = Space::new(k, untyped).map_err(|e| alloc::format!("address space: {}", e))?;
+        space.cap = self.pool.app_cap(); // one app's share of the pool (pool.rs)
         let cnode = match space.object(k, Object::CNode, APP_CNODE_BITS) {
             Ok(c) => c,
             Err(e) => {
@@ -435,7 +516,10 @@ impl Runtime {
         .iter()
         .map(|s| String::from(*s))
         .collect();
-        let loaded = match procmgr::load(&mut space, k, &mut self.pool, image, &argv, &env, random) {
+        // A dynamically linked program: musl's loader, as the system image has it.
+        // (Never a copy an app wrote there: syscall.rs `loader`.)
+        let interp = procmgr::interp(image).filter(|l| !self.fs.from_layer(l)).and_then(|l| self.fs.contents(l));
+        let loaded = match procmgr::load(&mut space, k, &mut self.pool, image, interp, &argv, &env, random, layout) {
             Ok(l) => l,
             Err(e) => {
                 space.destroy(k, &mut self.pool);
@@ -444,8 +528,9 @@ impl Runtime {
             }
         };
         // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
-        space.add(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
-        let Some(stub_page) = space.resolve(k, &mut self.pool, procmgr::STUBS) else {
+        // The app has the page read-execute; the runtime writes it through its own mapping.
+        space.add(layout.stubs, layout.stubs + procmgr::WINDOW, procmgr::PROT_READ | procmgr::PROT_EXEC);
+        let Some(_) = space.resolve(k, &mut self.pool, layout.stubs) else {
             space.destroy(k, &mut self.pool);
             self.release_objects(index, core::mem::take(&mut space.object_slots));
             return Err(String::from("out of memory"));
@@ -461,14 +546,16 @@ impl Runtime {
             threads: Vec::new(),
             fds: Vec::new(),
             cwd,
-            stub_page: stub_page as u32,
             events: Default::default(),
             surface: None,
             exit_code: None,
             digest,
             new_hash,
+            owner,
             frozen: None,
             used_ns: sys::now_ns(),
+            life: Default::default(),
+            sig: signal::Proc::new(0),
         };
         for _ in 0..3 {
             app.fds.push(Some(Rc::new(RefCell::new(device::OpenFile::new(device::Kind::Log, 2)))));
@@ -479,7 +566,7 @@ impl Runtime {
             self.reap(index);
             return Err(alloc::format!("thread: {}", e));
         }
-        log!("started {} as pid {} ({} KiB free)", program, pid, self.pool.available() * 64);
+        log!("started {} as pid {} ({} KiB free)", program, pid, self.pool.available() * sys::PAGE_KIB);
         let app_name = self.apps[index].as_ref().unwrap().name.clone();
         self.sentinel.note_exec(pid, &app_name, &digest);
         let _ = measured;
@@ -502,12 +589,30 @@ impl Runtime {
     /// thread starts at its ARM-mode trampoline, which jumps there.
     pub fn spawn(&mut self, index: usize, tid: u32, mut regs: sys::Regs, target: u32) -> Result<usize, i32> {
         let app = self.apps[index].as_mut().unwrap();
-        let slot = app.threads.len();
+        // A thread that ended (exit, a vfork child after execve) leaves its
+        // slot, TCB and fault endpoint for the next: posix_spawn makes and
+        // ends one each time, and slots and kernel memory are never freed.
+        let reuse = app.threads.iter().position(|t| !t.alive && t.reply.is_none());
+        let slot = reuse.unwrap_or(app.threads.len());
         // The app's CNode holds one badged fault endpoint per thread.
         if slot >= (1 << APP_CNODE_BITS) - 2 {
             return Err(-11);
         }
         let k = &mut self.k;
+        if let Some(s) = reuse {
+            let (tcb, sc) = (app.threads[s].tcb, app.threads[s].sc);
+            if sys::mcs() || sys::cores() > 1 {
+                let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
+                sys::tcb_schedule(tcb, sc, 0, tier)?;
+            }
+            let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
+            (regs.pc, regs.cpsr) = (stub, 0x10);
+            let t = &mut app.threads[s];
+            (t.tid, t.wait, t.deadline, t.saved, t.clear_tid, t.alive) = (tid, None, None, [0; 9], 0, true);
+            t.sig = signal::Thread::new(0);
+            sys::tcb_write(tcb, true, &regs)?;
+            return Ok(slot);
+        }
         let tcb = app.space.object(k, Object::Tcb, 0)?;
         let ep_slot = slot as u32 + 1;
         sys::mint_into(app.cnode, ep_slot, APP_CNODE_BITS, sys::SLOT_FAULT_EP, badge(index, slot))?;
@@ -529,14 +634,9 @@ impl Runtime {
             let tier = if self.tiered == Some(index) { sys::tier_foreground() } else { sys::tier_background(index) };
             sys::tcb_schedule(tcb, 0, 0, tier)?;
         }
-        let stub = procmgr::STUBS + 8 * slot as u32;
-        let words = [0xe51f_f004u32, target];
-        let at = app.stub_page as usize + 8 * slot;
-        unsafe {
-            (at as *mut u32).write_volatile(words[0]);
-            ((at + 4) as *mut u32).write_volatile(words[1]);
-        }
-        app.space.sync_code(procmgr::STUBS, procmgr::STUBS + sys::PAGE as u32);
+        // The trampoline page is looked up each time, never through a kept
+        // address: no thread starts if the runtime's page is not there.
+        let stub = app.space.stub(k, &mut self.pool, slot, target).ok_or(-12)?;
         regs.pc = stub;
         regs.cpsr = 0x10;
         app.threads.push(Thread {
@@ -550,6 +650,7 @@ impl Runtime {
             alive: true,
             slot: slot as u32,
             sc,
+            sig: signal::Thread::new(0),
         });
         sys::tcb_write(tcb, true, &regs)?;
         Ok(slot)
@@ -563,28 +664,25 @@ impl Runtime {
         }
     }
 
-    /// Reclaim an app slot and memory from the least recently used background app.
-    /// Prefer apps without an open audio stream so music can continue playing.
+    /// Reclaim an app slot and memory: close a background app, frozen ones
+    /// first, then cached, then Settings, then visible ones, least recently
+    /// used first and an app with an audio stream last (lifecycle.rs).
     fn reclaim(&mut self, caller: Option<usize>) -> bool {
-        let victim = self.apps.iter().enumerate()
-            .filter(|(i, _)| Some(*i) != self.foreground && Some(*i) != self.home && Some(*i) != caller)
-            .filter_map(|(i, app)| app.as_ref().map(|app| (i, app)))
-            .filter(|(_, app)| app.path != appstore::INSTALLER && app.frozen.is_none())
-            .min_by_key(|(_, app)| {
-                let has_audio = app.fds.iter().flatten()
-                    .any(|fd| matches!(fd.borrow().kind, device::Kind::Audio { .. }));
-                (has_audio, app.used_ns)
-            })
-            .map(|(i, app)| (i, app.name.clone()));
-        let Some((index, name)) = victim else { return false };
-        self.reap(index);
-        log!("low on app memory: closed {} in the background ({} KiB free)", name, self.pool.available() * 64);
+        self.update_pressure(sys::now_ns());
+        let Some(v) = self.victim(caller, 3) else { return false };
+        self.close_for_memory(v, "low memory");
         true
     }
 
     /// Tear an app down: its threads stop and its memory returns to the pool.
     pub fn reap(&mut self, index: usize) {
         let Some(mut app) = self.apps[index].take() else { return };
+        // Its parent learns its wait status (syscall.rs, processes).
+        self.proc_ended(&app);
+        // Its wake lock, if it held one, ends with it.
+        powerctl::app_gone(app.pid);
+        // The resolver forgets the names it resolved (names.rs).
+        self.net.forget(app.pid);
         for t in &app.threads {
             if t.alive {
                 sys::tcb_suspend(t.tcb);
@@ -594,13 +692,16 @@ impl Runtime {
                 self.k.release(r);
             }
         }
+        // Its page directory goes first (with its kernel objects), so giving
+        // back each page costs no page-table walk or TLB flush of its own.
+        self.release_objects(index, core::mem::take(&mut app.space.object_slots));
+        app.space.destroy(&mut self.k, &mut self.pool);
+        // Screen pages only now, when no mapping holds them (frames.rs).
         if let Some(surface) = app.surface.take() {
             for p in surface.pages {
                 self.pool.give_back(p);
             }
         }
-        app.space.destroy(&mut self.k, &mut self.pool);
-        self.release_objects(index, core::mem::take(&mut app.space.object_slots));
         log!("{} (pid {}) exited with status {}", app.name, app.pid, app.exit_code.unwrap_or(-1));
         if self.home == Some(index) {
             self.home = None;
@@ -618,14 +719,28 @@ impl Runtime {
     }
 
     /// Answer a waiting thread and let it run again.
+    /// While its app is frozen (lifecycle or Shield) the answer is held
+    /// (Wait::Held) and given when it thaws: a frozen app runs no code.
     pub fn wake(&mut self, index: usize, slot: usize, result: i32) {
         let Some(app) = self.apps[index].as_mut() else { return };
+        let held = lifecycle::held(app.frozen.is_some(), &app.life);
         let t = &mut app.threads[slot];
+        if held && t.reply.is_some() {
+            t.wait = Some(Wait::Held { result });
+            t.deadline = None;
+            return;
+        }
         let Some(reply) = t.reply.take() else { return };
         t.wait = None;
         t.deadline = None;
         let mut mrs = t.saved;
-        mrs[0] = result as u32;
+        if result == trusted_ui::RESTART {
+            // Back onto the svc (saved[8] is past it: 4 bytes in ARM, 2 in Thumb): the call runs again as made.
+            let thumb = sys::tcb_read(t.tcb).is_ok_and(|r| signal::thumb(r.cpsr));
+            mrs[8] = mrs[8].wrapping_sub(if thumb { 2 } else { 4 });
+        } else {
+            mrs[0] = result as u32;
+        }
         sys::send(reply, &mrs);
         self.k.reply_done(reply);
     }
@@ -636,27 +751,66 @@ impl Runtime {
         if index >= MAX_APPS || self.apps[index].as_ref().map_or(true, |a| slot >= a.threads.len()) {
             return;
         }
+        // A fault in the runtime from here on closes this app only (contain.rs);
+        // the callers say when the work is over.
+        contain::STATE.serve(index);
+        // Test images only (built with VIOLET_TEST_FAULT=1, never a release):
+        // system call 0xffa17 makes the runtime fault while it serves the
+        // caller, by a panic (r0 = 0) or a write to the unmapped page at 0.
+        #[cfg(open_fault_probe)]
+        if r.label == sys::FAULT_UNKNOWN_SYSCALL && r.mrs[7] == 0xf_fa17 {
+            if r.mrs[0] == 0 {
+                panic!("fault probe");
+            }
+            unsafe { ((r.mrs[0] & 0xffc) as usize as *mut u32).write_volatile(0) };
+        }
         match r.label {
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
                 let (pc, addr) = (r.mrs[0], r.mrs[1]);
-                let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr);
-                // Out of pages: close a background app and try again.
-                let can_reclaim = self.foreground == Some(index)
-                    && self.apps[index].as_ref().unwrap().space.find(addr).is_some_and(|v| v.prot != 0);
-                while !resolved && can_reclaim && self.pool.available() == 0 && self.reclaim(None) {
-                    resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr);
+                // Read, write or instruction fetch: the region must allow it (vma.rs).
+                let access = vma::access(r.mrs[2], r.mrs[3]);
+                let mut resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
+                // Out of pages: close an app that matters less and try again.
+                // The app in front, Home or the agent may close any app
+                // behind; another app only frozen and cached ones, then
+                // itself (lifecycle.rs `fault_victim`).
+                let valid = self.apps[index].as_ref().unwrap().space.find(addr).is_some_and(|v| access.allowed(v.prot));
+                if !resolved && valid && self.pool.available() == 0 {
+                    self.update_pressure(sys::now_ns());
                 }
-                let app = self.apps[index].as_mut().unwrap();
+                while !resolved && valid && self.pool.available() == 0 {
+                    match self.fault_victim_for(index) {
+                        Some(v) if v != index => self.close_for_memory(v, "low memory"),
+                        _ => break,
+                    }
+                    resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
+                }
+                // Any fault a region allows that still has no page ran out
+                // of memory (the pool, its family's cap: pool.rs `app_cap`,
+                // kernel memory or slots): out of memory, never a bad access
+                // (procmgr.rs `starved`).
+                if !resolved && valid && !self.apps[index].as_ref().unwrap().space.holds(addr) {
+                    return self.close_for_memory(index, "out of memory");
+                }
                 if resolved {
                     sys::reply(&[]);
+                    // A fault that waited while its app froze: the thread stays put until it thaws.
+                    if self.apps[index].as_ref().is_some_and(|a| a.frozen.is_none() && a.life.state == lifecycle::State::Frozen) {
+                        self.hold_thread(index, slot);
+                    }
+                } else if self.fault_signal(index, slot, r.label, addr, Some(access), r.mrs[3]) {
+                    // A SIGSEGV handler runs (syscall.rs, signals).
                 } else {
+                    let app = self.apps[index].as_mut().unwrap();
                     let (pages, tables) = app.space.usage();
-                    log!("{} (pid {}): bad memory access at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, addr, pc, self.pool.available() * 64, pages * 64, tables);
+                    log!("{} (pid {}): bad memory access ({:?}) at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, access, addr, pc, self.pool.available() * sys::PAGE_KIB, pages * sys::PAGE_KIB, tables);
                     app.exit_code = Some(139);
                     self.reap(index);
                 }
             }
+            // An undefined instruction: SIGILL, to a handler if there is one.
+            sys::FAULT_USER_EXCEPTION if self.fault_signal(index, slot, r.label, r.mrs[0], None, 0) => {}
             _ => {
                 let app = self.apps[index].as_mut().unwrap();
                 log!("{} (pid {}): fault {} at pc {:#x}", app.name, app.pid, r.label, r.mrs[0]);
@@ -671,9 +825,11 @@ impl Runtime {
         let now = sys::now_ns();
         for index in 0..MAX_APPS {
             let Some(app) = self.apps[index].as_ref() else { continue };
-            if app.frozen.is_some() {
+            // Neither a Shield freeze nor a lifecycle freeze serves waits.
+            if app.frozen.is_some() || app.life.state == lifecycle::State::Frozen {
                 continue;
             }
+            contain::STATE.serve(index); // finishing this app's waits is work for it
             let waiting: Vec<(usize, Wait, Option<u64>)> = app
                 .threads
                 .iter()
@@ -688,14 +844,40 @@ impl Runtime {
                         Wait::Futex { .. } => syscall::ETIMEDOUT,
                         Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Sleep => 0,
                         Wait::Read { .. } | Wait::RecvFrom { .. } | Wait::Audio { .. } | Wait::Send { .. } => syscall::EAGAIN,
+                        Wait::Accept { .. } => syscall::EAGAIN,
                         Wait::Connect { .. } => -110,
-                        Wait::Frozen => syscall::EACCES,
-                        Wait::Present { result } => result,
+                        Wait::Frozen | Wait::Consent { .. } => syscall::EACCES,
+                        Wait::Present { result } | Wait::Held { result } => result,
                         Wait::Vsync { .. } => 0,
+                        Wait::Signal => syscall::EAGAIN,
                     };
                     self.wake(index, slot, result);
                 }
             }
+        }
+        contain::STATE.done();
+    }
+
+    /// After a fault in this process (a panic, a bad pointer) the supervisor
+    /// started the thread again and `run` found the runtime as the fault left
+    /// it (contain.rs). The app being served is closed; the others go on.
+    fn recover(&mut self, served: Option<usize>) {
+        // What the lost stack would have undone: a lowered priority
+        // (sys::Lowered), and with MCS a Reply object taken for a saved call:
+        // made from the untyped kept for Replies (pool.rs `Kernel::replies`;
+        // SLOT_KERNEL is carved up by then). The retype fails harmlessly
+        // when the slot still holds one.
+        if sys::timer_ready() {
+            sys::set_own_priority(sys::EVENT_PRIORITY);
+        }
+        if sys::mcs() {
+            let from = if self.k.replies != 0 { self.k.replies } else { sys::SLOT_KERNEL };
+            let _ = sys::retype(from, Object::Reply, 0, sys::SLOT_REPLY);
+        }
+        let n = contain::STATE.recovered();
+        if contain::recover(self, served) == contain::Verdict::Nothing {
+            log!("runtime fault {} in no app's call: stopped", n);
+            halt()
         }
     }
 
@@ -723,9 +905,18 @@ impl Runtime {
         if let Some(line) = path.strip_prefix("@sys ") {
             // Shared settings too ("@sys set relay 192.168.1.20:8787" points the agent at a relay).
             if line.starts_with("frames") || line.starts_with("bench ") || line.starts_with("set ") || line.starts_with("get ") || line == "installed" || line == "memory" {
-                let answer = self.system(self.foreground.unwrap_or(0), line);
+                // The trusted UI knows it is the cable, not the app in front.
+                trusted_ui::set_usb(true);
+                // "memory" over the cable is every app's, whatever app is in front.
+                let answer = if line == "memory" { self.lifecycle_report(None) + "\n" } else { self.system(self.foreground.unwrap_or(0), line) };
+                trusted_ui::set_usb(false);
                 log!("{}: {}", line, answer.trim_end());
             }
+            return;
+        }
+        // Nothing is started on a locked phone (trusted_ui.rs).
+        if trusted_ui::locked() {
+            log!("locked: not starting {}", path);
             return;
         }
         // A new build replaces the copy that is running.
@@ -862,14 +1053,29 @@ impl Runtime {
         let t0 = sys::now_ns();
         data::flush(&mut self.fs);
         self.wifi.tick(&self.fs, t0);
+        // Bluetooth sharing (hci.rs): its own clean-up after an app closed.
+        hci::tick();
+        // Network time (timesync.rs).
+        // Each request draws its own 64 bits; none if the generator is unseeded.
+        let entropy = &mut self.entropy;
+        timesync::tick(&mut self.net, t0, &mut || {
+            let mut b = [0u8; 8];
+            entropy.fill(&mut b).then(|| u64::from_le_bytes(b))
+        });
         self.usb_requests();
         self.usb_installs();
         let t1 = sys::now_ns();
-        let focus = request(GET, FOCUS, 0);
+        // With the poll, whether the lock screen is up: Runtime then keeps the
+        // open apps in front, so no built-in screen is reachable behind it.
+        let focus = request(GET, FOCUS, trusted_ui::locked() as u32);
         let t2 = sys::now_ns();
         self.stats.step(0, t1 - t0);
         self.stats.step(1, t2 - t1);
         let focused = focus.op == OK && focus.value == OPEN_APPS;
+        // Runtime answers 0 while the phone sleeps: the screen is off, so lock.
+        if focus.op == OK && focus.value == 0 {
+            trusted_ui::screen_off();
+        }
         if focused != self.focused {
             log!("in front: {} (focus {} op {})", focused, focus.value, focus.op);
         }
@@ -877,8 +1083,7 @@ impl Runtime {
             // Home starts the first time the open apps come to the front, so it
             // costs nothing on a system that never shows them.
             self.home_tried = true;
-            self.lock_at_start();
-            self.start_home();
+            self.start_home(true);
         }
         if focused && !self.focused {
             self.shell.dirty = true;
@@ -888,11 +1093,9 @@ impl Runtime {
                 // shell; a finger already lifted counts as lifted.
                 self.shell.arm_with(self.ring.down);
             }
-            if let Some(i) = self.foreground {
-                // Locked, Home draws its lock screen: what it showed before stays hidden.
-                if !self.power.locked {
-                    self.refresh(i);
-                }
+            // Not under system UI: the app hears FOCUS_GAINED when it goes (trusted_ui.rs).
+            if let Some(i) = self.foreground.filter(|_| !trusted_ui::shown_over()) {
+                self.refresh(i);
                 self.lifecycle(i, abi::LIFECYCLE_FOCUS_GAINED);
             }
             // Runtime turned the microphone off with the screen: an agent
@@ -902,7 +1105,8 @@ impl Runtime {
             }
         }
         if !focused && self.focused {
-            if let Some(i) = self.foreground {
+            // Under system UI it was told already (trusted_ui.rs ui_switch).
+            if let Some(i) = self.foreground.filter(|_| !trusted_ui::shown_over()) {
                 self.lifecycle(i, abi::LIFECYCLE_FOCUS_LOST);
             }
         }
@@ -973,9 +1177,13 @@ impl Runtime {
     }
 
     /// Runtime polls (focus, and touch without the interrupt ring): every
-    /// 4 ms while apps run, 16 ms when touch arrives by interrupt, 50 ms idle.
+    /// 4 ms while apps run and a finger is down or lifted under a second ago,
+    /// 16 ms otherwise or when touch arrives by interrupt, 50 ms idle. (The
+    /// first press after a quiet second waits up to 16 ms, like the ring's.)
     fn poll_interval(&self, busy: bool) -> u64 {
-        match (busy, self.ring.live()) {
+        // Every sample with a finger down moves last_touch_ns (device.rs).
+        let touching = self.last_poll.wrapping_sub(self.last_touch_ns) < 1_000_000_000;
+        match (busy, self.ring.live() || !touching) {
             (false, _) => 50_000_000,
             (true, true) => 16_000_000,
             (true, false) => 4_000_000,
@@ -1022,13 +1230,18 @@ impl Runtime {
 
     fn bench_tick(&mut self, now: u64) {
         let Some(mut b) = self.frames.bench else { return };
+        // Never onto system UI, and never under it (trusted_ui.rs).
+        if trusted_ui::covers() {
+            self.frames.bench = None;
+            return;
+        }
         if now < b.next_ns {
             return;
         }
         let Some(i) = self.foreground.filter(|_| self.focused) else {
             // `bench press` on the app list taps it like a finger would.
             if b.release && self.focused && self.foreground.is_none() {
-                self.touch(b.x, b.y, !b.pressed);
+                self.synthetic_touch(b.x, b.y, !b.pressed); // not the user, to Violet Shield
                 b.pressed = !b.pressed;
                 if !b.pressed {
                     b.left -= 1;
@@ -1074,6 +1287,8 @@ impl Runtime {
     }
 
     fn run(&mut self) -> ! {
+        // Since when the loop has had calls to serve on every pass (cores.rs).
+        let mut busy_since = 0u64;
         loop {
             let mut handled = 0;
             while handled < 64 {
@@ -1088,8 +1303,12 @@ impl Runtime {
                     continue;
                 }
                 self.handle_fault(r);
+                contain::STATE.done();
                 handled += 1;
             }
+            // Timers, and signals for threads not in a call (syscall.rs): with
+            // fewer than 64 handled, the fault queue was found empty.
+            self.signal_pass(handled < 64);
             let now = sys::now_ns();
             self.stats.loops += 1;
             self.stats.faults += handled as u64;
@@ -1101,12 +1320,23 @@ impl Runtime {
                 let (blocks, free) = heap::HEAP.stats();
                 let waiting: usize = self.apps.iter().flatten().map(|a| a.threads.iter().filter(|t| t.wait.is_some()).count()).sum();
                 let threads: usize = self.apps.iter().flatten().map(|a| a.threads.iter().filter(|t| t.alive).count()).sum();
+                // The four busiest calls, picked by hand: a sort here costs kilobytes of code.
                 let mut calls = core::mem::take(&mut self.stats.calls);
-                calls.sort_by_key(|c| core::cmp::Reverse(c.1));
-                let top: Vec<String> = calls.iter().take(4).map(|(n, c)| alloc::format!("{}:{}/s", n, *c as u64 / secs)).collect();
+                let mut top = String::new();
+                for _ in 0..4 {
+                    let mut best = 0;
+                    for j in 1..calls.len() {
+                        if calls[j].1 > calls[best].1 {
+                            best = j;
+                        }
+                    }
+                    let Some(c) = calls.get_mut(best).filter(|c| c.1 != 0) else { break };
+                    top += &alloc::format!("{}:{}/s ", c.0, c.1 as u64 / secs);
+                    c.1 = 0;
+                }
                 log!(
                     "stats: {} loops/s, asleep {}%, {} faults/s [{}], slowest poll {} us (flush {} focus {} touch {}), slowest pass {} us, {} threads ({} waiting), heap {} free blocks {} KiB",
-                    self.stats.loops / secs, self.stats.slept_ns / 10_000_000 / secs, self.stats.faults / secs, top.join(" "), self.stats.slowest_poll / 1000,
+                    self.stats.loops / secs, self.stats.slept_ns / 10_000_000 / secs, self.stats.faults / secs, top.trim_end(), self.stats.slowest_poll / 1000,
                     self.stats.slowest_step[0] / 1000, self.stats.slowest_step[1] / 1000, self.stats.slowest_step[2] / 1000,
                     self.stats.slowest_pass / 1000, threads, waiting, blocks, free / 1024
                 );
@@ -1131,18 +1361,31 @@ impl Runtime {
             }
             self.power_tick(now);
             self.drain_touch();
+            // The band, prompts, the passcode pad and the lock screen.
+            self.ui_tick(now);
             self.set_tiers();
             self.bench_tick(now);
             self.gesture_tick(now);
             self.beam.tick();
             self.flush_presents();
+            // Before the waiters: an app back in front runs again this pass.
+            self.lifecycle_tick(now);
+            net::linger_tick(now);
             self.check_waiters();
             if now.wrapping_sub(self.last_sentinel) >= 100_000_000 {
                 self.last_sentinel = now;
                 self.shield_tick(now);
             }
             if handled == 0 {
+                busy_since = 0;
                 self.idle(now);
+            } else if busy_since == 0 {
+                busy_since = now;
+            } else if cores::relief_due(sys::cores(), busy_since, now) {
+                // An app on another core can keep this loop busy, above the
+                // services on their own core: let them run once.
+                busy_since = 0;
+                sys::relieve();
             }
         }
     }
@@ -1167,13 +1410,18 @@ impl Runtime {
         self.stats.pass_start = 0; // a pass measures work, not sleep
         if r.badge != 0 && r.badge & sys::NOTIFY_BADGES == 0 {
             self.handle_fault(r);
+            contain::STATE.done();
         }
     }
 
     /// When the loop must run next: the Runtime poll (touch, focus), the
     /// Shield tick, thread deadlines, presents waiting on the panel, frames
     /// for VSync waiters, and a short interval while a thread waits on
-    /// something only polling notices (sockets, the audio ring, poll/epoll).
+    /// something only polling notices (sockets, the audio ring, the
+    /// microphone, camera or Bluetooth, directly or through poll/epoll). A
+    /// wait on events, pipes or /dev/violet/sys needs no polling: only this
+    /// loop changes them, and it checks the waiters after every pass. Frozen
+    /// apps wake nothing.
     fn next_wake(&mut self, now: u64) -> u64 {
         let busy = self.focused || self.apps.iter().any(|a| a.is_some());
         let mut wake = self.last_poll + self.poll_interval(busy);
@@ -1182,7 +1430,7 @@ impl Runtime {
             wake = wake.min(b.next_ns);
         }
         let next_frame = self.beam.frame_ns + u64::from(self.beam.period_us()) * 1000 + 200_000;
-        for app in self.apps.iter().flatten() {
+        for app in self.apps.iter().flatten().filter(|a| a.life.state != lifecycle::State::Frozen) {
             if let Some(([_, y0, _, y1], _)) = app.surface.as_ref().and_then(|s| s.pending) {
                 // Just as the beam leaves the rows.
                 wake = wake.min(now + self.beam.wait_ns(y0, y1).max(50_000));
@@ -1193,13 +1441,282 @@ impl Runtime {
                     wake = wake.min(d);
                 }
                 match w {
-                    Wait::Futex { .. } | Wait::Sleep | Wait::Frozen | Wait::Present { .. } => {}
+                    Wait::Futex { .. } | Wait::Sleep | Wait::Frozen | Wait::Present { .. } | Wait::Signal | Wait::Consent { .. } => {}
                     Wait::Vsync { .. } => wake = wake.min(next_frame.max(now + 500_000)),
+                    w if !polled(app, w) => {}
                     _ => wake = wake.min(now + 2_000_000),
                 }
             }
         }
+        if let Some(t) = self.signal_wake(now) {
+            wake = wake.min(t); // signal timers (syscall.rs)
+        }
         wake.min(now + 50_000_000)
+    }
+}
+
+// ---- Background lifecycle and the low-memory killer (policy: lifecycle.rs) ----
+
+/// Whether fd's readiness can change without this loop doing it (a socket,
+/// the audio or microphone ring, camera frames, Bluetooth), so a wait on it
+/// needs polling. Unknown kinds count as such.
+fn external(app: &App, fd: i32) -> bool {
+    use device::Kind::*;
+    app.fds.get(fd as usize).and_then(|f| f.as_ref()).is_some_and(|f| {
+        !matches!(f.borrow().kind, Events | Sys { .. } | EventFd { .. } | Pipe { .. } | File { .. } | Dir { .. } | Log | Null | Random | Screen)
+    })
+}
+
+const _: () = assert!(abi::LIFECYCLE_LOW_MEMORY == lifecycle::LIFECYCLE_LOW_MEMORY);
+
+/// Bytes waiting in the pipes `app` writes to, each pipe once: runtime heap
+/// it holds (lifecycle.rs `pipe_room`, `heap_victim`).
+pub fn pipe_bytes(app: &App) -> usize {
+    let mut ends: Vec<(usize, usize)> = app.fds.iter().flatten().filter_map(|f| match &f.borrow().kind {
+        device::Kind::Pipe { buffer, write: true, .. } => Some((Rc::as_ptr(buffer) as usize, buffer.borrow().len())),
+        _ => None,
+    }).collect();
+    ends.sort_unstable();
+    ends.dedup_by_key(|e| e.0);
+    ends.iter().map(|e| e.1).sum()
+}
+
+/// Whether a wait needs the loop's short polling interval.
+fn polled(app: &App, w: &Wait) -> bool {
+    match w {
+        Wait::Read { fd, .. } => external(app, *fd),
+        Wait::Poll { fds, .. } => fds.iter().any(|&(fd, _)| external(app, fd)),
+        Wait::Epoll { epfd, .. } => app.fds.get(*epfd as usize).and_then(|f| f.as_ref()).map_or(true, |f| match &f.borrow().kind {
+            device::Kind::Epoll { interest, .. } => interest.iter().any(|&(fd, _, _)| external(app, fd)),
+            _ => true,
+        }),
+        _ => true,
+    }
+}
+
+impl Runtime {
+    /// A reason to keep running behind: the agent; an audio stream, the
+    /// microphone or Bluetooth open; a TCP upload in progress (bytes sent
+    /// and not yet reported, or reported in the grace period; guard.rs); or a
+    /// TCP connect not yet answered (bounded by its timeout), so the app hears
+    /// how it ended and does not keep the slot frozen.
+    fn own_facts(&self, i: usize, app: &App, now: u64) -> lifecycle::Facts {
+        use device::Kind::*;
+        // A wake lock keeps it running behind, but Cached (powerctl.rs `left_ns`).
+        let left_ns = powerctl::left_ns(app.pid, app.used_ns, now);
+        let sending = self.tx_stats.iter().flatten()
+            .any(|t| t.index == i && t.pid == app.pid && (t.pending > 0 || now.wrapping_sub(t.last_ns) < lifecycle::GRACE_NS));
+        let reason = app.path == appstore::INSTALLER || sending
+            || app.fds.iter().flatten().any(|f| match f.borrow().kind {
+                Audio { .. } | Mic { .. } | Hci { .. } => true,
+                Tcp { slot: Some(s), .. } if self.net.state(s).0 == net::CONNECTING => true,
+                // A connection offered or bytes sent to it lately (sockets.rs), so a server's clients do not hang.
+                ref k => self.socket_wakes(k, now),
+            });
+        lifecycle::Facts { front: self.foreground == Some(i), home: self.home == Some(i), reason, shield: app.frozen.is_some(), left_ns }
+    }
+
+    /// Its own facts, or for a child process those it takes from the app
+    /// that started it (lifecycle::inherit).
+    fn life_facts(&self, i: usize, app: &App, now: u64) -> lifecycle::Facts {
+        let own = self.own_facts(i, app, now);
+        let r = self.root(i);
+        match self.apps[r].as_ref() {
+            Some(top) if r != i => lifecycle::inherit(own, &self.own_facts(r, top, now)),
+            _ => own,
+        }
+    }
+
+    /// The oldest ancestor of app `i` still running (lifecycle::root_of).
+    fn root(&self, i: usize) -> usize {
+        let index_of = |pid: u32| (0..MAX_APPS).find(|&p| pid != 0 && self.apps[p].as_ref().is_some_and(|q| q.pid == pid));
+        let parent: Vec<Option<usize>> = (0..MAX_APPS).map(|n| self.apps[n].as_ref().and_then(|a| index_of(a.sig.ppid))).collect();
+        lifecycle::root_of(&parent, i)
+    }
+
+    /// Every app as the killer sees it. Never closed: the app in front, Home,
+    /// the agent, a Shield-held app, and the children of the app in front, of
+    /// Home and of `caller`'s family.
+    fn candidates(&self, caller: Option<usize>) -> Vec<Option<lifecycle::Candidate>> {
+        let now = sys::now_ns();
+        let family = caller.map(|c| self.root(c));
+        (0..MAX_APPS)
+            .map(|i| {
+                let app = self.apps[i].as_ref()?;
+                let f = self.life_facts(i, app, now);
+                let r = self.root(i);
+                let kept = self.foreground == Some(r) || self.home == Some(r) || Some(r) == family;
+                Some(lifecycle::Candidate {
+                    state: lifecycle::next_state(&f, now, self.life.pressure),
+                    protected: f.front || f.home || f.shield || kept || app.path == appstore::INSTALLER,
+                    core: app.path == wifi::SETTINGS_APP,
+                    audio: app.fds.iter().flatten().any(|fd| matches!(fd.borrow().kind, device::Kind::Audio { .. })),
+                    used_ns: app.used_ns,
+                    heap: pipe_bytes(app),
+                })
+            })
+            .collect()
+    }
+
+    /// The app to close for memory, of class up to `max_class` (lifecycle::class).
+    fn victim(&self, caller: Option<usize>, max_class: u8) -> Option<usize> {
+        lifecycle::pick_victim(&self.candidates(caller), max_class)
+    }
+
+    /// The app to close for a page fault by app `i` (lifecycle::fault_victim):
+    /// any app behind for the app in front, Home, the agent or their
+    /// children; only frozen and cached ones for anyone else.
+    fn fault_victim_for(&self, i: usize) -> Option<usize> {
+        let r = self.root(i);
+        let privileged = self.foreground == Some(r) || self.home == Some(r) || self.apps[r].as_ref().is_some_and(|a| a.path == appstore::INSTALLER);
+        lifecycle::fault_victim(&self.candidates(Some(i)), privileged)
+    }
+
+    /// Thread `slot` of an app the lifecycle froze ran into the runtime (a
+    /// call or a fault that was queued as it froze): it is suspended with
+    /// the others and resumed when the app thaws.
+    pub fn hold_thread(&mut self, i: usize, slot: usize) {
+        let Some(app) = self.apps[i].as_mut() else { return };
+        sys::tcb_suspend(app.threads[slot].tcb);
+        if !app.life.parked.contains(&slot) {
+            app.life.parked.push(slot);
+        }
+    }
+
+    /// A call by a thread of a lifecycle-frozen app is not made: the thread
+    /// is answered back onto its svc instruction (`again`: r0..r7 as they
+    /// were and the FaultIP of the call itself) and held, so it makes the
+    /// call again when the app thaws.
+    pub fn defer_call(&mut self, i: usize, slot: usize, again: &[u32; 9]) {
+        sys::reply(again);
+        self.hold_thread(i, slot);
+    }
+
+    /// Close app `i` for memory: status 137, logged and kept for `memory`.
+    /// Opening it again starts it afresh.
+    fn close_for_memory(&mut self, i: usize, reason: &'static str) {
+        let Some(app) = self.apps[i].as_mut() else { return };
+        app.exit_code = Some(lifecycle::EXIT_CLOSED);
+        let pages = app.space.usage().0 + app.surface.as_ref().map_or(0, |s| s.pages.len());
+        let (name, state) = (app.name.clone(), app.life.state.name());
+        let place = if self.foreground == Some(i) { "in front" } else { "in the background" };
+        self.reap(i);
+        log!("low on app memory: closed {} {} ({} KiB free; it was {} with {} KiB: {})", name, place, self.pool.available() * sys::PAGE_KIB, state, pages * sys::PAGE_KIB, reason);
+        self.life.note(lifecycle::Closed { name, reason, kib: pages * sys::PAGE_KIB, at_s: sys::now_ns() / 1_000_000_000 });
+        self.shell.dirty = true;
+    }
+
+    /// Freeze app `i`: suspend its running threads; the rest are blocked in
+    /// a call, whose wait is not served until it thaws.
+    fn park(&mut self, i: usize) {
+        let Some(app) = self.apps[i].as_mut() else { return };
+        let parked: Vec<usize> = (0..app.threads.len()).filter(|&s| app.threads[s].alive && app.threads[s].reply.is_none()).collect();
+        for &s in &parked {
+            sys::tcb_suspend(app.threads[s].tcb);
+        }
+        app.life = lifecycle::Life { state: lifecycle::State::Frozen, parked };
+        log!("lifecycle: froze {} (pid {}) in the background", app.name, app.pid);
+    }
+
+    /// Thaw app `i` into `state`. A Shield freeze that began meanwhile owns
+    /// the threads; they stay as the Shield left them.
+    fn unpark(&mut self, i: usize, state: lifecycle::State) {
+        let Some(app) = self.apps[i].as_mut() else { return };
+        let parked = core::mem::take(&mut app.life.parked);
+        if app.frozen.is_none() {
+            for s in parked {
+                if app.threads[s].alive {
+                    sys::tcb_resume(app.threads[s].tcb);
+                }
+            }
+        }
+        app.life.state = state;
+    }
+
+    /// Every pass: the app in front runs at once. Every second: each app's
+    /// state, memory pressure, and closing an app when the pool or the heap
+    /// is nearly gone.
+    fn lifecycle_tick(&mut self, now: u64) {
+        use lifecycle::{Pressure, State};
+        if let Some(f) = self.foreground {
+            match self.apps[f].as_ref().map(|a| a.life.state) {
+                Some(State::Frozen) => self.unpark(f, State::Foreground),
+                Some(s) if s != State::Foreground => self.apps[f].as_mut().unwrap().life.state = State::Foreground,
+                _ => {}
+            }
+        }
+        if now.wrapping_sub(self.life.last_ns) < 1_000_000_000 {
+            return;
+        }
+        self.life.last_ns = now;
+        let p = self.update_pressure(now);
+        for i in 0..MAX_APPS {
+            let Some(app) = self.apps[i].as_ref() else { continue };
+            let (cur, next) = (app.life.state, lifecycle::next_state(&self.life_facts(i, app, now), now, p));
+            if cur == next {
+                continue;
+            }
+            if next == State::Frozen {
+                self.park(i);
+            } else if cur == State::Frozen {
+                self.unpark(i, next);
+            } else {
+                self.apps[i].as_mut().unwrap().life.state = next;
+            }
+        }
+        // The pool: a frozen or cached app. The heap: whoever holds the most
+        // of it (its pipes) first, in any state but protected (lifecycle::heap_victim).
+        if p == Pressure::Critical {
+            if let Some(v) = self.victim(None, 1) {
+                self.close_for_memory(v, "memory pressure");
+            }
+        } else if heap::HEAP.stats().1 < heap::LOW_BYTES {
+            if let Some(v) = lifecycle::heap_victim(&self.candidates(None)) {
+                self.close_for_memory(v, "runtime heap");
+            }
+        }
+    }
+
+    /// The pool's pressure now; on the way out of Normal, background apps
+    /// hear LOW_MEMORY once. Also run before an on-demand close, so they hear
+    /// it even when one fault drains the pool between two ticks.
+    fn update_pressure(&mut self, now: u64) -> lifecycle::Pressure {
+        let was = self.life.pressure;
+        let p = lifecycle::pressure(self.pool.available(), RESERVE_PAGES, was);
+        self.life.pressure = p;
+        if was == lifecycle::Pressure::Normal && p != lifecycle::Pressure::Normal {
+            log!("lifecycle: app memory low ({} KiB free): background apps asked to free memory", self.pool.available() * sys::PAGE_KIB);
+            let behind: Vec<usize> = (0..MAX_APPS).filter(|&i| self.apps[i].is_some() && self.foreground != Some(i)).collect();
+            for i in behind {
+                self.event(i, abi::InputEvent { timestamp_us: now / 1000, kind: abi::EVENT_LIFECYCLE, value: abi::LIFECYCLE_LOW_MEMORY, ..Default::default() });
+            }
+        }
+        p
+    }
+
+    /// `memory`: the pool, the heap, the app limit and each app's pages,
+    /// screen surface, page tables and state, then pressure and closings (KiB).
+    /// `only`: an app without the system capability sees its own entry and
+    /// the pressure, not which other apps run, their states or closings.
+    pub fn lifecycle_report(&self, only: Option<usize>) -> String {
+        let (_, heap_free) = heap::HEAP.stats();
+        let running = self.apps.iter().flatten().count();
+        let mut out = alloc::format!(
+            "free={} total={} apps_pool={} heap_free={} heap={} apps={}/{} refused={}",
+            self.pool.available() * sys::PAGE_KIB, self.pool.total * sys::PAGE_KIB, self.pool.app_pages * sys::PAGE_KIB, heap_free / 1024,
+            heap::HEAP.total() / 1024, running, self.app_limit, self.pool.refused
+        );
+        for (i, a) in self.apps.iter().enumerate() {
+            let Some(a) = a.as_ref().filter(|_| only.map_or(true, |o| o == i)) else { continue };
+            let (pages, tables) = a.space.usage();
+            let surface = a.surface.as_ref().map_or(0, |s| s.pages.len());
+            out += &alloc::format!(" {}={}+{}(t{},{})", lifecycle::clean(&a.name), pages * sys::PAGE_KIB, surface * sys::PAGE_KIB, tables, a.life.state.name());
+        }
+        match only {
+            None => self.life.report(&mut out),
+            Some(_) => out += [" pressure=normal", " pressure=low", " pressure=critical"][self.life.pressure as usize],
+        }
+        out
     }
 }
 
@@ -1235,18 +1752,77 @@ impl Stats {
 /// Enough heap to report a failed start before the pool exists (the pool
 /// then adds HEAP_PAGES of its own; see pool.rs).
 /// 7.9 KiB: with the other statics, the package (code and zeroed data) must
-/// stay within its 0x3e000-byte window.
+/// stay within its 0x80000-byte window.
 static mut BOOT_HEAP: [u64; 1008] = [0; 1008];
 
+/// Recovery's view of the runtime (contain.rs `recover`).
+impl contain::Host for Runtime {
+    fn slots(&self) -> usize {
+        self.untypeds.len().min(MAX_APPS)
+    }
+    fn present(&self, i: usize) -> bool {
+        self.apps.get(i).map_or(false, Option::is_some)
+    }
+    fn close(&mut self, i: usize) {
+        if let Some(app) = self.apps[i].as_mut() {
+            log!("runtime fault {}: closed {} (pid {})", contain::STATE.recovered(), app.name, app.pid);
+            app.exit_code = Some(134);
+        }
+        self.reap(i);
+    }
+    fn revoke(&mut self, i: usize) {
+        sys::revoke(self.untypeds[i]);
+    }
+    fn home(&mut self) -> &mut Option<usize> {
+        &mut self.home
+    }
+    fn front(&mut self) -> &mut Option<usize> {
+        &mut self.foreground
+    }
+    fn home_tried(&self) -> bool {
+        self.home_tried
+    }
+    fn start_home(&mut self) {
+        Runtime::start_home(self, false);
+    }
+    fn show_home(&mut self) {
+        Runtime::show_home(self);
+    }
+}
+
+/// Stop this thread for good: what the supervisor did on every fault before
+/// containment, done from inside (SLOT_AUTHORITY is the runtime's own TCB).
+fn halt() -> ! {
+    loop {
+        sys::tcb_suspend(sys::SLOT_AUTHORITY);
+        sys::yield_now();
+    }
+}
+
 pub fn run() -> ! {
+    // The first start, or the supervisor's restart after a fault in this
+    // process, with memory as the fault left it (contain.rs).
+    match contain::STATE.enter() {
+        contain::Entry::Cold => {}
+        // A fault during boot: nothing here can be trusted, so stay down
+        // (suspended, not spinning: the fault may come at EVENT_PRIORITY).
+        contain::Entry::Boot => halt(),
+        contain::Entry::Warm { runtime, served } => {
+            // Set by `settle` below: the runtime, which is never freed or moved.
+            let rt = unsafe { &mut *(runtime as *mut Runtime) };
+            rt.recover(served);
+            rt.run()
+        }
+    }
     Log::init();
     unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1008 * 8) };
     let mut rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
             Log::write(alloc::format!("[open] start failed: seL4 error {}\n", e).as_bytes());
+            // Suspended, as halt() (written out here: it costs less code).
             loop {
-                sys::yield_now();
+                sys::tcb_suspend(sys::SLOT_AUTHORITY);
             }
         }
     };
@@ -1256,9 +1832,8 @@ pub fn run() -> ! {
     log!(
         "ready: {} files in /apps image, {} MiB for apps",
         rt.fs.files(),
-        rt.pool.available() / 16
+        rt.pool.available() / sys::MIB_PAGES
     );
-    let _ = rt.policy.check(policy::AppId(0), &policy::Action::SpawnApp { path: "/apps" });
     if sys::timer_selftest() {
         sys::set_own_priority(sys::EVENT_PRIORITY);
         log!("event-driven: the timer works; waiting for events at priority {}", sys::EVENT_PRIORITY);
@@ -1271,5 +1846,8 @@ pub fn run() -> ! {
         sys::cores(),
         if sys::cores() > 1 { "cores (the app in front on core 1, others on 2-3)" } else { "core" }
     );
+    // On the heap for good, so a restart after a fault finds it (contain.rs).
+    let rt = alloc::boxed::Box::leak(alloc::boxed::Box::new(rt));
+    contain::STATE.settle(rt as *mut Runtime as usize);
     rt.run()
 }

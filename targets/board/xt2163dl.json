@@ -1,0 +1,523 @@
+{
+  "name": "xt2163dl",
+  "title": "Motorola Moto G Pure (XT2163DL, MediaTek MT6765)",
+  "arch": "aarch32",
+  "cpu": "cortex-a53",
+  "cores": 1,
+  "kernel": {
+    "platform": "ellis",
+    "build": "kernel/sel4/build.py",
+    "timer_hz": 13000000,
+    "interrupt_controller": "gic-v3",
+    "device_tree": "decompiled from the factory boot image at build time"
+  },
+  "boot": {
+    "format": "Android boot image v2 carrying a 32-bit zImage, written to boot_b",
+    "factory_boot_sha256": "36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a"
+  },
+  "memory": {
+    "ram": {
+      "pa": "0x40000000",
+      "size": "0xc0000000",
+      "what": "the RAM range the loader requires of the firmware's device tree"
+    },
+    "kernel_ram": [
+      {
+        "pa": "0x40000000",
+        "size": "0x01000000"
+      },
+      {
+        "pa": "0x41300000",
+        "size": "0x00d00000"
+      },
+      {
+        "pa": "0x42700000",
+        "size": "0x01500000"
+      }
+    ],
+    "regions": {
+      "kernel": {
+        "pa": "0x40000000",
+        "size": "0x00100000",
+        "what": "kernel image"
+      },
+      "root": {
+        "pa": "0x40200000",
+        "size": "0x00180000",
+        "va": "0x00100000",
+        "what": "the supervisor's image (with the built-in catalog) and stack"
+      },
+      "connectivity": {
+        "pa": "0x42000000",
+        "size": "0x00400000",
+        "what": "connectivity chip memory window (secure-monitor protected)"
+      },
+      "wifi_dma": {
+        "pa": "0x42400000",
+        "size": "0x00300000",
+        "what": "Wi-Fi packet DMA pool"
+      },
+      "catalog": {
+        "pa": "0x43c00000",
+        "size": "0x00200000",
+        "what": "installed catalog (up to 1.25 MiB), USB trial scratch and the loader's bank word"
+      },
+      "firmware": {
+        "pa": "0x43e00000",
+        "size": "0x00200000",
+        "what": "read-only connectivity firmware bundle; boot notes in its last page"
+      },
+      "framebuffer": {
+        "pa": "0x79450000",
+        "size": "0x00fb0000",
+        "what": "the panel framebuffer the bootloader leaves lit (720 pixels wide)"
+      },
+      "open_apps": {
+        "pa": "0xc0000000",
+        "size": "0x20000000",
+        "what": "open apps: file system image (96 MiB), then the 256 MiB app pool"
+      },
+      "camera": {
+        "pa": "0xe0000000",
+        "size": "0x00400000",
+        "what": "camera frame memory"
+      }
+    }
+  },
+  "devices": {
+    "storage": {
+      "kind": "mediatek-msdc (eMMC)",
+      "pa": "0x11230000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "storage",
+          "va": "0x0a000000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "power": {
+      "kind": "mediatek-pmic-wrapper",
+      "pa": "0x1000d000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "power",
+          "va": "0x09000000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "watchdog": {
+      "kind": "mediatek-wdt",
+      "pa": "0x10007000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "touch",
+          "va": "0x09005000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "touch_spi": {
+      "kind": "mediatek-spi",
+      "pa": "0x11013000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "touch",
+          "va": "0x09003000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "usb": {
+      "kind": "mediatek-musb",
+      "pa": "0x11200000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "usb_diag",
+          "va": "0x09000000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "radio_uart": {
+      "kind": "mediatek-btif",
+      "pa": "0x1100c000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "radio",
+          "va": "0x09010000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "radio_mcu": {
+      "kind": "mediatek-connsys",
+      "pa": "0x18002000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "radio",
+          "va": "0x09015000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    },
+    "camera_i2c": {
+      "kind": "mediatek-i2c",
+      "pa": "0x11009000",
+      "size": "0x1000",
+      "windows": [
+        {
+          "owner": "camera",
+          "va": "0x09002000",
+          "frames": 1,
+          "rights": "rw"
+        }
+      ]
+    }
+  },
+  "supervisor_windows": [
+    {
+      "owner": "supervisor",
+      "pa": "0x10000000",
+      "va": "0x09708000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "touch",
+      "pa": "0x10000000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x10001000",
+      "va": "0x09701000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "touch",
+      "pa": "0x10001000",
+      "va": "0x09001000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "touch",
+      "pa": "0x10002000",
+      "va": "0x09004000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x10005000",
+      "va": "0x09702000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "touch",
+      "pa": "0x10005000",
+      "va": "0x09002000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x10006000",
+      "va": "0x09700000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x10007000",
+      "va": "0x09703000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "touch",
+      "pa": "0x1000b000",
+      "va": "0x09006000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x1000c000",
+      "va": "0x0970d000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x10010000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "r"
+    },
+    {
+      "owner": "context",
+      "pa": "0x11007000",
+      "va": "0x09004000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x11220000",
+      "va": "0x09010000",
+      "bits": 12,
+      "frames": 10,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x11230000",
+      "va": "0x0a000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x11c10000",
+      "va": "0x09020000",
+      "bits": 12,
+      "frames": 6,
+      "rights": "rw"
+    },
+    {
+      "owner": "usb_diag",
+      "pa": "0x11cc0000",
+      "va": "0x09001000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x14000000",
+      "va": "0x0970f000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x14002000",
+      "va": "0x0970e000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x1400d000",
+      "va": "0x09804000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "r"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x18002000",
+      "va": "0x09706000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x18004000",
+      "va": "0x09011000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x18006000",
+      "va": "0x09014000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x18007000",
+      "va": "0x09012000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x18007000",
+      "va": "0x09704000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x180b1000",
+      "va": "0x09705000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "r"
+    },
+    {
+      "owner": "radio",
+      "pa": "0x180c1000",
+      "va": "0x09013000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x180c1000",
+      "va": "0x09707000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x1a000000",
+      "va": "0x09000000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x1a002000",
+      "va": "0x09001000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x1a040000",
+      "va": "0x09010000",
+      "bits": 12,
+      "frames": 8,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x1a050000",
+      "va": "0x09018000",
+      "bits": 12,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x42000000",
+      "va": "0x09800000",
+      "bits": 20,
+      "frames": 4,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x42400000",
+      "va": "0x09c00000",
+      "bits": 20,
+      "frames": 3,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x43c00000",
+      "va": "0x0d000000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x43d00000",
+      "va": "0x0d100000",
+      "bits": 20,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0x43e00000",
+      "va": "0x09400000",
+      "bits": 20,
+      "frames": 2,
+      "rights": "r"
+    },
+    {
+      "owner": "supervisor",
+      "pa": "0x79450000",
+      "va": "0x07900000",
+      "bits": 16,
+      "frames": 1,
+      "rights": "rw"
+    },
+    {
+      "owner": "display",
+      "pa": "0x79460000",
+      "va": "0x08010000",
+      "bits": 16,
+      "frames": 70,
+      "rights": "rw"
+    },
+    {
+      "owner": "context",
+      "pa": "0xc0000000",
+      "va": "0x10000000",
+      "bits": 24,
+      "frames": 6,
+      "rights": "r"
+    },
+    {
+      "owner": "camera",
+      "pa": "0xe0000000",
+      "va": "0x0b000000",
+      "bits": 20,
+      "frames": 4,
+      "rights": "rw"
+    }
+  ]
+}

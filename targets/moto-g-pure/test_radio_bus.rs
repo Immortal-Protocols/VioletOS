@@ -26,6 +26,14 @@ pub struct Model {
     pub wrong_channel: bool,
     pub drop_key_done: bool,
     pub wrong_seq: bool,
+    /// Management frames the station sent after associating (SA Query).
+    pub management: Vec<Vec<u8>>,
+    /// Answer this many association requests "try again later" (status 30),
+    /// naming `comeback_units` time units if not 0.
+    pub comeback: u32,
+    pub comeback_units: u32,
+    /// Model time of each association request.
+    pub association_requests: Vec<u32>,
 }
 thread_local! {static STATE:RefCell<Model>=RefCell::new(Model::default());}
 pub fn reset() {
@@ -37,6 +45,21 @@ pub fn with<R>(f: impl FnOnce(&mut Model) -> R) -> R {
 impl Model {
     fn get(&self, a: usize) -> u32 {
         *self.regs.get(&a).unwrap_or(&0)
+    }
+    /// Deliver an 802.11 management frame from the air (RX ring 0, as beacons arrive).
+    pub fn receive_management(&mut self, frame: &[u8]) {
+        let mut packet = vec![0u8; 16];
+        packet[..4].copy_from_slice(&[(16 + frame.len()) as u8, 0, 1, 224]);
+        packet.extend_from_slice(frame);
+        self.inject(0, &packet);
+    }
+    /// Let `ms` of model time pass with nobody looking.
+    pub fn advance(&mut self, ms: u32) {
+        self.time += ms;
+    }
+    /// Deliver a received frame with its RX descriptor, as the firmware hands it over.
+    pub fn receive_packet(&mut self, packet: &[u8]) {
+        self.inject(0, packet);
     }
     fn inject(&mut self, r: usize, bytes: &[u8]) {
         let reg = REG + 0x400 + r * 16;
@@ -84,6 +107,11 @@ impl Model {
             if bytes[36] == 2 {
                 self.regs.insert(0x09013140, 6);
             }
+        } else if bytes[5] == 0xcc && bytes[32] == 0xd0 {
+            // An action frame to the access point's WTBL entry at the basic rate.
+            assert_eq!((bytes[2], bytes[3], bytes[4], bytes[7], bytes[8]), (12, 0x84, 1, 2, 0x0d));
+            assert_eq!(bytes[12] & 2, 0);
+            self.management.push(bytes[32..].to_vec());
         } else if bytes[5] == 0xcc {
             let request = &bytes[32..];
             let auth = request[0] == 0xb0;
@@ -92,10 +120,23 @@ impl Model {
             if auth {
                 assert_eq!(&request[24..], &[0, 0, 1, 0, 0, 0]);
             } else {
-                assert!(request.ends_with(super::station::RSN));
+                assert!(request.ends_with(super::station::RSN) || request[request.len() - 28..request.len() - 26] == [48, 26]);
             }
-            let mut packet = [0u8; 46];
+            let mut packet = vec![0u8; 46];
             packet[..4].copy_from_slice(&[46, 0, 1, 224]);
+            if !auth {
+                self.association_requests.push(self.time);
+            }
+            let later = !auth && self.comeback != 0;
+            if later {
+                self.comeback -= 1;
+                if self.comeback_units != 0 {
+                    // Timeout Interval: association comeback time.
+                    packet[0] += 7;
+                    packet.extend_from_slice(&[56, 5, 3]);
+                    packet.extend_from_slice(&self.comeback_units.to_le_bytes());
+                }
+            }
             let frame = &mut packet[16..];
             frame[0] = if auth { 0xb0 } else { 0x10 };
             frame[4..10].copy_from_slice(&request[10..16]);
@@ -103,6 +144,8 @@ impl Model {
             frame[16..22].copy_from_slice(&request[16..22]);
             if auth {
                 frame[26] = 2;
+            } else if later {
+                frame[26] = 30;
             } else if self.deny_association {
                 frame[26] = 17;
             } else {
