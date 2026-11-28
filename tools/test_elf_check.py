@@ -326,18 +326,19 @@ class ElfCheck(unittest.TestCase):
         import tempfile
         if os.environ.get("VIOLET_OPEN_PIE") == "0":
             self.skipTest("VIOLET_OPEN_PIE=0")
-        saved = build_python_package.PYTHON_ROOT
+        target = build_python_package.build_python.TARGETS["aarch32"]
+        saved = target.pyroot
         try:
             with tempfile.TemporaryDirectory(prefix="violet-pypkg-") as work:
-                build_python_package.PYTHON_ROOT = Path(work)
+                target.pyroot = Path(work)
                 (Path(work) / "bin").mkdir()
                 for program, why in ((elf(2, SHIPPED), "not position-independent"),
                                      (static_pie([], sealed=False), "does not seal its RELRO")):
                     (Path(work) / "bin/python3").write_bytes(program)
                     with self.assertRaisesRegex(SystemExit, why):
-                        build_python_package.archive()
+                        build_python_package.archive("aarch32")
         finally:
-            build_python_package.PYTHON_ROOT = saved
+            target.pyroot = saved
 
 if __name__ == "__main__":
     unittest.main()

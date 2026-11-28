@@ -195,7 +195,9 @@ def build_python(t=None):
     # Open Runtime runs fork, vfork and execve.
     unused = ["_codecs_cn", "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
               "_multibytecodec", "_xxsubinterpreters", "_xxinterpchannels", "_lsprof", "spwd", "syslog",
-              "termios", "_posixshmem", "_multiprocessing", "_crypt", "audioop"]
+              "termios", "_posixshmem", "_multiprocessing", "_crypt", "audioop",
+              # CPython's own test modules, which it links as shared objects even here.
+              "xxlimited", "xxlimited_35"]
     answers = ("ac_cv_file__dev_ptmx=no\nac_cv_file__dev_ptc=no\nac_cv_buggy_getaddrinfo=no\n" +
                "".join(f"py_cv_module_{m}=n/a\n" for m in unused))
     # Configure again when the answers change (a module added or left out).
