@@ -16,7 +16,10 @@ sandbox. It prints a JSON line: the program's path, size and build time.
 An app's manifest.txt (next to its app.txt) says what it may use on the
 phone ("caps: net mic camera audio-out hci"; runtime/open/policy.rs). The
 program at `path` then ends with it (the manifest, its length, "VMF1"),
-which the phone splits off at install. Without one the app gets only its
+which the phone splits off at install.
+
+Native apps are built for the phone's architecture: AArch64 by default,
+VIOLET_ARCH=aarch32 for the 32-bit system (tools/build_initfs.py ARCHES). Without one the app gets only its
 own /data, the screen and touch. Net, the microphone and the camera are
 asked of the user the first time the app uses them.
 
@@ -47,27 +50,29 @@ CHECK_SECONDS = 8
 
 
 def environment(work):
-    rustc, lld = build_initfs.toolchain()
+    arch = build_initfs.arch_of()
+    a = build_initfs.ARCHES[arch]
+    rustc, lld = build_initfs.toolchain(a["target"])
     cargo = rustc.parent / "cargo"
     ndk = Path(os.environ.get("ANDROID_NDK_HOME", Path.home() / "Library/Android/sdk/ndk/28.2.13676358"))
     bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin"))
     if not bins:
         raise SystemExit("Install the Android NDK (its clang builds ring)")
-    key = build_initfs.TARGET.replace("-", "_")
+    key = a["target"].replace("-", "_")
     env = dict(os.environ, **{
         f"CC_{key}": str(bins[0] / "clang"),
         f"AR_{key}": str(bins[0] / "llvm-ar"),
-        f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
+        f"CFLAGS_{key}": a["cflags"],
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *build_initfs.CPU_FLAGS,
-                                                               *map(str, build_initfs.pie_flags(rustc))]),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *a["cpu"],
+                                                               *map(str, build_initfs.pie_flags(rustc, arch=arch))]),
         "CARGO_TARGET_DIR": str(work / "target"),
         "CARGO_HOME": str(work / ".cargo-home"),
         "RUSTC": str(rustc),
         "TMPDIR": str(work / "target/tmp"),
     })
     (work / "target/tmp").mkdir(parents=True, exist_ok=True)
-    return cargo, env
+    return cargo, env, arch
 
 
 def setup(work):
@@ -112,7 +117,7 @@ def setup(work):
             subprocess.run(["cp", "-c", "-R", str(src), str(home)], check=True)
         else:
             home.mkdir()
-    cargo, env = environment(work)
+    cargo, env, _ = environment(work)
     lock = work / "Cargo.lock"
     if not lock.exists() and (ROOT / "apps/Cargo.lock").exists():
         shutil.copy2(ROOT / "apps/Cargo.lock", lock)
@@ -192,20 +197,21 @@ def build(work, name):
         return build_python(work, name)
     if not (app / "Cargo.toml").exists():
         raise SystemExit(f"no app at {app} (make python/{name}/main.py, or apps/{name}/Cargo.toml and src/main.rs)")
-    cargo, env = environment(work)
+    cargo, env, arch = environment(work)
+    target = build_initfs.ARCHES[arch]["target"]
     start = time.monotonic()
-    r = subprocess.run([cargo, "build", "--offline", "--profile", "agent", "--target", build_initfs.TARGET, "-p", name],
+    r = subprocess.run([cargo, "build", "--offline", "--profile", "agent", "--target", target, "-p", name],
                        cwd=work, env=env, capture_output=True, text=True)
     seconds = round(time.monotonic() - start, 1)
     if r.returncode:
         sys.stderr.write(r.stderr[-6000:])
         print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
         return 1
-    out = work / "target" / build_initfs.TARGET / "agent" / name
+    out = work / "target" / target / "agent" / name
     # The same gate as the system image: a position-independent program the
     # phone's loader takes (W^X, code in its own pages, relocations it can apply).
     try:
-        elf_check.check({name: out.read_bytes()}, allow_fixed=elf_check.fixed_allowed())
+        elf_check.check({name: out.read_bytes()}, allow_fixed=elf_check.fixed_allowed(), arch=arch)
     except SystemExit as e:
         sys.stderr.write(f"{e}\n")
         print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
@@ -222,7 +228,8 @@ def build(work, name):
             return 1
         out = packed
     title = (app / "app.txt").read_text().strip() if (app / "app.txt").exists() else name.title()
-    print(json.dumps({"ok": True, "name": name, "title": title, "path": str(out), "bytes": out.stat().st_size, "seconds": seconds}))
+    print(json.dumps({"ok": True, "name": name, "title": title, "path": str(out), "bytes": out.stat().st_size, "seconds": seconds,
+                      "arch": arch}))
     return 0
 
 

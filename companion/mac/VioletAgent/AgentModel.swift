@@ -966,7 +966,9 @@ final class AgentModel: ObservableObject {
 
     /// Python for the phone (tools/build_python_package.py), installed once as the "python" package.
     private func installPython(_ done: @escaping (Bool, String) -> Void) {
-        let package = repo.appendingPathComponent("build/python-package.vgz")
+        // One package per architecture (tools/build_python_package.py default_out): AArch64 unless VIOLET_ARCH says otherwise.
+        let arch = ProcessInfo.processInfo.environment["VIOLET_ARCH"] ?? "aarch64"
+        let package = repo.appendingPathComponent(arch == "aarch32" ? "build/python-package.vgz" : "build/python-package-\(arch).vgz")
         log("the phone has no Python yet: installing it first")
         DispatchQueue.global().async {
             if !FileManager.default.fileExists(atPath: package.path) {

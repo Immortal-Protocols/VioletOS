@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Python for the phone as one installable package (runtime/open/appstore.rs).
 
-    python3 tools/build_python_package.py [OUT]   # default build/python-package.vgz
+    python3 tools/build_python_package.py [OUT]   # default build/python-package-aarch64.vgz
+
+VIOLET_ARCH=aarch32 packs the 32-bit Python instead (build/python-package.vgz).
 
 The handset image has no room for Python, so the agent installs it the first
 time the user asks for a Python app. The package is "VGZ1", the gzip length
 and the gzip of a cpio archive holding:
 
-- /bin/python3: CPython 3.12, static for armv7 musl (tools/build_python.py python)
+- /bin/python3: CPython 3.12, static for AArch64 (or ARMv7) musl (tools/build_python.py python)
 - /lib/python312.zip: the standard library, compiled to .pyc on this Mac
   (Homebrew's python3.12, the same release), minus what cannot run on the phone
 - /lib/python3.12/violet.py and violet_font.bin: the phone's API for Python apps
@@ -30,8 +32,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build_initfs  # noqa: E402
+import build_python  # noqa: E402
 
-PYTHON_ROOT = ROOT / "build/open-toolchain/python-root"
 FONT = ROOT / "build/violet-font.bin"
 HOST_PYTHON = os.environ.get("VIOLET_HOST_PYTHON", "/opt/homebrew/bin/python3.12")
 # Parts of the standard library that need what the phone lacks (a terminal,
@@ -65,9 +67,15 @@ def font():
     return FONT.read_bytes()
 
 
-def stdlib_zip():
+def default_out(arch):
+    """Where the package for `arch` goes: one file per architecture, so a Mac that
+    built for one phone never sends the other phone's Python."""
+    return ROOT / ("build/python-package.vgz" if arch == "aarch32" else f"build/python-package-{arch}.vgz")
+
+
+def stdlib_zip(python_root):
     """The standard library as sourceless .pyc files in a zip (zipimport reads them)."""
-    lib = PYTHON_ROOT / "lib/python3.12"
+    lib = python_root / "lib/python3.12"
     check = subprocess.run([HOST_PYTHON, "-c", "import sys; print(sys.version.split()[0])"], capture_output=True, text=True)
     version = check.stdout.strip()
     if not version.startswith("3.12."):
@@ -100,19 +108,20 @@ def stdlib_zip():
     return buf.getvalue()
 
 
-def archive():
-    binary = PYTHON_ROOT / "bin/python3"
+def archive(arch):
+    python_root = build_python.TARGETS[arch].pyroot
+    binary = python_root / "bin/python3"
     if not binary.exists():
-        raise SystemExit("Build Python for the phone first: python3 tools/build_python.py python")
+        raise SystemExit(f"Build Python for the phone first: VIOLET_ARCH={arch} python3 tools/build_python.py python")
     # The image's release gate, for the one place the phone's python3 ships
     # (the handset image leaves it out): position-independent, RELRO sealed,
     # loadable. A python3 linked before these rules is refused, not packed.
     import elf_check
     try:
-        elf_check.check({"bin/python3": binary.read_bytes()}, allow_fixed=elf_check.fixed_allowed())
+        elf_check.check({"bin/python3": binary.read_bytes()}, allow_fixed=elf_check.fixed_allowed(), arch=arch)
     except SystemExit as e:
-        raise SystemExit(f"{e}\nrelink it with python3 tools/build_python.py python")
-    stdlib = stdlib_zip()
+        raise SystemExit(f"{e}\nrelink it with VIOLET_ARCH={arch} python3 tools/build_python.py python")
+    stdlib = stdlib_zip(python_root)
     files = {
         "bin/python3": (binary.read_bytes(), 0o100755),
         "lib/python312.zip": (stdlib, 0o100644),
@@ -134,8 +143,9 @@ def archive():
 
 
 def main():
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build/python-package.vgz"
-    data, raw = archive()
+    arch = build_initfs.arch_of()
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else default_out(arch)
+    data, raw = archive(arch)
     out.write_bytes(data)
     print(f"python package: {len(data)} bytes ({raw} unpacked) -> {out}")
 
