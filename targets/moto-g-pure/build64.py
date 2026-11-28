@@ -19,7 +19,7 @@ volume, the boot history and the two catalog banks. What differs:
 - verified boot: loader.c `verified()` checks the kernel and the supervisor
   against a manifest signed for MOTO (link_loader signs it for the kernel it
   links); a refusal is boot stage 90 + the reason. No stored floor (LK keeps
-  none). Not run on the phone;
+  none). Accepted and refused on the phone (README, AArch64 boot path);
 - the supervisor, services, Storage, Sentinel and Open Runtime are the AArch32
   build's sources for VIOLET_ARCH=aarch64 (image/packages/build.py), and the
   open apps are aarch64 Linux programs (tools/build_initfs.py).
@@ -237,7 +237,9 @@ def build(out, stock_path, probe_stage=None):
         (out / "developer-key.h").write_text("static unsigned char developer_key[] = {" +
                                              ",".join(map(str, signer.keys[DEVELOPER_KEY_ID])) + "};\n")
         defines.append("-DVIOLET_DEVELOPER_KEY")
-    for name, flags in [("loader-history.a", ["--cfg", "loader_trace", "--cfg", "package_catalog"]),
+    # The loader's one Rust library: the boot history and, verified boot
+    # (link_loader), verified_entry.rs with the supervisor's pinned keys.
+    for name, flags in [("loader-history.a", ["--cfg", "loader_trace", "--cfg", "package_catalog", "--cfg", "loader_verified"]),
                         ("root-history.a", ["--cfg", "package_catalog"])]:
         run(rust + ["--crate-type=staticlib", "--cfg", "boot_trace", *flags, HERE / "boot_trace.rs", "-o", name])
     run(common + [f"-DROOT_BYTES={ROOT_BYTES:#x}", "-c", loader_dir / "root64.S", "-o", "supervisor-entry.o"])
@@ -256,10 +258,9 @@ def build(out, stock_path, probe_stage=None):
     if len(root) > ROOT_BYTES - 8192:
         sys.exit(f"root.bin is {len(root)} bytes: under 8192 bytes would be left for the root task's stack")
     print(sign_summary(signer))
-    # The loader's verified-boot check (link_loader): verified_lib.rs with the
-    # supervisor's pinned keys, and the same BearSSL objects.
-    run(rust + ["--crate-type=staticlib", REPO / "boot/loader/verified_lib.rs", "-o", "loader-verified.a"])
-    verified = [str(out / "loader-verified.a"), str(out / "verify-crypto.o"), str(build_crypto(REPO, out, common)[1])]
+    # The loader's verified-boot check (link_loader): verified_entry.rs, in
+    # loader-history.a, over the same BearSSL objects as the supervisor's.
+    verified = [str(out / "verify-crypto.o"), str(build_crypto(REPO, out, common)[1])]
     (out / "loader.json").write_text(json.dumps({"defines": defines, "cc": str(cc), "verified": verified}) + "\n")
 
     # The open apps for aarch64 Linux (the handset's set), gzip in the ramdisk.

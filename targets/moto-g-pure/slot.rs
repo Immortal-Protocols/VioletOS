@@ -31,7 +31,14 @@
 //!  20  reserved[8]
 //!  28  crc32_le         CRC-32 (zlib) of bytes 0..28
 //!
-//! What is NOT established from the files: that Motorola's bootloader
+//! Seen on the phone since (November 28, 2026, README.md "AArch64 boot
+//! path"): LK reads this record. The tries it held matched fastboot's
+//! slot-retry-count, and after the AArch64 handset build marked B
+//! (emmc.rs mark_running_slot, `--cfg slot_mark`) fastboot reported
+//! slot-successful:_b yes and stopped spending B's tries. The running slot
+//! comes from androidboot.slot_suffix (loader.c running_slot).
+//!
+//! What was NOT established from the files alone: that Motorola's bootloader
 //! (MBM-2.1, LK) reads this record rather than a private copy (the 3-bit
 //! retry field matches the 7 retries fastboot reported, nothing more); the
 //! LBA of misc (it is found by name in the live, CRC-checked GPT, never

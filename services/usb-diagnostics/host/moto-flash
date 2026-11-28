@@ -196,6 +196,17 @@ def select_b(fallback_reboots):
     `set_active b`, as before this check.
     """
     fastboot("set_active", "b")
+    # The 64-bit image marks B successful once healthy (targets/moto-g-pure
+    # README, "Slot B is marked successful"), and LK never falls back from a
+    # marked slot: make the new image a counted trial. Switching to A and back
+    # gives B 7 tries, unmarked; A is only selected, never written.
+    if getvar("slot-successful:_b") == "yes":
+        log("Slot B is marked successful; set_active a, set_active b so the new image is a counted trial")
+        fastboot("set_active", "a")
+        fastboot("set_active", "b")
+        if getvar("slot-successful:_b") == "yes":
+            raise SystemExit("Slot B is still marked successful after set_active a/b: an image that does not boot "
+                             "would never fall back to A. boot_b is written; the handset is in fastboot.")
     tries, a_bootable = getvar("slot-retry-count:_b"), getvar("slot-bootable:_a")
     if tries != "0" or a_bootable != "No":
         return

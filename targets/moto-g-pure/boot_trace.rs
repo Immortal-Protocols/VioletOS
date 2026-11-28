@@ -11,6 +11,12 @@ use emmc::PackageDisk as Disk;
 #[path = "../../system/package-manager/catalog_volume.rs"]
 mod catalog_volume;
 
+// The AArch64 handset loader's verified-boot check, in this one library
+// (build64.py): two Rust static libraries would each bring a panic handler.
+#[cfg(loader_verified)]
+#[path = "../../boot/loader/verified_entry.rs"]
+mod verified_entry;
+
 #[no_mangle]
 pub extern "C" fn record_boot_stage(stage: u8) -> u32 {
     match emmc::Disk::open_checked().ok().and_then(|mut d| d.boot_record(stage).ok()) {

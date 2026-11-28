@@ -315,6 +315,10 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
                 *(["--cfg", "open_fault_probe"] if name == "open" and os.environ.get("VIOLET_TEST_FAULT") == "1"
                   and os.environ.get("VIOLET_RELEASE") != "1" else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
+                # The AArch64 handset marks its running boot slot successful
+                # (targets/moto-g-pure/emmc.rs mark_running_slot): only misc's
+                # bootloader_control record, after the supervisor's health signal.
+                *(["--cfg", "slot_mark"] if target == "moto" and name == "storage" and arch == "aarch64" else []),
                 crate,
                 "-o",
                 lib,

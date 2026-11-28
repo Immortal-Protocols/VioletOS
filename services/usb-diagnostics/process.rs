@@ -417,13 +417,25 @@ pub fn run() -> ! {
             // The architecture this VioletOS runs in (its word size), the level the
             // AArch64 loader was entered at, and the supervisor's last fault record
             // (who, label, four message words), then why the loader could not open the
-            // boot history (16 bytes of text): diagnostic words 54-64.
+            // boot history (16 bytes of text), then the AArch64 loader's verified-boot
+            // word ("VB" and the system version it accepted): diagnostic words 54-65.
             (0xc0, 0x59, 0, 0) => {
-                let mut out = [0; 52];
+                let mut out = [0; 56];
                 out[..4].copy_from_slice(b"VAR1");
                 out[4..8].copy_from_slice(&(usize::BITS).to_le_bytes());
                 for (i, dest) in out[8..].chunks_exact_mut(4).enumerate() {
                     dest.copy_from_slice(&unsafe { (0x09202000 as *const u32).add(54 + i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
+            // The AArch64 handset's boot-slot mark (supervisor.c mark_running_slot):
+            // the loader's "SL" word, Storage's status, the attempts, whether it
+            // wrote, the slot, misc's record as read and its slot halfwords after.
+            (0xc0, 0x5a, 0, 0) => {
+                let mut out = [0; 64];
+                out[..4].copy_from_slice(b"VSL1");
+                for (i, dest) in out[4..].chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { (0x09202000 as *const u32).add(66 + i).read_volatile() }.to_le_bytes());
                 }
                 send(&out, len);
             }

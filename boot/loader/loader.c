@@ -170,6 +170,25 @@ static unsigned radio_profile(const void *dt) {
     return 0;
 }
 #ifdef __aarch64__
+// The boot slot LK started, from androidboot.slot_suffix in the handoff's
+// bootargs (or Motorola's mmi,bootconfig): "SL" and 1 for _a, 2 for _b, or 0
+// when no property names one or two disagree. The supervisor hands it to
+// Storage to mark that slot successful once the system is healthy.
+static unsigned running_slot(const void *dt) {
+    int chosen=fdt_path_offset(dt,"/chosen"),len;
+    const char *props[]={"mmi,bootconfig","bootargs"};
+    unsigned seen=0;
+    for (unsigned i=0;i<2;i++) {
+        const char *s=fdt_getprop(dt,chosen,props[i],&len);
+        if (!s) continue;
+        unsigned a=boot_token(s,len,"androidboot.slot_suffix=_a"), b=boot_token(s,len,"androidboot.slot_suffix=_b");
+        if (a && b) return 0;
+        unsigned here=a ? 1 : b ? 2 : 0;
+        if (here && seen && here!=seen) return 0;
+        if (here) seen=here;
+    }
+    return seen ? 0x534c0000u | seen : 0;
+}
 // Bring-up evidence without a console (targets/moto-g-pure/README.md,
 // "AArch64 boot path"): the MT6357 RTC fast-boot flag (RTC_PDN1 bit 13, as
 // Power's set_fastboot and probe64/a64.S set it) and a TOPRGU reset, so LK
@@ -251,6 +270,8 @@ extern char boot_manifest[], boot_manifest_end[];
 // no rollback floor, so the handset's check has none (version 0 is still
 // refused). The /apps image is the ramdisk where LK put it (layout_ok()).
 static unsigned verified_refused;
+// The system version the check accepted, for USB Diagnostics ("VB" word).
+static unsigned verified_version;
 static void say(const char *s) { (void)s; }
 static void say_number(unsigned v) { (void)v; }
 #else
@@ -285,6 +306,7 @@ static int verified(void) {
 #ifdef VIOLET_MOTO
     boot_progress();
     verified_refused = why;
+    verified_version = why ? 0 : version;
 #endif
     if (!why) {
         say("VioletOS loader: verified boot, system version ");
@@ -403,6 +425,14 @@ void prepare(const void *dt)
 #ifdef __aarch64__
     // "EL" and the level LK entered the kernel at (0x454c0002: EL2).
     *(volatile unsigned *)0x43ffffd0 = 0x454c0000u | dt_fallback | (entry_el >> 2);
+    // "SL" and the boot slot LK started (running_slot).
+    *(volatile unsigned *)0x43ffffb8 = running_slot(dt);
+    // "VB" and the system version verified boot accepted (0: not checked).
+#ifdef VIOLET_VERIFIED_BOOT
+    *(volatile unsigned *)0x43ffffbc = 0x56420000u | (verified_version & 0xffff);
+#else
+    *(volatile unsigned *)0x43ffffbc = 0;
+#endif
 #endif
     *(volatile unsigned *)0x43dffffc = volume_load((void *)0x43c00000);
     // Resume the bootloader's USB peripheral clock for the diagnostic device.

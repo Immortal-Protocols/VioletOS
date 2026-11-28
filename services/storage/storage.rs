@@ -167,6 +167,10 @@ mod ota {
     }
 }
 
+/// The supervisor's request to mark the running slot (ota.rs MARK's number, "OTAK").
+#[cfg(slot_mark)]
+const MARK_SLOT: u32 = 0x4f54_414b;
+
 /// The 64 KiB window shared with the Open Runtime for the app extent.
 const APP_WINDOW: *mut u8 = 0x0d30_0000 as *mut u8;
 const APP_WINDOW_SECTORS: usize = 128;
@@ -284,6 +288,34 @@ pub extern "C" fn storage_task() {
                 ota::serve(d, &mut updater, m.op == STORAGE_APPS + 1, m.value & !ota::SLOT, m.arg)
             } else {
                 Message::error(OFFLINE)
+            };
+            response.reply();
+            continue;
+        }
+        // The handset: mark the boot slot the loader says LK started
+        // successful (emmc.rs mark_running_slot). `value` is the loader's
+        // "SL" word, passed on by the supervisor; anything else writes nothing.
+        #[cfg(slot_mark)]
+        if m.op == MARK_SLOT && badge == 0 {
+            let response = match (m.value >> 16 == 0x534c, m.value & 0xffff) {
+                (true, n @ (1 | 2)) => match disk.as_mut() {
+                    Some(d) => {
+                        let (mut before, mut after) = ([0u8; 32], [0u8; 32]);
+                        match d.mark_running_slot(n as usize - 1, &mut before, &mut after) {
+                            Ok(changed) => {
+                                let mut r = Message::result(changed as u32);
+                                r.arg = n - 1;
+                                r.data = before;
+                                r.tail.copy_from_slice(&after[12..20]);
+                                r
+                            }
+                            Err(crate::block::slot::Error::Io) => Message::error(OFFLINE),
+                            Err(_) => Message::error(INVALID),
+                        }
+                    }
+                    None => Message::error(OFFLINE),
+                },
+                _ => Message::error(DENIED),
             };
             response.reply();
             continue;

@@ -1012,6 +1012,10 @@ static void open_runtime(void) {
   // And why it could not open the boot history, if it could not (words 61-64).
   for (unsigned i = 0; i < 4; i++)
     ((volatile unsigned *)0x09202000)[61 + i] = VM_AARCH64 ? ((volatile unsigned *)0x09f00000)[0xfffc0 / 4 + i] : 0;
+  // The AArch64 loader's verified-boot word: "VB" and the version it accepted (word 65).
+  ((volatile unsigned *)0x09202000)[65] = VM_AARCH64 ? ((volatile unsigned *)0x09f00000)[0xfffbc / 4] : 0;
+  // And its "SL" word: the boot slot LK started (word 66; mark_running_slot).
+  ((volatile unsigned *)0x09202000)[66] = VM_AARCH64 ? ((volatile unsigned *)0x09f00000)[0xfffb8 / 4] : 0;
 #endif
   if (((volatile unsigned *)0x09f00000)[0xfffec / 4] == 0x4e45504f) {
     open_setup[0] = 4;
@@ -2029,6 +2033,28 @@ static bool ota_storage(unsigned op, unsigned value, const unsigned in[8], unsig
   for (unsigned i = 0; out && i < 12; i++) out[i] = seL4_GetMR(2 + i);
   return true;
 }
+#if defined(VIOLET_MOTO) && VM_AARCH64
+// The AArch64 handset: ask Storage to mark the boot slot the loader saw LK
+// start (diagnostic word 66, "SL" and 1 or 2) successful, the stock HAL's
+// MarkBootSuccessful on misc's bootloader_control (targets/moto-g-pure/emmc.rs
+// mark_running_slot). For USB Diagnostics (request 0x5a, "VSL1"): word 67
+// Storage's status (0 done), 68 the attempts, 69 whether it wrote, 70 the
+// slot, 71-78 the record as read, 79-80 its slot halfwords afterwards.
+static bool mark_running_slot(void) {
+  volatile unsigned *diag = (void *)0x09202000;
+  for (unsigned i = 0; i < 14; i++) seL4_SetMR(i, 0);
+  seL4_SetMR(0, 0x4f54414b);
+  seL4_SetMR(2, diag[66]);
+  seL4_MessageInfo_t reply = seL4_Call(procs[STORAGE].ep, seL4_MessageInfo_new(0, 0, 0, 14));
+  unsigned status = seL4_MessageInfo_get_length(reply) == 14 ? (unsigned)seL4_GetMR(0) : 0xffffffffu;
+  diag[68] += 1;
+  if (status == 0)
+    for (unsigned i = 0; i < 12; i++) diag[69 + i] = (unsigned)seL4_GetMR(2 + i);
+  __sync_synchronize();
+  diag[67] = status;
+  return status == 0;
+}
+#endif
 // The update's version, or 0 with *why set (ota.rs; 8: Storage refused or
 // has no inactive slot, 9: the switch itself failed).
 static unsigned ota_request(bool apply, unsigned *why) {
@@ -2136,8 +2162,13 @@ void root_main(seL4_BootInfo *bi) {
             // And the boot slot: the bootloader stops spending its tries on
             // it (Storage writes nothing if it is already marked). A request
             // Storage could not carry out is sent again a little later.
+#if defined(VIOLET_MOTO) && VM_AARCH64
+            if (procs[STORAGE].package && ota_mark_due(settled, ticks()))
+              ota_mark_result(mark_running_slot(), ticks(), freq);
+#else
             if (procs[STORAGE].package && ota_mark_due(settled, ticks()))
               ota_mark_result(ota_storage(0x4f54414b, 0, 0, 0), ticks(), freq);
+#endif
           }
           seL4_Yield();
           continue;
