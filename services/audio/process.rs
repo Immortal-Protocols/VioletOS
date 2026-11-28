@@ -109,6 +109,9 @@ impl Button {
     }
 }
 
+/// The loop's period while idle, in milliseconds.
+const IDLE_MS: u32 = 4;
+
 struct Audio {
     caps: u32,
     level: u32,
@@ -504,15 +507,20 @@ pub fn run() -> ! {
         audio.poll_inputs();
         audio.poll_mic();
         audio.pump();
+        let playing = audio.playing();
         board::publish(
             audio.level,
             audio.flags(),
             audio.serial,
-            audio.playing(),
+            playing,
         );
         let m = audio.microphone();
         board::publish_mic(m.arg, m.value);
         audio.snapshot();
-        unsafe { delay_ms(1) };
+        // Every millisecond while there are samples to move; with nothing
+        // playing and the microphone off, the buttons, the jack and a new
+        // stream are looked at every IDLE_MS (a command waits that long at
+        // most), so an idle phone is not woken a thousand times a second.
+        unsafe { delay_ms(if playing == 0 && audio.mic_mode == MIC_OFF { IDLE_MS } else { 1 }) };
     }
 }

@@ -206,11 +206,16 @@ fn band_system(mode: Mode, indicators: u32) {
     if indicators != 0 {
         rect(282, 2, 144, BAND_H - 4, BG);
     }
+    lamps(indicators, 290, 362);
+}
+
+/// MIC and CAM in the band while an app holds them, then the band is shown.
+fn lamps(indicators: u32, mic_x: u32, cam_x: u32) {
     if indicators & 1 != 0 {
-        text(290, 6, "MIC", 3, OK_GREEN);
+        text(mic_x, 6, "MIC", 3, OK_GREEN);
     }
     if indicators & 2 != 0 {
-        text(362, 6, "CAM", 3, ALERT);
+        text(cam_x, 6, "CAM", 3, ALERT);
     }
     shown(0, BAND_H);
 }
@@ -439,13 +444,7 @@ impl Runtime {
         if installed {
             text(16 + (title.len() as u32 + 1) * 18, 9, "INSTALLED", 2, AMBER);
         }
-        if indicators & 1 != 0 {
-            text(720 - 16 - 3 * 18, 6, "MIC", 3, OK_GREEN);
-        }
-        if indicators & 2 != 0 {
-            text(720 - 16 - 7 * 18, 6, "CAM", 3, ALERT);
-        }
-        shown(0, BAND_H);
+        lamps(indicators, 720 - 16 - 3 * 18, 720 - 16 - 7 * 18);
     }
 
     fn ui_draw(&mut self, mode: Mode) {

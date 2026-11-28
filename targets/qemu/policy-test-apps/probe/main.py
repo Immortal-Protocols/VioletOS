@@ -1,4 +1,4 @@
-"""The capability policy from inside an app (targets/qemu/test_policy.py).
+"""The capability policy from inside an app (targets/qemu/test_system.py).
 No manifest, so it may use only its own /data, the screen, touch and the
 unprivileged /dev/violet/sys commands. Each check prints a line; any
 "policy: FAIL" fails the test."""
@@ -49,7 +49,7 @@ expect("write own file", 0, lambda: write("/data/probe"))
 expect("write own dotted file", 0, lambda: write("/data/probe.state"))
 expect("read own file", 0, lambda: read("/data/probe"))
 # Another app's files do not exist, and cannot be made or removed.
-for path in ["/data/victim", "/data/victim.keys", "/data/networks", "/data/agent", "/data/.settings", "/data/.grants", "/data/.shield-mode"]:
+for path in ["/data/victim", "/data/victim.keys", "/data/networks", "/data/agent", "/data/.settings", "/data/.grants", "/data/.shield-mode", "/data/.lock"]:
     expect(f"read {path}", errno.ENOENT, lambda p=path: read(p))
     expect(f"stat {path}", errno.ENOENT, lambda p=path: os.stat(p))
 # Writes look missing too (ENOENT), unless Violet Shield refuses first (EACCES).
@@ -91,6 +91,21 @@ expect("remove the manifests", (errno.EROFS, errno.EACCES), lambda: os.unlink("/
 expect("add to /bin", (errno.EROFS, errno.EACCES), lambda: os.mkdir("/bin/x"))
 expect("add to /", (errno.EROFS, errno.EACCES), lambda: write("/x"))
 expect("read Home's program", 0, lambda: read("/apps/home"))
+# Violet Shield's side doors into another app's program, through the real
+# dispatch (syscall.rs, guard.rs fd_write_error): a write and a truncate
+# through a read-only descriptor, a truncate by path, a read-only open with
+# O_TRUNC. Home's program must come through unchanged.
+home_size = os.stat("/apps/home").st_size
+home_fd = os.open("/apps/home", os.O_RDONLY)
+expect("write Home through a read-only descriptor", errno.EBADF, lambda: os.write(home_fd, b"x"))
+expect("ftruncate Home through a read-only descriptor", (errno.EBADF, errno.EACCES), lambda: os.ftruncate(home_fd, 0))
+os.close(home_fd)
+expect("truncate Home by path", (errno.EROFS, errno.EACCES), lambda: os.truncate("/apps/home", 0))
+expect("open Home read-only with O_TRUNC", (errno.EROFS, errno.EACCES), lambda: os.close(os.open("/apps/home", os.O_RDONLY | os.O_TRUNC)))
+checks += 1
+if os.stat("/apps/home").st_size != home_size:
+    failures.append("Home's program changed")
+    print(f"policy: FAIL Home's program is {os.stat('/apps/home').st_size} bytes, was {home_size}", flush=True)
 # Devices that take a capability, and sockets.
 for node in ["mic", "camera", "hci", "audio"]:
     expect(f"open /dev/violet/{node}", errno.EACCES, lambda n=node: os.close(os.open(f"/dev/violet/{n}", os.O_RDWR)))

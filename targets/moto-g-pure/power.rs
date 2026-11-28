@@ -122,6 +122,15 @@ pub fn battery_percent() -> i32 {
 // (POWER_INFO without the SENSOR and DVFS flags). Trip points are a
 // placeholder that nothing reads until a sensor exists.
 pub const ZONE: Zone = Zone { warm: 60_000, hot: 75_000, critical: 95_000, hysteresis: 5_000 };
+/// The phone's operating points and idle states as its factory device tree
+/// gives them (tools/power_tables.py; checked by `make test-unit`). Data
+/// only, and in no package: `opps()` below stays empty, because switching a
+/// point needs the PLL and VPROC sequence, which is not written, and an idle
+/// state needs PSCI calls the kernel does not pass on. The tree has no
+/// thermal trip points, so ZONE above is still a placeholder.
+#[allow(dead_code)]
+#[path = "power_tables.rs"]
+pub mod tables;
 pub struct Hardware;
 impl Board for Hardware {
     fn temperature(&mut self) -> Reading { Reading::Absent }

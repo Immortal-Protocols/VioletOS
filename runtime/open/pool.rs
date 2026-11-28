@@ -1,8 +1,12 @@
-//! Physical memory for apps: the supervisor's pool untypeds, cut into 64 KiB
-//! pages. Every page stays mapped in the Open Runtime at POOL_VA + index * 64 KiB,
-//! writable and Execute-Never, so reading or writing app memory is a plain
-//! memory access and nothing an app wrote can run in this process. Apps get
-//! copies of the page capabilities, mapped with their own rights (procmgr.rs).
+//! Physical memory for apps: the supervisor's pool untypeds, cut into pages
+//! (sys::PAGE: 4 KiB). Every page stays mapped in the Open Runtime at
+//! POOL_VA + index * PAGE, writable and Execute-Never, so reading or writing
+//! app memory is a plain memory access and nothing an app wrote can run in
+//! this process. Apps get copies of the page capabilities, mapped with their
+//! own rights (procmgr.rs).
+//!
+//! One capability slot per page, in one run, and one more for each page an
+//! app has mapped: sys::CNODE_BITS is sized for both (pages.rs).
 use super::sys::*;
 use alloc::vec::Vec;
 
@@ -31,6 +35,19 @@ pub struct Kernel {
     pub replies: u32,
 }
 
+/// The CSpace holds the pool's pages, one mapping of every page the apps
+/// may hold (each is held by one address space and mapped once there, so
+/// repeated mappings of a screen cannot use slots up), and the kernel
+/// objects (pages.rs `slots_needed`, sys::CNODE_BITS, supervisor.c OPEN_BITS).
+const _: () = assert!(slots_needed(POOL_PAGES, super::HEAP_PAGES) <= SLOTS as usize);
+
+/// The last slot: handed out when every other is in use, to every caller
+/// that asks then. The first finds it empty; the rest find it taken and
+/// their kernel call fails: a system call gets an error, and a fault closes
+/// its app as out of memory (mod.rs). Only kernel objects past
+/// pages.rs OBJECT_SLOTS can get here; the runtime itself does not stop.
+const LAST_SLOT: u32 = SLOTS - 1;
+
 impl Kernel {
     pub fn new() -> Self {
         Self { next_slot: SLOT_DYNAMIC, free_slots: Vec::new(), idle_replies: Vec::new(), replies: 0 }
@@ -39,7 +56,9 @@ impl Kernel {
         if let Some(s) = self.free_slots.pop() {
             return s;
         }
-        assert!(self.next_slot < SLOTS, "out of capability slots");
+        if self.next_slot >= LAST_SLOT {
+            return LAST_SLOT;
+        }
         self.next_slot += 1;
         self.next_slot - 1
     }
@@ -67,7 +86,9 @@ impl Kernel {
     }
     /// Return a slot that is already empty.
     pub fn release(&mut self, slot: u32) {
-        self.free_slots.push(slot);
+        if slot != LAST_SLOT {
+            self.free_slots.push(slot);
+        }
     }
     pub fn object(&mut self, untyped: u32, o: Object, bits: u32) -> Result<u32, i32> {
         let slot = self.slot();
@@ -82,7 +103,7 @@ impl Kernel {
 }
 
 pub fn page_va(index: u32) -> usize {
-    POOL_VA + (index as usize) * PAGE
+    pool_base() + (index as usize) * PAGE
 }
 
 impl Pool {
@@ -95,8 +116,8 @@ impl Pool {
         let mut index = 0u32;
         for (u, &bits) in POOL_BITS.iter().enumerate() {
             for _ in 0..1u32 << (bits - PAGE_BITS) {
-                retype(SLOT_POOL + u as u32, Object::LargePage, PAGE_BITS, first_slot + index)?;
-                let va = page_va(index) as u32;
+                retype(SLOT_POOL + u as u32, PAGE_OBJECT, PAGE_BITS, first_slot + index)?;
+                let va = (POOL_VA + index as usize * PAGE) as u32;
                 if va & 0xf_ffff == 0 {
                     let pt = k.object(SLOT_KERNEL, Object::PageTable, 0)?;
                     pt_map(pt, SLOT_PD, va)?;
@@ -122,6 +143,13 @@ impl Pool {
     }
     pub fn available(&self) -> usize {
         self.free.len()
+    }
+    /// The most pages one app may hold (procmgr.rs `Space::cap`, counted
+    /// over the app and every process it forked or they exec'd): seven
+    /// eighths of the apps' memory, so no single app can take all of it and
+    /// leave the low-memory killer nothing to close but every other app.
+    pub fn app_cap(&self) -> u32 {
+        (self.app_pages - self.app_pages / 8) as u32
     }
     /// A zeroed page.
     pub fn take(&mut self) -> Option<u32> {

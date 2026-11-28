@@ -2,6 +2,17 @@
 //! original stopwatch journal layout. Launcher uses sectors 2–3 and Wi-Fi Setup uses 4–5.
 #[path = "files.rs"]
 mod files;
+// /data: VioletFS on the data volume, served by path (vfs.rs).
+#[path = "legacy.rs"]
+mod legacy;
+#[path = "vfs.rs"]
+mod vfs;
+#[path = "vfsproto.rs"]
+mod vfsproto;
+#[path = "violetfs/mod.rs"]
+mod violetfs;
+#[path = "volume.rs"]
+mod volume;
 use crate::protocol::*;
 use crate::{
     block::Disk,
@@ -160,6 +171,16 @@ mod ota {
 const APP_WINDOW: *mut u8 = 0x0d30_0000 as *mut u8;
 const APP_WINDOW_SECTORS: usize = 128;
 
+/// /data: the filesystem server (vfs.rs) on the volume mount.rs places.
+/// The server is a static that outlives every borrow of the disk, so the
+/// disk is lent to it for the length of one call.
+#[path = "mount.rs"]
+mod mount;
+static mut MOUNT: mount::Mount = mount::Mount::new();
+fn data() -> &'static mut mount::Mount {
+    unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) }
+}
+
 /// Read or write `count` sectors of the installed apps' extent at `first`
 /// through the shared window. A count of 0 asks the size (read) or flushes (write).
 fn apps(d: &mut Disk, write: bool, first: usize, count: usize) -> Message {
@@ -209,6 +230,18 @@ pub extern "C" fn storage_task() {
         let adopted = device.adopt_userdata();
         if adopted.starts_with(b"APPS MOVE") || adopted == b"USERDATA READ" {
             diagnostic = adopted;
+        }
+    }
+    // /data's volume. A disk that is there always answers for it: a volume
+    // that does not open (or has no room, or is not where it was made)
+    // answers ENODEV and is reported, never OFFLINE ("nothing kept").
+    // A disk lost after this (a failed read below or a timed-out commit)
+    // does not turn into "no disk, nothing kept" for /data (see below).
+    let had_disk = disk.is_some();
+    if let Some(device) = disk.as_mut() {
+        let wrong = data().open(device);
+        if !wrong.is_empty() && diagnostic.is_empty() {
+            diagnostic = wrong;
         }
     }
     let mut stages = [files::Stage::new(); 8];
@@ -265,6 +298,23 @@ pub extern "C" fn storage_task() {
         if m.op == 0x56434d54 && badge == 0 {
             let bank = catalog::commit(m.value, m.arg);
             (if bank != 0 { Message::result(bank) } else { Message::error(OFFLINE) }).reply();
+            continue;
+        }
+        // /data, by path (vfsproto.rs): the Open Runtime's requests only.
+        if (STORAGE_APPS..STORAGE_APPS + 2).contains(&m.op) && m.value & vfsproto::VFS != 0 {
+            let response = match disk.as_mut() {
+                _ if badge != 3 || m.op != STORAGE_APPS + 1 || m.value != vfsproto::VFS => Message::error(DENIED),
+                Some(d) => {
+                    let window = unsafe { core::slice::from_raw_parts_mut(APP_WINDOW, vfsproto::WINDOW) };
+                    data().serve(d, window, m.arg as usize);
+                    Message::result(0)
+                }
+                // OFFLINE says there never was a disk (nothing was kept); a
+                // disk that was there and is lost now is a failure (EIO).
+                None if had_disk => Message::error(INVALID),
+                None => Message::error(OFFLINE),
+            };
+            response.reply();
             continue;
         }
         if m.op == STORAGE_DIAGNOSTIC && badge == 3 {

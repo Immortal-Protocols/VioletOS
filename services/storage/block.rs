@@ -4,6 +4,9 @@
 //! request header at 256, status at 272 and one sector at 512.
 use crate::journal::Sector;
 use core::ptr::{read_volatile, write_volatile};
+#[allow(dead_code)]
+#[path = "extent.rs"]
+pub mod extent;
 #[cfg(package_volume)]
 const MMIO: usize = 0x0a003000;
 #[cfg(not(package_volume))]
@@ -34,6 +37,8 @@ pub struct Disk {
     index: u16,
     retired: bool,
     pub sectors: usize,
+    /// The data volume's extent once Storage has placed it (`use_data`).
+    data: extent::Place,
 }
 impl Disk {
     #[cfg(not(package_volume))]
@@ -87,6 +92,7 @@ impl Disk {
         Some(Self {
             index: 0,
             retired: false,
+            data: extent::NOWHERE,
             sectors: if reg(0x104) != 0 {
                 usize::MAX
             } else {
@@ -195,13 +201,44 @@ impl Disk {
         }
         self.write(APPS + index, bytes)
     }
+    /// Where extent.rs would put a data volume on this disk.
+    #[allow(dead_code)]
+    pub fn data_offer(&self) -> extent::Place {
+        let (first, count) = extent::qemu(self.sectors);
+        extent::Place { first: first as u32, count: count as u32, raw: false }
+    }
+    /// Serve the data volume from `p` (services/storage/mount.rs decides).
+    #[allow(dead_code)]
+    pub fn use_data(&mut self, p: extent::Place) {
+        self.data = p;
+    }
+    /// The data volume's extent (volume.rs holds VioletFS in it), and
+    /// nothing outside it: none until it is placed.
+    #[allow(dead_code)]
+    pub fn data_sectors(&self) -> usize {
+        self.data.count as usize
+    }
+    #[allow(dead_code)]
+    pub fn data_read(&mut self, index: usize) -> Result<Sector, ()> {
+        if index >= self.data_sectors() {
+            return Err(());
+        }
+        self.read(self.data.first as usize + index)
+    }
+    #[allow(dead_code)]
+    pub fn data_write(&mut self, index: usize, bytes: &mut Sector) -> Result<(), ()> {
+        if index >= self.data_sectors() {
+            return Err(());
+        }
+        self.write(self.data.first as usize + index, bytes)
+    }
 }
 /// Full-system updates (services/storage/slotwrite.rs, tools/ota_boot.py):
 /// on a data disk large enough (make test-ota makes one), misc at 16 MiB
 /// with bootloader_control in its fifth sector, then two 64 MiB boot slots.
 /// A smaller disk has no slots and updates are unavailable.
 #[allow(dead_code)]
-const OTA_MISC: usize = 32768;
+const OTA_MISC: usize = extent::QEMU_OTA_MISC;
 #[allow(dead_code)]
 const OTA_SLOT: [usize; 2] = [34816, 34816 + 131072];
 #[allow(dead_code)]
@@ -236,6 +273,6 @@ impl Disk {
     }
 }
 #[allow(dead_code)]
-const APPS: usize = 4096;
+const APPS: usize = extent::QEMU_APPS;
 #[allow(dead_code)]
-const APP_SECTORS: usize = 24576;
+const APP_SECTORS: usize = extent::QEMU_APP_SECTORS;

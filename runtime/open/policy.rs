@@ -1,428 +1,308 @@
-//! The Open Runtime's capability policy: default deny.
+//! The Open Runtime's capability policy: an enforcement stub. Default deny.
 //!
 //! seL4 isolates every app in hardware and stamps every trapped system call
 //! with an unforgeable badge, so the runtime always knows which app asks. What
-//! the app may then do is decided here, in pure functions the host tests run
-//! (runtime/open/tests/policy_host.rs, `make test-unit`); manifest.rs applies
-//! them at the one place each power is granted: socket creation, the open of
-//! each /dev/violet node, each /dev/violet/sys command and every path.
+//! the app may then do is decided by the Sentinel, a component with its own
+//! address space (system/sentinel/): the manifest rules, the path namespace,
+//! the capability each device node and /dev/violet/sys command needs, and
+//! the user's consent answers, which it keeps and hands back only sealed
+//! with a key this process never sees. manifest.rs applies the answers at
+//! the one place each power is granted: socket creation, the open of each
+//! /dev/violet node, each /dev/violet/sys command and every path.
 //!
-//! An app's powers come from its manifest ("caps:" and "data:" lines):
-//!   - a built-in app's is checked in next to it (apps/open/NAME/manifest.txt,
-//!     packed into the image's /apps/.manifests by tools/build_initfs.py);
-//!   - an Agent-built app's travels at the end of its program (`envelope`),
-//!     written by tools/agent_build.py;
-//!   - anything else (no manifest, a program pushed over USB, one written at
-//!     run time) gets only its own /data, the screen, touch and the
-//!     unprivileged /dev/violet/sys commands.
-//! Privileged powers (wifi-admin, system) and shared /data files count only
-//! in the boot image's manifests. Net, the microphone and the camera of an
-//! Agent-built app are asked of the user (`ask` answers `Ask`); the answer is
-//! kept by the runtime in /data/.grants, which no app can open.
+//! Every function here asks over IPC (system/sentinel/client.rs) and fails
+//! closed: no answer, an answer to another question, a verdict that is not
+//! one, or output that does not match its checksum is a refusal. Nothing in
+//! this file can turn a missing answer into a yes.
+//!
+//! This runtime is still the enforcement point, and every input to a decision
+//! (origin, manifest text, owner, path) is what it tells the Sentinel. So the
+//! split does not constrain a compromised runtime, which can skip the
+//! question or ask with a lie; it keeps the consent store and the sealing
+//! key out of this address space (system/sentinel/README.md).
+//!
+//! What stays here decides nothing about a running app: the vocabulary (Cap,
+//! Decision, Origin, ...) and the manifest text helpers (system/sentinel/
+//! common.rs), the manifest text an app runs under (`Profile`, which the
+//! Sentinel parses on every question), and the sealed text of the consent
+//! store as last handed back (`Grants`), which manifest.rs writes to
+//! /data/.grants. On a host build the stub is joined to the real Sentinel
+//! engine in memory (system/sentinel/hostlink.rs), so host tests run the
+//! shipped stub, wire format and decisions.
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Unforgeable caller identity assigned by seL4 endpoint badging.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AppId(pub u32);
+/// The vocabulary and the wire format, shared with the Sentinel.
+#[path = "../../system/sentinel/common.rs"]
+pub mod wire;
+#[path = "../../system/sentinel/client.rs"]
+mod client;
+#[cfg(not(target_os = "none"))]
+#[path = "../../system/sentinel/hostlink.rs"]
+pub mod port;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccessMode {
-    Read,
-    Write,
-    Exec,
-}
+use wire as common;
+#[allow(unused_imports)]
+pub use wire::{envelope, image_manifest, owns_data, shared_by_image, split_manifest};
+#[allow(unused_imports)]
+pub use wire::{AccessMode, Action, AppId, Cap, Decision, Origin, CAPS, CONSENT, EACCES, ENOENT, EROFS, PRIVILEGED, STAGED};
+use wire::*;
 
-/// What Violet Shield (shield.rs) is shown of each guarded call.
-#[derive(Clone, Copy, Debug)]
-pub enum Action<'a> {
-    OpenPath { path: &'a str, mode: AccessMode },
-    Connect { host: &'a str, port: u16 },
-    Bind { port: u16 },
-    BackgroundAudio,
-    AllocMemory { total_bytes: usize },
-    SpawnThread { total_threads: usize },
-    SpawnApp { path: &'a str },
-    SystemControl { command: &'a str },
-    /// `mmap`/`mprotect` asking for pages that are writable and executable at once.
-    MapWriteExec { addr: u32, len: u32 },
-}
+/// The kernel edge: the endpoint the supervisor put in this process's CSpace
+/// and the two windows it mapped (system/supervisor/supervisor.c, "Sentinel").
+#[cfg(target_os = "none")]
+mod port {
+    use super::client::Port;
+    use super::common::{REQ_MAGIC, WINDOW};
+    use crate::protocol::{Message, EXECUTE};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
-    Allow,
-    /// Returned to the app as `EACCES` (-13).
-    Deny,
-    /// Only the user can say: the trusted UI asks (trusted_ui.rs `request_consent`).
-    Ask,
-}
+    /// OPEN_SLOT_SENTINEL.
+    const SLOT: u32 = 9;
+    /// Two pages this process writes and the Sentinel only reads.
+    const REQUEST: usize = 0x0914_0000;
+    /// Two pages the Sentinel writes and this process only reads.
+    const REPLY: usize = 0x0914_8000;
 
-/// A power an app's manifest can declare. The bit numbers are those the
-/// trusted UI's prompts use (sysui.rs `Cap`): Net 0, Mic 2, Camera 4, Hci 5.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Cap {
-    /// TCP and UDP sockets (and name lookups, which need one).
-    Net = 0,
-    /// /dev/violet/audio, `sound` and `volume`.
-    AudioOut = 1,
-    /// /dev/violet/mic and `mic`.
-    Mic = 2,
-    /// /dev/violet/camera.
-    Camera = 4,
-    /// /dev/violet/hci (Bluetooth).
-    Hci = 5,
-    /// `wifi join|leave`, `relay on|off|...`.
-    WifiAdmin = 6,
-    /// Home, Settings and the Agent: `open`, `launch`, `install`, `uninstall`,
-    /// Shield settings and link, the Agent's staging file, listening to the
-    /// microphone from behind other apps.
-    System = 7,
-}
-
-/// Each capability and its word in a manifest.
-pub const CAPS: [(Cap, &str); 7] = [
-    (Cap::Net, "net"),
-    (Cap::AudioOut, "audio-out"),
-    (Cap::Mic, "mic"),
-    (Cap::Camera, "camera"),
-    (Cap::Hci, "hci"),
-    (Cap::WifiAdmin, "wifi-admin"),
-    (Cap::System, "system"),
-];
-
-impl Cap {
-    pub fn bit(self) -> u8 {
-        1 << self as u8
+    pub struct Wire;
+    impl Port for Wire {
+        fn window(&mut self) -> &mut [u8] {
+            unsafe { core::slice::from_raw_parts_mut(REQUEST as *mut u8, WINDOW) }
+        }
+        fn call(&mut self, seq: u32, len: u32, crc: u32) -> Option<[u32; 6]> {
+            // Test images only (VIOLET_SENTINEL_FAULT=1 at build time): a
+            // request about a path ending in "sentinel-fault-probe" has one
+            // bit changed after it was summed, as a damaged runtime would
+            // send it. The Sentinel must refuse it.
+            #[cfg(sentinel_fault)]
+            {
+                let frame = &mut self.window()[..len as usize];
+                if frame.ends_with(b"sentinel-fault-probe") {
+                    frame[len as usize - 1] ^= 1;
+                }
+            }
+            let mut m = Message::new(EXECUTE, REQ_MAGIC, seq).with_arg(len);
+            m.data[..4].copy_from_slice(&crc.to_le_bytes());
+            let r = m.call(SLOT);
+            let word = |n: usize| u32::from_le_bytes([r.data[n], r.data[n + 1], r.data[n + 2], r.data[n + 3]]);
+            Some([r.op, r.key, r.value, r.arg, word(0), word(4)])
+        }
+        fn output(&self) -> &[u8] {
+            unsafe { core::slice::from_raw_parts(REPLY as *const u8, WINDOW) }
+        }
     }
-    pub fn name(self) -> &'static str {
-        CAPS.iter().find(|(c, _)| *c == self).map_or("?", |(_, n)| *n)
-    }
-    pub fn parse(token: &str) -> Option<Cap> {
-        CAPS.iter().find(|(_, n)| *n == token).map(|(c, _)| *c)
+
+    /// The Open Runtime asks from its one thread.
+    static mut SEQ: u32 = 0;
+    pub fn with<R>(f: impl FnOnce(&mut Wire, u32) -> R) -> R {
+        let seq = unsafe {
+            SEQ = SEQ.wrapping_add(1);
+            SEQ
+        };
+        f(&mut Wire, seq)
     }
 }
 
-/// Only the boot image's manifests can grant these.
-pub const PRIVILEGED: u8 = 1 << Cap::WifiAdmin as u8 | 1 << Cap::System as u8;
-/// An Agent-built app gets these only with the user's consent (the trusted
-/// UI has a prompt for each: sysui.rs `Cap::words`).
-pub const CONSENT: u8 = 1 << Cap::Net as u8 | 1 << Cap::Mic as u8 | 1 << Cap::Camera as u8 | 1 << Cap::Hci as u8;
-
-/// Where the running program's bytes came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    /// /apps/NAME from the boot image, unchanged since boot.
-    Image,
-    /// /apps/NAME installed by the Agent (appstore.rs), as the store holds it.
-    Installed,
-    /// Anything else: pushed over USB, written at run time, started from
-    /// outside its own /apps folder.
-    Other,
+/// Said once: after this every question is refused the same way. Only for a
+/// question that was sent: one too big to send is refused without a word.
+fn unanswered(_op: u8) {
+    #[cfg(target_os = "none")]
+    {
+        static mut TOLD: bool = false;
+        if unsafe { !TOLD } {
+            unsafe { TOLD = true };
+            crate::log!("policy: no valid answer from the Sentinel (request {})", _op);
+        }
+    }
 }
 
+/// Does a request with these fields fit the window (common.rs `encode`)?
+fn fits(fields: &[&[u8]]) -> bool {
+    HEAD + fields.iter().map(|f| f.len()).sum::<usize>() <= WINDOW
+}
+
+/// Ask the Sentinel: its verdict and value. None is a refusal.
+fn call(op: u8, a: u8, b: u8, fields: &[&[u8]]) -> Option<(u32, u32)> {
+    call_out(op, a, b, fields).map(|(v, n, _)| (v, n))
+}
+
+/// As `call`, with the reply's output.
+pub fn call_out(op: u8, a: u8, b: u8, fields: &[&[u8]]) -> Option<(u32, u32, Vec<u8>)> {
+    use client::Port;
+    if !fits(fields) {
+        return None;
+    }
+    let r = port::with(|p, seq| {
+        let r = client::transact(p, seq, op, a, b, fields)?;
+        Some((r.verdict, r.value, Vec::from(&p.output()[..r.len])))
+    });
+    if r.is_none() {
+        unanswered(op);
+    }
+    r
+}
+
+/// The manifest an app runs under: where its program came from and the
+/// manifest's text. The Sentinel reads the text; nothing here does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
     pub origin: Origin,
-    /// Declared capabilities (Cap bits), already limited by the origin.
-    pub caps: u8,
-    /// Files or folders directly in /data shared with this app (image only).
-    pub shared: Vec<String>,
-    /// Reserved /tmp names (".NAME", which covers /tmp/.NAME and
-    /// /tmp/.NAME.*) this app may reach (image only, `tmp:` lines).
-    pub tmp: Vec<String>,
-}
-
-/// A name in /data a manifest may share: not hidden, not a path.
-fn share_name(n: &str) -> bool {
-    (1..=23).contains(&n.len()) && !n.starts_with('.') && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    manifest: String,
 }
 
 impl Profile {
     /// Only its own /data, the screen and touch.
     pub fn minimal(origin: Origin) -> Profile {
-        Profile { origin, caps: 0, shared: Vec::new(), tmp: Vec::new() }
+        Profile { origin, manifest: String::new() }
     }
-    /// A manifest's text: "caps: net audio-out" and "data: networks relay"
-    /// lines, '#' comments. Unknown words and lines are ignored (they never
-    /// add anything); what the origin may not hold is dropped.
+    /// A manifest longer than the Sentinel reads (MANIFEST_MAX) is the
+    /// minimal profile: never a request it refuses, so the app keeps its own
+    /// /data and nothing else.
     pub fn parse(text: &str, origin: Origin) -> Profile {
-        let mut p = Profile::minimal(origin);
-        if origin == Origin::Other {
-            return p;
-        }
-        for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("");
-            let Some((key, rest)) = line.split_once(':') else { continue };
-            match key.trim() {
-                "caps" => {
-                    for c in rest.split(|c: char| c.is_whitespace() || c == ',').filter_map(Cap::parse) {
-                        p.caps |= c.bit();
-                    }
-                }
-                "data" if origin == Origin::Image => {
-                    for n in rest.split(|c: char| c.is_whitespace() || c == ',').filter(|n| share_name(n)) {
-                        if p.shared.len() < 8 && !p.shared.iter().any(|s| s == n) {
-                            p.shared.push(String::from(n));
-                        }
-                    }
-                }
-                "tmp" if origin == Origin::Image => {
-                    for n in rest.split(|c: char| c.is_whitespace() || c == ',') {
-                        if n.strip_prefix('.').is_some_and(share_name) && p.tmp.len() < 8 && !p.tmp.iter().any(|s| s == n) {
-                            p.tmp.push(String::from(n));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if origin != Origin::Image {
-            p.caps &= !PRIVILEGED;
-        }
-        p
-    }
-    pub fn has(&self, cap: Cap) -> bool {
-        self.caps & cap.bit() != 0
+        Profile { origin, manifest: if text.len() > MANIFEST_MAX { String::new() } else { String::from(text) } }
     }
 }
 
-/// The image's /apps/.manifests: "@NAME" on a line, then that app's manifest.
-pub fn image_manifest<'a>(table: &'a str, name: &str) -> Option<&'a str> {
-    let (mut at, mut found) = (0, None);
-    for line in table.split_inclusive('\n') {
-        if let Some(n) = line.trim_end().strip_prefix('@') {
-            if let Some(start) = found {
-                return Some(&table[start..at]);
-            }
-            if n == name {
-                found = Some(at + line.len());
-            }
-        }
-        at += line.len();
-    }
-    found.map(|start| &table[start..])
-}
-
-/// Does an image manifest share a /data name that app `name` would own
-/// (`owns_data`)? Then no installed app may take that name.
-pub fn shared_by_image(table: &str, name: &str) -> bool {
-    table.lines().filter_map(|l| l.strip_prefix("data:")).flat_map(|l| l.split(|c: char| c.is_whitespace() || c == ',')).any(|s| owns_data(name, s))
-}
-
-/// An Agent-built program carries its manifest after it: the program, the
-/// manifest (UTF-8), its length (u16 LE), "VMF1". (At the end, so the
-/// program still starts as itself: the Mac tells a Python app by its "#!".)
-/// Returns the manifest and the program; a blob without one is all program.
-pub fn envelope(data: &[u8]) -> (Option<&str>, &[u8]) {
-    let Some(head) = data.strip_suffix(b"VMF1") else { return (None, data) };
-    let Some((len, body)) = head.split_last_chunk::<2>().map(|(b, l)| (u16::from_le_bytes(*l) as usize, b)) else { return (Some(""), &[]) };
-    match body.len().checked_sub(len).map(|at| (at, core::str::from_utf8(&body[at..]))) {
-        Some((at, Ok(m))) => (Some(m), &body[..at]),
-        // A damaged manifest grants nothing, and the bytes are not a program.
-        _ => (Some(""), &[]),
+/// How many apps the consent store has answers for.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct Rows(u32);
+impl Rows {
+    pub fn len(&self) -> usize {
+        self.0 as usize
     }
 }
 
-/// Split an Agent-built program into its manifest and the program, in
-/// place: the program is the blob's head (`envelope`), so the tail goes.
-pub fn split_manifest(mut blob: Vec<u8>) -> (String, Vec<u8>) {
-    let (manifest, program) = envelope(&blob);
-    let (manifest, keep) = (String::from(manifest.unwrap_or("")), program.len());
-    blob.truncate(keep);
-    (manifest, blob)
-}
-
-/// The user's answers, kept by the runtime in /data/.grants:
-/// "OWNER<TAB>allowed<TAB>denied" lines, Cap bits in hex.
+/// The user's answers to consent prompts. The Sentinel holds them; this is
+/// the sealed text it last handed back, for /data/.grants.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Grants {
-    pub rows: Vec<(String, u8, u8)>,
+    pub rows: Rows,
+    sealed: String,
 }
-
-/// At most this many apps' answers are kept (the oldest go first).
-const GRANT_ROWS: usize = 64;
 
 impl Grants {
+    /// Hand the Sentinel the saved store. Text it did not seal is not
+    /// loaded: every answer is then asked again. The text read stays what
+    /// is saved until the Sentinel hands back a store, so a store that did
+    /// not load (a lost reply) is never overwritten with nothing.
     pub fn parse(text: &str) -> Grants {
-        let mut g = Grants::default();
-        for line in text.lines() {
-            let mut f = line.split('\t');
-            let (Some(owner), Some(a), Some(d)) = (f.next(), f.next(), f.next()) else { continue };
-            let (Ok(a), Ok(d)) = (u8::from_str_radix(a, 16), u8::from_str_radix(d, 16)) else { continue };
-            if !owner.is_empty() && owner.len() <= 24 && !owner.contains(char::is_whitespace) && g.rows.len() < GRANT_ROWS {
-                // Never anything privileged, and a cap answered both ways is denied.
-                g.rows.push((String::from(owner), a & CONSENT & !d, d & CONSENT));
+        let rows = match call(OP_LOAD, 0, 0, &[text.as_bytes()]) {
+            Some((V_ALLOW, rows)) => rows,
+            _ => {
+                if !text.is_empty() {
+                    #[cfg(target_os = "none")]
+                    crate::log!("policy: .grants not opened");
+                }
+                0
             }
-        }
-        g
-    }
-    pub fn format(&self) -> String {
-        let mut s = String::new();
-        for (o, a, d) in &self.rows {
-            s.push_str(&alloc::format!("{}\t{:x}\t{:x}\n", o, a, d));
-        }
-        s
-    }
-    /// What the user said about `cap` for `owner`, if anything.
-    pub fn answer(&self, owner: &str, cap: Cap) -> Option<bool> {
-        let (_, a, d) = self.rows.iter().find(|r| r.0 == owner)?;
-        if d & cap.bit() != 0 {
-            Some(false)
-        } else if a & cap.bit() != 0 {
-            Some(true)
-        } else {
-            None
-        }
-    }
-    /// Keep the user's answer. Only consent capabilities are ever kept.
-    pub fn record(&mut self, owner: &str, cap: Cap, allow: bool) {
-        let bit = cap.bit() & CONSENT;
-        if bit == 0 || owner.is_empty() || owner.len() > 24 || owner.contains(char::is_whitespace) {
-            return;
-        }
-        let row = match self.rows.iter().position(|r| r.0 == owner) {
-            Some(i) => self.rows.remove(i),
-            None => (String::from(owner), 0, 0),
         };
-        let (a, d) = if allow { (row.1 | bit, row.2 & !bit) } else { (row.1 & !bit, row.2 | bit) };
-        if self.rows.len() >= GRANT_ROWS {
-            self.rows.remove(0);
-        }
-        self.rows.push((row.0, a, d));
+        Grants { rows: Rows(rows), sealed: String::from(text) }
+    }
+    /// The sealed store, to save.
+    pub fn format(&self) -> String {
+        self.sealed.clone()
+    }
+    /// Keep the user's answer.
+    pub fn record(&mut self, owner: &str, cap: Cap, allow: bool) {
+        self.update(OP_RECORD, cap as u8, allow as u8, owner);
     }
     pub fn forget(&mut self, owner: &str) {
-        self.rows.retain(|r| r.0 != owner);
+        self.update(OP_FORGET, 0, 0, owner);
+    }
+    /// The Sentinel changes its store before it replies: if the reply is
+    /// lost, ask for the store as it stands, so what is saved is what is
+    /// enforced. With neither, the text held stays (never an empty one).
+    fn update(&mut self, op: u8, a: u8, b: u8, owner: &str) {
+        let take = |r: Option<(u32, u32, Vec<u8>)>| match r {
+            Some((V_ALLOW, rows, out)) if !out.is_empty() => String::from_utf8(out).ok().map(|t| (rows, t)),
+            _ => None,
+        };
+        if let Some((rows, sealed)) = take(call_out(op, a, b, &[owner.as_bytes()])).or_else(|| take(call_out(OP_EXPORT, 0, 0, &[]))) {
+            *self = Grants { rows: Rows(rows), sealed };
+        }
     }
 }
 
-/// `policy::ask(owner, cap)`: may the app `owner`, running under `profile`,
-/// use `cap`? Allow and Deny are final; Ask means the user must be asked.
-pub fn ask(profile: &Profile, grants: &Grants, owner: &str, cap: Cap) -> Decision {
-    let bit = cap.bit();
-    if profile.caps & bit == 0 {
-        return Decision::Deny;
-    }
-    match profile.origin {
-        Origin::Image => Decision::Allow,
-        Origin::Installed if bit & PRIVILEGED != 0 => Decision::Deny,
-        Origin::Installed if bit & CONSENT == 0 => Decision::Allow,
-        Origin::Installed => match grants.answer(owner, cap) {
-            Some(true) => Decision::Allow,
-            Some(false) => Decision::Deny,
-            None => Decision::Ask,
-        },
-        Origin::Other => Decision::Deny,
+/// May the app `owner`, running under `profile`, use `cap`? Allow and Deny
+/// are final; Ask means the user must be asked. (`grants` is the Sentinel's.)
+pub fn ask(profile: &Profile, _grants: &Grants, owner: &str, cap: Cap) -> Decision {
+    match call(OP_ASK, profile.origin as u8, cap as u8, &[owner.as_bytes(), profile.manifest.as_bytes()]) {
+        Some((V_ALLOW, _)) => Decision::Allow,
+        Some((V_ASK, _)) => Decision::Ask,
+        _ => Decision::Deny,
     }
 }
 
 /// The capability a device node needs, if it is one that needs any.
-/// Err(()) for a /dev/violet node that does not exist.
+/// Err(()) for a /dev/violet node that does not exist (or no answer).
 pub fn device_cap(path: &str) -> Result<Option<Cap>, ()> {
-    let Some(node) = path.strip_prefix("/dev/violet/") else { return Ok(None) };
-    match node {
-        "screen" | "events" | "sys" => Ok(None),
-        "audio" => Ok(Some(Cap::AudioOut)),
-        "mic" => Ok(Some(Cap::Mic)),
-        "camera" => Ok(Some(Cap::Camera)),
-        "hci" => Ok(Some(Cap::Hci)),
+    // Not a device node: there is nothing to ask.
+    if !path.starts_with("/dev/violet/") {
+        return Ok(None);
+    }
+    match call(OP_DEVICE, 0, 0, &[path.as_bytes()]) {
+        Some((V_ALLOW, cap)) => client::cap_of(cap),
         _ => Err(()),
     }
 }
 
+/// At most `max` bytes of `s`, ending on a character.
+fn clip(s: &str, max: usize) -> &[u8] {
+    let mut n = s.len().min(max);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    &s.as_bytes()[..n]
+}
+
 /// The capability a /dev/violet/sys command needs; None for the commands
-/// every app may use (home, status, get, set, log, time, wakelock, ...).
+/// every app may use. The Sentinel is shown the command's first two words,
+/// which name it. With no answer the command needs `system`, and the ask for
+/// that is refused too.
 pub fn sys_cap(line: &str) -> Option<Cap> {
     let mut w = line.split_whitespace();
-    match (w.next()?, w.next()) {
-        ("open" | "launch" | "install" | "uninstall" | "shield-agent" | "shield-mode" | "shield-release" | "update", _) => Some(Cap::System),
-        ("wifi", Some("join" | "leave")) | ("relay", Some(_)) => Some(Cap::WifiAdmin),
-        ("mic", _) => Some(Cap::Mic),
-        ("sound" | "volume", _) => Some(Cap::AudioOut),
+    let verb = w.next()?;
+    let fields = [clip(verb, 64), clip(w.next().unwrap_or(""), 64)];
+    match call(OP_SYS, 0, 0, if fields[1].is_empty() { &fields[..1] } else { &fields[..] }) {
+        Some((V_ALLOW, cap)) => client::cap_of(cap).unwrap_or(Some(Cap::System)),
+        _ => Some(Cap::System),
+    }
+}
+
+/// Does an execve of `path` by app `caller` (not Home, Settings or the
+/// Agent: `core`) start another app's program? With no answer it does: the
+/// new program then runs under the caller's name with the minimal profile
+/// (manifest.rs `exec_identity`).
+pub fn exec_crosses(caller: &str, core: bool, path: &str) -> bool {
+    !matches!(call(OP_EXEC, core as u8, 0, &[caller.as_bytes(), path.as_bytes()]), Some((V_ALLOW, 0)))
+}
+
+/// May app `owner` (with `profile`) reach `path`, for writing or not? Err is
+/// the errno the Sentinel chose (ENOENT, EROFS or EACCES); EACCES with no answer.
+pub fn path_rule(owner: &str, profile: &Profile, path: &str, write: bool) -> Result<(), i32> {
+    // Longer than the Sentinel takes: refused without asking.
+    if path.len() > PATH_MAX {
+        return Err(EACCES);
+    }
+    match call(OP_PATH, profile.origin as u8, write as u8, &[owner.as_bytes(), profile.manifest.as_bytes(), path.as_bytes()]) {
+        Some((V_ALLOW, _)) => Ok(()),
+        Some((V_DENY, errno)) if errno as i32 == ENOENT || errno as i32 == EROFS => Err(errno as i32),
+        _ => Err(EACCES),
+    }
+}
+
+/// Seal a small piece of runtime state (the Shield's saved mode) so that
+/// only text the Sentinel sealed is taken back. None: nothing to save.
+pub fn seal_state(label: &str, value: &[u8]) -> Option<String> {
+    match call_out(OP_SEAL, 0, 0, &[label.as_bytes(), value]) {
+        Some((V_ALLOW, _, out)) => String::from_utf8(out).ok(),
         _ => None,
     }
 }
 
-pub const ENOENT: i32 = -2;
-pub const EACCES: i32 = -13;
-pub const EROFS: i32 = -30;
-
-/// The Agent's staging file for installs (appstore.rs): system apps only.
-pub const STAGED: &str = "/apps/.agent-install";
-
-/// Is `name` (a name directly in /data) the app `owner`'s own? An app owns
-/// /data/OWNER (a file, or a folder and all in it) and the files
-/// /data/OWNER.ANYTHING: only names directly in /data are kept across
-/// restarts (services/storage/writeback.rs), so that is where an app keeps
-/// state. App names have no '.', so the owner of a name is unambiguous.
-pub fn owns_data(owner: &str, name: &str) -> bool {
-    !owner.is_empty() && !owner.contains(['.', '/']) && covers(owner, name)
-}
-/// `name` is `prefix` or `prefix.ANYTHING`.
-fn covers(prefix: &str, name: &str) -> bool {
-    name.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-}
-
-/// The app folder NAME of /apps/NAME or /apps/NAME/... (shield.rs `app_folder`).
-fn app_folder(path: &str) -> Option<&str> {
-    path.strip_prefix("/apps/")?.split('/').next().filter(|n| !n.is_empty())
-}
-
-/// Does an execve of `path` by app `caller` (not Home, Settings or the
-/// Agent: `core`) start another app's program? Then the new program is not
-/// that app: it keeps the caller's owner and runs as a program from
-/// outside its own folder (the minimal profile, no image identity), since
-/// the caller chose its arguments, environment (PYTHONPATH, LD_PRELOAD) and
-/// descriptors. Only a launch (`open`/`launch`, the user, the phone) starts
-/// an app as itself.
-pub fn exec_crosses(caller: &str, core: bool, path: &str) -> bool {
-    !core && app_folder(path).is_some_and(|n| n != caller)
-}
-
-/// May app `owner` (with `profile`) reach `path`, for writing or not?
-/// `path` is what the runtime resolved (fs::normalize): absolute, with no
-/// ".", ".." or empty parts, and the file system has no links, so checking
-/// its leading parts is checking the file. Anything else is refused.
-/// Another app's /data names, the runtime's dot files in /data and /tmp and
-/// the staging file look missing (ENOENT) to reads and writes alike, so
-/// whether they exist cannot be told (an O_CREAT open is a read when the
-/// file is there and a write when it is not). Other refused writes are
-/// EACCES, or EROFS for the image's trees (/apps, /bin, /lib, /etc, the root).
-pub fn path_rule(owner: &str, profile: &Profile, path: &str, write: bool) -> Result<(), i32> {
-    let refuse = |rofs: bool| Err(if !write { ENOENT } else if rofs { EROFS } else { EACCES });
-    if !path.starts_with('/') || (path.len() > 1 && path[1..].split('/').any(|p| p.is_empty() || p == "." || p == "..")) {
-        return refuse(false);
+/// What `seal_state` protected, or None for anything else.
+pub fn unseal_state(label: &str, sealed: &[u8]) -> Option<Vec<u8>> {
+    match call_out(OP_UNSEAL, 0, 0, &[label.as_bytes(), sealed]) {
+        Some((V_ALLOW, _, out)) => Some(out),
+        _ => None,
     }
-    let under = |root: &str| path.strip_prefix(root).filter(|r| r.is_empty() || r.starts_with('/'));
-    if let Some(r) = under("/dev") {
-        // Device nodes (which need `device_cap`); nothing new can be made here.
-        let node = matches!(r, "/null" | "/urandom" | "/random" | "/tty" | "/stdout" | "/stderr" | "/console") || r.starts_with("/violet/");
-        return if write && !node { refuse(true) } else { Ok(()) };
-    }
-    for root in ["/tmp", "/data"] {
-        if under(root) == Some("") {
-            return if write { refuse(false) } else { Ok(()) };
-        }
-    }
-    let image = profile.origin == Origin::Image;
-    if let Some(rest) = path.strip_prefix("/tmp/") {
-        // Shared by all apps, except dot names: those only for the image
-        // apps whose manifests name them (Settings' /tmp/.ota-chunk, the
-        // Music and Agent exchange /tmp/.locomo.*).
-        let name = rest.split('/').next().unwrap_or("");
-        return if !name.starts_with('.') || image && profile.tmp.iter().any(|t| covers(t, name)) { Ok(()) } else { Err(ENOENT) };
-    }
-    if let Some(rest) = path.strip_prefix("/data/") {
-        let name = rest.split('/').next().unwrap_or("");
-        let shared = image && profile.shared.iter().any(|s| s == name);
-        // Dot names (/data/.grants, .settings, .shield-mode) are the runtime's.
-        return if !name.starts_with('.') && (owns_data(owner, name) || shared) { Ok(()) } else { Err(ENOENT) };
-    }
-    if path == STAGED {
-        return if image && profile.has(Cap::System) { Ok(()) } else { Err(ENOENT) };
-    }
-    if under("/proc").is_some() {
-        return if write { refuse(false) } else { Ok(()) };
-    }
-    if write { refuse(true) } else { Ok(()) }
 }

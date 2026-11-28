@@ -34,6 +34,19 @@ class Repository(unittest.TestCase):
             self.assertIn(f"| `{option}` | {entry['value']} | {entry['why']} |", readme,
                           f"README.md's row for {option} does not match delta.json")
         self.assertIn("not a verified", readme)
+        # The tables are delta.json's, word for word (python3 kernel/sel4/delta.py --tables).
+        for name, table in delta.tables(manifest).items():
+            self.assertIn(table, readme, f"README.md's {name} table is not the one delta.json generates")
+        self.assertIn(manifest["nearest_verified"]["config"], readme)
+
+    def test_every_change_says_what_it_does_to_the_proofs(self):
+        manifest = delta.load()
+        for group in ("changed", "added", "options"):
+            for name in manifest[group]:
+                broken = copy.deepcopy(manifest)
+                del broken[group][name]["proof"]
+                errors = delta.source_errors(broken)
+                self.assertTrue(any(name in e and "proofs" in e for e in errors), f"{group} {name}: {errors}")
 
     def test_a_changed_source_or_option_is_reported(self):
         manifest = delta.load()
@@ -241,6 +254,109 @@ class Content(unittest.TestCase):
             self.assertIn(entry.get("from"), manifest["sources"], path)
         for path, entry in manifest["added"].items():
             self.assertTrue(entry.get("from") in manifest["sources"] or entry.get("copy_of"), path)
+
+
+class Configuration(unittest.TestCase):
+    """The build's configuration against the nearest verified one."""
+    INCLUDE = """
+set(KernelSel4Arch "aarch32" CACHE STRING "")
+set(KernelAArch32FPUEnableContextSwitch OFF CACHE BOOL "")
+set(KernelVerificationBuild ON CACHE BOOL "")
+set(KernelNumDomains 16 CACHE STRING "")
+set(KernelMaxNumNodes "1" CACHE STRING "")
+"""
+    CONFIG = """
+include(${CMAKE_CURRENT_LIST_DIR}/include/ARM_verified_include.cmake)
+set(KernelPlatform "imx8mm-evk" CACHE STRING "")
+set(KernelAArch32FPUEnableContextSwitch ON CACHE BOOL "" FORCE)
+"""
+    CACHE = """
+// a comment
+KernelSel4Arch:STRING=aarch32
+KernelAArch32FPUEnableContextSwitch:BOOL=ON
+KernelVerificationBuild:BOOL=OFF
+KernelNumDomains:STRING=1
+KernelMaxNumNodes:STRING=1
+KernelPlatform:STRING=ellis
+KernelArmExportVCNTUser:BOOL=ON
+"""
+
+    def manifest(self):
+        return {"verified_configuration": False, "options": {"KernelArmExportVCNTUser": {}}, "nearest_verified": {
+            "config": "configs/ARM_imx8mm_verified.cmake",
+            "differences": {
+                "KernelPlatform": {"verified": "imx8mm-evk", "violetos": "ellis", "proof": "p"},
+                "KernelVerificationBuild": {"verified": "ON", "violetos": "OFF", "proof": "p"},
+                "KernelNumDomains": {"verified": "16", "violetos": "1", "proof": "p"}},
+            "beyond": {"KernelArmExportVCNTUser": "ON"},
+            "build_variants": {"KernelMaxNumNodes": "more cores"}}}
+
+    def errors(self, manifest=None, cache=None):
+        verified = delta.verified_settings([self.INCLUDE, self.CONFIG])
+        return delta.configuration_errors(manifest or self.manifest(), verified, delta.cache_settings(cache or self.CACHE))
+
+    def test_parsing(self):
+        verified = delta.verified_settings([self.INCLUDE, self.CONFIG])
+        # A later file's setting wins (FORCE), quoted or not.
+        self.assertEqual(verified, {"KernelSel4Arch": "aarch32", "KernelAArch32FPUEnableContextSwitch": "ON",
+                                    "KernelVerificationBuild": "ON", "KernelNumDomains": "16", "KernelMaxNumNodes": "1",
+                                    "KernelPlatform": "imx8mm-evk"})
+        self.assertEqual(delta.cache_settings(self.CACHE)["KernelNumDomains"], "1")
+
+    def test_the_recorded_differences_and_no_others(self):
+        self.assertEqual(self.errors(), [])
+        # An option that drifts from the verified value without being listed.
+        drift = self.errors(cache=self.CACHE.replace("FPUEnableContextSwitch:BOOL=ON", "FPUEnableContextSwitch:BOOL=OFF"))
+        self.assertEqual(len(drift), 1)
+        self.assertIn("not listed under nearest_verified", drift[0])
+        gone = self.errors(cache=self.CACHE.replace("KernelSel4Arch:STRING=aarch32\n", ""))
+        self.assertIn("KernelSel4Arch is absent", gone[0])
+        # A listed difference that is no longer what the build does, or no longer a difference.
+        self.assertIn("delta.json says OFF", self.errors(cache=self.CACHE.replace("VerificationBuild:BOOL=OFF", "VerificationBuild:BOOL=ON"))[0])
+        m = self.manifest()
+        m["nearest_verified"]["differences"]["KernelSel4Arch"] = {"verified": "aarch32", "violetos": "aarch32", "proof": "p"}
+        self.assertIn("is aarch32 in both", self.errors(m)[0])
+        # Upstream changing the verified configuration under a recorded difference.
+        m = self.manifest()
+        m["nearest_verified"]["differences"]["KernelNumDomains"]["verified"] = "8"
+        self.assertIn("sets 16, delta.json says 8", self.errors(m)[0])
+        m = self.manifest()
+        m["nearest_verified"]["differences"]["KernelFastpath"] = {"verified": "ON", "violetos": "OFF", "proof": "p"}
+        self.assertIn("does not set it", self.errors(m)[0])
+        m = self.manifest()
+        del m["nearest_verified"]["differences"]["KernelPlatform"]["proof"]
+        self.assertIn("proofs", self.errors(m)[0])
+
+    def test_options_beyond_the_verified_file_and_build_variants(self):
+        self.assertIn("KernelArmExportVCNTUser is OFF", self.errors(cache=self.CACHE.replace("VCNTUser:BOOL=ON", "VCNTUser:BOOL=OFF"))[0])
+        m = self.manifest()
+        m["nearest_verified"]["beyond"]["KernelNumDomains"] = "1"
+        self.assertTrue(any("sets it" in e for e in self.errors(m)))
+        # VIOLET_CORES=4: allowed, because the manifest says what it means.
+        self.assertEqual(self.errors(cache=self.CACHE.replace("MaxNumNodes:STRING=1", "MaxNumNodes:STRING=4")), [])
+        m = self.manifest()
+        del m["nearest_verified"]["build_variants"]
+        self.assertIn("KernelMaxNumNodes is 4", self.errors(m, self.CACHE.replace("MaxNumNodes:STRING=1", "MaxNumNodes:STRING=4"))[0])
+        m = self.manifest()
+        m["verified_configuration"] = True
+        self.assertIn("verified_configuration: false", self.errors(m)[0])
+        self.assertTrue(delta.configuration_errors(self.manifest(), {}, delta.cache_settings(self.CACHE)))
+
+    def test_the_real_manifest_against_upstream_and_any_built_kernel(self):
+        # With the pinned archive present (after any image build), the real
+        # manifest is compared with upstream's own configuration file and with
+        # each kernel build directory there is.
+        archive = delta.REPO / "build/sel4/downloads" / (delta.load()["upstream"]["name"] + ".tar.gz")
+        if not archive.is_file():
+            self.skipTest("the pinned upstream archive has not been downloaded")
+        manifest = delta.load()
+        verified = delta.nearest_verified_settings(manifest, archive)
+        self.assertEqual(verified["KernelPlatform"], "imx8mm-evk")
+        self.assertEqual(set(manifest["nearest_verified"]["differences"]) - set(verified), set())
+        for target in ("qemu", "moto"):
+            cache = delta.REPO / "build/sel4" / target / "kernel/CMakeCache.txt"
+            if cache.is_file() and not any(__import__("os").environ.get(v) for v in ("VIOLET_MCS", "VIOLET_CORES")):
+                self.assertEqual(delta.configuration_errors(manifest, verified, delta.cache_settings(cache.read_text())), [], target)
 
 
 class Smc(unittest.TestCase):

@@ -92,7 +92,7 @@ The Open Runtime is component 24. Unmodified Rust `std`, C (musl), Go and CPytho
 Decisions made while implementing:
 
 - **The Open Runtime builds app processes itself.** Rather than asking the supervisor to map each page, it receives its own CSpace, the ASID pool, kernel memory and the page pool, and is the fault handler of every app thread. The procmgr code lives in `system/supervisor/procmgr.rs` as the skeleton placed it, but is compiled into the Open Runtime.
-- **Pages are 64 KiB.** Every pool page stays mapped in the Open Runtime too, which makes copying to and from apps a plain memory access and keeps the capability count manageable.
+- **Pages are 64 KiB.** Every pool page stays mapped in the Open Runtime too, which makes copying to and from apps a plain memory access and keeps the capability count manageable. (Since changed: pages are 4 KiB, at the cost of a larger capability table; see `runtime/open/README.md`, Memory.)
 - **AArch32 stays** (open question 1). The kernel now uses `TPIDRURO` as its TLS register, which is what Linux ARM programs read.
 - **The handset's image rides in the boot image's ramdisk** (open question 2), compressed, so no new eMMC partition is needed yet; the 16 MiB boot payload limit leaves about 7 MiB for more programs.
 - **Coexistence uses Runtime's client 9.** Built-in apps are unchanged. Home's **/APPS** button gives the Open Runtime the screen; it draws the app list or the app in front itself.

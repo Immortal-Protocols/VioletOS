@@ -1,6 +1,11 @@
 //! The file system open apps see: a read-only image (a cpio "newc" archive
 //! built on the Mac, holding /apps, /bin and /lib) under a writable in-memory
 //! layer. Writing to an image file copies it up; deleting one hides it.
+//!
+//! /data is the part of the layer that is kept: data.rs loads it from the
+//! Storage service's filesystem at start and writes back every path noted in
+//! `changed` (files, folders and removals, at any depth). The rest of the
+//! layer (/tmp, copies of image files) lasts until the restart.
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -26,10 +31,13 @@ pub struct Fs {
     image: BTreeMap<String, ImageEntry>,
     layer: BTreeMap<String, Layer>,
     hidden: BTreeSet<String>,
-    /// Paths under /data written, removed or renamed since the last save.
+    /// Paths under /data written, made, removed or renamed since the last save.
     pub changed: BTreeSet<String>,
-    /// What Storage holds for each file in /data, to write only what differs.
+    /// What Storage holds for each small file in /data, to write only what differs.
     pub stored: BTreeMap<String, Vec<u8>>,
+    /// Names under /data a rename took a file from, until their removal is
+    /// saved: it waits for the new name (services/storage/writeback.rs).
+    pub moved: BTreeSet<String>,
     /// Every directory, from the image, the layer and the parents of files.
     dirs: BTreeSet<String>,
 }
@@ -49,6 +57,23 @@ fn hex(b: &[u8]) -> Option<u32> {
     }
     Some(v)
 }
+const ENAMETOOLONG: i32 = -36;
+/// Can Storage's filesystem hold the name? Under /data a part of a path is
+/// at most 255 bytes and the path below /data at most 1024; a new name that
+/// is not is refused when it is made, so that every file in /data is kept.
+fn keepable(path: &str) -> bool {
+    match path.strip_prefix("/data/") {
+        Some(rest) => rest.len() <= 1024 && rest.split('/').all(|part| part.len() <= 255),
+        None => true,
+    }
+}
+/// Put a path under /data (one that is kept) into `set`.
+#[inline(never)]
+fn note(set: &mut BTreeSet<String>, path: &str) {
+    if path.starts_with("/data/") {
+        set.insert(String::from(path));
+    }
+}
 fn parent(path: &str) -> &str {
     match path.rfind('/') {
         Some(0) | None => "/",
@@ -66,25 +91,22 @@ fn inode(path: &str) -> u64 {
 
 /// Make `path` absolute and drop ".", ".." and repeated slashes.
 pub fn normalize(cwd: &str, path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    let joined;
-    let full = if path.starts_with('/') {
-        path
-    } else {
-        joined = alloc::format!("{}/{}", cwd, path);
-        &joined
-    };
-    for part in full.split('/') {
+    let mut out = String::new();
+    // A relative path goes on from the current directory.
+    let before = if path.starts_with('/') { "" } else { cwd };
+    for part in before.split('/').chain(path.split('/')) {
         match part {
             "" | "." => {}
-            ".." => {
-                parts.pop();
+            ".." => out.truncate(out.rfind('/').unwrap_or(0)),
+            p => {
+                out.push('/');
+                out.push_str(p);
             }
-            p => parts.push(p),
         }
     }
-    let mut out = String::from("/");
-    out.push_str(&parts.join("/"));
+    if out.is_empty() {
+        out.push('/');
+    }
     out
 }
 
@@ -96,6 +118,7 @@ impl Fs {
             hidden: BTreeSet::new(),
             changed: BTreeSet::new(),
             stored: BTreeMap::new(),
+            moved: BTreeSet::new(),
             dirs: BTreeSet::new(),
         };
         for d in ["/", "/apps", "/bin", "/lib", "/tmp", "/data", "/dev", "/dev/violet", "/proc", "/proc/self"] {
@@ -197,14 +220,11 @@ impl Fs {
     }
     /// A writable copy of a file, created empty (or copied up from the image).
     pub fn writable(&mut self, path: &str, create: bool, truncate: bool, now: u32) -> Option<&mut Vec<u8>> {
-        if path.starts_with("/data/") {
-            self.changed.insert(String::from(path));
-        }
         if !self.layer.contains_key(path) {
             let existing = if self.hidden.contains(path) { None } else { self.image.get(path) };
             let (data, mode) = match existing {
                 Some(e) => (if truncate { Vec::new() } else { e.data.to_vec() }, e.mode),
-                None if create && self.dirs.contains(parent(path)) => (Vec::new(), S_IFREG | 0o644),
+                None if create && self.dirs.contains(parent(path)) && keepable(path) => (Vec::new(), S_IFREG | 0o644),
                 None => return None,
             };
             self.hidden.remove(path);
@@ -218,18 +238,29 @@ impl Fs {
             l.data.clear();
         }
         l.mtime = now;
+        // To be saved (only a file that is there: a name that was refused
+        // is nothing to save or to remove).
+        note(&mut self.changed, path);
         Some(&mut l.data)
     }
     pub fn mkdir(&mut self, path: &str) -> Result<(), i32> {
         if self.stat(path).is_some() {
             return Err(super::syscall::EEXIST);
         }
+        if !keepable(path) {
+            return Err(ENAMETOOLONG);
+        }
         if !self.dirs.contains(parent(path)) {
             return Err(super::syscall::ENOENT);
         }
         self.hidden.remove(path);
         self.dirs.insert(String::from(path));
+        note(&mut self.changed, path);
         Ok(())
+    }
+    /// Is the path a directory (one not removed)?
+    pub fn is_dir(&self, path: &str) -> bool {
+        self.dirs.contains(path) && !self.hidden.contains(path)
     }
     pub fn unlink(&mut self, path: &str, dir: bool) -> Result<(), i32> {
         let st = self.stat(path).ok_or(super::syscall::ENOENT)?;
@@ -241,9 +272,7 @@ impl Fs {
             return Err(super::syscall::ENOTEMPTY);
         }
         self.layer.remove(path);
-        if path.starts_with("/data/") {
-            self.changed.insert(String::from(path));
-        }
+        note(&mut self.changed, path);
         if dir {
             self.dirs.remove(path);
         }
@@ -257,25 +286,32 @@ impl Fs {
         if !self.dirs.contains(parent(to)) {
             return Err(super::syscall::ENOENT);
         }
-        let mode = self.stat(from).map(|s| s.mode).unwrap_or(S_IFREG | 0o644);
-        // Move a file from the layer without copying it (installs are megabytes).
-        let data = match self.layer.remove(from) {
-            Some(l) => l.data,
-            None => self.contents(from).unwrap_or(&[]).to_vec(),
+        if !keepable(to) {
+            return Err(ENAMETOOLONG);
+        }
+        // Move a file from the layer without copying it (installs are
+        // megabytes), with its mode and time.
+        let (data, mode, mtime) = match self.layer.remove(from) {
+            Some(l) => (l.data, l.mode, l.mtime),
+            None => match self.image.get(from) {
+                Some(e) => (e.data.to_vec(), e.mode, e.mtime),
+                None => return Err(super::syscall::ENOENT),
+            },
         };
         self.hidden.insert(String::from(from));
         self.hidden.remove(to);
-        self.layer.insert(String::from(to), Layer { data, mode, mtime: 0 });
-        for p in [from, to] {
-            if p.starts_with("/data/") {
-                self.changed.insert(String::from(p));
-            }
-        }
+        self.layer.insert(String::from(to), Layer { data, mode, mtime });
+        note(&mut self.changed, from);
+        note(&mut self.changed, to);
+        note(&mut self.moved, from);
         Ok(())
     }
     /// Names directly inside a directory, with whether each is a directory.
     pub fn list(&self, dir: &str) -> Vec<(String, bool)> {
-        let prefix = if dir == "/" { String::from("/") } else { alloc::format!("{}/", dir) };
+        let mut prefix = String::from(dir);
+        if dir != "/" {
+            prefix.push('/');
+        }
         let mut out: BTreeMap<String, bool> = BTreeMap::new();
         let mut consider = |path: &String, is_dir: bool| {
             if let Some(rest) = path.strip_prefix(prefix.as_str()) {

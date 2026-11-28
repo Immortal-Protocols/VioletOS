@@ -289,6 +289,17 @@ class Format(unittest.TestCase):
         big = [self.keys.dev.sign(unsigned(i, size=0x3E000), 1) for i in (1, 4, 5, 6, 7)]
         with self.assertRaisesRegex(ValueError, "exceeds boot window"):
             pack(big + [self.keys.dev.sign(unsigned(3, size=0x38000), 1)])
+        # The handset's banks take 1.25 MiB (catalog_volume.rs, supervisor.c
+        # CATALOG_LIMIT); QEMU's windows stay at one MiB, and so does unpack's default.
+        self.assertEqual((package_format.catalog_limit("moto"), package_format.catalog_limit("qemu")),
+                         (package_format.HANDSET_LIMIT, package_format.LIMIT))
+        handset = pack(big + [self.keys.dev.sign(unsigned(3), 1)], limit=package_format.HANDSET_LIMIT)
+        self.assertGreater(len(handset), package_format.LIMIT)
+        self.assertEqual(sorted(unpack(handset, package_format.HANDSET_LIMIT)), [1, 3, 4, 5, 6, 7])
+        with self.assertRaises(ValueError):
+            unpack(handset)
+        with self.assertRaisesRegex(ValueError, "exceeds boot window"):
+            pack(big + [self.keys.dev.sign(unsigned(3, size=0x38000), 1)], limit=package_format.HANDSET_LIMIT)
 
     def test_build_key_configuration(self):
         with tempfile.TemporaryDirectory() as directory:

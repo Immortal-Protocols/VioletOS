@@ -235,8 +235,13 @@ class Bootloader(unittest.TestCase):
             d = Path(d)
             disk = d / "disk"
             files = {name: name.encode() * 50 for name in ota_bundle.QEMU_FILES}
+            # The model checks the slot's signed manifest and the version the loader states.
+            import boot_manifest
+            keys = Keys(d)
+            files["zImage"] += ota_bundle.VERSION_NOTE + struct.pack("<2I", 1, 0xFFFFFFFE) + \
+                boot_manifest.build(keys.dev, 1, b"kernel", b"root task")
             disk.write_bytes(b"\x5a" * (1 << 20))  # existing data must stay
-            ota_boot.provision(disk, ota_bundle.container(files), geometry=ota_boot.SMALL)
+            ota_boot.provision(disk, ota_bundle.container(files), geometry=ota_boot.SMALL, signer=keys.dev)
             self.assertEqual(disk.read_bytes()[:1 << 20], b"\x5a" * (1 << 20))
             out = d / "boot"
             slot = ota_boot.boot(disk, out, geometry=ota_boot.SMALL)
@@ -247,17 +252,17 @@ class Bootloader(unittest.TestCase):
             self.assertEqual(control.suffix(), 0)
             self.assertFalse(control.bootable(1))
             # Stage a trial in B by hand (what Storage does) and boot it; a
-            # garbled container counts as a failed attempt.
+            # garbled container fails the bootloader's check: B is marked
+            # unbootable and A boots in the same power-on.
             g = ota_boot.SMALL
             with disk.open("r+b") as f:
                 f.seek(g.first[1] * 512)
                 f.write(b"garbage!" * 64)
             control.set_active(1, 0)
             ota_boot.write_control(disk, control, g)
-            for _ in range(6):
-                self.assertIsNone(ota_boot.boot(disk, out, geometry=g))
             self.assertEqual(ota_boot.boot(disk, out, geometry=g), 0)
             self.assertFalse(ota_boot.read_control(disk, g).bootable(1))
+            self.assertEqual(ota_boot.boot(disk, out, geometry=g), 0)
 
 
 if __name__ == "__main__":

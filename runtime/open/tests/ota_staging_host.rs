@@ -41,7 +41,7 @@ fn only_the_updating_app_reaches_its_staging_file() {
                 assert_eq!(path_rule(other, p, &path, false), Err(ENOENT), "{other} reads {path}");
             }
         }
-        // Too long a name for Storage to keep: pieces never go to the disk as /data files.
+        // A name the write-back never sends: pieces never go to the disk as /data files.
         assert_eq!(writeback::key(&path), None, "{path}");
     }
 }

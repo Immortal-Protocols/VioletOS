@@ -51,11 +51,17 @@
     "id": 24,
     "name": "open",
     "required": false,
-    "version": 1
+    "version": 2
   },
   {
     "id": 25,
     "name": "camera",
+    "required": false,
+    "version": 1
+  },
+  {
+    "id": 26,
+    "name": "sentinel",
     "required": false,
     "version": 1
   }

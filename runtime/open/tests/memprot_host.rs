@@ -422,6 +422,9 @@ fn loader_maps_segments_with_their_own_rights() {
     assert_eq!(sys::at(0x10000), Some((false, false)), "constants: read-only, not executable");
     assert_eq!(sys::at(0x20000), Some((false, true)), "code: read-execute");
     assert_eq!(sys::at(0x30000), Some((true, false)), "data: read-write, not executable");
+    // Bss past the file's last page has no memory until it is touched.
+    assert_eq!(sys::at(0x40000), None, "bss: on demand");
+    assert!(w.fault(0x40000, Access::Write));
     assert_eq!(sys::at(0x40000), Some((true, false)), "bss");
     let stack = Layout::fixed().stack_top - 0x10000;
     assert_eq!(sys::at(stack), Some((true, false)), "stack: read-write, not executable");
@@ -1328,4 +1331,233 @@ fn the_trampoline_page_holds_the_signal_gate() {
     // No trampoline reaches the gate.
     assert_eq!(w.space.stub(&mut w.k, &mut w.pool, (signal::GATE_OFFSET / 8) as usize, 0x20d91), None);
     w.no_app_bytes_in_executable_pages();
+}
+
+// ---- the frame ledger (system/supervisor/frames.rs): one address space per pool page ----
+
+/// How many app mappings the stand-in hardware has of pool page `index`.
+fn mappings_of(index: u32) -> usize {
+    sys::HW.with(|h| {
+        let h = h.borrow();
+        h.mapped.keys().filter(|frame| h.frames.get(frame) == Some(&index)).count()
+    })
+}
+const SHARED: u32 = 0x5000_0000;
+
+#[test]
+fn a_pool_page_is_never_mapped_in_two_address_spaces() {
+    let mut w = world();
+    let mut other = Space::new(&mut w.k, 2).unwrap();
+    let end = SHARED + sys::PAGE as u32;
+    w.space.add(SHARED, end, RW);
+    other.add(SHARED, end, RW);
+    let page = w.pool.take().unwrap();
+    w.space.map(&mut w.k, &w.pool, SHARED, page, false).unwrap();
+    assert_eq!(procmgr::ledger().owner(page), w.space.pd);
+    // The same index offered for a second app (stale, or simply wrong): refused, and nothing is mapped.
+    assert_eq!(other.map(&mut w.k, &w.pool, SHARED, page, false), Err(EACCES));
+    assert_eq!(other.map(&mut w.k, &w.pool, SHARED, page, true), Err(EACCES));
+    assert_eq!(mappings_of(page), 1);
+    assert_eq!(procmgr::ledger().refused, 2);
+    // The holder does not map it a second time (a surface mapped twice): one
+    // mapping per page per space keeps the CSpace's slots bounded by the pool
+    // (pool.rs). The refusal leaves its first mapping and its hold as they were.
+    w.space.add(SHARED + 0x10_0000, end + 0x10_0000, RW);
+    assert_eq!(w.space.map(&mut w.k, &w.pool, SHARED + 0x10_0000, page, false), Err(syscall::ENOMEM));
+    assert_eq!(mappings_of(page), 1);
+    assert_eq!(procmgr::ledger().owner(page), w.space.pd);
+    assert_eq!(other.map(&mut w.k, &w.pool, SHARED, page, false), Err(EACCES));
+    w.space.remove(&mut w.k, &mut w.pool, SHARED, end);
+    assert_eq!(procmgr::ledger().owner(page), 0);
+    // Free of its last holder, another app may have it.
+    other.map(&mut w.k, &w.pool, SHARED, page, false).unwrap();
+    assert_eq!(procmgr::ledger().owner(page), other.pd);
+    assert_eq!(mappings_of(page), 1);
+}
+
+#[test]
+fn only_the_apps_pages_and_app_addresses_can_be_mapped() {
+    let mut w = world();
+    // As at boot: pages below 8 are the runtime's heap, from 64 up the system image.
+    procmgr::ledger().limit(8, 64);
+    let end = SHARED + 4 * sys::PAGE as u32;
+    w.space.add(SHARED, end, RW);
+    for outside in [0, 7, 64, 95, u32::MAX] {
+        assert_eq!(w.space.map(&mut w.k, &w.pool, SHARED, outside, false), Err(EACCES), "page {outside}");
+        assert_eq!(mappings_of(outside), 0);
+    }
+    w.space.map(&mut w.k, &w.pool, SHARED, 8, false).unwrap();
+    w.space.map(&mut w.k, &w.pool, SHARED + sys::PAGE as u32, 63, false).unwrap();
+    // Nothing is mapped at or above the top of app memory, whatever the regions say.
+    assert_eq!(w.space.map(&mut w.k, &w.pool, vma::USER_TOP, 9, false), Err(EACCES));
+    assert_eq!(w.space.map(&mut w.k, &w.pool, 0xffff_0000, 9, false), Err(EACCES));
+    assert_eq!(procmgr::ledger().owner(9), 0, "a refused mapping holds nothing");
+    // A mapping that fails after the ledger agreed gives the page up again.
+    assert_eq!(w.space.map(&mut w.k, &w.pool, SHARED, 10, false), Err(syscall::EEXIST));
+    assert_eq!(procmgr::ledger().owner(10), 0);
+    // Before boot has said which pages are the apps', none can be mapped.
+    let mut closed = procmgr::frames::Frames::new(0, 0);
+    assert_eq!(closed.claim(w.space.pd, 8), Err(procmgr::frames::Refused::Range));
+}
+
+#[test]
+fn a_page_handed_out_while_still_held_is_passed_over() {
+    let mut w = world();
+    let mut other = Space::new(&mut w.k, 2).unwrap();
+    let end = SHARED + sys::PAGE as u32;
+    w.space.add(SHARED, end, RW);
+    other.add(SHARED, end, RW);
+    let page = w.pool.take().unwrap();
+    w.space.map(&mut w.k, &w.pool, SHARED, page, false).unwrap();
+    assert!(w.write(SHARED, b"first app"));
+    // The bug this guards against: the page returns to the pool while still mapped.
+    w.pool.give_back(page);
+    // The other app touches memory: it gets some other page, not this one.
+    assert!(other.fault(&mut w.k, &mut w.pool, SHARED, Access::Write));
+    assert!(other.write(&mut w.k, &mut w.pool, SHARED, b"second"));
+    assert_eq!(mappings_of(page), 1);
+    assert_eq!(procmgr::ledger().owner(page), w.space.pd);
+    // The second app's bytes are in its own page. (The pool zeroes a page as
+    // it hands it out, before the process manager sees it, so the first app
+    // reads zeros: its data is lost to the pool's bug, but shown to nobody.)
+    assert_eq!(other.usage().0, 1);
+    let mut got = [0u8; 6];
+    assert!(other.read(&mut w.k, &mut w.pool, SHARED, &mut got));
+    assert_eq!(&got, b"second");
+    assert_ne!(w.read(SHARED, 6).unwrap(), b"second".to_vec(), "one app's writes never reach the other");
+}
+
+#[test]
+fn a_held_page_off_the_free_list_comes_back_once_its_holder_lets_go() {
+    // X holds page P, and P is wrongly on the free list as well.
+    let mut w = world();
+    let mut x = Space::new(&mut w.k, 3).unwrap();
+    x.add(SHARED, SHARED + sys::PAGE as u32, RW);
+    let p = w.pool.take().unwrap();
+    x.map(&mut w.k, &w.pool, SHARED, p, true).unwrap();
+    assert!(x.write(&mut w.k, &mut w.pool, SHARED, b"live data"));
+    w.pool.give_back(p);
+    // Another app's touch passes P over: it gets another page, and P leaves the free list.
+    let free = w.pool.available();
+    w.space.add(SHARED, SHARED + sys::PAGE as u32, RW);
+    assert!(w.fault(SHARED, Access::Write));
+    assert_eq!(w.pool.available(), free - 2, "P passed over and dropped, one page taken");
+    assert_eq!(procmgr::ledger().owner(p), x.pd);
+    // X lets go: P is given back, once.
+    x.destroy(&mut w.k, &mut w.pool);
+    assert_eq!(w.pool.available(), free - 1);
+    assert_eq!(procmgr::ledger().owner(p), 0);
+}
+
+#[test]
+fn fork_never_copies_into_a_page_another_space_holds() {
+    let (mut w, _) = started(2, Layout::fixed());
+    // Another app X holds page P, and P is wrongly on the free list as well
+    // (the stale give-back the ledger is there for), at the front.
+    let mut x = Space::new(&mut w.k, 3).unwrap();
+    x.add(SHARED, SHARED + sys::PAGE as u32, RW);
+    let p = w.pool.take().unwrap();
+    x.map(&mut w.k, &w.pool, SHARED, p, true).unwrap();
+    w.pool.give_back(p);
+    let mut child = Space::new(&mut w.k, 2).unwrap();
+    w.space.fork_into(&mut child, &mut w.k, &mut w.pool).expect("fork passes over the held page and succeeds");
+    assert_eq!(procmgr::ledger().owner(p), x.pd, "X keeps its page");
+    assert_eq!(mappings_of(p), 1);
+    // None of the parent's bytes reached X's page.
+    let page = unsafe { core::slice::from_raw_parts(pool::page_va(p) as *const u8, sys::PAGE) };
+    assert!(page.iter().all(|&b| b == 0), "the forking app's data was copied into another app's page");
+    // And X letting go later puts it back exactly once.
+    let before = w.pool.available();
+    x.destroy(&mut w.k, &mut w.pool);
+    assert_eq!(w.pool.available(), before + 1);
+}
+
+#[test]
+fn the_ledger_follows_fork_and_exit() {
+    let (mut w, _) = started(2, Layout::fixed());
+    let mut child = Space::new(&mut w.k, 2).unwrap();
+    w.space.fork_into(&mut child, &mut w.k, &mut w.pool).unwrap();
+    let (parent_pages, child_pages) = (w.space.usage().0, child.usage().0);
+    assert_eq!(parent_pages, child_pages);
+    assert_eq!(procmgr::ledger().held_by(w.space.pd), parent_pages);
+    assert_eq!(procmgr::ledger().held_by(child.pd), child_pages, "the child holds its own copies, none of the parent's");
+    child.destroy(&mut w.k, &mut w.pool);
+    assert_eq!(procmgr::ledger().held_by(child.pd), 0, "an app that ended holds nothing");
+    assert_eq!(procmgr::ledger().held_by(w.space.pd), parent_pages);
+    w.space.destroy(&mut w.k, &mut w.pool);
+    assert_eq!(procmgr::ledger().held_by(w.space.pd), 0);
+    assert_eq!(procmgr::ledger().refused, 0);
+}
+
+// ---- static PIE (the memres cluster): every shipped program is one ----
+
+/// A static position-independent executable as lld lays one out: the ELF
+/// headers and constants at 0 (in the first segment's file range, so the
+/// start code finds its program headers), code at 0x10000, data and bss at 0x20000.
+fn static_pie() -> Vec<u8> {
+    let segments: [(u32, u32, u32, u32, u32); 3] = [(0, 0, 0x200, 0x200, 4), (0x200, 0x10000, 0x400, 0x400, 5), (0x600, 0x20000, 0x100, 0x3000, 6)];
+    let mut image = vec![0x11u8; 0x200];
+    image.extend(vec![0x22u8; 0x400]);
+    image.extend(vec![0x33u8; 0x100]);
+    image[..52].fill(0);
+    image[..4].copy_from_slice(b"\x7fELF");
+    image[4] = 1;
+    image[5] = 1;
+    image[16..18].copy_from_slice(&3u16.to_le_bytes());
+    image[18..20].copy_from_slice(&40u16.to_le_bytes());
+    image[24..28].copy_from_slice(&0x10010u32.to_le_bytes());
+    image[28..32].copy_from_slice(&52u32.to_le_bytes());
+    image[42..44].copy_from_slice(&32u16.to_le_bytes());
+    image[44..46].copy_from_slice(&3u16.to_le_bytes());
+    for (i, (offset, vaddr, filesz, memsz, flags)) in segments.iter().enumerate() {
+        for (k, w) in [1, *offset, *vaddr, *vaddr, *filesz, *memsz, *flags, 0x10000].iter().enumerate() {
+            let at = 52 + 32 * i + 4 * k;
+            image[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    image
+}
+
+#[test]
+fn a_static_pie_can_relocate_itself_wherever_it_lands() {
+    let image = static_pie();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut bases = std::collections::BTreeSet::new();
+    for _ in 0..24 {
+        let layout = Layout::random(&random_bytes(&mut seed));
+        let base = layout.pie_base;
+        bases.insert(base);
+        let mut w = world();
+        let args = [String::from("/apps/pie")];
+        let loaded = load(&mut w.space, &mut w.k, &mut w.pool, &image, None, &args, &[], [3; 16], layout).unwrap();
+        // What musl's rcrt1 reads to find itself: no loader (AT_BASE 0), its
+        // own program headers at their moved address, and they are the file's.
+        let a = aux(&mut w, loaded.sp);
+        let get = |key| a.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap();
+        assert_eq!(get(7), 0, "AT_BASE");
+        assert_eq!((get(3), get(4), get(5)), (base + 52, 32, 3), "AT_PHDR, AT_PHENT, AT_PHNUM");
+        assert_eq!(get(9), base + 0x10010, "AT_ENTRY");
+        assert_eq!(loaded.entry, base + 0x10010);
+        assert_eq!(w.read(base + 52, 96).unwrap(), image[52..148].to_vec());
+        // It then patches its data (relative relocations: the image's own
+        // words and bss), which the app may write...
+        for target in [base + 0x20010, base + 0x200fc, base + 0x22ff0] {
+            assert!(w.fault(target, Access::Write), "the relocation at {target:#x} must not fault");
+            assert!(w.write(target, &base.to_le_bytes()));
+        }
+        // ...and nothing else: a relocation in code or constants would end
+        // it here (tools/elf_check.py refuses such a program at build time).
+        assert!(!w.fault(base + 0x10040, Access::Write), "code is not writable");
+        assert!(!w.fault(base + 0x40, Access::Write), "constants are not writable");
+        assert!(!w.write(base + 0x10040, &[0; 4]) && !w.write(base + 0x40, &[0; 4]));
+        // It runs from where it was put, and only its code runs.
+        assert!(w.fault(loaded.entry, Access::Exec));
+        assert!(!w.fault(base + 0x20010, Access::Exec) && !w.fault(base + 0x40, Access::Exec));
+        assert!(!w.fault(0x10010, Access::Exec), "nothing is at the link address");
+        assert!(w.space.brk_start >= base + 0x23000 && w.space.brk_start < vma::MMAP_BASE);
+        w.check();
+        // The next start is a new address space on the same (stand-in) hardware.
+        w.space.destroy(&mut w.k, &mut w.pool);
+    }
+    assert!(bases.len() >= 20, "the base did not move: {bases:x?}");
 }

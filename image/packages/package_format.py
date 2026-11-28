@@ -1,4 +1,5 @@
-"""Wire formats shared with the supervisor. One MiB per boot catalog.
+"""Wire formats shared with the supervisor. One MiB per boot catalog on QEMU,
+1.25 MiB on the handset (HANDSET_LIMIT).
 
 A package is a VPK2 record: header[24] | image[size] | signature trailer[80]
 (sign.py). inspect() checks a record's shape; given the pinned keys it also
@@ -9,6 +10,15 @@ import binascii
 import struct
 
 LIMIT = 1 << 20
+# The handset's built-in and installed catalogs: its catalog banks
+# (system/package-manager/catalog_volume.rs LIMIT under package_catalog) and
+# the supervisor's CATALOG_LIMIT. QEMU's staged and installed windows stay 1 MiB.
+HANDSET_LIMIT = 0x140000
+
+
+def catalog_limit(target):
+    """The largest catalog the supervisor of `target` boots."""
+    return HANDSET_LIMIT if target == "moto" else LIMIT
 HEADER = 24
 # "VSG1", key ID, security version, target tag, then the raw P-256 signature.
 TRAILER = 80
@@ -33,7 +43,7 @@ def inspect(blob, keys=None, target=None):
     if (
         magic != b"VPK2"
         or (abi != package_abi(identity) and (identity, abi) not in ((7, 3), (7, 4)))
-        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24, 25))
+        or not (1 <= identity <= 8 or 10 <= identity <= 14 or identity in (21, 22, 24, 25, 26))
     ):
         raise ValueError("unsupported package or ABI")
     # The Open Runtime (24) keeps its stack elsewhere, so its image may be larger.
@@ -83,7 +93,7 @@ def floor_record(floors):
     return struct.pack("<4sI", b"VFL1", len(floors)) + b"".join(struct.pack("<2I", i, v) for i, v in sorted(floors.items()))
 
 
-def pack(packages, floors=None):
+def pack(packages, floors=None, limit=LIMIT):
     records = {}
     for blob in packages:
         identity = inspect(blob)
@@ -104,19 +114,19 @@ def pack(packages, floors=None):
         struct.pack("<4s3I", b"VCT1", len(body), len(records), binascii.crc32(body))
         + body
     )
-    if len(result) > LIMIT:
+    if len(result) > limit:
         raise ValueError("catalog exceeds boot window")
     return result
 
 
-def _parse(data):
+def _parse(data, limit=LIMIT):
     if len(data) < 16:
         raise ValueError("truncated catalog")
     magic, size, count, crc = struct.unpack_from("<4s3I", data)
     if (
         magic != b"VCT1"
         or size + 16 != len(data)
-        or len(data) > LIMIT
+        or len(data) > limit
         or binascii.crc32(data[16:]) != crc
     ):
         raise ValueError("invalid catalog")
@@ -146,14 +156,14 @@ def _parse(data):
         if list(record) != sorted(record) or len(record) != entries:
             raise ValueError("invalid version floor record")
     # pack() refuses bad floors and packages below them; the bytes must match exactly.
-    if pack(blobs.values(), record) != data:
+    if pack(blobs.values(), record, limit) != data:
         raise ValueError("invalid catalog contents")
     return blobs, record
 
 
-def unpack(data):
+def unpack(data, limit=LIMIT):
     """{component ID: record} of a catalog."""
-    return _parse(data)[0]
+    return _parse(data, limit)[0]
 
 
 def floors(data):

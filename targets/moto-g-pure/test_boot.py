@@ -84,16 +84,16 @@ with TemporaryDirectory() as tmp:
             struct.pack_into("<I", trial, 12, len(code))
             trial[24:image_end(trial)] = code.ljust(image_end(trial) - 24, b"\0")
             sys.path.insert(0, str(repo / "image/packages"))
-            from package_format import pack, unpack
+            from package_format import HANDSET_LIMIT, pack, unpack
             catalog = (moto / "catalog.bin").read_bytes()
-            packages = unpack(catalog)
+            packages = unpack(catalog, HANDSET_LIMIT)
             storage = bytearray(packages[6])
             assert len(code) <= struct.unpack_from("<I", storage, 12)[0]
             struct.pack_into("<I", storage, 12, len(code))
             storage[24:image_end(storage)] = code.ljust(image_end(storage) - 24, b"\0")
             packages[6] = bytes(signed(storage))
             assert root.count(catalog) == 1
-            root = root.replace(catalog, pack(packages.values()))
+            root = root.replace(catalog, pack(packages.values(), limit=HANDSET_LIMIT))
         else:
             instruction = 0xe7f000f0 if args.diagnostics_trial == "fault" else 0xeafffffe
             struct.pack_into("<I", trial, 24, instruction)
@@ -105,12 +105,12 @@ with TemporaryDirectory() as tmp:
             struct.pack_into("<I", root, offset, 5)
         struct.pack_into("<I", root, root_offset("usb_trial_bytes"), len(trial))
         (out / "root.bin").write_bytes(root)
-        extra_devices = ["-device", f"loader,file={out}/trial.vpk,addr=0x43d00000,force-raw=on"]
+        extra_devices = ["-device", f"loader,file={out}/trial.vpk,addr=0x43d40000,force-raw=on"]
     elif args.stall_services or args.radio_package:
         sys.path.insert(0, str(repo / "image/packages"))
-        from package_format import pack, unpack
+        from package_format import HANDSET_LIMIT, pack, unpack
         catalog = (moto / "catalog.bin").read_bytes()
-        packages = unpack(catalog)
+        packages = unpack(catalog, HANDSET_LIMIT)
         if args.radio_package:
             packages[7] = args.radio_package.read_bytes()
         for identity in ((4, 6) if args.stall_services else ()):
@@ -119,7 +119,7 @@ with TemporaryDirectory() as tmp:
             packages[identity] = bytes(signed(blob))
         root = (moto / "root.bin").read_bytes()
         assert root.count(catalog) == 1
-        candidate = pack(packages.values())
+        candidate = pack(packages.values(), limit=HANDSET_LIMIT)
         if len(candidate) != len(catalog):
             raise ValueError("Fixture substitution requires an equal-sized catalog")
         (out / "root.bin").write_bytes(root.replace(catalog, candidate))
@@ -227,7 +227,7 @@ with TemporaryDirectory() as tmp:
                 assert read_root("volume_bank") == 1 and read_root("source") == 3
                 saved = out / "active-catalog.bin"
                 command("human-monitor-command", {"command-line": f'pmemsave 0x43c00000 {len(catalog)} "{saved}"'})
-                assert unpack(saved.read_bytes())[21] == trial
+                assert unpack(saved.read_bytes(), HANDSET_LIMIT)[21] == trial
                 print("Supervisor confirmed Diagnostics and loaded the replacement from the committed catalog.")
             else:
                 reason = read_root("usb_last_failure") & 0xff

@@ -14,7 +14,7 @@ fn wide(b: &[u8], p: usize) -> u64 {
     u64::from_le_bytes(b[p..p + 8].try_into().unwrap())
 }
 /// Installed open apps (runtime/open/appstore.rs) keep the last 12 MiB of boot_b,
-/// which the flashed image (19,926,528 bytes) never reaches, until VioletOS has
+/// which the flashed image (20,450,816 bytes: two 1.25 MiB catalog banks) never reaches, until VioletOS has
 /// claimed Android's userdata partition (emmc.rs, Disk::adopt_userdata): then they
 /// live there (23 GiB), and this extent is only read once, to move them.
 pub const APPS: u32 = BOOT_B + 20 * 1024 * 1024 / 512;

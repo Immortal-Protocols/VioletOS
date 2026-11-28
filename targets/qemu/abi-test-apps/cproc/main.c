@@ -1,4 +1,4 @@
-/* Processes under the Open Runtime (make test-abi): fork (a copy of memory),
+/* Processes under the Open Runtime (make test-system): fork (a copy of memory),
  * fork then execve, posix_spawn (clone with CLONE_VM|CLONE_VFORK) with a pipe,
  * an environment and a close-on-exec descriptor, a missing program, vfork,
  * a child killed by a signal, SIGCHLD, ECHILD, and the kill rule. */

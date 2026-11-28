@@ -7,10 +7,13 @@
 //!               Home, the agent, an app holding an audio stream, the
 //!               microphone or Bluetooth, uploading or still connecting over TCP, and any app
 //!               for GRACE_NS after it left the front (to save its state).
-//!               Runs. (A wake lock is not yet a reason: powerctl.rs keeps
-//!               its holders private.)
+//!               Runs.
 //!   Cached      behind with no such reason. Still runs for CACHED_RUN_NS, so
-//!               a fetch or a save in progress can finish.
+//!               a fetch or a save in progress can finish. An app holding a
+//!               wake lock (`wakelock 1`, which needs no capability) stays
+//!               here and running while Power holds the lock (powerctl.rs
+//!               `facts`), so a lock never ranks it above cached apps for
+//!               memory.
 //!   Frozen      a cached app past that, or any cached app while memory is
 //!               low: its threads are suspended, its memory kept. It runs
 //!               again the moment it comes back to the front.

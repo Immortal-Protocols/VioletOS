@@ -99,6 +99,8 @@ Recorded traces ([targets/qemu/shield-traces](../targets/qemu/shield-traces), re
 - photosync: quarantined when user-added or in strict mode; reported only (`over-limit`) as recorded, because the demo builds it into the image.
 - themes: the recorded windows end at its W+X map, before its write to `/apps/home`, so the replay only warns. The write itself is covered by a constructed test (refused by rule 1 and, for a containable program, frozen).
 
+Real traces: four more processes (`qemu-enforce-*.log`) are the complete records of one emulator run of the shipped image. `make test-unit` replays them ([test_traces.rs](../tools/shield-trainer/test_traces.rs)): Home and notes get no warning, refusal or containment in any mode; photosync is quarantined as a user's app; both of themes' writes to `/apps/home` are refused and a user's themes is frozen. This run exposed the warning the scorer gave Home on every boot, which is fixed. The pipeline for collecting more, scrubbed and with consent, is in [Shield data](shield-data.md). The model is still trained on synthetic windows only.
+
 `make shield-fp-report` prints the same for any trace files. A defensible false-positive rate needs complete traces from real use; there is no `make shield-capture` yet (`test_shield_enforce.py` saves the complete records of its run to `build/shield/qemu-traces/enforce-last.log`).
 
 ### Not done
@@ -112,7 +114,7 @@ Recorded traces ([targets/qemu/shield-traces](../targets/qemu/shield-traces), re
 - An unnamed program (started from outside `/apps` by the user) that starts a changed copy of itself through Home would be a new unnamed app. Apps cannot do that themselves: what an app starts belongs to it.
 - An app in front with the user's touch, or one that stays under every limit, is not stopped by this layer.
 - Quarantine, rate-limit state and the scorer's windows do not survive a restart. `FLAG_DEV_PUSH` is still never set.
-- The Sentinel still lives in the Open Runtime's process.
+- The on-device scorer runs in the [Sentinel component](../system/sentinel/README.md), and the saved mode is sealed by it. The per-call rules, the quarantine state and the companion link (`services/sentinel`) still live in the Open Runtime's process.
 
 ## Original iPhone proof of concept
 
@@ -230,7 +232,7 @@ The labels come from the scenario generator, softened the way a teacher's probab
 - **Window size.** The RFC suggests 48 events. Gemma spends about 25 tokens per event line, mostly because it tokenizes digits one at a time. Windows hold 16 events in a fixed 384-token input; if a window is still too long, both sides drop its oldest events until it fits.
 - **Sends are merged.** In the first live run, photosync's 64 KiB send records filled the window and pushed out the cross-app read, so the model called it benign. This weakness never showed up on synthetic data. Consecutive sends now merge into one running total, at ingest and in the window, on both sides.
 - **Baseline Shields.** A model's verdict arrives after the call it judges. In the original demo, when the link came up, the companion signed three rules: writes into another app's folder, into `/bin` or into `/lib` freeze the writer. Those rules are now built into the phone as denials and need no companion (see above); no companion signs them any more.
-- **Sentinel placement.** The Sentinel is a module inside the Open Runtime's process. Apps hold no capability to it, but the RFC's separate seL4 process is future work. The telemetry ring is an in-process queue for the same reason.
+- **Sentinel placement.** The companion link and its `VSH1` verifier (`services/sentinel`) are a module inside the Open Runtime's process. Apps hold no capability to it. A separate seL4 component, the [Sentinel](../system/sentinel/README.md), now holds the capability policy, the consent store and the on-device scorer; moving the link and the per-call rules there is future work. The telemetry ring is an in-process queue for the same reason.
 - **A real false positive, fixed in Home.** With the built-in apps in the demo, the model sometimes froze Home (p up to 0.996, exfiltration or C2). Home read Weather's private `/data/weather` before every weather fetch, often from the background, and then connected out. That is the same shape as photosync's theft. The city is now a shared setting the runtime keeps (`set weather.city N` and `get weather.city` on `/dev/violet/sys`, stored in `/data/settings`), so no app opens another app's data. The test fails if Home or another ordinary app is contained.
 - **Open Runtime size.** The Shield and BearSSL take the Open Runtime past its 0x3e000-byte package window, so it is built with `opt-level=z`, and the app list uses ASCII upper-casing (Unicode's case tables were 12 KB). The package was 0x3a010 bytes then; the window has since grown to 0x80000 bytes.
 - **Copying arguments once.** PR #16 already copies paths and socket addresses into private buffers before use, so the RFC's `copy_user_bytes_once` was not needed.

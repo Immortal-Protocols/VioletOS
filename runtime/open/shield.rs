@@ -120,10 +120,11 @@ impl Mode {
     pub fn build_default() -> Mode {
         option_env!("VIOLET_SHIELD_MODE").and_then(Mode::parse).unwrap_or(Mode::Enforce)
     }
-    /// The mode a restart begins in. The saved file is not authenticated
-    /// (whoever holds the storage can write it), so it may only make the
-    /// build's mode stricter, never weaker: a choice of `Monitor` on an
-    /// enforcing build lasts until the phone restarts.
+    /// The mode a restart begins in. The saved file is sealed by the Sentinel
+    /// (guard.rs `load_shield_mode`), but with the build's key, not one held
+    /// in this phone's hardware, so it may only make the build's mode
+    /// stricter, never weaker: a choice of `Monitor` on an enforcing build
+    /// lasts until the phone restarts.
     pub fn at_boot(build: Mode, saved: Option<Mode>) -> Mode {
         match saved {
             Some(s) if s as u8 > build as u8 => s,
@@ -288,6 +289,42 @@ impl TelemetryEvent {
     }
 }
 
+impl TelemetryEvent {
+    /// The record as it crosses to the Sentinel's scorer and back
+    /// (system/sentinel/scoring.rs): the fields in order, little-endian.
+    pub fn to_wire(&self) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..8].copy_from_slice(&self.timestamp_us.to_le_bytes());
+        b[8..12].copy_from_slice(&self.app_id.to_le_bytes());
+        b[12] = self.kind;
+        b[13] = self.flags;
+        b[14..16].copy_from_slice(&self.port.to_le_bytes());
+        b[16..20].copy_from_slice(&self.aux_u32.to_le_bytes());
+        b[20..24].copy_from_slice(&self.ipv4);
+        b[24..].copy_from_slice(&self.detail);
+        b
+    }
+    /// Any 64 bytes are a record (`kind` is checked where it is used).
+    pub fn from_wire(b: &[u8]) -> Option<TelemetryEvent> {
+        if b.len() != 64 {
+            return None;
+        }
+        let u32_at = |n: usize| u32::from_le_bytes([b[n], b[n + 1], b[n + 2], b[n + 3]]);
+        let mut detail = [0u8; 40];
+        detail.copy_from_slice(&b[24..]);
+        Some(TelemetryEvent {
+            timestamp_us: u64::from(u32_at(0)) | u64::from(u32_at(4)) << 32,
+            app_id: u32_at(8),
+            kind: b[12],
+            flags: b[13],
+            port: u16::from_le_bytes([b[14], b[15]]),
+            aux_u32: u32_at(16),
+            ipv4: [b[20], b[21], b[22], b[23]],
+            detail,
+        })
+    }
+}
+
 /// Bounded event queue drained by the Sentinel. The Open Runtime is single
 /// threaded, so producer and consumer never run at once; on overflow the
 /// oldest low-priority record goes first.
@@ -314,6 +351,12 @@ impl TelemetryRing {
     pub fn len(&self) -> usize {
         self.events.len()
     }
+}
+
+/// May the phone contain `who` on its own in `mode`? (`ShieldPolicy::eligible`,
+/// and the Sentinel's scorer, system/sentinel/scoring.rs.)
+pub fn eligible_in(mode: Mode, who: &Subject) -> bool {
+    who.role & ROLE_CORE == 0 && (who.flags & FLAG_NEW_HASH != 0 || mode == Mode::Strict)
 }
 
 /// Who is acting, with what we know about the program.
@@ -419,6 +462,26 @@ impl Subject {
     }
     pub fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("")
+    }
+    /// The subject as the Sentinel's scorer is shown it: 36 bytes.
+    pub fn to_wire(&self) -> [u8; 36] {
+        let mut b = [0u8; 36];
+        b[..4].copy_from_slice(&self.app.0.to_le_bytes());
+        b[4..8].copy_from_slice(&self.sha256_prefix);
+        b[8] = self.flags;
+        b[9] = self.role;
+        b[10] = self.name_len;
+        b[12..].copy_from_slice(&self.name);
+        b
+    }
+    /// None unless the name's length fits the name.
+    pub fn from_wire(b: &[u8]) -> Option<Subject> {
+        if b.len() != 36 || b[10] > 24 {
+            return None;
+        }
+        let mut name = [0u8; 24];
+        name.copy_from_slice(&b[12..]);
+        Some(Subject { app: AppId(u32::from_le_bytes([b[0], b[1], b[2], b[3]])), sha256_prefix: [b[4], b[5], b[6], b[7]], flags: b[8], name, name_len: b[10], role: b[9] })
     }
 }
 
@@ -652,7 +715,7 @@ impl ShieldPolicy {
     /// May the phone contain this program on its own? Never Home, Settings or
     /// the Agent; other image apps only in `Strict`.
     pub fn eligible(&self, who: &Subject) -> bool {
-        who.role & ROLE_CORE == 0 && (who.flags & FLAG_NEW_HASH != 0 || self.mode == Mode::Strict)
+        eligible_in(self.mode, who)
     }
 
     /// Check one action and record it. Expired rules are dropped first.
@@ -955,7 +1018,12 @@ impl ShieldPolicy {
                 if (device || !write && quiet_read(path, who.name())) && verdict == ShieldVerdict::Allow && shadow == 0 {
                     return;
                 }
-                if cross_app(path, who.name()) {
+                // The image's two lists in /apps (appstore::TITLES, the titles Home
+                // reads every few seconds, and manifest::MANIFESTS) are nobody's
+                // private data: reading one is not a read of another app's files.
+                // Writing one still is, and so is reading any other /apps/.NAME
+                // (the Agent's /apps/.agent-install, a push's /apps/.NAME.part).
+                if cross_app(path, who.name()) && (write || !matches!(*path, "/apps/.home" | "/apps/.manifests")) {
                     flags |= FLAG_CROSS_APP;
                 }
                 (if write { EventKind::OpenWrite } else { EventKind::OpenRead }, path.as_bytes(), 0)
@@ -1355,6 +1423,25 @@ pub mod tests {
             p.note_sent(S, &pushed, 64 * 1024);
         }
         assert!(p.is_quarantined(S, pushed.key()));
+    }
+
+    #[test]
+    fn only_the_image_lists_in_apps_are_exempt_from_cross_app() {
+        let mut p = ShieldPolicy::with_mode(Mode::Enforce);
+        let a = added(151, "weather");
+        let flags = |p: &mut ShieldPolicy, act: Action<'_>| {
+            p.evaluate(0, &a, &act);
+            let ev: Vec<_> = p.ring.drain().into_iter().filter(|e| e.kind != EventKind::ShieldTriggered as u8).collect();
+            assert_eq!(ev.len(), 1);
+            ev[0].flags & FLAG_CROSS_APP
+        };
+        for path in ["/apps/.home", "/apps/.manifests"] {
+            assert_eq!(flags(&mut p, read(path)), 0, "reading {}", path);
+            assert_eq!(flags(&mut p, write(path)), FLAG_CROSS_APP, "writing {}", path);
+        }
+        for path in ["/apps/.agent-install", "/apps/.notes.part", "/apps/.home.part", "/apps/.homex", "/apps/.home/x", "/apps/.caps"] {
+            assert_eq!(flags(&mut p, read(path)), FLAG_CROSS_APP, "reading {}", path);
+        }
     }
 
     #[test]

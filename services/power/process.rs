@@ -45,10 +45,11 @@ fn radio_rails(m: &mut Manager, on: bool) -> Message {
 }
 
 /// GET POWER POWER_INFO: value is the thermal level (0 normal, 1 warm, 2 hot,
-/// 3 critical), arg the POWER_INFO_* flags, then seven words: temperature in
+/// 3 critical), arg the POWER_INFO_* flags, then eight words: temperature in
 /// milli-degrees C, operating point, its kHz, the wake-lock kinds held (one
-/// bit each), the number of locks, the battery percentage (-1 unknown) and
-/// milliseconds since boot (low half).
+/// bit each), the number of locks, the battery percentage (-1 unknown),
+/// milliseconds since boot (low half), and the last wake's sources (policy
+/// WAKE_* bits, low byte) with the number of suspends above them.
 fn info(m: &mut Manager, board: &power_backend::Hardware, now: u64) -> Message {
     let s = m.snapshot(board, now);
     let mut r = Message::result(u32::from(s.level));
@@ -56,8 +57,12 @@ fn info(m: &mut Manager, board: &power_backend::Hardware, now: u64) -> Message {
         | u32::from(s.sensor_failed) * POWER_INFO_SENSOR_FAILED
         | u32::from(s.dvfs) * POWER_INFO_DVFS
         | u32::from(s.sleep_deferred) * POWER_INFO_SLEEP_DEFERRED
-        | u32::from(!s.screen_on) * POWER_INFO_SCREEN_OFF;
-    let words = [s.temperature_mc as u32, s.opp, s.khz, s.blockers, s.locks, power_backend::battery_percent() as u32, now as u32];
+        | u32::from(!s.screen_on) * POWER_INFO_SCREEN_OFF
+        | u32::from(s.suspended) * POWER_INFO_SUSPENDED
+        | u32::from(s.want == policy::WANT_WAKE) * POWER_INFO_WANT_WAKE
+        | u32::from(s.want == policy::WANT_SLEEP) * POWER_INFO_WANT_SLEEP;
+    let wake = s.last_wake & 0xff | s.suspends << 8;
+    let words = [s.temperature_mc as u32, s.opp, s.khz, s.blockers, s.locks, power_backend::battery_percent() as u32, now as u32, wake];
     for (i, w) in words.into_iter().enumerate() {
         put(&mut r, i, w);
     }
@@ -89,7 +94,8 @@ fn locks(m: &Manager, index: usize, stats: bool, now: u64) -> Message {
 
 /// EXECUTE POWER POWER_LOCK|action<<4|kind with the owner in arg. Actions:
 /// 0 release, 1 take (or renew), 2 the owner is gone. The reply's value is
-/// the lock kinds still held by anyone. A refusal is DENIED with the reason
+/// the lock kinds still held by anyone; for a take, arg is the milliseconds
+/// until the lock lapses (policy `remaining`; 0: no expiry). A refusal is DENIED with the reason
 /// in arg (POWER_LOCK_FULL, POWER_LOCK_SCREEN_OFF), EMPTY for a lock not
 /// held, INVALID for a bad request.
 fn lock(m: &mut Manager, board: &mut power_backend::Hardware, owner: u32, request: u32, now: u64) -> Message {
@@ -103,7 +109,7 @@ fn lock(m: &mut Manager, board: &mut power_backend::Hardware, owner: u32, reques
         _ => Err(LockError::BadKind),
     };
     match result {
-        Ok(()) => Message::result(m.locks.blockers(now)),
+        Ok(()) => Message::result(m.locks.blockers(now)).with_arg(if action == 1 { m.locks.remaining(owner, kind, now) } else { 0 }),
         Err(e) => {
             let (op, arg) = e.reply();
             Message::error(op).with_arg(arg)
@@ -125,15 +131,35 @@ const _: () = assert!(
 
 static mut MANAGER: Manager = Manager::new(power_backend::ZONE, 0);
 
+extern "C" {
+    /// The supervisor's timekeeper (runtime/transport.c): whether it serves
+    /// this process, and a signal `ms` from now. Power's notification is
+    /// bound to its thread, so the signal ends `receive` with TIMER_BADGE.
+    pub fn timekeeper_live() -> u32;
+    fn timekeeper_arm_ms(ms: u32);
+}
+
 pub fn run() -> ! {
     // Only this thread uses the manager.
     let manager = unsafe { &mut *core::ptr::addr_of_mut!(MANAGER) };
     let mut board = power_backend::Hardware;
     loop {
+        // The governors, the lapse of locks and the wake sources run on every
+        // request and, with the timekeeper, on Power's own deadlines while
+        // something is pending (policy `next_tick`). Without it they run when
+        // a request arrives, as before.
+        if unsafe { timekeeper_live() } != 0 {
+            if let Some(ms) = manager.next_tick(&board, now_ms()) {
+                unsafe { timekeeper_arm_ms(ms.min(60_000) as u32) };
+            }
+        }
         let (caller,m) = Message::receive(SERVER);
         let now = now_ms();
-        // Power has no timer: the governors run when a request arrives.
         manager.tick(&mut board, now);
+        if caller & TIMER_BADGE != 0 {
+            // A deadline, not a message: nobody is waiting for a reply.
+            continue;
+        }
         let reply = match (caller,m.key,m.op) {
             #[cfg(moto_board)]
             (21,0x4057,EXECUTE) => power_backend::usb_supply(),

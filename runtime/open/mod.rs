@@ -5,6 +5,7 @@
 //! map memory on demand. Built-in apps keep using Runtime, which knows this
 //! process as client 9 (OPEN_APPS).
 pub mod abi;
+pub mod contain;
 pub mod appstore;
 pub mod data;
 #[cfg(moto_board)]
@@ -15,6 +16,7 @@ pub mod fs;
 pub mod hci;
 pub mod heap;
 pub mod inflate;
+pub mod iov;
 pub mod names;
 pub mod net;
 pub mod loopback;
@@ -28,12 +30,12 @@ pub mod trusted_ui;
 pub mod policy;
 pub mod manifest;
 pub mod shield;
-pub mod scorer;
-pub mod scorer_model;
+// scorer.rs and scorer_model.rs are built into the Sentinel (system/sentinel/), not here.
 pub mod guard;
 #[path = "../../services/sentinel/mod.rs"]
 pub mod sentinel;
 pub mod pool;
+pub mod cores;
 pub mod lifecycle;
 pub mod vma;
 pub mod signal;
@@ -66,13 +68,13 @@ use sys::Object;
 pub const MAX_APPS: usize = 12;
 /// Pages one more app behind the front is budgeted in the pool: its two
 /// screen buffers and 2 MiB, for `app_limit`.
-const PER_APP_PAGES: usize = 2 * device::BUFFER_BYTES / sys::PAGE + 32;
+const PER_APP_PAGES: usize = 2 * device::BUFFER_BYTES / sys::PAGE + 2 * sys::MIB_PAGES;
 /// The Home app: started at boot and shown whenever no other app is in front.
 pub const HOME_APP: &str = "/apps/home";
 const APP_KERNEL_BITS: u32 = 19; // 512 KiB of kernel objects per app
 const APP_CNODE_BITS: u32 = 8;
 /// Pages of the pool kept for the runtime's own heap.
-const HEAP_PAGES: usize = 768; // 48 MiB: the runtime, pushed apps and file data
+const HEAP_PAGES: usize = sys::HEAP_PAGES; // 48 MiB: the runtime, pushed apps and file data (pages.rs)
 
 pub struct Log;
 impl Log {
@@ -84,6 +86,11 @@ impl Log {
             Self::page().add(1).write_volatile(0);
             Self::page().write_volatile(0x474f4c4f); // "OLOG"
         }
+    }
+    /// One line of the log (the `log!` macro), with its prefix.
+    #[inline(never)]
+    pub fn line(args: core::fmt::Arguments) {
+        Self::write(alloc::format!("[open] {}\n", args).as_bytes());
     }
     /// Append to the ring: word 0 magic, word 1 bytes written in total, data from byte 8.
     pub fn write(bytes: &[u8]) {
@@ -101,10 +108,10 @@ impl Log {
 }
 #[macro_export]
 macro_rules! log {
-    ($($arg:tt)*) => {{
-        let s = alloc::format!("[open] {}\n", alloc::format!($($arg)*));
-        $crate::process::Log::write(s.as_bytes());
-    }};
+    // One call per line logged; the text is put together in `Log::line`.
+    ($($arg:tt)*) => {
+        $crate::process::Log::line(format_args!($($arg)*))
+    };
 }
 
 #[derive(Clone)]
@@ -220,7 +227,7 @@ pub struct App {
 
 /// Room the pool keeps for the app in front: a launch closes background apps
 /// until this much is free (32 MiB).
-const RESERVE_PAGES: usize = 512;
+const RESERVE_PAGES: usize = 32 * sys::MIB_PAGES;
 
 pub struct Runtime {
     pub k: Kernel,
@@ -254,7 +261,7 @@ pub struct Runtime {
     pub camera: bool,
     pub net: net::Net,
     pub shield: ShieldPolicy,
-    pub scorer: scorer::Scorer,
+    pub scorer: guard::ScoreLink,
     pub sentinel: sentinel::Sentinel,
     pub last_touch_ns: u64,
     pub tx_stats: Vec<Option<TxStat>>,
@@ -341,6 +348,9 @@ impl Runtime {
                 }
             }
         }
+        // The pages apps may map (system/supervisor/frames.rs): the pool less
+        // the heap below and the unpacked image above. Until this, none.
+        procmgr::ledger().limit(HEAP_PAGES as u32, (HEAP_PAGES + pool.app_pages) as u32);
         let mut fs = fs::Fs::new(image);
         let listed = data::load(&mut fs);
         let store = appstore::Store::load(&mut fs);
@@ -349,7 +359,7 @@ impl Runtime {
         trusted_ui::boot(&fs, listed);
         let book = manifest::Book::load(&mut fs);
         let app_limit = lifecycle::app_limit(MAX_APPS, untypeds.len(), pool.app_pages, RESERVE_PAGES, PER_APP_PAGES).max(1);
-        log!("apps: up to {} at once ({} kernel slices, {} MiB of pool for apps)", app_limit, untypeds.len(), pool.app_pages / 16);
+        log!("apps: up to {} at once ({} kernel slices, {} MiB of pool for apps)", app_limit, untypeds.len(), pool.app_pages / sys::MIB_PAGES);
         Ok(Runtime {
             app_limit,
             life: lifecycle::Book::default(),
@@ -375,7 +385,7 @@ impl Runtime {
             // Radio (handset) or the emulator's host relay serves the socket pages.
             net: net::Net::new(true),
             shield: ShieldPolicy::new(),
-            scorer: scorer::Scorer::new(),
+            scorer: guard::ScoreLink::default(),
             sentinel: {
                 let mut id = [0u8; 16];
                 let (a, b) = (sys::counter() ^ 0x5bd1e995, sys::counter().rotate_left(17) ^ 0x9e3779b97f4a7c15);
@@ -470,6 +480,7 @@ impl Runtime {
         let untyped = self.untypeds[index];
         let k = &mut self.k;
         let mut space = Space::new(k, untyped).map_err(|e| alloc::format!("address space: {}", e))?;
+        space.cap = self.pool.app_cap(); // one app's share of the pool (pool.rs)
         let cnode = match space.object(k, Object::CNode, APP_CNODE_BITS) {
             Ok(c) => c,
             Err(e) => {
@@ -510,7 +521,7 @@ impl Runtime {
         };
         // ARM-mode trampolines: `ldr pc, [pc, #-4]` then the target, per thread.
         // The app has the page read-execute; the runtime writes it through its own mapping.
-        space.add(layout.stubs, layout.stubs + sys::PAGE as u32, procmgr::PROT_READ | procmgr::PROT_EXEC);
+        space.add(layout.stubs, layout.stubs + procmgr::WINDOW, procmgr::PROT_READ | procmgr::PROT_EXEC);
         let Some(_) = space.resolve(k, &mut self.pool, layout.stubs) else {
             space.destroy(k, &mut self.pool);
             self.release_objects(index, core::mem::take(&mut space.object_slots));
@@ -547,7 +558,7 @@ impl Runtime {
             self.reap(index);
             return Err(alloc::format!("thread: {}", e));
         }
-        log!("started {} as pid {} ({} KiB free)", program, pid, self.pool.available() * 64);
+        log!("started {} as pid {} ({} KiB free)", program, pid, self.pool.available() * sys::PAGE_KIB);
         let app_name = self.apps[index].as_ref().unwrap().name.clone();
         self.sentinel.note_exec(pid, &app_name, &digest);
         let _ = measured;
@@ -673,13 +684,16 @@ impl Runtime {
                 self.k.release(r);
             }
         }
+        // Its page directory goes first (with its kernel objects), so giving
+        // back each page costs no page-table walk or TLB flush of its own.
+        self.release_objects(index, core::mem::take(&mut app.space.object_slots));
+        app.space.destroy(&mut self.k, &mut self.pool);
+        // Screen pages only now, when no mapping holds them (frames.rs).
         if let Some(surface) = app.surface.take() {
             for p in surface.pages {
                 self.pool.give_back(p);
             }
         }
-        app.space.destroy(&mut self.k, &mut self.pool);
-        self.release_objects(index, core::mem::take(&mut app.space.object_slots));
         log!("{} (pid {}) exited with status {}", app.name, app.pid, app.exit_code.unwrap_or(-1));
         if self.home == Some(index) {
             self.home = None;
@@ -729,6 +743,19 @@ impl Runtime {
         if index >= MAX_APPS || self.apps[index].as_ref().map_or(true, |a| slot >= a.threads.len()) {
             return;
         }
+        // A fault in the runtime from here on closes this app only (contain.rs);
+        // the callers say when the work is over.
+        contain::STATE.serve(index);
+        // Test images only (built with VIOLET_TEST_FAULT=1, never a release):
+        // system call 0xffa17 makes the runtime fault while it serves the
+        // caller, by a panic (r0 = 0) or a write to the unmapped page at 0.
+        #[cfg(open_fault_probe)]
+        if r.label == sys::FAULT_UNKNOWN_SYSCALL && r.mrs[7] == 0xf_fa17 {
+            if r.mrs[0] == 0 {
+                panic!("fault probe");
+            }
+            unsafe { ((r.mrs[0] & 0xffc) as usize as *mut u32).write_volatile(0) };
+        }
         match r.label {
             sys::FAULT_UNKNOWN_SYSCALL => self.syscall(index, slot, &r.mrs),
             sys::FAULT_VM => {
@@ -751,7 +778,11 @@ impl Runtime {
                     }
                     resolved = self.apps[index].as_mut().unwrap().space.fault(&mut self.k, &mut self.pool, addr, access);
                 }
-                if !resolved && valid && self.pool.available() == 0 {
+                // Any fault a region allows that still has no page ran out
+                // of memory (the pool, its family's cap: pool.rs `app_cap`,
+                // kernel memory or slots): out of memory, never a bad access
+                // (procmgr.rs `starved`).
+                if !resolved && valid && !self.apps[index].as_ref().unwrap().space.holds(addr) {
                     return self.close_for_memory(index, "out of memory");
                 }
                 if resolved {
@@ -765,7 +796,7 @@ impl Runtime {
                 } else {
                     let app = self.apps[index].as_mut().unwrap();
                     let (pages, tables) = app.space.usage();
-                    log!("{} (pid {}): bad memory access ({:?}) at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, access, addr, pc, self.pool.available() * 64, pages * 64, tables);
+                    log!("{} (pid {}): bad memory access ({:?}) at {:#x}, pc {:#x} ({} KiB free; it held {} KiB in {} tables)", app.name, app.pid, access, addr, pc, self.pool.available() * sys::PAGE_KIB, pages * sys::PAGE_KIB, tables);
                     app.exit_code = Some(139);
                     self.reap(index);
                 }
@@ -790,6 +821,7 @@ impl Runtime {
             if app.frozen.is_some() || app.life.state == lifecycle::State::Frozen {
                 continue;
             }
+            contain::STATE.serve(index); // finishing this app's waits is work for it
             let waiting: Vec<(usize, Wait, Option<u64>)> = app
                 .threads
                 .iter()
@@ -814,6 +846,30 @@ impl Runtime {
                     self.wake(index, slot, result);
                 }
             }
+        }
+        contain::STATE.done();
+    }
+
+    /// After a fault in this process (a panic, a bad pointer) the supervisor
+    /// started the thread again and `run` found the runtime as the fault left
+    /// it (contain.rs). The app being served is closed; the others go on.
+    fn recover(&mut self, served: Option<usize>) {
+        // What the lost stack would have undone: a lowered priority
+        // (sys::Lowered), and with MCS a Reply object taken for a saved call:
+        // made from the untyped kept for Replies (pool.rs `Kernel::replies`;
+        // SLOT_KERNEL is carved up by then). The retype fails harmlessly
+        // when the slot still holds one.
+        if sys::timer_ready() {
+            sys::set_own_priority(sys::EVENT_PRIORITY);
+        }
+        if sys::mcs() {
+            let from = if self.k.replies != 0 { self.k.replies } else { sys::SLOT_KERNEL };
+            let _ = sys::retype(from, Object::Reply, 0, sys::SLOT_REPLY);
+        }
+        let n = contain::STATE.recovered();
+        if contain::recover(self, served) == contain::Verdict::Nothing {
+            log!("runtime fault {} in no app's call: stopped", n);
+            halt()
         }
     }
 
@@ -1001,7 +1057,9 @@ impl Runtime {
         self.usb_requests();
         self.usb_installs();
         let t1 = sys::now_ns();
-        let focus = request(GET, FOCUS, 0);
+        // With the poll, whether the lock screen is up: Runtime then keeps the
+        // open apps in front, so no built-in screen is reachable behind it.
+        let focus = request(GET, FOCUS, trusted_ui::locked() as u32);
         let t2 = sys::now_ns();
         self.stats.step(0, t1 - t0);
         self.stats.step(1, t2 - t1);
@@ -1017,7 +1075,7 @@ impl Runtime {
             // Home starts the first time the open apps come to the front, so it
             // costs nothing on a system that never shows them.
             self.home_tried = true;
-            self.start_home();
+            self.start_home(true);
         }
         if focused && !self.focused {
             self.shell.dirty = true;
@@ -1190,6 +1248,8 @@ impl Runtime {
     }
 
     fn run(&mut self) -> ! {
+        // Since when the loop has had calls to serve on every pass (cores.rs).
+        let mut busy_since = 0u64;
         loop {
             let mut handled = 0;
             while handled < 64 {
@@ -1204,6 +1264,7 @@ impl Runtime {
                     continue;
                 }
                 self.handle_fault(r);
+                contain::STATE.done();
                 handled += 1;
             }
             // Timers, and signals for threads not in a call (syscall.rs): with
@@ -1220,12 +1281,23 @@ impl Runtime {
                 let (blocks, free) = heap::HEAP.stats();
                 let waiting: usize = self.apps.iter().flatten().map(|a| a.threads.iter().filter(|t| t.wait.is_some()).count()).sum();
                 let threads: usize = self.apps.iter().flatten().map(|a| a.threads.iter().filter(|t| t.alive).count()).sum();
+                // The four busiest calls, picked by hand: a sort here costs kilobytes of code.
                 let mut calls = core::mem::take(&mut self.stats.calls);
-                calls.sort_by_key(|c| core::cmp::Reverse(c.1));
-                let top: Vec<String> = calls.iter().take(4).map(|(n, c)| alloc::format!("{}:{}/s", n, *c as u64 / secs)).collect();
+                let mut top = String::new();
+                for _ in 0..4 {
+                    let mut best = 0;
+                    for j in 1..calls.len() {
+                        if calls[j].1 > calls[best].1 {
+                            best = j;
+                        }
+                    }
+                    let Some(c) = calls.get_mut(best).filter(|c| c.1 != 0) else { break };
+                    top += &alloc::format!("{}:{}/s ", c.0, c.1 as u64 / secs);
+                    c.1 = 0;
+                }
                 log!(
                     "stats: {} loops/s, asleep {}%, {} faults/s [{}], slowest poll {} us (flush {} focus {} touch {}), slowest pass {} us, {} threads ({} waiting), heap {} free blocks {} KiB",
-                    self.stats.loops / secs, self.stats.slept_ns / 10_000_000 / secs, self.stats.faults / secs, top.join(" "), self.stats.slowest_poll / 1000,
+                    self.stats.loops / secs, self.stats.slept_ns / 10_000_000 / secs, self.stats.faults / secs, top.trim_end(), self.stats.slowest_poll / 1000,
                     self.stats.slowest_step[0] / 1000, self.stats.slowest_step[1] / 1000, self.stats.slowest_step[2] / 1000,
                     self.stats.slowest_pass / 1000, threads, waiting, blocks, free / 1024
                 );
@@ -1264,7 +1336,15 @@ impl Runtime {
                 self.shield_tick(now);
             }
             if handled == 0 {
+                busy_since = 0;
                 self.idle(now);
+            } else if busy_since == 0 {
+                busy_since = now;
+            } else if cores::relief_due(sys::cores(), busy_since, now) {
+                // An app on another core can keep this loop busy, above the
+                // services on their own core: let them run once.
+                busy_since = 0;
+                sys::relieve();
             }
         }
     }
@@ -1289,6 +1369,7 @@ impl Runtime {
         self.stats.pass_start = 0; // a pass measures work, not sleep
         if r.badge != 0 && r.badge & sys::NOTIFY_BADGES == 0 {
             self.handle_fault(r);
+            contain::STATE.done();
         }
     }
 
@@ -1380,6 +1461,8 @@ impl Runtime {
     /// how it ended and does not keep the slot frozen.
     fn own_facts(&self, i: usize, app: &App, now: u64) -> lifecycle::Facts {
         use device::Kind::*;
+        // A wake lock keeps it running behind, but Cached (powerctl.rs `left_ns`).
+        let left_ns = powerctl::left_ns(app.pid, app.used_ns, now);
         let sending = self.tx_stats.iter().flatten()
             .any(|t| t.index == i && t.pid == app.pid && (t.pending > 0 || now.wrapping_sub(t.last_ns) < lifecycle::GRACE_NS));
         let reason = app.path == appstore::INSTALLER || sending
@@ -1389,7 +1472,7 @@ impl Runtime {
                 // A connection offered or bytes sent to it lately (sockets.rs), so a server's clients do not hang.
                 ref k => self.socket_wakes(k, now),
             });
-        lifecycle::Facts { front: self.foreground == Some(i), home: self.home == Some(i), reason, shield: app.frozen.is_some(), left_ns: app.used_ns }
+        lifecycle::Facts { front: self.foreground == Some(i), home: self.home == Some(i), reason, shield: app.frozen.is_some(), left_ns }
     }
 
     /// Its own facts, or for a child process those it takes from the app
@@ -1477,8 +1560,8 @@ impl Runtime {
         let (name, state) = (app.name.clone(), app.life.state.name());
         let place = if self.foreground == Some(i) { "in front" } else { "in the background" };
         self.reap(i);
-        log!("low on app memory: closed {} {} ({} KiB free; it was {} with {} KiB: {})", name, place, self.pool.available() * 64, state, pages * 64, reason);
-        self.life.note(lifecycle::Closed { name, reason, kib: pages * 64, at_s: sys::now_ns() / 1_000_000_000 });
+        log!("low on app memory: closed {} {} ({} KiB free; it was {} with {} KiB: {})", name, place, self.pool.available() * sys::PAGE_KIB, state, pages * sys::PAGE_KIB, reason);
+        self.life.note(lifecycle::Closed { name, reason, kib: pages * sys::PAGE_KIB, at_s: sys::now_ns() / 1_000_000_000 });
         self.shell.dirty = true;
     }
 
@@ -1561,7 +1644,7 @@ impl Runtime {
         let p = lifecycle::pressure(self.pool.available(), RESERVE_PAGES, was);
         self.life.pressure = p;
         if was == lifecycle::Pressure::Normal && p != lifecycle::Pressure::Normal {
-            log!("lifecycle: app memory low ({} KiB free): background apps asked to free memory", self.pool.available() * 64);
+            log!("lifecycle: app memory low ({} KiB free): background apps asked to free memory", self.pool.available() * sys::PAGE_KIB);
             let behind: Vec<usize> = (0..MAX_APPS).filter(|&i| self.apps[i].is_some() && self.foreground != Some(i)).collect();
             for i in behind {
                 self.event(i, abi::InputEvent { timestamp_us: now / 1000, kind: abi::EVENT_LIFECYCLE, value: abi::LIFECYCLE_LOW_MEMORY, ..Default::default() });
@@ -1579,14 +1662,14 @@ impl Runtime {
         let running = self.apps.iter().flatten().count();
         let mut out = alloc::format!(
             "free={} total={} apps_pool={} heap_free={} heap={} apps={}/{} refused={}",
-            self.pool.available() * 64, self.pool.total * 64, self.pool.app_pages * 64, heap_free / 1024,
+            self.pool.available() * sys::PAGE_KIB, self.pool.total * sys::PAGE_KIB, self.pool.app_pages * sys::PAGE_KIB, heap_free / 1024,
             heap::HEAP.total() / 1024, running, self.app_limit, self.pool.refused
         );
         for (i, a) in self.apps.iter().enumerate() {
             let Some(a) = a.as_ref().filter(|_| only.map_or(true, |o| o == i)) else { continue };
             let (pages, tables) = a.space.usage();
             let surface = a.surface.as_ref().map_or(0, |s| s.pages.len());
-            out += &alloc::format!(" {}={}+{}(t{},{})", lifecycle::clean(&a.name), pages * 64, surface * 64, tables, a.life.state.name());
+            out += &alloc::format!(" {}={}+{}(t{},{})", lifecycle::clean(&a.name), pages * sys::PAGE_KIB, surface * sys::PAGE_KIB, tables, a.life.state.name());
         }
         match only {
             None => self.life.report(&mut out),
@@ -1631,15 +1714,74 @@ impl Stats {
 /// stay within its 0x3e000-byte window.
 static mut BOOT_HEAP: [u64; 1008] = [0; 1008];
 
+/// Recovery's view of the runtime (contain.rs `recover`).
+impl contain::Host for Runtime {
+    fn slots(&self) -> usize {
+        self.untypeds.len().min(MAX_APPS)
+    }
+    fn present(&self, i: usize) -> bool {
+        self.apps.get(i).map_or(false, Option::is_some)
+    }
+    fn close(&mut self, i: usize) {
+        if let Some(app) = self.apps[i].as_mut() {
+            log!("runtime fault {}: closed {} (pid {})", contain::STATE.recovered(), app.name, app.pid);
+            app.exit_code = Some(134);
+        }
+        self.reap(i);
+    }
+    fn revoke(&mut self, i: usize) {
+        sys::revoke(self.untypeds[i]);
+    }
+    fn home(&mut self) -> &mut Option<usize> {
+        &mut self.home
+    }
+    fn front(&mut self) -> &mut Option<usize> {
+        &mut self.foreground
+    }
+    fn home_tried(&self) -> bool {
+        self.home_tried
+    }
+    fn start_home(&mut self) {
+        Runtime::start_home(self, false);
+    }
+    fn show_home(&mut self) {
+        Runtime::show_home(self);
+    }
+}
+
+/// Stop this thread for good: what the supervisor did on every fault before
+/// containment, done from inside (SLOT_AUTHORITY is the runtime's own TCB).
+fn halt() -> ! {
+    loop {
+        sys::tcb_suspend(sys::SLOT_AUTHORITY);
+        sys::yield_now();
+    }
+}
+
 pub fn run() -> ! {
+    // The first start, or the supervisor's restart after a fault in this
+    // process, with memory as the fault left it (contain.rs).
+    match contain::STATE.enter() {
+        contain::Entry::Cold => {}
+        // A fault during boot: nothing here can be trusted, so stay down
+        // (suspended, not spinning: the fault may come at EVENT_PRIORITY).
+        contain::Entry::Boot => halt(),
+        contain::Entry::Warm { runtime, served } => {
+            // Set by `settle` below: the runtime, which is never freed or moved.
+            let rt = unsafe { &mut *(runtime as *mut Runtime) };
+            rt.recover(served);
+            rt.run()
+        }
+    }
     Log::init();
     unsafe { heap::HEAP.add(core::ptr::addr_of_mut!(BOOT_HEAP) as usize, 1008 * 8) };
     let mut rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
             Log::write(alloc::format!("[open] start failed: seL4 error {}\n", e).as_bytes());
+            // Suspended, as halt() (written out here: it costs less code).
             loop {
-                sys::yield_now();
+                sys::tcb_suspend(sys::SLOT_AUTHORITY);
             }
         }
     };
@@ -1649,7 +1791,7 @@ pub fn run() -> ! {
     log!(
         "ready: {} files in /apps image, {} MiB for apps",
         rt.fs.files(),
-        rt.pool.available() / 16
+        rt.pool.available() / sys::MIB_PAGES
     );
     if sys::timer_selftest() {
         sys::set_own_priority(sys::EVENT_PRIORITY);
@@ -1663,5 +1805,8 @@ pub fn run() -> ! {
         sys::cores(),
         if sys::cores() > 1 { "cores (the app in front on core 1, others on 2-3)" } else { "core" }
     );
+    // On the heap for good, so a restart after a fault finds it (contain.rs).
+    let rt = alloc::boxed::Box::leak(alloc::boxed::Box::new(rt));
+    contain::STATE.settle(rt as *mut Runtime as usize);
     rt.run()
 }

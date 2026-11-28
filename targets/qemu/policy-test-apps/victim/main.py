@@ -1,5 +1,5 @@
 """Keeps private files under its own name in /data, for the policy probe
-(targets/qemu/test_policy.py) to fail to see. No manifest: its own /data,
+(targets/qemu/test_system.py) to fail to see. No manifest: its own /data,
 the screen and touch."""
 import os
 

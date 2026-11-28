@@ -17,6 +17,14 @@
 //   word 9  guest  wake locks held
 //   word 10 guest  wake-lock kinds held, one bit each
 //   word 11 guest  times the governors ran
+//   word 12 guest  1 while suspended to idle (the timekeeper holds every
+//                  process's timers; the machine keeps running, unlike word 1)
+//   word 13 host   wake lines, taken (and cleared) by the guest: bit 0 the
+//                  power key, bit 1 a touch, bit 3 the network
+//   word 14 host   a wake alarm in milliseconds from now, taken by the guest
+//   word 15 guest  the last wake's sources (bits as word 13, bit 2 the alarm)
+//                  in the low byte, the number of suspends above
+//   word 16 guest  what Power asks of the screen: 0 nothing, 1 wake, 2 sleep
 use crate::process::policy::{Board, DvfsStep, Opp, Reading, Snapshot, Zone};
 use crate::protocol::*;
 
@@ -27,14 +35,49 @@ fn get(word: usize) -> u32 {
 fn set(word: usize, value: u32) {
     unsafe { (PAGE as *mut u32).add(word).write_volatile(value) }
 }
+/// Read a host word and clear it atomically (LDREX/STREX).
+fn take(word: usize) -> u32 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    unsafe { (*(PAGE as *const AtomicU32).add(word)).swap(0, Ordering::AcqRel) }
+}
 
 pub fn read() -> Message {
     let mut r = Message::result(get(0).min(100));
-    r.arg = get(1) & 1;
+    r.arg = (get(1) | get(12)) & 1;
     r
 }
+extern "C" {
+    // The supervisor's timekeeper (runtime/transport.c).
+    fn timekeeper_command(op: u32, arg: u32);
+    fn timekeeper_state() -> u32;
+    fn timekeeper_reason() -> u32;
+}
+const TK_OP_SUSPEND: u32 = 1;
+const TK_OP_RESUME: u32 = 2;
+const TK_FROZEN: u32 = 1;
+/// The processes that may end a suspend to idle themselves (system_wake in
+/// runtime/transport.c), by supervisor identity: Runtime, Touch, Radio and
+/// the Open Runtime. None of them calls it yet; Power's own look at the wake
+/// lines below is what wakes the emulator.
+const WAKE_PROCESSES: u32 = 1 << 3 | 1 << 4 | 1 << 7 | 1 << 24;
+/// Suspend (1) with the timekeeper is a suspend to idle inside the guest:
+/// every process's timers are held and released twice a second, and the
+/// machine runs on, so the wake sources work. Without the timekeeper it is
+/// the old register that tools/run.py answers by pausing the machine.
 pub fn command(value: u32) -> Message {
-    set(1, value);
+    let idle = unsafe { crate::process::timekeeper_live() } != 0;
+    match value {
+        1 if idle => {
+            unsafe { timekeeper_command(TK_OP_SUSPEND, WAKE_PROCESSES) };
+            set(12, 1);
+        }
+        0 if idle => {
+            unsafe { timekeeper_command(TK_OP_RESUME, 0) };
+            set(12, 0);
+            set(1, 0);
+        }
+        _ => set(1, value),
+    }
     Message::result(value)
 }
 pub fn battery_percent() -> i32 {
@@ -91,5 +134,30 @@ impl Board for Hardware {
         set(9, s.locks);
         set(10, s.blockers);
         set(11, get(11).wrapping_add(1));
+        set(15, s.last_wake & 0xff | s.suspends << 8);
+        set(16, u32::from(s.want));
+    }
+    const SUSPENDS: bool = true;
+    fn wake_events(&mut self) -> u32 {
+        // Taken and cleared in one exclusive access: a line the host sets
+        // between a read and a separate clear would be lost.
+        let mut events = take(13);
+        // A process ended the suspend itself: the timekeeper says why.
+        if get(12) == 1 && unsafe { crate::process::timekeeper_live() != 0 && timekeeper_state() & TK_FROZEN == 0 } {
+            // Whatever it gave as the reason, the suspend is over: say so.
+            events |= match unsafe { timekeeper_reason() } & 0xb {
+                0 => 8,
+                bits => bits,
+            };
+        }
+        events
+    }
+    fn take_alarm(&mut self) -> Option<u64> {
+        let ms = get(14);
+        if ms == 0 {
+            return None;
+        }
+        set(14, 0);
+        Some(u64::from(ms))
     }
 }

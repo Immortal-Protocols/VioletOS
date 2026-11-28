@@ -34,8 +34,54 @@ def companion_key(repo, dest):
     return out
 
 
+def sentinel_key_path(repo, environ=None):
+    """Where the handset Sentinel's build secret is kept (QEMU uses none).
+
+    VIOLET_SENTINEL_SEAL names the file. A release (VIOLET_RELEASE=1) must name
+    it: the build fails rather than invent one. A developer build keeps it
+    beside the developer signing key when VIOLET_DEVELOPER_KEY_DIR is set
+    (image/packages/sign.py), so every worktree shares it, else in this tree.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get("VIOLET_SENTINEL_SEAL"):
+        return Path(environ["VIOLET_SENTINEL_SEAL"])
+    if environ.get("VIOLET_RELEASE") == "1":
+        raise SystemExit("VIOLET_RELEASE=1 needs VIOLET_SENTINEL_SEAL: the Sentinel's sealing secret (system/sentinel/README.md)")
+    if environ.get("VIOLET_DEVELOPER_KEY_DIR"):
+        return Path(environ["VIOLET_DEVELOPER_KEY_DIR"]) / "sentinel-seal.bin"
+    return repo / "build/sentinel/seal-secret.bin"
+
+
+def sentinel_key(repo, dest):
+    """The handset Sentinel's sealing secret (system/sentinel/seal.rs), built into its package only.
+
+    32 random bytes, made once where `sentinel_key_path` says. Phones built
+    from the same file share it, and a Sentinel built with another secret
+    opens nothing the old one sealed. A QEMU Sentinel has no build secret: it
+    derives its key from the device root key (cfg device_root_key).
+    """
+    key = sentinel_key_path(repo)
+    if not key.exists() and os.environ.get("VIOLET_SENTINEL_SEAL"):
+        raise SystemExit(f"VIOLET_SENTINEL_SEAL: {key} not found")
+    if not key.exists():
+        key.parent.mkdir(parents=True, exist_ok=True)
+        tmp = key.with_suffix(".new")
+        tmp.write_bytes(os.urandom(32))
+        tmp.chmod(0o600)
+        tmp.replace(key)
+    secret = key.read_bytes()
+    if len(secret) != 32:
+        raise SystemExit(f"{key} is not a 32-byte sealing secret")
+    out = dest / "sentinel_key.rs"
+    out.write_text("pub const SEAL_SECRET: [u8; 32] = [" + ",".join(map(str, secret)) + "];\n")
+    return out
+
+
 def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=None, storage_backend=None, target="qemu"):
     from package_format import package_abi
+    # The architecture comes from VIOLET_ARCH (violet_arch.py): aarch32 unless set.
+    import violet_arch
+    violet_arch.require_components()
 
     platform_include = repo / "platform/sel4/include"
     dest = out / "packages"
@@ -66,6 +112,7 @@ def components(repo, out, cc, common, incs, rustc, objects, only=None, selected=
         "audio": repo / "services/audio/process.rs",
         "camera": repo / "services/camera/process.rs",
         "open": repo / "runtime/open/mod.rs",
+        "sentinel": repo / "system/sentinel/process.rs",
     }
     board = repo / "targets" / ("moto-g-pure" if target == "moto" else "qemu")
     if target == "moto":
@@ -159,6 +206,8 @@ SECTIONS {
             )
         if name == "open":
             modules["companion_key"] = companion_key(repo, dest)
+        if name == "sentinel" and target == "moto":
+            modules["sentinel_key"] = sentinel_key(repo, dest)
         body = "process::run()"
         if name == "runtime":
             modules["lanes"] = repo / "runtime/lanes.rs"
@@ -174,11 +223,13 @@ SECTIONS {
                 storage=repo / "services/storage/storage.rs",
                 block=storage_backend or repo / "services/storage/block.rs",
                 journal=repo / "services/storage/journal.rs",
+                # The trait VioletFS (and the cipher under it) sit on: /data.
+                blockdev=repo / "services/storage/blockdev.rs",
             )
             body = "storage::storage_task()"
         crate = dest / (name + ".rs")
         # The Open Runtime keeps its tables on a heap.
-        prelude = "extern crate alloc;\n" if name == "open" else ""
+        prelude = "extern crate alloc;\n" if name in ("open", "sentinel") else ""
         crate.write_text(
             "#![no_std]\n#![allow(dead_code)]\n" + prelude
             + "".join(
@@ -195,17 +246,26 @@ SECTIONS {
                 rustc,
                 "--edition=2021",
                 "--crate-type=staticlib",
-                "--target=armv7a-none-eabi",
+                "--target=" + violet_arch.rust_target(),
                 "-Cpanic=abort",
                 # The Open Runtime (with the Sentinel) is optimised for size; its window is 0x80000 bytes.
-                "-Copt-level=z" if name == "open" else "-Copt-level=s",
+                "-Copt-level=z" if name in ("open", "sentinel") else "-Copt-level=s",
                 # The Open Runtime is also optimised together with core and
                 # alloc (fat LTO): their unused generic code goes, which keeps
                 # the handset catalog inside its 1 MiB banks.
-                *(["-Clto=fat"] if name == "open" else []),
+                *(["-Clto=fat"] if name in ("open", "sentinel") else []),
                 # One codegen unit: smaller code.
                 "-Ccodegen-units=1",
                 *(["--cfg", "moto_board"] if target=="moto" and name in ("power", "open", "launcher") else []),
+                # Test images only: the Open Runtime damages its own requests about
+                # paths ending in "sentinel-fault-probe" (runtime/open/policy.rs).
+                *(["--cfg", "sentinel_fault"] if name == "open" and os.environ.get("VIOLET_SENTINEL_FAULT") == "1" else []),
+                # QEMU: the Sentinel's sealing key comes from the device root key page.
+                *(["--cfg", "device_root_key"] if name == "sentinel" and target != "moto" else []),
+                # Test images only: a system call that makes the Open Runtime fault, to
+                # show the fault ends one app (runtime/open/contain.rs). Never in a release.
+                *(["--cfg", "open_fault_probe"] if name == "open" and os.environ.get("VIOLET_TEST_FAULT") == "1"
+                  and os.environ.get("VIOLET_RELEASE") != "1" else []),
                 *(["--cfg", "boot_trace", "--cfg", "package_catalog"] if target == "moto" and name == "storage" else []),
                 crate,
                 "-o",
@@ -319,8 +379,8 @@ SECTIONS {
         (dest / (name + ".vpk")).write_bytes(package_signer.sign(header + image, int(test_versions.get(name, item.get("version", 1)))))
     if only:
         return
-    from package_format import pack
+    from package_format import catalog_limit, pack
 
     (out / "catalog.bin").write_bytes(
-        pack([(dest / (n + ".vpk")).read_bytes() for n in names])
+        pack([(dest / (n + ".vpk")).read_bytes() for n in names], limit=catalog_limit(target))
     )

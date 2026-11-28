@@ -13,15 +13,43 @@ The metadata is Android's bootloader_control, the record the XT2163DL's own
 boot control HAL writes (targets/moto-g-pure/slot.rs explains where that is
 known from); the codec below mirrors slot.rs and is tested against the same
 golden record. A slot holds a VSL1 container (tools/ota_bundle.py) of the
-files QEMU is started with; an update's manifest is in the slot's last
-sector, which this model, like a real bootloader on an unlocked phone, does
-not check: the phone checked it before it switched (system/package-manager/
-ota.rs).
+files QEMU is started with, and the slot's last sector holds the signed
+update manifest (VOT1) for it: what Storage writes when it switches slots
+(services/storage/slotwrite.rs), and what `provision` writes for the factory
+image.
+
+Like an AVB bootloader, the model checks a slot before it loads it, against
+keys and a rollback floor it keeps itself, never ones read from the slot
+(the loader and the keys it pins travel in the slot, so whoever writes a
+slot would otherwise choose what is trusted):
+
+    misc + 4   bootloader_control (the only misc sector Storage's slot
+               interface reaches: services/storage/block.rs slot_sector)
+    misc + 5   the rollback floor (tools/boot_manifest.py floor_record): the
+               highest version a slot was marked successful with
+    misc + 6   the trusted keys ("VBK1"), written once by `provision`, as a
+               phone's key is fused at the factory
+
+The slot boots only if its manifest is signed for QEMU by a trusted key, its
+digest covers the whole slot image (loader, entry, device tree, /apps), its
+version is at least the floor, and the boot manifest the loader carries
+(boot/loader/verified.rs) states the same version. A slot that fails is
+marked unbootable and the other slot is tried in the same power-on, so a
+refused slot can never hold the device while a good one is on disk. The
+floor rises only from a slot that passed this check and is marked
+successful; the loader then gets the floor as well (OUT_DIR/rollback-floor,
+tools/run.py) and checks the kernel and root task against its manifest.
+
+A real bootloader keeps the floor and keys where the system cannot rewrite
+them (RPMB or fuses). Here they are disk sectors outside what Storage's slot
+interface accepts, so they hold against a compromised package manager or app
+using slot writes, not against code that drives the disk directly (Storage
+itself, or the host).
 
 `boot()` does what an AOSP-style bootloader does at power-on: take the
 bootable slot of highest priority, spend one of its tries unless it was
-marked successful, record its suffix, and load it. A slot that does not load
-is a failed attempt; once a trial's tries are spent the other slot boots.
+marked successful, record its suffix, verify and load it; once a trial's
+tries are spent, or a slot fails its check, the other slot boots.
 
     python3 tools/ota_boot.py provision DISK IMAGE_DIR   # slot A from a build
     python3 tools/ota_boot.py boot DISK OUT_DIR          # pick a slot, unpack it
@@ -34,6 +62,7 @@ import struct
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boot_manifest  # noqa: E402
 import ota_bundle  # noqa: E402
 
 MAGIC = 0x42414342
@@ -160,13 +189,74 @@ def write_control(disk, control, g=QEMU):
         f.write(control.encode())
 
 
-def provision(disk, image, geometry=QEMU):
+def read_floor(disk, g=QEMU):
+    """The stored rollback floor; ValueError when its record is damaged."""
+    with Path(disk).open("rb") as f:
+        f.seek((g.control + 1) * 512)
+        return boot_manifest.read_floor_record(f.read(512).ljust(16, b"\0"))
+
+
+def write_floor(disk, floor, g=QEMU):
+    with Path(disk).open("r+b") as f:
+        f.seek((g.control + 1) * 512)
+        f.write(boot_manifest.floor_record(floor).ljust(512, b"\0"))
+
+
+KEYS_MAGIC = b"VBK1"
+POINT = 65
+
+
+def key_record(keys):
+    """The trusted-keys sector: "VBK1" | count u32 | count x (key ID u32,
+    P-256 point) | CRC-32 of what precedes it."""
+    if not 0 < len(keys) <= 4:
+        raise ValueError("the bootloader model trusts 1 to 4 keys")
+    body = KEYS_MAGIC + struct.pack("<I", len(keys))
+    for key_id, point in sorted(keys.items()):
+        if len(point) != POINT or point[0] != 4 or not 0 < key_id < 1 << 32:
+            raise ValueError("a trusted key is a key ID and an uncompressed P-256 point")
+        body += struct.pack("<I", key_id) + bytes(point)
+    return (body + struct.pack("<I", binascii.crc32(body))).ljust(512, b"\0")
+
+
+def read_key_record(sector):
+    """{key_id: point}; ValueError when missing or damaged (nothing may boot)."""
+    raw = bytes(sector)
+    if raw[:4] != KEYS_MAGIC:
+        raise ValueError("no trusted keys provisioned")
+    count, = struct.unpack_from("<I", raw, 4)
+    if not 0 < count <= 4:
+        raise ValueError("trusted keys record")
+    end = 8 + count * (4 + POINT)
+    if binascii.crc32(raw[:end]) != struct.unpack_from("<I", raw, end)[0]:
+        raise ValueError("trusted keys record")
+    keys = {}
+    for i in range(count):
+        at = 8 + i * (4 + POINT)
+        keys[struct.unpack_from("<I", raw, at)[0]] = raw[at + 4:at + 4 + POINT]
+    return keys
+
+
+def read_keys(disk, g=QEMU):
+    with Path(disk).open("rb") as f:
+        f.seek((g.control + 2) * 512)
+        return read_key_record(f.read(512).ljust(512, b"\0"))
+
+
+def provision(disk, image, geometry=QEMU, signer=None):
     """Grow `disk` to hold the slots, put `image` in slot A as the proven
-    system and leave B unbootable (a factory flash). Data before misc stays."""
+    system with its signed manifest, record the signer's keys as the ones
+    this bootloader trusts, and leave B unbootable (a factory flash). The
+    signer is this tree's (image/packages/sign.py config) unless given; the
+    manifest's version is the image's own. Data before misc stays."""
     g = geometry
     disk = Path(disk)
     if len(image) > (g.sectors - 1) * 512:
         raise ValueError("slot image larger than a slot")
+    if signer is None:
+        signer = ota_bundle.sign.config(ota_bundle.ROOT, "qemu")
+    manifest = ota_bundle.manifest(signer, ota_bundle.image_version(image), ota_bundle.LAYOUT_QEMU, image)
+    keys = key_record(signer.keys)
     if not disk.exists():
         disk.write_bytes(b"")
     with disk.open("r+b") as f:
@@ -175,56 +265,82 @@ def provision(disk, image, geometry=QEMU):
             f.truncate(disk_bytes(g))
         f.seek(g.misc * 512)
         f.write(bytes((g.first[0] - g.misc) * 512))
+        f.seek((g.control + 2) * 512)
+        f.write(keys)
         f.seek(g.first[0] * 512)
         f.write(ota_bundle.pad(image))
         f.write(bytes((g.sectors * 512) - len(ota_bundle.pad(image))))
+        f.seek((g.first[0] + g.sectors - 1) * 512)
+        f.write(manifest)
     control = Control.initial(0)
     control.set_unbootable(1)
     write_control(disk, control, g)
 
 
-def slot_image(disk, slot, g=QEMU):
-    """The VSL1 container in `slot`, read the way a bootloader would: from
-    its header, never past the slot. ValueError if it does not parse."""
+def verified_slot(disk, slot, keys, floor, g=QEMU):
+    """The files of `slot` and its version, after the bootloader's check
+    (see the top of this file); ValueError names the first failure."""
     with Path(disk).open("rb") as f:
+        f.seek((g.first[slot] + g.sectors - 1) * 512)
+        sector = f.read(512)
+        _, version, _, layout, length, _ = ota_bundle.fields(sector)
+        if layout != ota_bundle.LAYOUT_QEMU or not 0 < length <= (g.sectors - 1) * 512:
+            raise ValueError("slot manifest layout or length")
         f.seek(g.first[slot] * 512)
-        head = f.read(512)
-        if head[:4] != ota_bundle.CONTAINER:
-            raise ValueError("no slot image")
-        count, = struct.unpack_from("<I", head, 4)
-        if not 0 < count <= 20:
-            raise ValueError("bad slot image header")
-        end = max(at + length for _, at, length in
-                  (struct.unpack_from("<16s2I", head, 8 + 24 * i) for i in range(count)))
-        if end > (g.sectors - 1) * 512:
-            raise ValueError("slot image runs past its slot")
-        f.seek(g.first[slot] * 512)
-        return ota_bundle.unpack(f.read(end))
-
-
-def boot(disk, out, geometry=QEMU):
-    """One power-on: choose a slot, spend a try, unpack it into `out`.
-    Returns the slot, or None when the chosen slot did not load (an attempt
-    that counted) or nothing is bootable."""
-    g = geometry
-    control = read_control(disk, g)
-    slot = control.choose()
-    write_control(disk, control, g)
-    if slot is None:
-        return None
-    try:
-        files = slot_image(disk, slot, g)
-    except ValueError:
-        return None
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
+        image = f.read(len(ota_bundle.pad(bytes(length))))
+    ota_bundle.verify(sector + image, keys, "qemu")
+    if version < floor:
+        raise ValueError(f"slot version {version} is below the rollback floor {floor}")
+    files = ota_bundle.unpack(image[:length])
     for name in ota_bundle.QEMU_FILES:
         if name not in files:
+            raise ValueError(f"slot image has no {name}")
+    inner = boot_manifest.find(files["zImage"])
+    if inner is None or inner.version != version:
+        raise ValueError("the loader's boot manifest does not state the slot's version")
+    return files, version
+
+
+def boot(disk, out, geometry=QEMU, refusals=None):
+    """One power-on: choose a slot, spend a try, verify it, unpack it into
+    `out`. A slot that fails its check is marked unbootable and the other is
+    tried. Returns the slot, or None when nothing bootable passes (or the
+    floor or keys are unreadable: then no try is spent). Each refusal's
+    reason is appended to `refusals` when given."""
+    g = geometry
+    try:
+        # An unreadable floor or key record: nothing boots, no try is spent.
+        floor = read_floor(disk, g)
+        keys = read_keys(disk, g)
+    except ValueError as e:
+        if refusals is not None:
+            refusals.append(str(e))
+        return None
+    control = read_control(disk, g)
+    for _ in range(2):
+        slot = control.choose()
+        write_control(disk, control, g)
+        if slot is None:
             return None
-    for name, data in files.items():
-        if name in ota_bundle.QEMU_FILES:
-            (out / name).write_bytes(data)
-    return slot
+        try:
+            files, version = verified_slot(disk, slot, keys, floor, g)
+        except ValueError as e:
+            if refusals is not None:
+                refusals.append(f"slot {'AB'[slot]}: {e}")
+            control.set_unbootable(slot)
+            write_control(disk, control, g)
+            continue
+        # Verified here and marked successful (it ran healthy): nothing older boots again.
+        if control.slot(slot)["successful"] and version > floor:
+            floor = version
+            write_floor(disk, floor, g)
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "rollback-floor").write_text(f"{floor}\n")
+        for name in ota_bundle.QEMU_FILES:
+            (out / name).write_bytes(files[name])
+        return slot
+    return None
 
 
 def main(argv):
@@ -232,10 +348,13 @@ def main(argv):
         provision(argv[1], ota_bundle.qemu_image(argv[2]))
         print(read_control(argv[1]).describe())
     elif len(argv) == 3 and argv[0] == "boot":
-        slot = boot(argv[1], argv[2])
+        refusals = []
+        slot = boot(argv[1], argv[2], refusals=refusals)
+        for reason in refusals:
+            print("refused:", reason)
         print("booting", "AB"[slot] if slot is not None else "nothing (failed attempt)")
     elif len(argv) == 2 and argv[0] == "show":
-        print(read_control(argv[1]).describe())
+        print(read_control(argv[1]).describe() + f"; rollback floor {read_floor(argv[1])}")
     else:
         sys.exit(__doc__)
 

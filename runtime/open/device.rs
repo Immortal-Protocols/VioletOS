@@ -16,7 +16,12 @@ use core::cell::RefCell;
 pub const WIDTH: usize = 720;
 pub const HEIGHT: usize = 1600;
 pub const STRIDE: usize = WIDTH * 4;
-pub const BUFFER_BYTES: usize = (STRIDE * HEIGHT + PAGE - 1) & !(PAGE - 1);
+/// A screen buffer, rounded up to 64 KiB (apps map the second one at this offset).
+pub const BUFFER_BYTES: usize = (STRIDE * HEIGHT + 0xffff) & !0xffff;
+/// The most one read or write of a file moves (1 MiB): a longer one comes
+/// back short, as POSIX allows, so a huge copy is many calls, each served in
+/// turn with the other apps' calls, and its buffer cannot exhaust the heap.
+pub const RW_SLICE: u32 = 1 << 20;
 
 pub enum Kind {
     File { path: String },
@@ -365,7 +370,9 @@ impl Runtime {
     }
 
     /// Start the Home app, if there is one. It stays running; "home" shows it.
-    pub fn start_home(&mut self) {
+    /// `agent`: also the paired agent behind it (at first focus; not after a
+    /// contained fault, mod.rs `recover`, where it may be running still).
+    pub fn start_home(&mut self, agent: bool) {
         if self.fs.stat(super::HOME_APP).is_none() {
             return;
         }
@@ -378,7 +385,7 @@ impl Runtime {
         }
         // A paired voice agent starts behind Home, so it hears the user without
         // being opened first (its state is /data/agent; "peer" once paired).
-        let paired = self.fs.contents("/data/agent").is_some_and(|d| d.split(|&b| b == b'\n').any(|l| l.starts_with(b"peer ")));
+        let paired = agent && self.fs.contents("/data/agent").is_some_and(|d| d.split(|&b| b == b'\n').any(|l| l.starts_with(b"peer ")));
         if paired && self.fs.stat(super::appstore::INSTALLER).is_some() {
             match self.launch(super::appstore::INSTALLER, &[], None) {
                 Ok(_) => crate::log!("started the agent in the background"),
@@ -996,7 +1003,7 @@ impl Runtime {
             Kind::File { path } => {
                 let Some(c) = self.fs.contents(path) else { return EIO };
                 let start = (offset as usize).min(c.len());
-                let end = (start + len as usize).min(c.len());
+                let end = (start + len.min(RW_SLICE) as usize).min(c.len());
                 c[start..end].to_vec()
             }
             Kind::Dir { .. } => return EISDIR,

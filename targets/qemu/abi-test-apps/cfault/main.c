@@ -1,5 +1,5 @@
 /* No handler: a fault ends the program as it always has (status 139, the
- * runtime's "bad memory access" line), make test-abi checks. */
+ * runtime's "bad memory access" line), make test-system checks. */
 #include <stdio.h>
 
 int main(void) {

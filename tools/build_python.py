@@ -63,22 +63,53 @@ def build_musl():
 
 
 def compiler_wrapper():
-    """A cc that compiles for the target and links fully static against musl."""
+    """A cc that compiles for the target and links fully static against musl:
+    a static position-independent executable (musl's self-relocating rcrt1.o,
+    no text relocations), which the Open Runtime loads at a random address,
+    with its RELRO sealed read-only before main (tools/relro_seal.rs).
+    VIOLET_OPEN_PIE=0 links at a fixed address instead, as tools/build_initfs.py
+    does (a development build only)."""
     b = ndk_bin()
     builtins = next(b.parent.glob("lib/clang/*/lib/linux/libclang_rt.builtins-arm-android.a"))
     wrapper = WORK / "bin/arm-linux-musleabihf-cc"
     wrapper.parent.mkdir(parents=True, exist_ok=True)
     lib = SYSROOT / "lib"
-    wrapper.write_text(f"""#!/bin/sh
+    pie = not fixed_allowed()
+    if pie:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import build_initfs
+        compile_flags, link_flags, start = "-fPIE", f"-static-pie -Wl,-z,text -Wl,-z,relro {build_initfs.relro_seal()}", "rcrt1.o"
+    else:
+        compile_flags, link_flags, start = "", "-static", "crt1.o"
+    text = f"""#!/bin/sh
 # Compile for ARMv7 Linux (musl); link statically with musl's start files.
-cc="{b / 'clang'} {FLAGS} --sysroot={SYSROOT} -isystem {SYSROOT / 'include'}"
+cc="{b / 'clang'} {FLAGS} {compile_flags} --sysroot={SYSROOT} -isystem {SYSROOT / 'include'}"
 for a in "$@"; do
   case "$a" in -c|-E|-S|-M|-MM) exec $cc "$@";; esac
 done
-exec $cc -static -fuse-ld=lld -nostdlib {lib / 'crt1.o'} {lib / 'crti.o'} "$@" -L{lib} -lc {builtins} {lib / 'crtn.o'}
-""")
+exec $cc {link_flags} -fuse-ld=lld -nostdlib {lib / start} {lib / 'crti.o'} "$@" -L{lib} -lc {builtins} {lib / 'crtn.o'}
+"""
+    wrapper.write_text(text)
     wrapper.chmod(0o755)
     return wrapper
+
+
+def fixed_allowed():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import elf_check
+    return elf_check.fixed_allowed()
+
+
+def stale(binary, pie):
+    """Whether the linked interpreter at `binary` was linked by other rules than
+    this build's (PIE or not, RELRO sealed or not): it is relinked then. Asked
+    of the binary itself, so an interrupted run cannot leave it behind."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import elf_check
+    if not binary.is_file():
+        return False
+    info = elf_check.inspect(binary.read_bytes())
+    return info is None or info["pie"] != pie or (pie and not info["sealed"])
 
 
 def host_python():
@@ -134,6 +165,11 @@ def build_python():
                         "--prefix=/", f"--with-build-python={host_python()}", "--disable-shared",
                         "--without-ensurepip", "--disable-test-modules", "--with-pymalloc",
                         "MODULE_BUILDTYPE=static"], cwd=build, env=env, check=True)
+    # The objects are position-independent either way (clang's default for
+    # this target); only the link differs, so a binary linked otherwise goes.
+    for name in ("python", "python.exe"):   # python.exe on a case-insensitive disk
+        if stale(build / name, not fixed_allowed()):
+            (build / name).unlink()
     subprocess.run(["make", f"-j{os.cpu_count()}", "python"], cwd=build, env=env, check=True)
     if PYROOT.exists():
         shutil.rmtree(PYROOT)
@@ -158,6 +194,11 @@ def build_python():
             link.unlink()
     (PYROOT / "bin/python3.12").rename(python)
     subprocess.run([b / "llvm-strip", python], check=True)
+    # What the image build will check again: a PIE the loader takes, whose
+    # start code can relocate it (fail here, minutes earlier).
+    sys.path.insert(0, str(ROOT / "tools"))
+    import elf_check
+    elf_check.check({"bin/python3": python.read_bytes()}, allow_fixed=elf_check.fixed_allowed())
     size = sum(p.stat().st_size for p in PYROOT.rglob("*") if p.is_file())
     print(f"Python tree: {PYROOT} ({size >> 20} MiB)")
 

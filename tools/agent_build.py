@@ -36,6 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build_initfs  # noqa: E402
+import elf_check  # noqa: E402
 
 DEFAULT = ROOT / "build/agent-workspace"
 TEMPLATE = ROOT / "tools/agent-workspace"
@@ -58,7 +59,8 @@ def environment(work):
         f"AR_{key}": str(bins[0] / "llvm-ar"),
         f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard",
         f"CARGO_TARGET_{key.upper()}_LINKER": str(lld),
-        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *build_initfs.CPU_FLAGS]),
+        f"CARGO_TARGET_{key.upper()}_RUSTFLAGS": " ".join(["-C", "linker-flavor=ld.lld", *build_initfs.CPU_FLAGS,
+                                                               *map(str, build_initfs.pie_flags(rustc))]),
         "CARGO_TARGET_DIR": str(work / "target"),
         "CARGO_HOME": str(work / ".cargo-home"),
         "RUSTC": str(rustc),
@@ -193,6 +195,14 @@ def build(work, name):
         print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
         return 1
     out = work / "target" / build_initfs.TARGET / "agent" / name
+    # The same gate as the system image: a position-independent program the
+    # phone's loader takes (W^X, code in its own pages, relocations it can apply).
+    try:
+        elf_check.check({name: out.read_bytes()}, allow_fixed=elf_check.fixed_allowed())
+    except SystemExit as e:
+        sys.stderr.write(f"{e}\n")
+        print(json.dumps({"ok": False, "name": name, "seconds": seconds}))
+        return 1
     if (app / build_initfs.MANIFEST).exists():
         # Cargo's own output stays as it is; the phone gets the program with its manifest.
         packed = work / "target/agent-out" / name

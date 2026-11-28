@@ -1,12 +1,17 @@
 //! Host test for the Open Runtime's capability policy (`make test-unit`):
-//! policy.rs's table, manifests, consent answers and the /data namespace,
+//! the Sentinel's table (system/sentinel/decide.rs), manifests, consent
+//! answers and the /data namespace,
 //! and fs.rs's path resolution feeding it, as the runtime joins them
 //! (manifest.rs: `at` normalizes, then `path_rule` decides).
 #![allow(dead_code)]
 extern crate alloc;
 
-#[path = "../policy.rs"]
-mod policy;
+// The decisions run in the Sentinel (system/sentinel/decide.rs); the Open
+// Runtime's policy.rs only asks. system/sentinel/tests/sentinel_host.rs
+// checks that asking gives these same answers.
+#[path = "../../../system/sentinel/engine.rs"]
+mod engine;
+use engine::decide as policy;
 #[path = "../fs.rs"]
 mod fs;
 #[path = "../sysui.rs"]

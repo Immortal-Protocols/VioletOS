@@ -1,6 +1,11 @@
 """Train the on-device scorer and write the files the phone and the tests use.
 
-    python3 tools/shield-trainer/train_tiny.py [--quick]      (make shield-train-tiny)
+    python3 tools/shield-trainer/train_tiny.py [--quick] [--real CORPUS]     (make shield-train-tiny)
+
+--real CORPUS adds the labelled traces of a collect.py corpus (docs/shield-data.md):
+real runs are split by capture into training, calibration and test, the report
+counts every split by where its windows came from, and real test runs are
+measured by themselves so a synthetic figure is never quoted as a field one.
 
 Standard library only: no torch, no download, about two minutes. It
 
@@ -112,6 +117,42 @@ def dataset(seed: int, n_apps: int, held_out: bool = False):
             s = gen.sample(rng.choice(sorted(RELAY_ONLY_GENERATORS)), app)
             relay.append((s.family, V[s.verdict], records(s.window, rng)))
     return out, relay
+
+
+def real_rows(corpus: Path):
+    """Labelled runs of a collect.py corpus as {"train"|"calibration"|"test": rows}.
+
+    A benign run gives a row for every length of its window as it filled (the
+    phone scores a filling window); an attack run gives only its last one,
+    because its first records look like any app's. Whole captures go to one
+    split (the capture's first place in the manifest decides: of every five,
+    three train, one calibrates, one tests), so no process of one boot is on
+    both sides of a measurement. Rows recorded under an older cross-app rule
+    are refused (collect.current_rows)."""
+    import collect  # noqa: E402  (the corpus's own reader)
+    out = {"train": [], "calibration": [], "test": []}
+    captures: dict[str, int] = {}
+    for m in collect.current_rows(corpus):
+        if m.get("label") not in ("benign", "attack") or m.get("verdict") not in V:
+            continue
+        n = captures.setdefault(m.get("capture") or m["file"], len(captures))
+        split = ("train", "train", "calibration", "train", "test")[n % 5]
+        recs = [r for r in collect.parse_records(corpus / m["file"]) if r[4] in tiny.KINDS]
+        if not recs:
+            continue
+        family = f"real_{m['source']}_{m['label']}"
+        cuts = range(1, len(recs) + 1) if m["label"] == "benign" else [len(recs)]
+        out[split] += [(family, V[m["verdict"]], recs[:k]) for k in cuts]
+    return out
+
+
+def by_source(rows) -> dict:
+    """Windows by where they came from: synthetic, real_qemu or real_handset."""
+    out: dict[str, int] = {}
+    for family, _, _ in rows:
+        key = "_".join(family.split("_")[:2]) if family.startswith("real_") else "synthetic"
+        out[key] = out.get(key, 0) + 1
+    return out
 
 
 def train(rows, hidden, epochs, seed):
@@ -285,12 +326,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="a small run to check the script (does not write the model)")
     ap.add_argument("--report", default=str(ROOT / "build/shield/tiny-report.json"))
+    ap.add_argument("--real", help="a collect.py corpus of labelled real traces to train and measure with")
     args = ap.parse_args()
     n_train, epochs = (150, 4) if args.quick else (1500, 30)
     train_rows, _ = dataset(11, n_train)
     calib_rows, _ = dataset(12, n_train // 2)
     test_rows, relay_rows = dataset(13, n_train // 2)
     held_rows, _ = dataset(14, max(60, n_train // 5), held_out=True)
+    real = real_rows(Path(args.real)) if args.real else {"train": [], "calibration": [], "test": []}
+    train_rows += real["train"]
+    calib_rows += real["calibration"]
     print(f"windows: train {len(train_rows)} calibration {len(calib_rows)} test {len(test_rows)} unseen {len(held_rows)}", file=sys.stderr)
     feats = [features(r) for _, _, r in train_rows]
     w = train([([v / 16 for v in f], y) for f, (_, y, _) in zip(feats, train_rows)], tiny.H, epochs, 5)
@@ -304,7 +349,9 @@ def main():
     q["t_warn"] = max(1, benign[min(len(benign) - 1, int(len(benign) * 0.999))] + 1)
     spread = benign[-1] - benign[len(benign) // 2]
     q["t_contain"] = max(q["t_warn"], benign[-1] + 1 + spread // 4)
-    q["trained_on"] = "synthetic windows from tools/shield-trainer/scenarios.py (no real-world data)"
+    sources = by_source(train_rows)
+    q["trained_on"] = "synthetic windows from tools/shield-trainer/scenarios.py (no real-world data)" if set(sources) == {"synthetic"} \
+        else "windows by source: " + ", ".join(f"{k} {v}" for k, v in sorted(sources.items()))
     q["features"] = tiny.FEATURES
     text = json.dumps(q, indent=1, sort_keys=True) + "\n"
     sha = hashlib.sha256(text.encode()).hexdigest()
@@ -312,13 +359,21 @@ def main():
     model = tiny.Model(q)
     report = {
         "model_sha256": sha, "t_warn": q["t_warn"], "t_contain": q["t_contain"], "shift1": q["shift1"],
-        "data": "synthetic (scenarios.py); seeds 11 train, 12 calibration, 13 test, 14 unseen families",
+        "data": "synthetic (scenarios.py); seeds 11 train, 12 calibration, 13 test, 14 unseen families"
+                + (f"; real traces from {args.real}" if args.real else ""),
+        "windows_by_source": {"train": by_source(train_rows), "calibration": by_source(calib_rows),
+                              "test": by_source(test_rows), "real_test": by_source(real["test"])},
         "calibration": summary(measure(model, calib_rows)),
         "test": summary(measure(model, test_rows)),
         "unseen_families": summary(measure(model, held_rows)),
         "relay_only_not_visible_on_device": summary(measure(model, relay_rows)),
     }
-    for split in ("calibration", "test", "unseen_families", "relay_only_not_visible_on_device"):
+    splits = ["calibration", "test", "unseen_families", "relay_only_not_visible_on_device"]
+    if args.real:
+        # Real runs the training never saw, by themselves.
+        report["real_test"] = summary(measure(model, real["test"]))
+        splits.append("real_test")
+    for split in splits:
         s = report[split]
         print(f"{split}: {s['windows']} windows, verdict accuracy {s['accuracy']:.3f}; benign warned {s['benign_warned']}/{s['benign_windows']}"
               f" (95% CI {s['benign_warn_rate_95ci'][0]:.3f}-{s['benign_warn_rate_95ci'][1]:.3f}), benign contained {s['benign_contained']}/{s['benign_windows']}"

@@ -1,4 +1,4 @@
-//! Rust std under the Open Runtime (make test-abi): a signal handler through
+//! Rust std under the Open Runtime (make test-system): a signal handler through
 //! musl's signal(3), std::process::Command (posix_spawn, pipes, exit status)
 //! and a program that does not exist.
 use std::process::{Command, Stdio};

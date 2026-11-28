@@ -1,4 +1,4 @@
-/* Memory-protection probe for `make test-wx` (targets/qemu/test_wx.py).
+/* Memory-protection probe for `make test-system` (targets/qemu/test_system.py).
  *
  * Every launch first makes the calls that must be refused without harm
  * (writable+executable memory, data turned into code, system calls writing
@@ -140,9 +140,13 @@ int main(void) {
     expect(at_random != 0, "AT_RANDOM");
 
     if (!failures) printf("wx %d: checks ok\n", n);
-    printf("wx %d: layout main=%p stack=%p heap=%p mmap=%p random=", n, (void *)main, (void *)&n, sbrk(0), (void *)data);
-    for (int i = 0; at_random && i < 16; i++) printf("%02x", at_random[i]);
-    printf("\n");
+    // One write for the line: the runtime's own log lines (a Shield verdict)
+    // share the serial port and may land between two writes.
+    char line[192];
+    int len = snprintf(line, sizeof line, "wx %d: layout main=%p stack=%p heap=%p mmap=%p random=", n, (void *)main, (void *)&n, sbrk(0), (void *)data);
+    for (int i = 0; at_random && i < 16; i++) len += snprintf(line + len, sizeof line - len, "%02x", at_random[i]);
+    line[len++] = '\n';
+    write(1, line, len);
 
     volatile unsigned stack_code[2] = {0xe12fff1e, 0};
     unsigned *heap_code = malloc(64);

@@ -185,8 +185,10 @@ impl Runtime {
 
     // ---- app memory helpers ----
     fn rd(&mut self, i: usize, va: u32, len: usize) -> Option<Vec<u8>> {
-        let mut v = alloc::vec![0u8; len];
         let app = self.apps[i].as_mut()?;
+        // `len` is the app's word: checked against its regions before any
+        // of the runtime's heap is spent on it (vma.rs `buffer`).
+        let mut v = super::vma::buffer(&app.space.vmas, va, len)?;
         app.space.read(&mut self.k, &mut self.pool, va, &mut v).then_some(v)
     }
     fn wr(&mut self, i: usize, va: u32, data: &[u8]) -> bool {
@@ -597,47 +599,48 @@ impl Runtime {
                 Done(r)
             }
             145 | 146 => {
-                let mut total = 0i32;
-                for k in 0..a[2] {
-                    let (Some(base), Some(len)) = (self.rd32(i, a[1] + 8 * k), self.rd32(i, a[1] + 8 * k + 4)) else {
-                        return Done(EFAULT);
-                    };
-                    if len == 0 {
-                        continue;
+                // The walk over the buffers, with its limits: iov.rs.
+                struct Io<'a> {
+                    rt: &'a mut Runtime,
+                    i: usize,
+                    fd: i32,
+                    write: bool,
+                    vec: u32,
+                }
+                impl super::iov::Vectored for Io<'_> {
+                    fn entry(&mut self, k: u32) -> Option<(u32, u32)> {
+                        let at = self.vec.wrapping_add(8 * k);
+                        Some((self.rt.rd32(self.i, at)?, self.rt.rd32(self.i, at.wrapping_add(4))?))
                     }
-                    let r = if n == 146 {
-                        self.write(i, a[0] as i32, base, len, None)
-                    } else {
-                        self.read_now(i, a[0] as i32, base, len)
-                    };
-                    if r == EAGAIN && total == 0 {
-                        // Nothing moved on a blocking socket or pipe: wait, as write and
-                        // read do, with this buffer (a short count is fine for writev).
-                        // rustls writes TLS records with writev, and a full send ring
-                        // used to come back as EAGAIN on a blocking socket.
-                        let blocking = self.file(i, a[0] as i32).map_or(false, |f| {
-                            let f = f.borrow();
-                            let tcp = matches!(f.kind, Kind::Tcp { .. });
-                            (tcp || matches!(f.kind, Kind::Pipe { .. })) && f.flags & O_NONBLOCK == 0
-                        });
-                        if blocking {
-                            let fd = a[0] as i32;
-                            return if n == 146 {
-                                Block(Wait::Send { fd, buf: base, len }, None)
-                            } else {
-                                Block(Wait::Read { fd, buf: base, len }, self.recv_deadline(i, fd))
-                            };
+                    fn io(&mut self, base: u32, len: u32) -> i32 {
+                        if self.write {
+                            self.rt.write(self.i, self.fd, base, len, None)
+                        } else {
+                            self.rt.read_now(self.i, self.fd, base, len)
                         }
                     }
-                    if r < 0 {
-                        return Done(if total > 0 { total } else { r });
-                    }
-                    total += r;
-                    if (r as u32) < len {
-                        break;
-                    }
                 }
-                Done(total)
+                let fd = a[0] as i32;
+                let (base, len) = match super::iov::run(&mut Io { rt: self, i, fd, write: n == 146, vec: a[1] }, a[2], super::device::RW_SLICE) {
+                    super::iov::Outcome::Done(r) => return Done(r),
+                    super::iov::Outcome::Wait { base, len } => (base, len),
+                };
+                // Nothing moved on a blocking socket or pipe: wait, as write and
+                // read do, with this buffer (a short count is fine for writev).
+                // rustls writes TLS records with writev, and a full send ring
+                // used to come back as EAGAIN on a blocking socket.
+                let blocking = self.file(i, fd).map_or(false, |f| {
+                    let f = f.borrow();
+                    let tcp = matches!(f.kind, Kind::Tcp { .. });
+                    (tcp || matches!(f.kind, Kind::Pipe { .. })) && f.flags & O_NONBLOCK == 0
+                });
+                if !blocking {
+                    Done(EAGAIN)
+                } else if n == 146 {
+                    Block(Wait::Send { fd, buf: base, len }, None)
+                } else {
+                    Block(Wait::Read { fd, buf: base, len }, self.recv_deadline(i, fd))
+                }
             }
             180 | 181 => {
                 let offset = u64::from(a[4]) | u64::from(a[5]) << 32;
@@ -830,10 +833,7 @@ impl Runtime {
                 }
                 let now = (self.clock(0) / 1_000_000_000) as u32;
                 match self.fs.writable(&path, false, false, now) {
-                    Some(data) => {
-                        data.resize(len as usize, 0);
-                        Done(0)
-                    }
+                    Some(data) => Done(super::vma::resize_file(data, len, true).err().unwrap_or(0)),
                     None => Done(ENOENT),
                 }
             }
@@ -1236,9 +1236,18 @@ impl Runtime {
                     n => n as u32,
                 }
             }
-            _ => len,
+            // Commands are lines: a batch longer than RW_SLICE is refused
+            // whole, never cut inside a line and run as two commands.
+            Kind::Sys { .. } if len > super::device::RW_SLICE => return EINVAL,
+            // One call moves at most RW_SLICE: the count comes back short and
+            // the app calls again, behind whatever other apps have asked for.
+            _ => len.min(super::device::RW_SLICE),
         };
-        let Some(data) = self.rd(i, buf, len as usize) else { return EFAULT };
+        let Some(data) = self.rd(i, buf, len as usize) else {
+            // A readable buffer the heap (or the pool) could not take: ENOMEM, not EFAULT.
+            let readable = self.apps[i].as_ref().map_or(false, |a| super::vma::permits(&a.space.vmas, buf, len as usize, 7));
+            return if readable { ENOMEM } else { EFAULT };
+        };
         let mut f = f.borrow_mut();
         let flags = f.flags;
         match &mut f.kind {
@@ -1267,10 +1276,10 @@ impl Runtime {
                 if let Some(e) = self.fd_write_error(i, &path, flags) { return e; }
                 let now = (self.clock(0) / 1_000_000_000) as u32;
                 let Some(content) = self.fs.writable(&path, false, false, now) else { return EIO };
-                let start = if flags & O_APPEND != 0 { content.len() } else { at.unwrap_or(f.offset) as usize };
-                if content.len() < start + data.len() {
-                    content.resize(start + data.len(), 0);
-                }
+                let start = if flags & O_APPEND != 0 { content.len() as u64 } else { at.unwrap_or(f.offset) };
+                // The offset is the app's: bounded and fallible (vma.rs), never a wrap or an abort.
+                if let Err(e) = super::vma::resize_file(content, start.saturating_add(data.len() as u64), false) { return e; }
+                let start = start as usize;
                 content[start..start + data.len()].copy_from_slice(&data);
                 if at.is_none() {
                     f.offset = (start + data.len()) as u64;
@@ -1414,6 +1423,10 @@ impl Runtime {
             }
         }
         let len = align_up(len, 4096);
+        // An app holding all the pool pages one app may gets no more memory.
+        if self.apps[i].as_ref().unwrap().space.capped() {
+            return Done(ENOMEM);
+        }
         let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
         let screen = flags & MAP_ANONYMOUS == 0
             && self.file(i, fd).map_or(false, |f| matches!(f.borrow().kind, Kind::Screen));
@@ -1447,10 +1460,10 @@ impl Runtime {
         }
         app.space.add(start, start + len, prot & 7);
         if screen {
-            if start & 0xffff != 0 || offset as usize % sys::PAGE != 0 {
-                return Done(EINVAL);
-            }
-            if let Err(e) = self.map_surface(i, start, len, offset) {
+            let mapped = if start & 0xffff != 0 || offset as usize % sys::PAGE != 0 { Err(EINVAL) } else { self.map_surface(i, start, len, offset) };
+            if let Err(e) = mapped {
+                // No region left behind: it would be anonymous memory.
+                self.apps[i].as_mut().unwrap().space.remove(&mut self.k, &mut self.pool, start, start + len);
                 return Done(e);
             }
             return Done(start as i32);
@@ -3000,11 +3013,12 @@ impl Runtime {
                 return Err("no kernel memory");
             }
         };
+        space.cap = self.pool.app_cap(); // one app's share of the pool (pool.rs)
         let k = &mut self.k;
         let cnode = space.object(k, sys::Object::CNode, super::APP_CNODE_BITS).map_err(|_| "no kernel memory");
         let loaded = cnode.and_then(|_| super::procmgr::load(&mut space, k, &mut self.pool, image, ld, argv, envp, random, layout));
         let stubs = loaded.and_then(|l| {
-            space.add(layout.stubs, layout.stubs + sys::PAGE as u32, super::procmgr::PROT_READ | super::procmgr::PROT_EXEC);
+            space.add(layout.stubs, layout.stubs + super::procmgr::WINDOW, super::procmgr::PROT_READ | super::procmgr::PROT_EXEC);
             space.resolve(k, &mut self.pool, layout.stubs).map(|_| l).ok_or("out of memory")
         });
         match (cnode, stubs) {
@@ -3147,13 +3161,14 @@ impl Runtime {
             let system = self.holds(i, super::policy::Cap::System);
             while system && self.apps[..limit].iter().all(Option::is_some) && self.reclaim(Some(i)) {}
             let Some(j) = self.apps[..limit].iter().position(|a| a.is_none()) else { return Done(EAGAIN) };
-            let (space, cnode, loaded) = match self.load_into(j, image, ld, &args, &envp, random, layout) {
+            let (mut space, cnode, loaded) = match self.load_into(j, image, ld, &args, &envp, random, layout) {
                 Ok(l) => l,
                 Err(e) => {
                     crate::log!("execve {}: {}", program, e);
                     return Done(ENOMEM);
                 }
             };
+            space.join(&self.apps[i].as_ref().unwrap().space); // the parent's family's pages (procmgr.rs)
             // The point of no return: the child leaves its parent's memory.
             let t = &mut self.apps[i].as_mut().unwrap().threads[slot];
             let (blocked, pending) = (t.sig.blocked, core::mem::take(&mut t.sig.pending));
@@ -3186,7 +3201,8 @@ impl Runtime {
         let mut app = self.retire(i);
         let pid = app.pid;
         match self.load_into(i, image, ld, &args, &envp, random, layout) {
-            Ok((space, cnode, loaded)) => {
+            Ok((mut space, cnode, loaded)) => {
+                space.join(&app.space); // still its family's pages (procmgr.rs)
                 (app.space, app.cnode, app.threads) = (space, cnode, Vec::new());
                 Self::close_on_exec(&mut app.fds, &app.sig.cloexec);
                 app.sig.exec_reset();
@@ -3217,7 +3233,7 @@ impl Runtime {
                 (app.threads[s].sig.blocked, app.threads[s].sig.pending) = (blocked, pending);
                 let name = app.name.clone();
                 self.sentinel.note_exec(pid, &name, &app_digest(self, j));
-                crate::log!("pid {} execve {} ({} KiB free)", pid, program, self.pool.available() * 64);
+                crate::log!("pid {} execve {} ({} KiB free)", pid, program, self.pool.available() * sys::PAGE_KIB);
             }
             Err(_) => {
                 self.apps[j].as_mut().unwrap().exit_code = Some(126);

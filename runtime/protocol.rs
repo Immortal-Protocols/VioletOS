@@ -106,6 +106,14 @@ pub const POWER_INFO_SENSOR_FAILED: u32 = 2;
 pub const POWER_INFO_DVFS: u32 = 4;
 pub const POWER_INFO_SLEEP_DEFERRED: u32 = 8;
 pub const POWER_INFO_SCREEN_OFF: u32 = 16;
+// Suspended to idle now; and what Power asks of the screen's driver (the
+// launcher): wake after the power key or a touch, sleep after the power key.
+pub const POWER_INFO_SUSPENDED: u32 = 32;
+pub const POWER_INFO_WANT_WAKE: u32 = 64;
+pub const POWER_INFO_WANT_SLEEP: u32 = 128;
+// A timekeeper deadline arriving as a receive's badge (runtime/transport.c,
+// platform/sel4/include/timekeeper.h TK_BADGE): no message, nothing to reply to.
+pub const TIMER_BADGE: u32 = 1 << 27;
 // Why a POWER_LOCK was DENIED, in the reply's arg: the lock table is full, or
 // an app asked with the screen off (a new lock, or past its allowance).
 pub const POWER_LOCK_FULL: u32 = 1;

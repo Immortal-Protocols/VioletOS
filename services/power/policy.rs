@@ -230,6 +230,17 @@ impl WakeLocks {
         self.locks.iter().filter(|l| l.held).count() as u32
     }
 
+    /// Milliseconds until `owner`'s lock of `kind` lapses: what Power tells
+    /// an app that took or renewed one, so the Open Runtime's record of it
+    /// ends when this one does (a renewal with the screen off ends at the
+    /// screen-off bound, not ten minutes on). 0: not held, or no expiry.
+    pub fn remaining(&self, owner: u32, kind: u8, now: u64) -> u32 {
+        self.locks
+            .iter()
+            .find(|l| l.held && l.owner == owner && l.kind == kind && l.deadline > now)
+            .map_or(0, |l| (l.deadline - now).min(u64::from(u32::MAX)) as u32)
+    }
+
     /// The `index`th held lock.
     pub fn held(&self, index: usize, now: u64) -> Option<Held> {
         let l = self.locks.iter().filter(|l| l.held).nth(index)?;
@@ -298,6 +309,32 @@ impl Sleep {
         self.wanted && !self.suspended
     }
 }
+
+// -------------------------------------------------------------- wake sources
+
+/// What ended (or may end) a suspend: one bit each. The power key and a touch
+/// mean the user is there, and the screen should come back; an alarm or the
+/// network only needs the CPU for a while.
+pub const WAKE_KEY: u32 = 1;
+pub const WAKE_TOUCH: u32 = 2;
+pub const WAKE_TIMER: u32 = 4;
+pub const WAKE_NETWORK: u32 = 8;
+pub const WAKE_USER: u32 = WAKE_KEY | WAKE_TOUCH;
+/// After a wake the system stays up this long before it may suspend again,
+/// so whatever woke it can be dealt with (and take a wake lock if it needs
+/// longer). A user's wake that nothing turns into a screen-on ends the same way.
+pub const LINGER_MS: u64 = 5_000;
+/// How often Power looks at the wake lines while suspended.
+pub const WAKE_POLL_MS: u64 = 100;
+/// How often it runs while the screen is off, a lock is held or a sensor
+/// needs sampling.
+pub const HOUSEKEEPING_MS: u64 = 1_000;
+
+/// What Power asks of whoever drives the screen (the launcher asks Runtime,
+/// which alone can blank and unblank): nothing, wake, or sleep.
+pub const WANT_NOTHING: u8 = 0;
+pub const WANT_WAKE: u8 = 1;
+pub const WANT_SLEEP: u8 = 2;
 
 // ------------------------------------------------------------------- thermal
 
@@ -732,6 +769,13 @@ pub struct Snapshot {
     pub sleep_deferred: bool,
     pub blockers: u32,
     pub locks: u32,
+    /// Suspended to idle now.
+    pub suspended: bool,
+    /// WANT_*: what the screen's driver should ask Runtime for.
+    pub want: u8,
+    /// WAKE_* bits of the last wake, and how often the board was suspended.
+    pub last_wake: u32,
+    pub suspends: u32,
 }
 
 /// The hardware side of the decisions (targets/*/power.rs).
@@ -749,6 +793,20 @@ pub trait Board {
     /// Peripherals that are only needed while the screen is on.
     fn screen_peripherals(&mut self, on: bool);
     fn publish(&mut self, snapshot: &Snapshot);
+    /// Whether `power(1)` really suspends and the two calls below can end
+    /// it. False (the handset today): a sleep only blanks the screen, and
+    /// Power neither watches wake lines nor suspends again by itself.
+    const SUSPENDS: bool = false;
+    /// Wake events since the last call, as WAKE_* bits: the power key, a
+    /// touch, the network. 0 on a board that can see none of them.
+    fn wake_events(&mut self) -> u32 {
+        0
+    }
+    /// A wake alarm the board was asked for since the last call, in
+    /// milliseconds from now.
+    fn take_alarm(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// Thermal samples are taken at most this often.
@@ -764,6 +822,13 @@ pub struct Manager {
     sampled: Option<u64>,
     screen_on: bool,
     off_sent: bool,
+    /// No suspend before this time (a wake's linger).
+    linger_until: u64,
+    /// A wake alarm, in milliseconds since boot.
+    alarm: Option<u64>,
+    want: u8,
+    last_wake: u32,
+    suspends: u32,
 }
 
 impl Manager {
@@ -779,18 +844,110 @@ impl Manager {
             sampled: None,
             screen_on: true,
             off_sent: false,
+            linger_until: 0,
+            alarm: None,
+            want: WANT_NOTHING,
+            last_wake: 0,
+            suspends: 0,
         }
     }
 
     fn settle(&mut self, board: &mut impl Board, now: u64) {
         let blockers = self.locks.blockers(now);
-        if self.off_sent {
+        if self.off_sent || now < self.linger_until {
             return;
         }
-        if self.sleep.settle(blockers) == SleepStep::Suspend && !board.power(1) {
-            // Not suspended after all: try again on the next change.
-            self.sleep.suspended = false;
+        if self.sleep.settle(blockers) == SleepStep::Suspend {
+            self.suspend(board);
         }
+    }
+
+    /// The suspend decision is made: tell the board. False if it refused;
+    /// the next change tries again.
+    fn suspend(&mut self, board: &mut impl Board) -> bool {
+        if board.power(1) {
+            self.suspends = self.suspends.wrapping_add(1);
+            // A wake that was never turned into a screen-on is forgotten.
+            self.want = WANT_NOTHING;
+            true
+        } else {
+            self.sleep.suspended = false;
+            false
+        }
+    }
+
+    /// Wake at `at` (milliseconds since boot) if the system is suspended
+    /// then; None: no alarm.
+    pub fn set_alarm(&mut self, at: Option<u64>) {
+        self.alarm = at;
+    }
+
+    /// The wake sources. Suspended, any of them resumes the CPU; the screen
+    /// stays off, and for a user's wake `want` asks its driver to turn it on.
+    /// Awake with the screen on, the power key asks for sleep.
+    fn wake_sources<B: Board>(&mut self, board: &mut B, now: u64) {
+        if !B::SUSPENDS {
+            return;
+        }
+        if let Some(ms) = board.take_alarm() {
+            self.alarm = Some(now.saturating_add(ms));
+        }
+        let mut reason = board.wake_events() & (WAKE_USER | WAKE_NETWORK);
+        if self.alarm.is_some_and(|at| now >= at) {
+            self.alarm = None;
+            // An alarm that passes while the system is up needs no wake.
+            if self.sleep.wanted {
+                reason |= WAKE_TIMER;
+            }
+        }
+        if reason == 0 || self.off_sent {
+            return;
+        }
+        if !self.sleep.wanted {
+            if reason & WAKE_KEY != 0 {
+                self.want = WANT_SLEEP;
+            }
+            return;
+        }
+        // The screen is off: suspended, or waiting to be.
+        self.last_wake = reason;
+        self.linger_until = now.saturating_add(LINGER_MS);
+        if reason & WAKE_USER != 0 {
+            self.want = WANT_WAKE;
+        }
+        if self.sleep.suspended {
+            self.sleep.suspended = false;
+            board.power(0);
+        }
+    }
+
+    /// Milliseconds until Power should run again without a request, or None
+    /// when nothing is pending (it then sleeps until one arrives).
+    pub fn next_tick<B: Board>(&self, _board: &B, now: u64) -> Option<u64> {
+        if self.off_sent {
+            return None;
+        }
+        // u64::MAX: nothing.
+        let mut next = u64::MAX;
+        if self.sensor || self.locks.count() != 0 {
+            next = HOUSEKEEPING_MS;
+        }
+        if B::SUSPENDS {
+            if self.sleep.suspended {
+                next = WAKE_POLL_MS;
+            } else if self.sleep.wanted && now < self.linger_until {
+                // Lingering after a wake: suspend when it ends.
+                next = next.min(self.linger_until.saturating_sub(now).clamp(WAKE_POLL_MS, HOUSEKEEPING_MS));
+            } else if self.sleep.wanted {
+                // Deferred by a lock: a release is a request and settles at
+                // once; a lapse needs only the housekeeping second.
+                next = next.min(HOUSEKEEPING_MS);
+            }
+            if let Some(at) = self.alarm {
+                next = next.min(at.saturating_sub(now).max(1));
+            }
+        }
+        (next != u64::MAX).then_some(next)
     }
 
     /// Run the governors. Power has no timer of its own, so this runs when a
@@ -838,6 +995,7 @@ impl Manager {
         if self.sensor && self.thermal.must_shut_down() && !self.off_sent {
             self.off_sent = board.power(2);
         }
+        self.wake_sources(board, now);
         self.settle(board, now);
         self.publish(board, now);
     }
@@ -865,6 +1023,10 @@ impl Manager {
             sleep_deferred: self.sleep.deferred(),
             blockers: self.locks.blockers(now),
             locks: self.locks.count(),
+            suspended: self.sleep.suspended,
+            want: self.want,
+            last_wake: self.last_wake,
+            suspends: self.suspends,
         }
     }
 
@@ -883,9 +1045,11 @@ impl Manager {
             self.locks.screen(Some(now));
             board.screen_peripherals(false);
         }
+        // Runtime's own command is not held back by a wake's linger.
+        self.linger_until = 0;
+        self.want = WANT_NOTHING;
         let blockers = self.locks.blockers(now);
-        if self.sleep.request(blockers) == SleepStep::Suspend && !board.power(1) {
-            self.sleep.suspended = false;
+        if self.sleep.request(blockers) == SleepStep::Suspend && !self.suspend(board) {
             return Err(());
         }
         Ok(blockers)
@@ -897,6 +1061,8 @@ impl Manager {
             return false;
         }
         self.sleep.wake();
+        self.linger_until = 0;
+        self.want = WANT_NOTHING;
         if !self.screen_on {
             self.screen_on = true;
             self.locks.screen(None);
@@ -1444,10 +1610,12 @@ mod tests {
         refuse_power: bool,
         fail_step: Option<DvfsStep>,
         last: Snapshot,
+        events: u32,
+        alarm: Option<u64>,
     }
     impl Fake {
         fn new(table: &'static [Opp]) -> Self {
-            Fake { reading: Reading::Absent, load: None, table, log: std::vec::Vec::new(), refuse_power: false, fail_step: None, last: Snapshot::default() }
+            Fake { reading: Reading::Absent, load: None, table, log: std::vec::Vec::new(), refuse_power: false, fail_step: None, last: Snapshot::default(), events: 0, alarm: None }
         }
         fn take(&mut self) -> std::vec::Vec<std::string::String> {
             core::mem::take(&mut self.log)
@@ -1481,6 +1649,59 @@ mod tests {
         fn publish(&mut self, snapshot: &Snapshot) {
             self.last = *snapshot;
         }
+        const SUSPENDS: bool = true;
+        fn wake_events(&mut self) -> u32 {
+            core::mem::take(&mut self.events)
+        }
+        fn take_alarm(&mut self) -> Option<u64> {
+            self.alarm.take()
+        }
+    }
+    /// A board whose sleep only blanks the screen (the handset today).
+    struct Blank(std::vec::Vec<u32>);
+    impl Board for Blank {
+        fn temperature(&mut self) -> Reading {
+            Reading::Absent
+        }
+        fn load_percent(&mut self) -> Option<u32> {
+            None
+        }
+        fn opps(&self) -> &'static [Opp] {
+            &[]
+        }
+        fn apply(&mut self, _: DvfsStep) -> bool {
+            false
+        }
+        fn power(&mut self, command: u32) -> bool {
+            self.0.push(command);
+            true
+        }
+        fn screen_peripherals(&mut self, _: bool) {}
+        fn publish(&mut self, _: &Snapshot) {}
+        // Even if it reported events, they are not acted on.
+        fn wake_events(&mut self) -> u32 {
+            WAKE_KEY | WAKE_TOUCH
+        }
+        fn take_alarm(&mut self) -> Option<u64> {
+            Some(1)
+        }
+    }
+    #[test]
+    fn a_board_that_cannot_suspend_is_left_alone() {
+        let mut b = Blank(std::vec::Vec::new());
+        let mut m = Manager::new(ZONE, 0);
+        m.tick(&mut b, 0);
+        assert_eq!(m.next_tick(&b, 0), None);
+        assert_eq!(m.sleep(&mut b, 10), Ok(0));
+        m.tick(&mut b, 20);
+        m.tick(&mut b, 20 + 10 * LINGER_MS);
+        // One sleep command reached it, no wake and no second suspend; no polling.
+        assert_eq!(b.0, [1]);
+        assert_eq!(m.next_tick(&b, 30), None);
+        // A held lock is still looked at once a second, so it lapses on time.
+        m.wake(&mut b);
+        m.lock(&mut b, APP, KIND_CPU, true, 100).unwrap();
+        assert_eq!(m.next_tick(&b, 100), Some(HOUSEKEEPING_MS));
     }
     static TABLE: [Opp; 4] = OPPS;
 
@@ -1629,10 +1850,19 @@ mod tests {
         let on = off + 500 * 60 * 1000;
         assert!(m.wake(&mut b));
         assert_eq!(m.lock(&mut b, APP, KIND_CPU, true, on), Ok(()));
+        assert_eq!(m.locks.remaining(APP, KIND_CPU, on), APP_LOCK_MS as u32);
         assert_eq!(m.sleep(&mut b, on + 1), Ok(1 << KIND_CPU));
         for minutes in [9, 18, 27, 30] {
             assert_eq!(m.lock(&mut b, APP, KIND_CPU, true, on + minutes * 60 * 1000), Ok(()));
         }
+        // What the app is told it has left: ten minutes awake, the screen-off
+        // bound once that comes first (renewed at 27: three minutes, not ten).
+        let at = on + 27 * 60 * 1000;
+        m.lock(&mut b, APP, KIND_CPU, true, at).unwrap();
+        assert_eq!(m.locks.remaining(APP, KIND_CPU, at), (on + 1 + APP_SCREEN_OFF_MS - at) as u32);
+        assert_eq!(m.locks.remaining(APP, KIND_CPU, on + 1 + APP_SCREEN_OFF_MS), 0, "lapsed");
+        assert_eq!(m.locks.remaining(APP + 1, KIND_CPU, at), 0, "not its lock");
+        assert_eq!(m.locks.remaining(AUDIO, KIND_AUDIO, at), 0, "a service's lock has no expiry");
         assert_eq!(m.lock(&mut b, APP, KIND_CPU, true, on + 1 + APP_SCREEN_OFF_MS), Err(LockError::ScreenOff));
         // A lock that lapsed in the dark is not taken again in the dark.
         let mut m = Manager::new(ZONE, 0);
@@ -1752,5 +1982,185 @@ mod tests {
         b.take();
         m.tick(&mut b, 5);
         assert_eq!(b.take(), ["power 1"]);
+    }
+    #[test]
+    fn a_background_wake_resumes_the_cpu_and_suspends_again() {
+        for source in [WAKE_NETWORK, WAKE_TIMER] {
+            let mut b = Fake::new(&[]);
+            let mut m = Manager::new(ZONE, 0);
+            if source == WAKE_TIMER {
+                m.set_alarm(Some(1_000));
+            }
+            assert_eq!(m.sleep(&mut b, 0), Ok(0));
+            assert_eq!(b.take(), ["screen false", "power 1"]);
+            m.tick(&mut b, 999);
+            assert!(b.take().is_empty() && b.last.suspended);
+            if source == WAKE_NETWORK {
+                b.events = WAKE_NETWORK;
+            }
+            m.tick(&mut b, 1_000);
+            // The CPU is up; the screen is not asked for.
+            assert_eq!(b.take(), ["power 0"]);
+            assert!(!b.last.suspended && !b.last.screen_on);
+            assert_eq!((b.last.want, b.last.last_wake, b.last.suspends), (WANT_NOTHING, source, 1));
+            // It lingers, then suspends again by itself.
+            m.tick(&mut b, 1_000 + LINGER_MS - 1);
+            assert!(b.take().is_empty());
+            m.tick(&mut b, 1_000 + LINGER_MS);
+            assert_eq!(b.take(), ["power 1"]);
+            assert_eq!(b.last.suspends, 2);
+        }
+    }
+
+    #[test]
+    fn a_user_wake_asks_for_the_screen() {
+        for source in [WAKE_KEY, WAKE_TOUCH] {
+            let mut b = Fake::new(&[]);
+            let mut m = Manager::new(ZONE, 0);
+            m.sleep(&mut b, 0).unwrap();
+            b.take();
+            b.events = source;
+            m.tick(&mut b, 50);
+            assert_eq!(b.take(), ["power 0"]);
+            assert_eq!((b.last.want, b.last.last_wake), (WANT_WAKE, source));
+            // Runtime's wake command completes it.
+            assert!(m.wake(&mut b));
+            assert_eq!(b.take(), ["screen true", "power 0"]);
+            m.tick(&mut b, 60);
+            assert_eq!(b.last.want, WANT_NOTHING);
+            assert!(b.last.screen_on && !b.last.suspended);
+            // Nothing suspends it again.
+            m.tick(&mut b, 60 + 10 * LINGER_MS);
+            assert!(b.take().is_empty());
+        }
+        // A wake nobody turns into a screen-on: suspended again, the request forgotten.
+        let mut b = Fake::new(&[]);
+        let mut m = Manager::new(ZONE, 0);
+        m.sleep(&mut b, 0).unwrap();
+        b.events = WAKE_TOUCH;
+        m.tick(&mut b, 10);
+        b.take();
+        m.tick(&mut b, 10 + LINGER_MS);
+        assert_eq!(b.take(), ["power 1"]);
+        assert_eq!(b.last.want, WANT_NOTHING);
+    }
+
+    #[test]
+    fn the_power_key_asks_for_sleep_when_awake() {
+        let mut b = Fake::new(&[]);
+        let mut m = Manager::new(ZONE, 0);
+        // A touch or the network while awake asks for nothing.
+        b.events = WAKE_TOUCH | WAKE_NETWORK;
+        m.tick(&mut b, 0);
+        assert_eq!(b.last.want, WANT_NOTHING);
+        b.events = WAKE_KEY;
+        m.tick(&mut b, 10);
+        assert_eq!(b.last.want, WANT_SLEEP);
+        assert!(b.take().is_empty());
+        // The request stands until Runtime's sleep arrives.
+        m.tick(&mut b, 20);
+        assert_eq!(b.last.want, WANT_SLEEP);
+        assert_eq!(m.sleep(&mut b, 30), Ok(0));
+        m.tick(&mut b, 31);
+        assert_eq!(b.last.want, WANT_NOTHING);
+        assert!(b.last.suspended);
+        // Bits a board must not send are ignored.
+        let mut m = Manager::new(ZONE, 0);
+        b.events = 0xffff_fff0;
+        m.tick(&mut b, 0);
+        assert_eq!(b.last.want, WANT_NOTHING);
+    }
+
+    #[test]
+    fn a_wake_lock_taken_after_a_wake_holds_the_suspend() {
+        let mut b = Fake::new(&[]);
+        let mut m = Manager::new(ZONE, 0);
+        m.sleep(&mut b, 0).unwrap();
+        b.events = WAKE_NETWORK;
+        m.tick(&mut b, 100);
+        b.take();
+        // Services may still take a lock with the screen off (apps may not).
+        m.lock(&mut b, AUDIO, KIND_RADIO, true, 200).unwrap();
+        m.tick(&mut b, 100 + 3 * LINGER_MS);
+        assert!(b.take().is_empty());
+        assert!(b.last.sleep_deferred);
+        m.lock(&mut b, AUDIO, KIND_RADIO, false, 100 + 4 * LINGER_MS).unwrap();
+        assert_eq!(b.take(), ["power 1"]);
+        // A user's touch while the suspend is only deferred still asks for the screen.
+        let mut m = Manager::new(ZONE, 0);
+        m.lock(&mut b, AUDIO, KIND_AUDIO, true, 0).unwrap();
+        assert_eq!(m.sleep(&mut b, 10), Ok(1 << KIND_AUDIO));
+        b.take();
+        b.events = WAKE_TOUCH;
+        m.tick(&mut b, 20);
+        assert_eq!(b.last.want, WANT_WAKE);
+        assert!(b.take().is_empty(), "nothing to resume: it never suspended");
+    }
+
+    #[test]
+    fn alarms() {
+        let mut b = Fake::new(&[]);
+        let mut m = Manager::new(ZONE, 0);
+        // One that passes while the system is up does nothing.
+        m.set_alarm(Some(100));
+        m.tick(&mut b, 150);
+        assert_eq!(b.last.last_wake, 0);
+        assert_eq!(m.next_tick(&b, 150), None);
+        // The board's alarm is relative to now.
+        b.alarm = Some(400);
+        m.tick(&mut b, 1_000);
+        assert_eq!(m.next_tick(&b, 1_000), Some(400));
+        m.sleep(&mut b, 1_100).unwrap();
+        b.take();
+        m.tick(&mut b, 1_399);
+        assert!(b.take().is_empty());
+        m.tick(&mut b, 1_400);
+        assert_eq!(b.take(), ["power 0"]);
+        assert_eq!(b.last.last_wake, WAKE_TIMER);
+        // Fired once.
+        m.tick(&mut b, 1_400 + LINGER_MS);
+        assert_eq!(b.take(), ["power 1"]);
+        m.tick(&mut b, 1_400 + 3 * LINGER_MS);
+        assert!(b.take().is_empty());
+    }
+
+    #[test]
+    fn power_runs_only_when_something_is_pending() {
+        let mut b = Fake::new(&[]);
+        let mut m = Manager::new(ZONE, 0);
+        m.tick(&mut b, 0);
+        assert_eq!(m.next_tick(&b, 0), None, "awake with nothing held: wait for a request");
+        m.lock(&mut b, APP, KIND_CPU, true, 0).unwrap();
+        assert_eq!(m.next_tick(&b, 0), Some(HOUSEKEEPING_MS), "a lock can lapse");
+        assert_eq!(m.sleep(&mut b, 10), Ok(1));
+        assert_eq!(m.next_tick(&b, 10), Some(HOUSEKEEPING_MS), "deferred by a lock: once a second, for its lapse");
+        assert_eq!(m.next_tick(&b, 10 + 9 * 60_000), Some(HOUSEKEEPING_MS), "and still, while it is held");
+        m.lock(&mut b, APP, KIND_CPU, false, 20).unwrap();
+        assert_eq!(m.next_tick(&b, 20), Some(WAKE_POLL_MS), "suspended: watch the wake lines");
+        b.events = WAKE_NETWORK;
+        m.tick(&mut b, 1_000);
+        assert_eq!(m.next_tick(&b, 1_000), Some(HOUSEKEEPING_MS), "lingering: no sooner than needed");
+        assert_eq!(m.next_tick(&b, 1_000 + LINGER_MS - 300), Some(300));
+        m.wake(&mut b);
+        assert_eq!(m.next_tick(&b, 9_000), None);
+        // A sensor is sampled once a second.
+        b.reading = Reading::Ok(30_000);
+        m.tick(&mut b, 10_000);
+        assert_eq!(m.next_tick(&b, 10_000), Some(HOUSEKEEPING_MS));
+    }
+
+    #[test]
+    fn a_power_off_for_heat_ignores_wake_sources() {
+        let mut b = Fake::new(&TABLE);
+        let mut m = Manager::new(ZONE, 0);
+        b.reading = Reading::Ok(ZONE.critical + 1);
+        m.tick(&mut b, 0);
+        assert!(m.powering_off());
+        b.take();
+        b.events = WAKE_KEY;
+        m.tick(&mut b, 10);
+        assert_eq!(b.last.want, WANT_NOTHING);
+        assert!(b.take().is_empty());
+        assert_eq!(m.next_tick(&b, 10), None);
     }
 }

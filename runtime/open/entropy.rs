@@ -198,11 +198,10 @@ pub fn collect(drbg: &mut Drbg) -> bool {
         sys::yield_now();
         sys::counter() as u32
     });
-    if drbg.seeded {
-        crate::log!("entropy: seeded from timer jitter ({} bits credited to {} samples); no hardware source", bits, samples);
-    } else {
-        crate::log!("entropy: too little timer jitter ({} bits in {} samples); apps will not start", bits, samples);
-    }
+    // "entropy: seeded from timer jitter" (no hardware source reaches this
+    // process), or "entropy: too little timer jitter": no app will start.
+    let how = if drbg.seeded { "seeded from" } else { "too little" };
+    crate::log!("entropy: {} timer jitter ({} bits credited to {} samples)", how, bits, samples);
     drbg.seeded
 }
 

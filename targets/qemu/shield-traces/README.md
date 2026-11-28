@@ -13,7 +13,14 @@ window never showed (EXIT, SHIELD_HIT) are missing; the themes traces stop befor
 to /apps/home because the old demo froze it there. All hosts are the demo's `.test` stand-ins
 or wttr.in; nothing here came from personal use.
 
-This is a small regression corpus (4 benign processes), not a measurement: no false positive
-in 4 still allows a true rate up to 49% at 95% confidence. Add complete traces from real runs
+`qemu-enforce-*.log` are different: the complete records (EXIT included, flags as the phone
+set them) of one emulator run of the shipped image under `make test-shield-enforce`, split per
+process by `tools/shield-trainer/collect.py ingest --source qemu`. Home's trace still carries
+the cross-app mark the phone used to put on its reads of `/apps/.home`; the replay sets flags
+again through today's policy, which no longer does. `tools/shield-trainer/test_traces.rs`
+holds these four to a budget (docs/shield-data.md).
+
+This is a small regression corpus (6 benign processes), not a measurement: no false positive
+in 6 still allows a true rate up to 39% at 95% confidence. Add complete traces from real runs
 (`build/shield/qemu-traces/enforce-last.log` after `make test-shield-enforce`, or
 `companion_sim.py --record`, converted to tab-separated lines) before quoting a rate.

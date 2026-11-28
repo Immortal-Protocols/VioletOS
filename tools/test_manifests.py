@@ -23,7 +23,7 @@ def folder(base, name, manifest=None):
 class Manifests(unittest.TestCase):
     def test_checked_in_manifests_pass(self):
         # Every manifest in the tree packs, for the image and the test images.
-        for top in ["apps/open", "apps/shield-demo", "targets/qemu/open-test-apps", "targets/qemu/net-test-apps"]:
+        for top in ["apps/open", "apps/shield-demo", "targets/qemu/open-test-apps", "targets/qemu/memory-test-apps"]:
             apps = [a for a in (ROOT / top).iterdir() if a.is_dir()]
             text = build_initfs.pack_manifests(apps)
             for a in apps:
@@ -36,6 +36,15 @@ class Manifests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             apps = [folder(t, "b", "caps: net, mic # the microphone\n\n# nothing\n"), folder(t, "a", "caps:\n"), folder(t, "c")]
             self.assertEqual(build_initfs.pack_manifests(apps), "@a\ncaps: \n@b\ncaps: net mic\n")
+        # serve: (runtime/open/loopback.rs serve_words) is packed as written,
+        # in the form tests/integration's World hands manifest.rs.
+        with tempfile.TemporaryDirectory() as t:
+            apps = [folder(t, "srv", "caps: net\nserve: apps, lan # loopback and the wildcard\n")]
+            self.assertEqual(build_initfs.pack_manifests(apps), "@srv\ncaps: net\nserve: apps lan\n")
+        self.assertEqual(build_initfs.read_manifest("serve: lan", "x"), ["serve: lan"])
+        for text in ["serve: world", "serve: apps internet", "serves: lan"]:
+            with self.assertRaises(SystemExit, msg=text):
+                build_initfs.read_manifest(text, "x")
 
     def test_mistakes_fail_the_build(self):
         bad = ["caps: network", "cap: net", "net", "data: ../agent", "data: .grants", "data: a/b", "data: other", "data: other.keys"]

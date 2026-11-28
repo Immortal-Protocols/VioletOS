@@ -13,6 +13,10 @@ and an added file must be exactly its listed source.
     python3 kernel/sel4/delta.py --tree build/sel4/qemu/upstream \
         --archive build/sel4/downloads/seL4-17.0.0.tar.gz
                                             compare a prepared kernel tree with the pinned archive
+    python3 kernel/sel4/delta.py --cache build/sel4/qemu/kernel/CMakeCache.txt \
+        --archive build/sel4/downloads/seL4-17.0.0.tar.gz
+                                            compare a built configuration with the nearest verified one
+    python3 kernel/sel4/delta.py --tables   print README.md's tables
 
 kernel/sel4/build.py runs the tree comparison on every build, and after the
 kernel links it checks that only the listed stubs contain an SMC instruction.
@@ -234,6 +238,11 @@ def source_errors(manifest, repo=REPO):
                 errors.append(f"{path}: its origin {origin} is not under sources")
             if not entry.get("why"):
                 errors.append(f"{path}: no reason given")
+            if not entry.get("proof"):
+                errors.append(f"{path}: nothing says what the change does to the proofs")
+    for name, entry in manifest["options"].items():
+        if not entry.get("proof"):
+            errors.append(f"build option {name}: nothing says what it does to the proofs")
     board = repo / "platform/sel4/board"
     if board.is_dir():
         present = {p.relative_to(repo).as_posix() for p in board.rglob("*") if p.is_file() and not ignored(p.as_posix())}
@@ -259,6 +268,88 @@ def source_errors(manifest, repo=REPO):
         if f'"{upstream["name"]}"' not in text or upstream["sha256"] not in text:
             errors.append("kernel/sel4/build.py does not pin the upstream archive delta.json names")
     return errors
+
+
+def verified_settings(texts):
+    """{option: value} that a verified configuration file sets, given its
+    includes' text first and its own last (a later set wins, as FORCE does)."""
+    settings = {}
+    for text in texts:
+        for name, quoted, bare in re.findall(r'^set\(\s*(\w+)\s+(?:"([^"]*)"|(\S+))\s+CACHE', text, re.M):
+            settings[name] = quoted or bare
+    return settings
+
+
+def cache_settings(text):
+    """{option: value} of a kernel build directory's CMakeCache.txt."""
+    return {name: value for name, value in re.findall(r"^(\w+):\w+=(.*)$", text, re.M)}
+
+
+def configuration_errors(manifest, verified, cache):
+    """Does the built configuration differ from the nearest verified one in
+    exactly the ways delta.json's nearest_verified records? `verified` is
+    verified_settings of that configuration, `cache` the build's cache_settings.
+    Options under build_variants are free: a build that sets them is further
+    from the verified configuration, as their entries say."""
+    near = manifest["nearest_verified"]
+    differences, variants, beyond = near["differences"], near.get("build_variants", {}), near.get("beyond", {})
+    errors = []
+    if manifest.get("verified_configuration") is not False:
+        errors.append("delta.json must say verified_configuration: false")
+    if not verified:
+        errors.append(f"{near['config']} sets nothing: is it the configuration upstream ships?")
+    for name, want in sorted(verified.items()):
+        have = cache.get(name, "absent")
+        recorded = differences.get(name)
+        if recorded is None:
+            if have != want and name not in variants:
+                errors.append(f"{name} is {have} in this build and {want} in {near['config']}: not listed under nearest_verified")
+        elif recorded.get("verified") != want:
+            errors.append(f"{name}: {near['config']} sets {want}, delta.json says {recorded.get('verified')}")
+        elif recorded.get("violetos") != have:
+            errors.append(f"{name} is {have} in this build, delta.json says {recorded.get('violetos')}")
+        elif have == want:
+            errors.append(f"{name} is listed as a difference but is {want} in both")
+        elif not recorded.get("proof"):
+            errors.append(f"{name}: nothing says what the difference does to the proofs")
+    for name in sorted(set(differences) - set(verified)):
+        errors.append(f"{name} is listed as a difference but {near['config']} does not set it")
+    for name, value in sorted(beyond.items()):
+        if name in verified:
+            errors.append(f"{name} is listed under beyond but {near['config']} sets it")
+        if cache.get(name, "absent") != value:
+            errors.append(f"{name} is {cache.get(name, 'absent')} in this build, delta.json's nearest_verified says {value}")
+        if name not in manifest["options"]:
+            errors.append(f"{name} is listed under beyond but is not a build option of delta.json")
+    return errors
+
+
+def archive_texts(archive, names):
+    """The text of the named files of the pinned source archive, in order."""
+    found = {}
+    with tarfile.open(archive) as tar:
+        for member in tar:
+            name = member.name.split("/", 1)[1] if "/" in member.name else ""
+            if name in names and member.isfile():
+                found[name] = tar.extractfile(member).read().decode()
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise SystemExit(f"the pinned upstream archive has no {', '.join(missing)}")
+    return [found[n] for n in names]
+
+
+def nearest_verified_settings(manifest, archive):
+    near = manifest["nearest_verified"]
+    return verified_settings(archive_texts(archive, [*near.get("includes", []), near["config"]]))
+
+
+def enforce_configuration(cache_text, archive):
+    """Stop the build when its configuration is not the one delta.json
+    describes relative to the nearest verified configuration."""
+    manifest = load()
+    errors = configuration_errors(manifest, nearest_verified_settings(manifest, archive), cache_settings(cache_text))
+    if errors:
+        sys.exit("Kernel delta check failed (kernel/sel4/delta.json):\n  " + "\n  ".join(errors))
 
 
 def smc_sites(disassembly):
@@ -294,6 +385,31 @@ def handset_base(factory_boot_sha256, device_tree):
     sys.exit("Kernel delta check failed: kernel/sel4/delta.json pins no factory boot image")
 
 
+def tables(manifest):
+    """The Markdown tables README.md carries, generated so they cannot drift
+    (test_delta.py compares them): python3 kernel/sel4/delta.py --tables."""
+    def link(origin):
+        return f"[{origin.rsplit('/', 1)[-1]}](../../{origin})"
+
+    def table(head, rows):
+        lines = ["| " + " | ".join(head) + " |", "| " + " | ".join("---" for _ in head) + " |"]
+        return "\n".join(lines + ["| " + " | ".join(row) + " |" for row in rows])
+
+    near = manifest["nearest_verified"]
+    return {
+        "changed": table(["File", "Changed by", "What changes", "What it does to the proofs"],
+                         [[f"`{p}`", link(e["from"]), e["why"], e["proof"]] for p, e in manifest["changed"].items()]),
+        "added": table(["File", "From", "What it is", "What it does to the proofs"],
+                       [[f"`{p}`", link(e["from"]) if e.get("from") else "upstream", e["why"], e["proof"]]
+                        for p, e in manifest["added"].items()]),
+        "options": table(["Option", "Value", "Why", "What it does to the proofs"],
+                         [[f"`{n}`", e["value"], e["why"], e["proof"]] for n, e in manifest["options"].items()]),
+        "nearest": table(["Option", near["config"].rsplit("/", 1)[-1], "VioletOS", "What the difference does to the proofs"],
+                         [[f"`{n}`", e["verified"], e["violetos"], e["proof"]] for n, e in near["differences"].items()]
+                         + [[f"`{n}`", "upstream's default", v, manifest["options"][n]["proof"]] for n, v in near["beyond"].items()]),
+    }
+
+
 def enforce_tree(tree, archive, derived=None):
     """Stop the build when the prepared kernel tree has an unlisted difference,
     or a listed file whose content is not what its origin produces."""
@@ -325,8 +441,13 @@ def main():
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--handset", action="store_true",
                         help="the tree was prepared for the handset: its base device tree comes from the factory image and is not compared")
+    parser.add_argument("--tables", action="store_true", help="print README.md's tables from delta.json")
+    parser.add_argument("--cache", type=Path, help="a kernel build's CMakeCache.txt: compare it with the nearest verified configuration (needs --archive)")
     args = parser.parse_args()
     manifest = load()
+    if args.tables:
+        print("\n\n".join(tables(manifest).values()))
+        return
     if args.update:
         for path in manifest["sources"]:
             manifest["sources"][path] = hashlib.sha256((REPO / path).read_bytes()).hexdigest()
@@ -338,6 +459,10 @@ def main():
         tree = tree_hashes(args.tree)
         derived = {p: tree.get(p) for p, e in manifest["added"].items() if e.get("handset")} if args.handset else None
         errors += tree_errors(manifest, archive_hashes(args.archive), tree, expected_hashes(manifest, args.archive, derived=derived))
+    if args.cache:
+        if not args.archive:
+            parser.error("--cache needs --archive")
+        errors += configuration_errors(manifest, nearest_verified_settings(manifest, args.archive), cache_settings(args.cache.read_text()))
     if errors:
         sys.exit("\n".join(errors))
     print(f"{len(manifest['changed'])} upstream files changed, {len(manifest['added'])} added, "

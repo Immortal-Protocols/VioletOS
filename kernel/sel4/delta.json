@@ -1,48 +1,105 @@
 {
-  "about": "Every difference between the kernel VioletOS builds and upstream seL4. Checked by kernel/sel4/delta.py (make test-unit, and every kernel build): which files differ, what each contains (the pinned upstream file plus its 'from' patch or script; an added file is its 'from' or 'copy_of'), and each build option's value. Edit this file in the same change as the kernel sources, then run python3 kernel/sel4/delta.py --update.",
+  "about": "Every difference between the kernel VioletOS builds and upstream seL4, and what each does to seL4's proofs. Checked by kernel/sel4/delta.py (make test-unit, and every kernel build): which files differ, what each contains (the pinned upstream file plus its 'from' patch or script; an added file is its 'from' or 'copy_of'), each build option's value, and how the configuration differs from the nearest verified one. Edit this file in the same change as the kernel sources, then run python3 kernel/sel4/delta.py --update.",
   "upstream": {
     "name": "seL4-17.0.0",
     "sha256": "cda7844ba516ba8920ba1f24ec8ab98302f0527007c1ec0cfe294aa46443b0fe"
   },
   "verified_configuration": false,
+  "nearest_verified": {
+    "config": "configs/ARM_imx8mm_verified.cmake",
+    "includes": [
+      "configs/include/ARM_verified_include.cmake"
+    ],
+    "why": "VioletOS's kernel matches no verified configuration. The nearest is ARM_imx8mm_verified: the same architecture (AArch32, no hypervisor mode), the same core (Cortex-A53), a GICv3 and floating-point context switching, with a C-level functional correctness proof but none of the security proofs (those are for AArch32 without FPU). The kernel differs from it in exactly the options below, in the options listed under 'beyond' (which that configuration leaves at upstream's default), in the compiler, and in every source change this file lists.",
+    "differences": {
+      "KernelPlatform": {
+        "verified": "imx8mm-evk",
+        "violetos": "ellis",
+        "proof": "Another platform: none of the proof's platform assumptions were checked for it."
+      },
+      "KernelVerificationBuild": {
+        "verified": "ON",
+        "violetos": "OFF",
+        "proof": "The build is not restricted to what the proofs cover."
+      },
+      "KernelBinaryVerificationBuild": {
+        "verified": "ON",
+        "violetos": "OFF",
+        "proof": "Nothing relates the compiled kernel to its C source."
+      },
+      "KernelOptimisationCloneFunctions": {
+        "verified": "OFF",
+        "violetos": "ON",
+        "proof": "A compiler optimisation the binary verification excludes."
+      },
+      "KernelIPCBufferLocation": {
+        "verified": "threadID_register",
+        "violetos": "absent",
+        "proof": "The option does not exist for this core; the thread pointer is set by KernelArmTLSReg instead."
+      },
+      "KernelNumDomains": {
+        "verified": "16",
+        "violetos": "1",
+        "proof": "The proofs are set up to be robust to this number (upstream CAVEATS.md); no domain scheduling is used."
+      }
+    },
+    "beyond": {
+      "KernelArmExportVCNTUser": "ON",
+      "KernelArmExportPTMRUser": "ON",
+      "KernelArmTLSReg": "tpidruro"
+    },
+    "build_variants": {
+      "KernelIsMCS": "VIOLET_MCS=1 turns it ON, further from this configuration.",
+      "KernelMaxNumNodes": "VIOLET_CORES above 1 is multicore, which no verified configuration is."
+    }
+  },
   "changed": {
     "include/arch/arm/arch/32/mode/object/structures.bf": {
       "from": "platform/sel4/board/wifi/aarch32.patch",
-      "why": "Adds the ellis_wifi_cap capability type (arch cap tag 0x4f), compiled only for the ellis platform."
+      "why": "Adds the ellis_wifi_cap capability type (arch cap tag 0x4f), compiled only for the ellis platform.",
+      "proof": "The generated capability datatype gains a type no proof layer knows: the abstract, design and C-level specifications and every lemma by cases over capabilities would need the new case."
     },
     "include/arch/arm/arch/32/mode/object/structures.h": {
       "from": "platform/sel4/board/wifi/aarch32.patch",
-      "why": "The new capability has no size, is not a physical object and has no object pointer (three switch cases)."
+      "why": "The new capability has no size, is not a physical object and has no object pointer (three switch cases).",
+      "proof": "Three functions the C refinement proof covers (capability size, physical, pointer) gain a case; their correspondence lemmas no longer match the code."
     },
     "src/arch/arm/kernel/boot.c": {
       "from": "platform/sel4/board/wifi/aarch32.patch",
-      "why": "Places the one ellis_wifi_cap in the root task's CNode at seL4_CapSMC during boot."
+      "why": "Places the one ellis_wifi_cap in the root task's CNode at seL4_CapSMC during boot.",
+      "proof": "The initial state differs from the one the boot invariants and the system-initialisation proof describe: one more capability in the root CNode."
     },
     "src/arch/arm/32/object/objecttype.c": {
       "from": "platform/sel4/board/wifi/aarch32.patch",
-      "why": "Deriving the capability gives a null cap (it cannot be copied or minted), two such caps compare as the same object, and invoking it calls ellisWifiInvocation."
+      "why": "Deriving the capability gives a null cap (it cannot be copied or minted), two such caps compare as the same object, and invoking it calls ellisWifiInvocation.",
+      "proof": "Arch_deriveCap, Arch_sameObjectAs and Arch_decodeInvocation gain a case. The new invocation calls the secure monitor, which the proofs' machine model does not contain: its effect on memory protection cannot be stated in them, so integrity and confidentiality would not follow even if the rest were re-proved."
     },
     "src/arch/arm/machine/gic_v3.c": {
       "from": "platform/sel4/board/gic-single-core.py",
-      "why": "On ellis the redistributor region is one 128 KiB frame per booted core instead of a fixed 1 MiB."
+      "why": "On ellis the redistributor region is one 128 KiB frame per booted core instead of a fixed 1 MiB.",
+      "proof": "Interrupt controller driver: machine-interface code the proofs assume correct and do not verify. Changed or not, a defect in it is not excluded by any proof."
     },
     "tools/hardware.yml": {
       "from": "platform/sel4/board/gic-single-core.py",
-      "why": "Adds the violet,ellis-boot-gic device rule: the kernel maps the distributor and four redistributor frames."
+      "why": "Adds the violet,ellis-boot-gic device rule: the kernel maps the distributor and four redistributor frames.",
+      "proof": "Build-time hardware description that decides which device memory the kernel keeps and which it offers to user level. The proofs assume the generated layout is right."
     }
   },
   "added": {
     "src/plat/ellis/config.cmake": {
       "from": "platform/sel4/board/config.cmake",
-      "why": "The ellis platform: AArch32 on Cortex-A53 (ARMv8-A) with GICv3 and the ARM generic timer. Not an upstream platform."
+      "why": "The ellis platform: AArch32 on Cortex-A53 (ARMv8-A) with GICv3 and the ARM generic timer. Not an upstream platform.",
+      "proof": "A platform the proofs have never been run for: its memory map, timer and interrupt numbers are assumptions no proof discharges."
     },
     "src/plat/ellis/kernel-overlay.dts": {
       "from": "platform/sel4/board/kernel-overlay.dts",
-      "why": "Device tree overlay: the kernel's GIC node and reserved memory."
+      "why": "Device tree overlay: the kernel's GIC node and reserved memory.",
+      "proof": "Input to the generated kernel memory layout, which the proofs assume correct."
     },
     "src/plat/ellis/moto-radio-memory.dts": {
       "from": "platform/sel4/board/moto-radio-memory.dts",
-      "why": "The handset's connectivity memory reservations, applied on both targets."
+      "why": "The handset's connectivity memory reservations, applied on both targets.",
+      "proof": "Input to the generated kernel memory layout, which the proofs assume correct."
     },
     "src/plat/ellis/factory-base.dts": {
       "from": "platform/sel4/board/qemu.dts",
@@ -50,23 +107,28 @@
       "handset": {
         "factory_boot_sha256": "36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a",
         "how": "For the handset, kernel/sel4/build.py decompiles the base device tree from the factory boot image with the pinned dtc. The build stops unless that image has this SHA-256 (the same one platform/sel4/loader/build.py requires)."
-      }
+      },
+      "proof": "Input to the generated kernel memory layout, which the proofs assume correct. On the handset it comes from the manufacturer."
     },
     "src/plat/ellis/wifi/monitor.S": {
       "from": "platform/sel4/board/wifi/monitor.S",
-      "why": "Four secure-monitor call stubs with fixed MediaTek function IDs. Compiled for the handset only."
+      "why": "Four secure-monitor call stubs with fixed MediaTek function IDs. Compiled for the handset only.",
+      "proof": "Assembly, which the proofs do not cover on any platform, entering closed secure firmware that can change memory protection and is outside every proof assumption."
     },
     "include/arch/arm/arch/object/ellis_wifi/invoke.h": {
       "from": "platform/sel4/board/wifi/invoke.h",
-      "why": "ellisWifiInvocation: three labels (inspect windows, prepare windows, read four secure random words). On QEMU the stubs are C functions that fail."
+      "why": "ellisWifiInvocation: turns one of four permitted requests into one secure-monitor call with fixed arguments and returns the monitor's reply words. No policy. On QEMU the stubs are C functions that fail.",
+      "proof": "Kernel-mode C that was never verified. It runs with interrupts masked for as long as the secure monitor takes, so the kernel's worst-case execution time is unbounded on the handset."
     },
-    "include/arch/arm/arch/object/ellis_wifi/windows.h": {
-      "from": "platform/sel4/board/wifi/windows.h",
-      "why": "The fixed connectivity and DMA window policy the invocation enforces."
+    "include/arch/arm/arch/object/ellis_wifi/table.h": {
+      "from": "platform/sel4/board/wifi/table.h",
+      "why": "The four permitted operations and their fixed monitor arguments: reads of four registers of regions 25 and 29 by either reader, the two programming steps of the one connectivity window, and the random number call.",
+      "proof": "Kernel-mode C that was never verified: the argument check that keeps every other secure-monitor call unreachable. Its only assurance is the host test."
     },
     "libsel4/sel4_plat_include/ellis/sel4/plat/api/constants.h": {
       "why": "A copy of upstream's imx8mm-evk/sel4/plat/api/constants.h, made by kernel/sel4/build.py.",
-      "copy_of": "libsel4/sel4_plat_include/imx8mm-evk/sel4/plat/api/constants.h"
+      "copy_of": "libsel4/sel4_plat_include/imx8mm-evk/sel4/plat/api/constants.h",
+      "proof": "None: a user-level header; the kernel does not include it."
     }
   },
   "sources": {
@@ -76,75 +138,91 @@
     "platform/sel4/board/qemu.dts": "fb6cf6a27ccc662c056d895531c623103ea1bd5d9754ea5e4a1d1660c9c07b28",
     "platform/sel4/board/gic-single-core.py": "2adce3e4929d2ab85eb45e57eda0b582e2c3fcfb8d8778cd618e278b695208b9",
     "platform/sel4/board/wifi/aarch32.patch": "95c2d1cb9793250e17b825b3616ab77c5ea7401a3c6d3f856244560266be505e",
-    "platform/sel4/board/wifi/invoke.h": "f8f8a714ee2605a7a5c01fb6023044d9f3cb1f82ece3669e2267a49e0fa6c4b4",
-    "platform/sel4/board/wifi/windows.h": "b93140b7bd793d4212bf2aef2838ccdcc90f791f15ebe0f125925f80f4041f56",
-    "platform/sel4/board/wifi/monitor.S": "4a3467c6eb81e40bcf34b957f95075aab7162528e7fce97446fdd5584cb1c20b"
+    "platform/sel4/board/wifi/invoke.h": "e687b436a50c115ce786a76b73505dc38d1a140d18c24892671d24e10b0815b2",
+    "platform/sel4/board/wifi/monitor.S": "4a3467c6eb81e40bcf34b957f95075aab7162528e7fce97446fdd5584cb1c20b",
+    "platform/sel4/board/wifi/table.h": "cf983b0fbd432ab5b16ff93fc060e7f167c23b11ab86b99ec1e3f53610afce31"
   },
   "not_in_kernel": {
     "platform/sel4/board/memory.h": "The board memory map for the loader and the supervisor (user level).",
-    "platform/sel4/board/watchdog.c": "The watchdog driver linked into user-level processes."
+    "platform/sel4/board/watchdog.c": "The watchdog driver linked into user-level processes.",
+    "platform/sel4/board/wifi/windows.h": "The connectivity window policy: when the window may be programmed and what the monitor's replies mean. Runs in the supervisor (user level) since the kernel extension was reduced to table.h.",
+    "platform/sel4/board/wifi/user.h": "The supervisor's side of the kernel extension: carries each monitor call windows.h makes to the kernel as one permitted operation, and filters the random words."
   },
   "options": {
     "CMAKE_TOOLCHAIN_FILE": {
       "value": "upstream's llvm.cmake, in the prepared tree",
       "expression": "str(src / 'llvm.cmake')",
-      "why": "The toolchain file seL4 ships for clang."
+      "why": "The toolchain file seL4 ships for clang.",
+      "proof": "The binary verification of AArch32 kernels is for GCC output; no proof says clang's output matches the C semantics the proofs use."
     },
     "TRIPLE": {
       "value": "arm-none-eabi",
-      "why": "The clang target triple llvm.cmake uses."
+      "why": "The clang target triple llvm.cmake uses.",
+      "proof": "As CMAKE_TOOLCHAIN_FILE: a clang build."
     },
     "PYTHON3": {
       "value": "the build's own Python (build/sel4/venv)",
       "expression": "str(py)",
-      "why": "The interpreter for the kernel's code generators."
+      "why": "The interpreter for the kernel's code generators.",
+      "proof": "None: runs the same generators."
     },
     "KernelPlatform": {
       "value": "ellis",
-      "why": "The VioletOS board port; no upstream platform, so no upstream proof configuration."
+      "why": "The VioletOS board port; no upstream platform, so no upstream proof configuration.",
+      "proof": "Decides everything platform-specific the proofs take as given. No proof run has ever used this platform."
     },
     "KernelSel4Arch": {
       "value": "aarch32",
-      "why": "32-bit ARM kernel on a 64-bit capable core."
+      "why": "32-bit ARM kernel on a 64-bit capable core.",
+      "proof": "The same as the verified AArch32 configurations."
     },
     "KernelVerificationBuild": {
       "value": "OFF",
-      "why": "Not a verification build."
+      "why": "Not a verification build.",
+      "proof": "The verified configurations set ON, which also forbids options and code the proof tools cannot handle. OFF means the build was never constrained to the verified subset."
     },
     "KernelDebugBuild": {
       "value": "OFF",
-      "why": "No debug syscalls."
+      "why": "No debug syscalls.",
+      "proof": "OFF as in the verified configurations."
     },
     "KernelPrinting": {
       "value": "OFF",
-      "why": "No kernel console."
+      "why": "No kernel console.",
+      "proof": "OFF as in the verified configurations."
     },
     "KernelIsMCS": {
       "value": "OFF, ON with VIOLET_MCS=1",
       "expression": "'ON' if os.environ.get('VIOLET_MCS') == '1' else 'OFF'",
-      "why": "Optional scheduling contexts (docs/8ms-frame-pipeline-rfc.md)."
+      "why": "Optional scheduling contexts (docs/8ms-frame-pipeline-rfc.md).",
+      "proof": "OFF by default, as in ARM_imx8mm_verified. With VIOLET_MCS=1 the kernel is the MCS variant, verified only as ARM_MCS_verified on imx6."
     },
     "KernelMaxNumNodes": {
       "value": "VIOLET_CORES, default 1",
       "expression": "os.environ.get('VIOLET_CORES', '1')",
-      "why": "Optional SMP on cluster 0."
+      "why": "Optional SMP on cluster 0.",
+      "proof": "1 by default, as in the verified configurations. No multicore configuration is verified: with VIOLET_CORES above 1 none of the proofs' concurrency assumptions hold."
     },
     "KernelArmExportVCNTUser": {
       "value": "ON",
-      "why": "User level reads the virtual counter."
+      "why": "User level reads the virtual counter.",
+      "proof": "Not set in any verified configuration. User level reads a clock, which the confidentiality proof's exclusion of timing channels does not cover."
     },
     "KernelArmExportPTMRUser": {
       "value": "ON",
-      "why": "The Open Runtime programs the physical timer (PPI 30)."
+      "why": "The Open Runtime programs the physical timer (PPI 30).",
+      "proof": "Not set in any verified configuration. User level programs a timer whose interrupt the kernel then delivers: hardware state the machine model does not have."
     },
     "KernelArmTLSReg": {
       "value": "tpidruro",
-      "why": "Linux ARM programs read their thread pointer from TPIDRURO."
+      "why": "Linux ARM programs read their thread pointer from TPIDRURO.",
+      "proof": "The verified configurations keep the default (tpidru). tpidruro also turns on KernelSetTLSBaseSelf, a system call outside the verified API."
     },
     "VioletQemuBoard": {
       "value": "ON for QEMU, OFF for the handset",
       "expression": "'ON' if target == 'qemu' else 'OFF'",
-      "why": "Selects the timer frequency and the secure-monitor fixture."
+      "why": "Selects the timer frequency and the secure-monitor fixture.",
+      "proof": "A VioletOS option of the ellis platform; meaningless to the proofs."
     }
   },
   "smc": {

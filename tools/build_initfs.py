@@ -53,19 +53,44 @@ def lld_for(sysroot, host):
 CPU_FLAGS = ["-C", "target-cpu=cortex-a53", "-C", "target-feature=+neon"]
 
 
-def pie_flags(rustc):
-    """VIOLET_OPEN_PIE=1 links the Rust apps as static position-independent
-    executables, which the Open Runtime loads at a random address. rustc has no
-    static-PIE mode for this target, so the link is spelled out: musl's
-    self-relocating start file (rcrt1.o) in place of crt1.o, and no text
-    relocations. Off by default: the result links, and tools/elf_check.py sees
-    a PIE, but it has not been run on the emulator or the phone yet."""
-    if os.environ.get("VIOLET_OPEN_PIE") != "1":
+def pie():
+    """Whether programs are built position-independent (the default; VIOLET_OPEN_PIE=0 turns it off)."""
+    return os.environ.get("VIOLET_OPEN_PIE") != "0"
+
+
+def relro_seal(out=None):
+    """tools/relro_seal.rs as an ARM object for every static PIE's link (its
+    .init_array entry makes PT_GNU_RELRO read-only before main), built with
+    the apps' rustc when the source is newer than the object."""
+    source = ROOT / "tools/relro_seal.rs"
+    out = Path(out or ROOT / "build/open-toolchain/relro-seal.o")
+    if not out.exists() or out.stat().st_mtime < source.stat().st_mtime:
+        rustc, _ = toolchain()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        part = out.with_name(f"{out.name}.{os.getpid()}")
+        subprocess.run([rustc, "--edition=2021", "--crate-type=lib", "--emit=obj", "-C", "opt-level=2",
+                        "-C", "panic=abort", "-C", "relocation-model=pic", "-C", "codegen-units=1",
+                        "--target", TARGET, source, "-o", part], check=True)
+        part.replace(out)
+    return out
+
+
+def pie_flags(rustc, seal=None):
+    """The Rust apps are linked as static position-independent executables,
+    which the Open Runtime loads at a random address. rustc has no static-PIE
+    mode for this target, so the link is spelled out: musl's self-relocating
+    start file (rcrt1.o) in place of crt1.o, and no text relocations.
+    tools/elf_check.py then refuses any program in the image that is not a
+    PIE. VIOLET_OPEN_PIE=0 goes back to fixed-address programs (a development
+    build: the image build says so)."""
+    if not pie():
         return []
     sysroot = Path(subprocess.run([rustc, "--print", "sysroot"], capture_output=True, text=True).stdout.strip())
     crt = sysroot / "lib/rustlib" / TARGET / "lib/self-contained"
-    link = ["-pie", "--no-dynamic-linker", "-static", "-z", "text", crt / "rcrt1.o", crt / "crti.o",
-            crt / "crtbeginS.o", f"-L{crt}", crt / "crtendS.o", crt / "crtn.o"]
+    # -z relro: constant pointer tables in PT_GNU_RELRO, which relro_seal.o
+    # makes read-only once rcrt1 has relocated them (tools/relro_seal.rs).
+    link = ["-pie", "--no-dynamic-linker", "-static", "-z", "text", "-z", "relro", crt / "rcrt1.o", crt / "crti.o",
+            crt / "crtbeginS.o", f"-L{crt}", seal or relro_seal(), crt / "crtendS.o", crt / "crtn.o"]
     return ["-C", "relocation-model=pic", "-C", "link-self-contained=no",
             *[part for arg in link for part in ("-C", f"link-arg={arg}")]]
 
@@ -163,7 +188,11 @@ def build_ladybird(folder):
     if bins:
         env.update({f"CC_{key}": str(bins[0] / "clang"), f"AR_{key}": str(bins[0] / "llvm-ar"),
                     f"CFLAGS_{key}": "--target=armv7-linux-musleabihf -march=armv7-a -mfpu=neon -mfloat-abi=hard"})
-    subprocess.run([cargo, "build", "--release", "--locked", "--target", TARGET], cwd=folder, env=env, check=True)
+    # The static-PIE link goes to the program's own rustc call only (cargo
+    # rustc), not into RUSTFLAGS; the crates under it are position-independent as built.
+    build = ["rustc", "--release", "--locked", "--target", TARGET, "--bin", "ladybird", "--", *map(str, pie_flags(rustc))] if pie() \
+        else ["build", "--release", "--locked", "--target", TARGET]
+    subprocess.run([cargo, *build], cwd=folder, env=env, check=True)
     return ROOT / "build/ladybird-cargo" / TARGET / "release/ladybird"
 
 
@@ -191,6 +220,12 @@ def c_toolchain():
     flags = ["--target=armv7-linux-musleabihf", "-march=armv7-a", "-mfpu=vfpv3-d16", "-mfloat-abi=hard",
              f"--sysroot={sysroot}", "-isystem", str(sysroot / "include")]
     link = ["-static", "-fuse-ld=lld", "-nostdlib", str(sysroot / "lib/crt1.o"), str(sysroot / "lib/crti.o")]
+    if pie():
+        # A static PIE: musl's self-relocating start file, no text relocations,
+        # and its RELRO sealed read-only before main (tools/relro_seal.rs).
+        flags.append("-fPIE")
+        link = ["-static-pie", "-Wl,-z,text", "-Wl,-z,relro", "-fuse-ld=lld", "-nostdlib", str(sysroot / "lib/rcrt1.o"),
+                str(sysroot / "lib/crti.o"), str(relro_seal())]
     tail = [f"-L{sysroot / 'lib'}", "-lc", str(builtins), str(sysroot / "lib/crtn.o")]
     return bin_dir / "clang", flags, link, tail
 
@@ -338,6 +373,16 @@ def entry(name, data, mode, mtime=0):
 
 # Test programs left out of the handset image, which must fit its boot partition
 # (Python alone is 17 MB); QEMU runs them all.
+def release_gate(files, fixed_ok, allow_fixed):
+    """tools/elf_check.py over every ELF file in the image ({name: (bytes,
+    mode)}), wherever it is: execve runs any of them. Returns the programs let
+    through with a fixed base; raises SystemExit for any it refuses."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import elf_check
+    return elf_check.check({name: data for name, (data, _) in files.items() if data[:4] == b"\x7fELF"},
+                           fixed_ok=fixed_ok, allow_fixed=allow_fixed)
+
+
 HANDSET_SKIP = {"gonet", "pyhello", "pynet", "pypaint", "pytone"}
 
 
@@ -354,6 +399,10 @@ def main(out, python=True, compress=False, skip=()):
     skip = set(skip) | {n for n in os.environ.get("VIOLET_OPEN_SKIP", "").split(",") if n}
     apps = sorted((a for d in folders for a in d.iterdir()), key=lambda a: a.name)
     cargo_out = None
+    fixed_ok = set()
+    sys.path.insert(0, str(ROOT / "tools"))
+    import elf_check
+    allow_fixed = elf_check.fixed_allowed()   # before minutes of building: VIOLET_RELEASE=1 refuses VIOLET_OPEN_PIE=0
     for app in apps:
         if not app.is_dir() or app.name in skip:
             continue
@@ -383,6 +432,12 @@ def main(out, python=True, compress=False, skip=()):
                 print(f"skipping {app.name}: {e}", file=sys.stderr)
                 continue
             files[f"apps/{app.name}"] = (binary.read_bytes(), 0o100755)
+            # Go links a PIE for linux/arm only through cgo, which these builds
+            # do not use: a Go test program keeps a fixed code address. Only the
+            # named QEMU test folders get that pass (elf_check.FIXED_TEST_PROGRAMS),
+            # and none in a release; any other Go app is refused by the gate.
+            if elf_check.fixed_test_program(ROOT, app):
+                fixed_ok.add(f"apps/{app.name}")
             continue
         if (app / "main.c").exists():
             binary = work / app.name
@@ -425,6 +480,12 @@ def main(out, python=True, compress=False, skip=()):
     python = python and os.environ.get("VIOLET_OPEN_NO_PYTHON") != "1"
     if not extra and python and (ROOT / "build/open-toolchain/python-root/bin/python3").exists():
         extra = str(ROOT / "build/open-toolchain/python-root")
+        # A python3 linked before the current rules (fixed address, or RELRO not sealed) is relinked, not shipped.
+        stale = elf_check.inspect((Path(extra) / "bin/python3").read_bytes())
+        if stale is not None and not allow_fixed and (elf_check.problems(stale) or not stale["pie"]):
+            raise SystemExit(f"{extra}/bin/python3 was linked before the current release rules "
+                             f"({'; '.join(elf_check.problems(stale)) or 'not position-independent'}): "
+                             "relink it with python3 tools/build_python.py python (or set VIOLET_OPEN_NO_PYTHON=1)")
     if extra:
         # A prepared tree (for example /bin/python3 and /lib) merged at the root.
         for path in sorted(Path(extra).rglob("*")):
@@ -435,12 +496,14 @@ def main(out, python=True, compress=False, skip=()):
     if os.environ.get("VIOLET_OPEN_LDSO") == "1":
         files[LOADER] = (musl_loader().read_bytes(), 0o100755)
     # The loader refuses programs that break W^X: fail here, not on the phone.
-    # Programs that are not position-independent keep a fixed code address.
-    sys.path.insert(0, str(ROOT / "tools"))
-    import elf_check
-    fixed = elf_check.check({name: data for name, (data, _) in files.items() if name.startswith(("apps/", "bin/", LOADER))})
+    # The release gate: every program is position-independent, so its code
+    # moves on every start, and seals its RELRO. Only Go test programs
+    # (fixed_ok) are let through. Every ELF file is a program execve may run,
+    # wherever it is in the tree.
+    fixed = release_gate(files, fixed_ok, allow_fixed)
     if fixed:
-        print(f"fixed code address (not PIE; stack, heap and mappings still move): {' '.join(fixed)}", file=sys.stderr)
+        print(f"{'NOT A RELEASE BUILD (VIOLET_OPEN_PIE=0): ' if allow_fixed else 'test programs with a '}"
+              f"fixed code address (not PIE; stack, heap and mappings still move): {' '.join(fixed)}", file=sys.stderr)
     blob = bytearray()
     dirs = sorted({str(Path(p).parent) for p in files if str(Path(p).parent) != "."} |
                   {str(q) for p in files for q in Path(p).parents if str(q) != "."})

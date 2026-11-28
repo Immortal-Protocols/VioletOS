@@ -2,11 +2,16 @@
 //!
 //! Each app has a page directory, regions (VMAs) that say which addresses are
 //! valid and how they may be used, and pages mapped on first touch from the
-//! pool. Pages are 64 KiB; a region may start on any 4 KiB boundary, as Linux
-//! allows. The hardware mapping of a page follows its regions: read-only,
-//! read-write or read-execute, never writable and executable, and
-//! Execute-Never unless it holds code (the rules are in ../../runtime/open/vma.rs).
+//! pool. Pages are sys::PAGE (4 KiB, the unit regions are made of, so every
+//! page has exactly its region's rights: a guard page or an mprotect of one
+//! page is enforced by the hardware, and a mapping costs the pages it
+//! touches, not 64 KiB each). The hardware mapping of a page follows its
+//! regions: read-only, read-write or read-execute, never writable and
+//! executable, and Execute-Never unless it holds code (the rules are in
+//! ../../runtime/open/vma.rs; they keep code and anything else at least a
+//! 64 KiB WINDOW apart, which is stricter than the hardware now needs).
 //! A page that holds code holds nothing else, and only the loader fills it.
+//! One app holds at most `Space::cap` pages of the pool.
 //! The runtime's copies to and from app memory check the same regions.
 //! The trampoline page belongs to the runtime: the app cannot unmap, replace
 //! or change it, so its pool page never returns to the pool while the app lives.
@@ -20,6 +25,9 @@
 //! `fork_into` copies an address space for fork(2).
 #[path = "../../runtime/open/elf.rs"]
 pub mod elf;
+// Which address space holds each pool page: asked before every mapping.
+#[path = "frames.rs"]
+pub mod frames;
 use super::pool::{page_va, Kernel, Pool};
 use super::signal::{GATE, GATE_OFFSET};
 use super::sys::{self, Object, PAGE, PAGE_BITS};
@@ -28,8 +36,10 @@ use super::vma::{self, HW_NONE, HW_RW, HW_RX};
 #[allow(unused_imports)]
 pub use super::vma::{Access, Layout, Vma, MMAP_BASE, MMAP_TOP, PROT_EXEC, PROT_READ, PROT_WRITE, STACK_SIZE, USER_TOP};
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 struct Page {
     pool: u32,
@@ -54,17 +64,79 @@ pub struct Space {
     spin: (u32, u32),
     /// Capability slots holding this app's kernel objects (freed by revoking `untyped`).
     pub object_slots: Vec<u32>,
+    /// Pool pages it owns now, and the most it may (the runtime sets it from
+    /// the pool's size; fork hands it on): at the cap it gets no new page.
+    owned: u32,
+    pub cap: u32,
+    /// Pool pages its whole family owns: this space, the children it forked
+    /// and the programs they exec'd share one count, and `cap` bounds that,
+    /// so forking cannot multiply one app's share.
+    family: Rc<Cell<u32>>,
 }
+
+/// The 64 KiB unit of app address-space layout: mmap placement, the
+/// trampoline region, and the windows the W^X policy keeps code alone in
+/// (vma.rs). It was also the hardware page; pages are sys::PAGE now.
+pub const WINDOW: u32 = 0x1_0000;
 
 pub struct Loaded {
     pub entry: u32,
     pub sp: u32,
 }
 
+/// Pages a fault brings in when first touches come in a row (4 KiB pages
+/// only: one 64 KiB page was already sixteen of them), and the free pool
+/// (8 MiB) below which a fault brings in just its own page.
+const AHEAD: u32 = if PAGE_BITS == 12 { 4 } else { 1 };
+const AHEAD_FLOOR: usize = (8 << 20) / PAGE;
+
 /// A fault that leaves the mapping as it was may be a stale TLB entry or a
 /// second thread arriving at a page the first just got. This many in a row
 /// at one place is an access the hardware keeps refusing: the app is stopped.
 const SPIN_LIMIT: u32 = 1024;
+
+/// The frame ledger (frames.rs). The runtime's is empty until boot says
+/// which pages are the apps' (`ledger().limit`): until then nothing maps.
+#[cfg(not(test))]
+pub fn ledger() -> &'static mut frames::Frames {
+    static mut LEDGER: frames::Frames = frames::Frames::new(0, 0);
+    // One process, one thread, and no caller keeps the reference.
+    unsafe { &mut *core::ptr::addr_of_mut!(LEDGER) }
+}
+/// Host tests run in parallel threads, each with its own stand-in pool: a
+/// ledger for each, open to every page unless the test limits it.
+#[cfg(test)]
+pub fn ledger() -> &'static mut frames::Frames {
+    std::thread_local!(static LEDGER: core::cell::Cell<*mut frames::Frames> = const { core::cell::Cell::new(core::ptr::null_mut()) });
+    LEDGER.with(|l| {
+        if l.get().is_null() {
+            l.set(alloc::boxed::Box::leak(alloc::boxed::Box::new(frames::Frames::new(0, u32::MAX))));
+        }
+        unsafe { &mut *l.get() }
+    })
+}
+
+/// A page from the pool that no address space holds (frames.rs). One the
+/// pool hands out while a space still holds it is passed over, before
+/// anything here writes to it: it stays out of the pool until its holder
+/// lets go and gives it back. (The pool itself zeroes a page as it hands it
+/// out, so such a page is zeroed under its holder; `give` is what keeps a
+/// held page off the free list in the first place.)
+fn fresh(pool: &mut Pool) -> Option<u32> {
+    loop {
+        let index = pool.take()?;
+        if ledger().owner(index) == 0 {
+            return Some(index);
+        }
+    }
+}
+/// Give a page back to the pool, unless an address space (this one, through
+/// another mapping, or any other) still holds it: then it stays out.
+fn give(pool: &mut Pool, index: u32) {
+    if ledger().owner(index) == 0 {
+        pool.give_back(index);
+    }
+}
 
 fn page_of(va: u32) -> u32 {
     va >> PAGE_BITS
@@ -119,6 +191,9 @@ impl Space {
             layout: Layout::fixed(),
             spin: (0, 0),
             object_slots: alloc::vec![pd],
+            owned: 0,
+            cap: u32::MAX,
+            family: Rc::new(Cell::new(0)),
         })
     }
 
@@ -139,9 +214,29 @@ impl Space {
         Ok(())
     }
 
-    /// Map pool page `index` at the 64 KiB page holding `va`, with the rights
+    /// Map pool page `index` at the page holding `va`, with the rights
     /// the regions there call for (none: the page is kept but not mapped).
+    /// Checked here whatever the caller passed: `va` is an app address, and
+    /// `index` is one of the apps' pages that no other address space holds
+    /// (frames.rs), so no page is ever mapped in two apps.
     pub fn map(&mut self, k: &mut Kernel, pool: &Pool, va: u32, index: u32, owned: bool) -> Result<(), i32> {
+        // One mapping per page per space: a page this space holds is not
+        // mapped again (the screen's pages are the only ones anyone asks
+        // twice for). With the ledger's one space per page, the slots all
+        // mappings take are at most the apps' pages (pool.rs).
+        if ledger().owner(index) == self.pd {
+            return Err(ENOMEM);
+        }
+        if va >= USER_TOP || ledger().claim(self.pd, index).is_err() {
+            return Err(EACCES);
+        }
+        let mapped = self.map_claimed(k, pool, va, index, owned);
+        if mapped.is_err() {
+            ledger().release(self.pd, index);
+        }
+        mapped
+    }
+    fn map_claimed(&mut self, k: &mut Kernel, pool: &Pool, va: u32, index: u32, owned: bool) -> Result<(), i32> {
         let p = page_of(va);
         if self.pages.contains_key(&p) {
             return Err(EEXIST);
@@ -161,15 +256,20 @@ impl Space {
             return Err(ENOMEM);
         }
         self.pages.insert(p, page);
+        self.owned += owned as u32;
+        self.family.set(self.family.get() + owned as u32);
         Ok(())
     }
 
     fn unmap_page(&mut self, k: &mut Kernel, pool: &mut Pool, p: u32) {
         if let Some(page) = self.pages.remove(&p) {
             sys::delete(page.cap);
+            ledger().release(self.pd, page.pool);
             k.release(page.cap);
             if page.owned {
-                pool.give_back(page.pool);
+                self.owned -= 1;
+                self.family.set(self.family.get() - 1);
+                give(pool, page.pool);
             }
         }
     }
@@ -188,9 +288,33 @@ impl Space {
         }
     }
 
-    /// Pool pages owned by this space (64 KiB each), and page tables made.
+    /// Pool pages owned by this space, and page tables made.
     pub fn usage(&self) -> (usize, usize) {
-        (self.pages.values().filter(|page| page.owned).count(), self.tables.len())
+        (self.owned as usize, self.tables.len())
+    }
+    /// At its cap (its family's pages, see `family`): it gets no new page
+    /// (mmap and brk answer ENOMEM, a touch of memory it has no page for
+    /// ends it as out of memory).
+    pub fn capped(&self) -> bool {
+        self.family.get() >= self.cap
+    }
+    /// A fault at `va` that failed for want of memory, not of rights: a
+    /// region there allows `access` and no page is mapped (the pool, the
+    /// cap, kernel memory or capability slots ran out). The runtime closes
+    /// the app as out of memory, not as a bad access.
+    /// (mod.rs asks `holds` after checking the region itself.)
+    pub fn starved(&self, va: u32, access: Access) -> bool {
+        self.find(va).is_some_and(|v| access.allowed(v.prot)) && !self.holds(va)
+    }
+    /// Whether a page is mapped at `va`.
+    pub fn holds(&self, va: u32) -> bool {
+        self.pages.contains_key(&page_of(va))
+    }
+    /// execve: this new space, loaded for a program `old`'s process now
+    /// runs, counts against `old`'s family from here on.
+    pub fn join(&mut self, old: &Space) {
+        old.family.set(old.family.get() + self.owned);
+        self.family = old.family.clone();
     }
 
     pub fn find(&self, va: u32) -> Option<&Vma> {
@@ -202,9 +326,12 @@ impl Space {
     fn page(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32) -> Option<usize> {
         let p = page_of(va);
         if !self.pages.contains_key(&p) {
-            let index = pool.take()?;
+            if self.capped() {
+                return None;
+            }
+            let index = fresh(pool)?;
             if self.map(k, pool, va, index, true).is_err() {
-                pool.give_back(index);
+                give(pool, index);
                 return None;
             }
             self.spin.1 = 0;
@@ -213,11 +340,12 @@ impl Space {
         Some(page_va(page.pool) + (va as usize & (PAGE - 1)))
     }
 
-    /// Whether [start, end) touches the trampoline page, which only the
-    /// runtime may map, unmap or change (munmap, mmap and mprotect refuse).
+    /// Whether [start, end) touches the trampoline region (one WINDOW),
+    /// which only the runtime may map, unmap or change (munmap, mmap and
+    /// mprotect refuse).
     pub fn pinned(&self, start: u32, end: u32) -> bool {
         let stubs = self.layout.stubs;
-        start < end && start < stubs.saturating_add(PAGE as u32) && end > stubs
+        start < end && start < stubs.saturating_add(WINDOW) && end > stubs
     }
 
     /// Write thread `slot`'s trampoline (`ldr pc, [pc, #-4]`, then `target`)
@@ -226,18 +354,21 @@ impl Space {
     /// (nothing written) if it is missing or altered, or memory ran out.
     pub fn stub(&mut self, k: &mut Kernel, pool: &mut Pool, slot: usize, target: u32) -> Option<u32> {
         let stubs = self.layout.stubs;
-        let whole = Vma { start: stubs, end: stubs.checked_add(PAGE as u32)?, prot: PROT_READ | PROT_EXEC };
+        let whole = Vma { start: stubs, end: stubs.checked_add(WINDOW)?, prot: PROT_READ | PROT_EXEC };
         if slot >= (GATE_OFFSET / 8) as usize || self.find(stubs) != Some(&whole) {
             return None;
         }
-        let page = self.page(k, pool, stubs)?;
-        let at = page + 8 * slot;
+        // The region is WINDOW long; only the pages in use have memory: the
+        // one with this trampoline (8 bytes, 8-aligned: never across pages)
+        // and the last, with the gate.
+        let at = self.page(k, pool, stubs + 8 * slot as u32)?;
+        let gate = self.page(k, pool, stubs + GATE_OFFSET)?;
         unsafe {
             (at as *mut u32).write_volatile(0xe51f_f004);
             ((at + 4) as *mut u32).write_volatile(target);
             // The signal gate, after the trampolines (rewritten with each: it costs little).
             for (n, word) in GATE.iter().enumerate() {
-                ((page + GATE_OFFSET as usize + 4 * n) as *mut u32).write_volatile(*word);
+                ((gate + 4 * n) as *mut u32).write_volatile(*word);
             }
         }
         self.sync_code(stubs, whole.end);
@@ -255,7 +386,14 @@ impl Space {
     /// are not copied and their regions are dropped. Nothing is shared, so
     /// nothing needs copy-on-write. On error the caller destroys `child`.
     pub fn fork_into(&self, child: &mut Space, k: &mut Kernel, pool: &mut Pool) -> Result<(), i32> {
+        // The child's pages count with this family's: fork fails (ENOMEM)
+        // where the copy would take the family past its cap.
+        if self.family.get() + self.owned > self.cap {
+            return Err(ENOMEM);
+        }
+        child.family = self.family.clone();
         child.layout = self.layout;
+        child.cap = self.cap;
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.vmas = self.vmas.clone();
@@ -263,10 +401,11 @@ impl Space {
             vma::carve(&mut child.vmas, p << PAGE_BITS, (p << PAGE_BITS).saturating_add(PAGE as u32));
         }
         for (&p, page) in self.pages.iter().filter(|(_, page)| page.owned) {
-            let index = pool.take().ok_or(ENOMEM)?;
+            // Checked before the copy: the parent's bytes never land in a page another space holds.
+            let index = fresh(pool).ok_or(ENOMEM)?;
             unsafe { core::ptr::copy_nonoverlapping(page_va(page.pool) as *const u8, page_va(index) as *mut u8, PAGE) };
             if let Err(e) = child.map(k, pool, p << PAGE_BITS, index, true) {
-                pool.give_back(index);
+                give(pool, index);
                 return Err(e);
             }
         }
@@ -288,12 +427,26 @@ impl Space {
     /// region does not allow (a write to read-only memory, running data), no
     /// region, or no memory left.
     pub fn fault(&mut self, k: &mut Kernel, pool: &mut Pool, va: u32, access: Access) -> bool {
-        if !self.find(va).is_some_and(|v| access.allowed(v.prot)) {
-            return false;
-        }
+        let Some(end) = self.find(va).filter(|v| access.allowed(v.prot)).map(|v| v.end) else { return false };
         let p = page_of(va);
         if !self.pages.contains_key(&p) {
-            return self.page(k, pool, va).is_some();
+            if self.page(k, pool, va).is_none() {
+                return false;
+            }
+            // First touches in a row (the page below is there already): the
+            // next few pages of the region come with this fault, so filling
+            // a buffer costs a fault every AHEAD pages, not one a page. A
+            // touch on its own gets its one page; none of this when memory
+            // is short.
+            if AHEAD > 1 && self.pages.contains_key(&p.wrapping_sub(1)) {
+                for q in p + 1..p + AHEAD {
+                    let at = q << PAGE_BITS;
+                    if at >= end || pool.available() < AHEAD_FLOOR || self.pages.contains_key(&q) || self.page(k, pool, at).is_none() {
+                        break;
+                    }
+                }
+            }
+            return true;
         }
         let hw = want(&self.vmas, p);
         let Some(page) = self.pages.get_mut(&p) else { return false };
@@ -401,7 +554,7 @@ impl Space {
         if self.pinned(start, end) {
             let stubs = self.layout.stubs;
             self.remove(k, pool, start, stubs);
-            return self.remove(k, pool, stubs.saturating_add(PAGE as u32), end);
+            return self.remove(k, pool, stubs.saturating_add(WINDOW), end);
         }
         vma::carve(&mut self.vmas, start, end);
         let inside: Vec<u32> = self.pages.range(page_of(start)..=page_of(end - 1)).map(|(&p, _)| p).collect();
@@ -436,7 +589,7 @@ impl Space {
     /// A free range of `len` bytes for mmap, highest first, below the
     /// layout's mmap top.
     pub fn free_range(&self, len: u32) -> Option<u32> {
-        // Mappings start on a 64 KiB page so unmapping one frees whole pages.
+        // Mappings start on a 64 KiB WINDOW (the W^X policy's unit, vma.rs).
         elf::free_in(&self.vmas, self.layout.mmap_top, len)
     }
     pub fn overlaps(&self, start: u32, end: u32) -> bool {
@@ -450,7 +603,7 @@ impl Space {
         let old_end = align_up(self.brk, 4096);
         let new_end = align_up(want, 4096);
         if new_end > old_end {
-            if self.overlaps(old_end, new_end) || self.refuses(old_end, new_end, PROT_READ | PROT_WRITE) {
+            if self.capped() || self.overlaps(old_end, new_end) || self.refuses(old_end, new_end, PROT_READ | PROT_WRITE) {
                 return self.brk;
             }
             self.add(old_end, new_end, PROT_READ | PROT_WRITE);
@@ -542,12 +695,8 @@ fn segments(space: &mut Space, k: &mut Kernel, pool: &mut Pool, image: &[u8], pl
         if !space.place(k, pool, va, data) {
             return Err("out of memory loading the program");
         }
-        // Touch the rest so the bss pages exist and are zero.
-        let mut a = align_down(va + s.filesz, PAGE as u32);
-        while a < seg_end {
-            space.resolve(k, pool, a.max(va)).ok_or("out of memory")?;
-            a += PAGE as u32;
-        }
+        // The rest (bss) gets its pages when it is touched: pool pages come
+        // zeroed, the tail of the last file page included.
         if s.flags & 1 != 0 {
             code.push((va, seg_end));
         }
@@ -589,7 +738,7 @@ pub fn load(
             return Err("/lib/ld-musl-armhf.so.1 is not a dynamic loader");
         }
         let (lo, hi) = ld.span();
-        let lo = align_down(lo, PAGE as u32);
+        let lo = align_down(lo, WINDOW);
         let at = space.free_range(hi - lo).ok_or("no room for the dynamic loader")?;
         ld_base = at.wrapping_sub(lo);
         segments(space, k, pool, ld_image, &ld, ld_base, layout.mmap_top, &mut code)?;

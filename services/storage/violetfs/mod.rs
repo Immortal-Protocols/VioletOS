@@ -50,6 +50,7 @@
 use crate::blockdev::BlockDev;
 
 mod check;
+#[allow(unused_imports)]
 pub use check::Report;
 
 pub const BLOCK: usize = 4096;
@@ -1836,6 +1837,13 @@ impl<D: BlockDev> Fs<D> {
     }
     /// Give the inode, and what it is charged for, to another owner.
     pub fn chown(&mut self, ino: u32, owner: u32) -> Result<(), Error> {
+        self.chown_over(ino, owner, 0)
+    }
+    /// `chown` of a file that is about to replace the file `old` (0: none)
+    /// by a rename: what `old` holds for the new owner counts as given back,
+    /// so that a file can be replaced by one as large within the quota. If
+    /// the rename never comes, the caller removes the file.
+    pub fn chown_over(&mut self, ino: u32, owner: u32, old: u32) -> Result<(), Error> {
         self.live()?;
         let r = (|| {
             let mut n = self.inode(ino)?;
@@ -1843,7 +1851,14 @@ impl<D: BlockDev> Fs<D> {
                 return Ok(());
             }
             self.reserve(4)?;
-            self.quota_ok(owner, n.blocks, 1)?;
+            let mut back = (0, 0);
+            if old != 0 {
+                let o = self.inode(old)?;
+                if o.owner == owner && o.nlink == 1 && !o.is_dir() {
+                    back = (o.blocks, 1);
+                }
+            }
+            self.quota_ok(owner, n.blocks.saturating_sub(back.0), 1 - back.1)?;
             self.charge(n.owner, -(n.blocks as i64), -1)?;
             self.charge(owner, n.blocks as i64, 1)?;
             n.owner = owner;

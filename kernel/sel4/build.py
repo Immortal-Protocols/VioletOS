@@ -43,8 +43,13 @@ def update(path, data):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target",choices=["qemu","moto"])
+    parser.add_argument("target",choices=["qemu","moto","qemu64"])
     target=parser.parse_args().target
+    if target=="qemu64":
+        # The AArch64 bring-up target has its own kernel configuration, delta
+        # manifest and image (kernel/sel4/aarch64, targets/qemu64); nothing below runs for it.
+        subprocess.run([sys.executable,ROOT/"targets/qemu64/build.py"],check=True)
+        return
     out=BUILD/target
     out.mkdir(parents=True,exist_ok=True)
     with (out/"build.lock").open("a+") as lock:
@@ -90,8 +95,10 @@ def build_target(target,out):
     update(wifi/"monitor.S", (board/"wifi/monitor.S").read_bytes())
     includes = src / "include/arch/arm/arch/object/ellis_wifi"
     includes.mkdir(exist_ok=True)
-    for name in ("windows.h", "invoke.h"):
+    for name in ("table.h", "invoke.h"):
         update(includes/name, (board/"wifi"/name).read_bytes())
+    # The window policy runs in the supervisor now; drop the copy an older build left.
+    (includes/"windows.h").unlink(missing_ok=True)
     patch = board / "wifi/aarch32.patch"
     # Idempotent for both a clean pinned source and an already-patched build.
     if subprocess.run(["git", "apply", "--reverse", "--check", patch], cwd=src,
@@ -133,6 +140,8 @@ def build_target(target,out):
         "-DKernelMaxNumNodes="+os.environ.get("VIOLET_CORES","1"),
         # Linux ARM programs read their thread pointer from TPIDRURO; the Open Runtime sets it.
         "-DKernelArmTLSReg=tpidruro")
+    # The configuration differs from the nearest verified one exactly as delta.json says.
+    delta.enforce_configuration((kernel/"CMakeCache.txt").read_text(),BUILD/"downloads"/(KERNEL[0]+".tar.gz"))
     generated=["include/sel4/"+f for f in ["shared_types_gen.h","syscall.h","invocation.h"]]
     generated+=["include/interfaces/sel4_client.h","arch_include/arm/sel4/arch/invocation.h",
                 "sel4_arch_include/aarch32/sel4/sel4_arch/invocation.h",

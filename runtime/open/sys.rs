@@ -112,6 +112,13 @@ pub fn pause() {
     timer_disarm();
 }
 
+/// Step down to the priority every process has for one turn, so services
+/// on this core run (mod.rs `run`, cores.rs `relief_due`).
+pub fn relieve() {
+    let _lowered = Lowered::new();
+    yield_now();
+}
+
 /// Long work (starting an app, a USB install) runs at the priority every
 /// process has, so it cannot hold up Audio or Radio; restored on drop.
 pub struct Lowered(bool);
@@ -165,10 +172,14 @@ pub const SLOT_AUTHORITY: u32 = 7;
 pub const SLOT_POOL: u32 = 16;
 /// Slots this process fills itself.
 pub const SLOT_FAULT_EP: u32 = 8;
-pub const CNODE_BITS: u32 = 14;
-pub const SLOTS: u32 = 1 << CNODE_BITS;
-/// First slot handed out dynamically.
-pub const SLOT_DYNAMIC: u32 = 64;
+// The CSpace's size (CNODE_BITS, SLOTS: one capability for every pool
+// page, one for every page an app has mapped, and the apps' kernel objects:
+// 2^18 slots for the emulator's 384 MiB pool, 2^17 for the handset's 256 MiB),
+// the pool untypeds (POOL_BITS), the page size (PAGE_BITS, PAGE_OBJECT) and
+// SLOT_DYNAMIC, the first slot handed out dynamically: pages.rs.
+#[path = "pages.rs"]
+mod pages;
+pub use pages::*;
 
 /// Virtual memory map of the Open Runtime itself.
 pub const FRAMEBUFFER: usize = 0x0800_0000;
@@ -177,24 +188,11 @@ pub const INITFS: usize = 0x1000_0000;
 pub const INITFS_BYTES: usize = 0x0600_0000;
 pub const POOL_VA: usize = 0x2000_0000;
 
-/// Physical app memory: the sizes (as bit counts) of the untypeds the
-/// supervisor places at SLOT_POOL onwards, per board.
-#[cfg(not(moto_board))]
-pub const POOL_BITS: &[u32] = &[27, 28];
-#[cfg(moto_board)]
-pub const POOL_BITS: &[u32] = &[28];
-pub const PAGE_BITS: u32 = 16;
-pub const PAGE: usize = 1 << PAGE_BITS;
-pub const fn pool_pages() -> usize {
-    let mut total = 0;
-    let mut i = 0;
-    while i < POOL_BITS.len() {
-        total += 1 << (POOL_BITS[i] - PAGE_BITS);
-        i += 1;
-    }
-    total
+/// Where the pool is mapped in this process (pool.rs `page_va`).
+#[inline(always)]
+pub fn pool_base() -> usize {
+    POOL_VA
 }
-pub const POOL_PAGES: usize = pool_pages();
 
 pub const PRIORITY: u32 = 100;
 
@@ -290,9 +288,10 @@ pub struct Tier {
     /// services and this process, 1 the app in front, 2 and 3 the rest.
     pub core: u32,
 }
-/// Apps in the background: round robin at 100, 10 ms slices, on core 2 or 3.
-pub const fn tier_background(app: usize) -> Tier {
-    Tier { priority: PRIORITY, budget_us: 10_000, period_us: 10_000, core: 2 + (app as u32 & 1) }
+/// Apps in the background: round robin at 100, 10 ms slices, spread over the
+/// cores from 2 up (cores.rs).
+pub fn tier_background(app: usize) -> Tier {
+    Tier { priority: PRIORITY, budget_us: 10_000, period_us: 10_000, core: super::cores::background(app, cores()) }
 }
 /// The app in front, on its own core. With MCS also above the services, but
 /// at most 6 ms of every 8, so a busy app cannot starve Audio, Radio or Touch
@@ -302,11 +301,11 @@ pub fn tier_foreground() -> Tier {
     let priority = if mcs() { 120 } else { PRIORITY };
     Tier { priority, budget_us: 6_000, period_us: 8_000, core: 1 }
 }
-/// SchedControl capabilities for cores 1-3 (supervisor.c).
+/// SchedControl capabilities for cores 1-7 (supervisor.c): slots 20 to 26.
 const SLOT_SCHED_CORES: u32 = 20;
 
 static CORES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Cores apps can run on, 1 to 4: under MCS those the supervisor gave
+/// Cores apps can run on, 1 to cores::MAX (8): under MCS those the supervisor gave
 /// SchedControl capabilities for, otherwise those the kernel was built for.
 pub fn cores() -> u32 {
     let known = CORES.load(core::sync::atomic::Ordering::Relaxed);
@@ -314,12 +313,12 @@ pub fn cores() -> u32 {
         return known;
     }
     if !mcs() {
-        let n = unsafe { open_cores() }.clamp(1, 4);
+        let n = unsafe { open_cores() }.clamp(1, super::cores::MAX);
         CORES.store(n, core::sync::atomic::Ordering::Relaxed);
         return n;
     }
     let mut n = 1;
-    while n < 4 && copy(SLOT_PROBE, SLOT_SCHED_CORES + n - 1).is_ok() {
+    while n < super::cores::MAX && copy(SLOT_PROBE, SLOT_SCHED_CORES + n - 1).is_ok() {
         delete(SLOT_PROBE);
         n += 1;
     }

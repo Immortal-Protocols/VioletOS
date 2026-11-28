@@ -1,4 +1,4 @@
-// Go under the Open Runtime (make test-abi), without GODEBUG=asyncpreemptoff=1:
+// Go under the Open Runtime (make test-system), without GODEBUG=asyncpreemptoff=1:
 // the runtime sets it for every app, so this program first execve's itself with
 // it removed. Then goroutines spinning in tight loops must not starve a timer
 // (asynchronous preemption by SIGURG to a thread running user code), os/signal

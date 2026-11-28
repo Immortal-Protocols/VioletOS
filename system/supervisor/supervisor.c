@@ -52,19 +52,41 @@ struct process {
 // Camera (25) serves the image sensors to the Open Runtime.
 enum { FIRST_WORKER = COUNT, USB_DIAG = COUNT + 6, AUDIO = COUNT + 7, OPEN_RT = COUNT + 9,
        CAMERA = COUNT + 10,
-       USB_TRANSFER_BADGE = 14, TOTAL = CAMERA + 1, LANE_BASE = 0x07400000,
+       USB_TRANSFER_BADGE = 14, TOTAL = CAMERA + 2, LANE_BASE = 0x07400000,
        RUNTIME_AUDIO_SLOT = 2, AUDIO_POWER_SLOT = 6, CAMERA_POWER_SLOT = 6,
        // Badges 16 and up mean faults, so Audio's and Camera's supervisor
        // requests use app identities that never hold the lifecycle endpoint.
        AUDIO_LIFE_BADGE = 12, AUDIO_PLATFORM = 0x4071,
        CAMERA_LIFE_BADGE = 13, CAMERA_PLATFORM = 0x4043 };
+// The Sentinel (26, system/sentinel/) decides the Open Runtime's capability
+// policy in an address space of its own. It gets the receive side of one
+// endpoint, which only the Open Runtime can call (slot OPEN_SLOT_SENTINEL
+// there), 64 KiB of private heap, and two windows shared with the Open
+// Runtime: requests (the runtime writes, the Sentinel reads) and replies (the
+// Sentinel writes, the runtime reads). No device but, on QEMU, the root key
+// blob's page read-only (its sealing key), and no other endpoint. A catalog
+// with an Open Runtime and no Sentinel is refused (parse).
+enum { SENTINEL = CAMERA + 1, OPEN_SLOT_SENTINEL = 9, SENTINEL_HEAP = 0x02800000,
+       SENTINEL_HEAP_BYTES = 0x10000, SENTINEL_WINDOW_PAGES = 2,
+       SENTINEL_REQUEST = 0x09300000, SENTINEL_REPLY = 0x09310000,
+       OPEN_SENTINEL_REQUEST = 0x09140000, OPEN_SENTINEL_REPLY = 0x09148000 };
+enum { SENTINEL_ROOT_KEY = 0x09320000 };
 // Every other package ends below its two-page stack at 0x13e000. The Open
 // Runtime's stack is at OPEN_STACK_TOP instead, so its image may run on up to
 // 0x180000, well below its IPC buffer at 0x200000.
 enum { OPEN_WINDOW = 0x80000 };
 // The Open Runtime's CSpace and the capabilities the supervisor places in it.
 // Runtime knows it as client 9, an identity no catalog app uses.
-enum { OPEN_BITS = 14, OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
+// OPEN_BITS: a slot for each 4 KiB page of its pool and one more for each
+// page an app has mapped (runtime/open/sys.rs CNODE_BITS, which must agree):
+// 2^18 for the emulator's 384 MiB pool (a 4 MiB table), 2^17 for the
+// handset's 256 MiB (2 MiB).
+#ifdef VIOLET_QEMU
+enum { OPEN_BITS = 18 };
+#else
+enum { OPEN_BITS = 17 };
+#endif
+enum { OPEN_RUNTIME_BADGE = 9, OPEN_STACK_TOP = 0x02c00000, OPEN_STACK_PAGES = 16,
        OPEN_SLOT_RUNTIME = 2, OPEN_SLOT_CNODE = 3, OPEN_SLOT_PD = 4, OPEN_SLOT_ASID = 5,
        OPEN_SLOT_KERNEL = 6, OPEN_SLOT_AUTHORITY = 7, OPEN_SLOT_TIMER = 10, OPEN_SLOT_WAKE = 11,
        OPEN_SLOT_SCHED_CONTROL = 13, OPEN_SLOT_SCHED_CORES = 20,
@@ -157,6 +179,7 @@ static bool valid_package(const struct package *p, unsigned limit) {
   if (p->id==RADIO && (p->abi==3 || p->abi==4)) abi_ok=true;
 #endif
   bool allowed_id = p->id < COUNT || p->id == AUDIO || p->id == OPEN_RT || p->id == CAMERA;
+  allowed_id |= p->id == SENTINEL;
 #ifdef VIOLET_MOTO
   allowed_id |= p->id == USB_DIAG;
 #endif
@@ -227,6 +250,12 @@ static bool parse(const struct archive *a, unsigned limit) {
     if ((i == LAUNCHER || i == RUNTIME || i == TOUCH || i == DISPLAY) &&
         !found[i])
       return false;
+  // This Open Runtime asks the Sentinel for every decision (system/sentinel).
+  // A catalog with an Open Runtime and no Sentinel (one from before it) is
+  // refused whole, so the boot falls back to the next catalog (in the end
+  // the factory's) instead of starting with no open apps.
+  if (found[OPEN_RT] && !found[SENTINEL])
+    return false;
   catalog_floors = floor_bytes ? floors : 0;
   catalog_floor_bytes = floor_bytes;
   for (unsigned i = 1; i < COUNT; i++)
@@ -238,6 +267,7 @@ static bool parse(const struct archive *a, unsigned limit) {
   procs[AUDIO].package = found[AUDIO];
   procs[OPEN_RT].package = found[OPEN_RT];
   procs[CAMERA].package = found[CAMERA];
+  procs[SENTINEL].package = found[SENTINEL];
   return true;
 }
 static void grant(struct task *t, unsigned slot, seL4_CPtr ep, unsigned badge,
@@ -312,6 +342,9 @@ static void prepare_process(unsigned id) {
   // Audio keeps the microphone recording in 128 KiB of zeroed private RAM.
   if (id == AUDIO)
     for (unsigned off = 0; off < 0x20000; off += PAGE) private_page(p, 0x02800000 + off, 0, 0, false);
+  // The Sentinel's heap: zeroed, private.
+  if (id == SENTINEL)
+    for (unsigned off = 0; off < SENTINEL_HEAP_BYTES; off += PAGE) private_page(p, SENTINEL_HEAP + off, 0, 0, false);
 #ifdef VIOLET_MOTO
   if (pkg->id==RADIO && (pkg->abi==3 || pkg->abi==4))
     for (unsigned off=0;off<(pkg->abi==4 ? 0x30000u : 0x20000u);off+=PAGE) private_page(p,0x02800000+off,0,0,false);
@@ -347,11 +380,15 @@ static void prepare_process(unsigned id) {
   check(seL4_TCB_SetPriority(t->thread, seL4_CapInitThreadTCB, 100));
 #endif
 }
+// The timekeeper (timekeeper_thread.h): one thread that owns the user timer,
+// so a process's delay blocks instead of spinning and the CPU can idle.
+#include "timekeeper_thread.h"
 static void start(unsigned id) {
   struct process *p = &procs[id];
   if (p->running)
     return;
-  seL4_UserContext regs = {.pc = BASE, .sp = stack_top(id), .r0 = id};
+  // r1: TK_LIVE if the process may sleep on the timekeeper (runtime/transport.c).
+  seL4_UserContext regs = {.pc = BASE, .sp = stack_top(id), .r0 = id, .r1 = timekeeper_token(id)};
   check(seL4_TCB_WriteRegisters(p->task.thread, 1, 0,
                                 sizeof(regs) / sizeof(unsigned), &regs));
   p->running = true;
@@ -463,7 +500,10 @@ static struct device_page devices[] = {
     {STORAGE, 0x0a000000, 0x0a000000, 0}, {RADIO, 0x0a001000, 0x09001000, 0},
     {RADIO, 0x0a002000, 0x09003000, 0},   {0, 0x0a003000, 0x0a003000, 0},
     {TOUCH, 0x49000000, 0x09005000, 0},   {RADIO, 0x49001000, 0x09000000, 0},
-    {POWER, 0x49002000, 0x09000000, 0},   {STORAGE, 0x49200000, 0x0b000000, 0},
+    {POWER, 0x49002000, 0x09000000, 0},
+    // The device root key blob (tools/root_key.py), for Storage alone.
+    {STORAGE, 0x49003000, 0x0b004000, 0},
+    {STORAGE, 0x49200000, 0x0b000000, 0},
     {RADIO, 0x49201000, 0x09002000, 0},   {RADIO, 0x49202000, 0x09005000, 0},
     {0, 0x49203000, 0x0b003000, 0},
     // Emulated sound card: control page, an eight-page PCM ring,
@@ -514,7 +554,12 @@ static struct device_page devices[] = {
 #else
 static unsigned handset_report[6];
 static unsigned uploaded, upload_size, upload_crc;
-static seL4_CPtr catalog_candidate_frame;
+// The composed catalog Storage commits (two sections, read-only in Storage
+// at 0x0d100000), and the USB trial's copy of a candidate package, which must
+// outlive a group teardown: in the device section after the installed
+// catalog's 1.25 MiB, below the loader's bank word at its last word.
+static seL4_CPtr catalog_candidate_frame[2];
+static unsigned char *usb_scratch;
 static const struct package *factory_usb;
 static bool usb_factory_only;
 static unsigned usb_trial_bytes, usb_trial_generation;
@@ -529,6 +574,14 @@ extern unsigned volume_load(void *destination);
 extern bool volume_commit(const void *data, unsigned length, unsigned active);
 extern bool volume_reject(unsigned active);
 static unsigned volume_bank;
+// The largest catalog this supervisor boots or composes: 1 MiB on QEMU (its
+// staged and installed windows are single 1 MiB frames), 1.25 MiB on the
+// handset (image/packages/package_format.py HANDSET_LIMIT, catalog_volume.rs).
+#ifdef VIOLET_MOTO
+enum { CATALOG_LIMIT = 0x140000 };
+#else
+enum { CATALOG_LIMIT = 1 << 20 };
+#endif
 static const struct package *inbox;
 static struct archive *local_catalog, *new_catalog;
 #ifdef VIOLET_MOTO
@@ -578,6 +631,7 @@ static const char *title(const struct package *p) {
                     open_name[16] = "OPEN RUNTIME", camera_name[16] = "CAMERA";
   if (p->id == USB_DIAG) return diag_name;
   if (p->id == CAMERA) return camera_name;
+  if (p->id == SENTINEL) return "SENTINEL\0\0\0\0\0\0\0";
   if (p->id == AUDIO) return audio_name;
   if (p->id == OPEN_RT) return open_name;
   return p->id >= 11 ? (const char *)p->bytes + p->size - 16 : names[p->id];
@@ -596,6 +650,9 @@ static bool update_catalog(unsigned id, bool remove) {
   if (remove && id >= STORAGE && id <= POWER) return false;
 #endif
   bool known = (id > 0 && id < COUNT && id != PACKAGES) || id == AUDIO || id == OPEN_RT || id == CAMERA;
+  known |= id == SENTINEL;
+  // The Open Runtime does not run without the Sentinel (parse): it stays.
+  if (remove && id == SENTINEL && procs[OPEN_RT].package) return false;
 #ifdef VIOLET_MOTO
   if (usb_trial_bytes && id != USB_DIAG) return false;
   if (id == USB_DIAG) known = !remove && usb_trial_bytes && usb_trial_generation == generation;
@@ -613,12 +670,12 @@ static bool update_catalog(unsigned id, bool remove) {
     return false;
   unsigned count = 0, length = 0;
   for (unsigned i = 1; i < TOTAL; i++) {
-    if (i >= COUNT && i != USB_DIAG && i != AUDIO && i != OPEN_RT && i != CAMERA) continue;
+    if (i >= COUNT && i != USB_DIAG && i != AUDIO && i != OPEN_RT && i != CAMERA && i != SENTINEL) continue;
     const struct package *p = i == id ? (remove ? 0 : inbox) : procs[i].package;
     if (!p || i == PACKAGES)
       continue;
     unsigned bytes = sizeof(*p) + p->size + SIGNATURE, aligned = (bytes + 3) & ~3u;
-    if (length + aligned + 16 > 1 << 20)
+    if (length + aligned + 16 > CATALOG_LIMIT)
       return false;
     memcpy(new_catalog->bytes + length, p, bytes);
     memset(new_catalog->bytes + length + bytes, 0, aligned - bytes);
@@ -629,7 +686,7 @@ static bool update_catalog(unsigned id, bool remove) {
   // removed or replaced here, in the catalog itself.
   unsigned char floors[FLOOR_RECORD];
   unsigned floor_bytes = package_floor_record(floors, sizeof(floors), id, remove ? 0 : package_version(inbox));
-  if (floor_bytes > sizeof(floors) || length + floor_bytes + 16 > 1 << 20)
+  if (floor_bytes > sizeof(floors) || length + floor_bytes + 16 > CATALOG_LIMIT)
     return false;
   memcpy(new_catalog->bytes + length, floors, floor_bytes);
   length += floor_bytes;
@@ -731,6 +788,23 @@ static seL4_CPtr spare_ram_in(unsigned type, unsigned bits, bool shared) {
 static seL4_CPtr spare_ram(unsigned type, unsigned bits) {
   return spare_ram_in(type, bits, true);
 }
+#ifdef VIOLET_MOTO
+// A 1 MiB section from a spare untyped of exactly that size first (several
+// are left around the reserved windows), so neither the shared untyped (8 MiB
+// on the handset, which the supervisor allocates from to the end) nor a larger
+// spare one the Open Runtime asks for is cut into.
+static seL4_CPtr spare_section(void) {
+  for (unsigned i = 0; i < boot->untyped.end - boot->untyped.start; i++) {
+    seL4_CPtr u = boot->untyped.start + i;
+    if (boot->untypedList[i].isDevice || u == ram || boot->untypedList[i].sizeBits != 20) continue;
+    if (next_slot >= boot->empty.end) stop();
+    if (!seL4_Untyped_Retype(u, seL4_ARM_SectionObject, 0, seL4_CapInitThreadCNode, 0, 0, next_slot, 1))
+      return next_slot++;
+  }
+  seL4_CPtr section = spare_ram(seL4_ARM_SectionObject, 20);
+  return section ? section : create(ram, seL4_ARM_SectionObject);
+}
+#endif
 // How far Open Runtime setup got, and the root CNode's use, for the boot harness.
 volatile unsigned open_setup[4], open_fault[6];
 static void give_open(unsigned slot, seL4_CPtr cap) {
@@ -757,10 +831,10 @@ static void open_runtime(void) {
   give_open(OPEN_SLOT_AUTHORITY, t->thread);
 #ifdef CONFIG_KERNEL_MCS
   // To give app threads scheduling contexts and move them between tiers:
-  // one SchedControl per core (core 0 at OPEN_SLOT_SCHED_CONTROL, cores 1-3
-  // from OPEN_SLOT_SCHED_CORES), which also decides the core a thread runs on.
+  // one SchedControl per core (core 0 at OPEN_SLOT_SCHED_CONTROL, cores 1-7
+  // from OPEN_SLOT_SCHED_CORES: slots 20-26), which also decides the core a thread runs on.
   give_open(OPEN_SLOT_SCHED_CONTROL, boot->schedcontrol.start);
-  for (unsigned core = 1; core < boot->schedcontrol.end - boot->schedcontrol.start && core < 4; core++)
+  for (unsigned core = 1; core < boot->schedcontrol.end - boot->schedcontrol.start && core < 8; core++)
     give_open(OPEN_SLOT_SCHED_CORES + core - 1, boot->schedcontrol.start + core);
 #endif
   // Its alarm clock: the nonsecure physical timer (PPI 30), which the kernel
@@ -771,6 +845,9 @@ static void open_runtime(void) {
   seL4_CPtr badged = next_slot++, handler = next_slot++;
   check(seL4_CNode_Mint(seL4_CapInitThreadCNode, badged, 32, seL4_CapInitThreadCNode, wake, 32,
                         seL4_AllRights, OPEN_TIMER_BADGE));
+  // With the timekeeper running, it owns the timer and signals `badged`.
+  if (timekeeper_open(t, wake, badged)) {
+  } else
   if (!seL4_IRQControl_Get(seL4_CapIRQControl, OPEN_TIMER_IRQ, seL4_CapInitThreadCNode, handler, 32)) {
     open_timer_handler = handler;
     if (!seL4_IRQHandler_SetNotification(handler, badged) && !seL4_TCB_BindNotification(t->thread, wake)) {
@@ -982,11 +1059,24 @@ static void wire(void) {
   report = handset_report;
   factory_usb = procs[USB_DIAG].package;
   check(!factory_usb);
+  // 0x43c00000-0x43e00000: the installed catalog the loader read from its
+  // bank (up to CATALOG_LIMIT), then the USB trial's scratch, then the
+  // loader's bank word in the last word.
   local_catalog = device(0,0x43c00000,0x0d000000,20);
-  new_catalog = device(0,0x43d00000,0x0d100000,20);
-  catalog_candidate_frame = next_slot-1;
+  device(0,0x43d00000,0x0d100000,20);
+  usb_scratch = (unsigned char *)local_catalog + CATALOG_LIMIT;
+  // The largest upload (a 0x3e000-byte image with its header and signature).
+  _Static_assert(0x200000 - 4 - CATALOG_LIMIT >= 24 + 0x3e000 + 80, "the USB trial scratch is too small");
+  // The catalog being composed: 2 MiB of RAM, made again each generation as
+  // the inbox is, from spare untypeds (spare_section).
+  for (unsigned i = 0; i < 2; i++) {
+    catalog_candidate_frame[i] = spare_section();
+    check(seL4_ARM_Page_Map(catalog_candidate_frame[i], bootstrap.pd, 0x0d400000 + i * 0x100000, seL4_AllRights,
+                            seL4_ARM_Default_VMAttributes|seL4_ARM_ExecuteNever));
+  }
+  new_catalog = (void *)0x0d400000;
   if (!generation) volume_bank = *(volatile unsigned *)0x0d1ffffc;
-  source = volume_bank>=1 && volume_bank<=2 && parse(local_catalog,1<<20) ? 3 : 0;
+  source = volume_bank>=1 && volume_bank<=2 && parse(local_catalog,CATALOG_LIMIT) ? 3 : 0;
   if (!source) volume_bank=0;
   unsigned upload_frame = create(ram,seL4_ARM_SectionObject);
   check(seL4_ARM_Page_Map(upload_frame,bootstrap.pd,0x0d200000,seL4_AllRights,
@@ -1000,7 +1090,7 @@ static void wire(void) {
   // and become permanent (until power-off) once this one has run healthy.
   package_floor_begin();
   for (unsigned id = 1; id < TOTAL; id++)
-    if ((id < COUNT || id == USB_DIAG || id == AUDIO || id == OPEN_RT || id == CAMERA) &&
+    if ((id < COUNT || id == USB_DIAG || id == AUDIO || id == OPEN_RT || id == CAMERA || id == SENTINEL) &&
         id != PACKAGES && procs[id].package)
       package_floor_ran(id, package_version(procs[id].package));
   if (source && catalog_floors)
@@ -1021,6 +1111,26 @@ static void wire(void) {
   }
   // Before Audio, which shares its PCM ring with the Open Runtime.
   prepare_process(OPEN_RT);
+  if (procs[SENTINEL].package) {
+    // Only the Open Runtime calls the Sentinel, and the Sentinel calls nobody.
+    prepare_process(SENTINEL);
+    procs[SENTINEL].ep = create(ram, seL4_EndpointObject);
+    grant(&procs[SENTINEL].task, 1, procs[SENTINEL].ep, 0, true);
+    // It runs only while the Open Runtime waits for its answer, and must not
+    // wait behind app threads (120) for the CPU: the Open Runtime's own priority.
+    check(seL4_TCB_SetPriority(procs[SENTINEL].task.thread, seL4_CapInitThreadTCB, OPEN_EVENT_PRIORITY));
+    if (procs[OPEN_RT].task.pd) {
+      grant(&procs[OPEN_RT].task, OPEN_SLOT_SENTINEL, procs[SENTINEL].ep, OPEN_RUNTIME_BADGE, false);
+      for (unsigned i = 0; i < SENTINEL_WINDOW_PAGES; i++) {
+        unsigned request = create(ram, seL4_ARM_SmallPageObject);
+        map_shared(request, &procs[OPEN_RT].task, OPEN_SENTINEL_REQUEST + i * PAGE, seL4_AllRights);
+        map_shared(request, &procs[SENTINEL].task, SENTINEL_REQUEST + i * PAGE, seL4_CanRead);
+        unsigned reply = create(ram, seL4_ARM_SmallPageObject);
+        map_shared(reply, &procs[SENTINEL].task, SENTINEL_REPLY + i * PAGE, seL4_AllRights);
+        map_shared(reply, &procs[OPEN_RT].task, OPEN_SENTINEL_REPLY + i * PAGE, seL4_CanRead);
+      }
+    }
+  }
   if (procs[AUDIO].package) {
     // Only Runtime calls Audio. On the handset Audio reaches the PMIC through Power.
     prepare_process(AUDIO);
@@ -1070,19 +1180,37 @@ static void wire(void) {
       continue;
     check(seL4_ARM_Page_Unmap(d.frame));
     ensure_table(t, d.va);
-    check(seL4_ARM_Page_Map(d.frame, t->pd, d.va, seL4_AllRights,
+    // The root key blob (crypt cluster) is read-only to Storage, so a
+    // stray write there cannot destroy the only copy of the key.
+    seL4_CapRights_t rights = d.pa == 0x49003000 ? seL4_CanRead : seL4_AllRights;
+    check(seL4_ARM_Page_Map(d.frame, t->pd, d.va, rights,
                             seL4_ARM_ExecuteNever));
   }
+  // The Sentinel derives its sealing key from the device root key
+  // (system/sentinel/seal.rs `master`): the same blob page, read-only, with
+  // Storage's attributes. Never the Open Runtime's.
+  for (unsigned i = 0; i < sizeof(devices) / sizeof(*devices); i++)
+    if (devices[i].pa == 0x49003000 && procs[SENTINEL].task.pd) {
+      unsigned copy = next_slot++;
+      check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, 32, seL4_CapInitThreadCNode,
+                            devices[i].frame, 32, seL4_CanRead));
+      ensure_table(&procs[SENTINEL].task, SENTINEL_ROOT_KEY);
+      check(seL4_ARM_Page_Map(copy, procs[SENTINEL].task.pd, SENTINEL_ROOT_KEY, seL4_CanRead,
+                              seL4_ARM_ExecuteNever));
+    }
 #else
   boot_stage(1);
-  unsigned copy_catalog=next_slot++;
-  check(seL4_CNode_Copy(seL4_CapInitThreadCNode,copy_catalog,32,seL4_CapInitThreadCNode,
-                        catalog_candidate_frame,32,seL4_CanRead));
-  check(seL4_ARM_Page_Map(copy_catalog,procs[STORAGE].task.pd,0x0d100000,seL4_CanRead,seL4_ARM_ExecuteNever));
+  for (unsigned i = 0; i < 2; i++) {
+    unsigned copy_catalog=next_slot++;
+    check(seL4_CNode_Copy(seL4_CapInitThreadCNode,copy_catalog,32,seL4_CapInitThreadCNode,
+                          catalog_candidate_frame[i],32,seL4_CanRead));
+    check(seL4_ARM_Page_Map(copy_catalog,procs[STORAGE].task.pd,0x0d100000 + i * 0x100000,seL4_CanRead,
+                            seL4_ARM_ExecuteNever));
+  }
   if (usb_factory_only) procs[USB_DIAG].package = factory_usb;
   if (usb_trial_bytes) {
     // The scratch section survives group teardown. The inbox does not.
-    memcpy((void *)inbox, new_catalog, usb_trial_bytes);
+    memcpy((void *)inbox, usb_scratch, usb_trial_bytes);
     uploaded = upload_size = usb_trial_bytes;
     if (inbox->id == USB_DIAG && valid_inbox()) {
       procs[USB_DIAG].package = inbox;
@@ -1234,6 +1362,7 @@ static void wire(void) {
   for (unsigned id = WIFI; id < COUNT; id++)
     if (procs[id].package)
       surface(id);
+  timekeeper_start();
   open_runtime();
   camera_frames();
   unsigned first = 0;
@@ -1252,8 +1381,10 @@ static void wire(void) {
     // The Open Runtime draws the app in front straight to scanout.
     share_scanout_with_open(next_slot - 1, 0x08000000 + off);
   }
+  timekeeper_attach_all();
 }
 static void dismantle(void) {
+  timekeeper_stop();
   for (unsigned i = 1; i < TOTAL; i++)
     if (procs[i].task.thread)
       check(seL4_TCB_Suspend(procs[i].task.thread));
@@ -1276,6 +1407,22 @@ static unsigned long long ticks64(void) {
   return ((unsigned long long)hi << 32) | lo;
 }
 unsigned ticks(void) { return (unsigned)ticks64(); }
+// Fault containment for the Open Runtime (runtime/open/contain.rs). A fault
+// in it (a panic, a bad pointer) starts its thread again at the package
+// entry on a fresh stack, with its memory as the fault left it: the runtime
+// sees it has run before, closes the app it was serving and carries on for
+// the rest. Only a real fault message does this, never a stall, and only as
+// often as open_recover.h allows; otherwise the thread is suspended as before.
+#include "open_recover.h"
+static struct open_warm open_warm;
+static bool open_faulted;
+static bool open_warm_restart(void) {
+  if (!open_faulted ||
+      !open_warm_allowed(&open_warm, ticks64(), (unsigned long long)OPEN_WARM_QUIET_MS * ticks_per_ms))
+    return false;
+  seL4_UserContext regs = {.pc = BASE, .sp = OPEN_STACK_TOP, .r0 = OPEN_RT};
+  return !seL4_TCB_WriteRegisters(procs[OPEN_RT].task.thread, 1, 0, sizeof(regs) / sizeof(unsigned), &regs);
+}
 static unsigned stalled(unsigned timeout) {
   unsigned now = ticks();
   for (unsigned lane = TOUCH; lane <= PACKAGES; lane++) {
@@ -1327,6 +1474,18 @@ static struct conn_backup conn_saved;
 static volatile unsigned wifi_memory_policy;
 static bool wifi_memory_prepared;
 static volatile unsigned wifi_memory_checks;
+// The Ellis AArch32 kernel installs its board-only cap in the reserved SMC
+// slot. No child owns this cap. The kernel makes only the four fixed monitor
+// calls of wifi/table.h; the window policy (wifi/windows.h) runs here.
+static int ellis_smc(unsigned label, unsigned length, unsigned a, unsigned b, unsigned reply[4]) {
+  seL4_SetMR(0, a);
+  seL4_SetMR(1, b);
+  seL4_MessageInfo_t info = seL4_Call(seL4_CapSMC, seL4_MessageInfo_new(label, 0, 0, length));
+  if (seL4_MessageInfo_get_label(info) || seL4_MessageInfo_get_length(info) > 4) return -1;
+  for (unsigned i = 0; i < seL4_MessageInfo_get_length(info); i++) reply[i] = seL4_GetMR(i);
+  return seL4_MessageInfo_get_length(info);
+}
+#include "../../platform/sel4/board/wifi/user.h"
 static unsigned wifi_memory_request(bool prepare, unsigned reader) {
   volatile unsigned *diag = (void *)0x09202000;
   volatile unsigned *spm = (void *)0x09700000;
@@ -1336,14 +1495,12 @@ static unsigned wifi_memory_request(bool prepare, unsigned reader) {
   }
   unsigned profile = *(volatile unsigned *)0x09fffff8;
   if (prepare && profile != 1 && profile != 2) return 0x31;
-  // The Ellis AArch32 kernel installs its board-only cap in the reserved
-  // SMC slot. No child owns this cap. The sole argument selects a bounded reader.
-  seL4_SetMR(0, reader);
-  seL4_MessageInfo_t reply = seL4_Call(seL4_CapSMC, seL4_MessageInfo_new(prepare ? 2 : 1,0,0,1));
-  if (seL4_MessageInfo_get_label(reply) || seL4_MessageInfo_get_length(reply) != 9)
-    return 0x43;
-  unsigned policy = seL4_GetMR(0);
-  for (unsigned i = 0; i < 8; ++i) diag[18+i] = seL4_GetMR(1+i);
+  if (reader > WIFI_OFFSET) return 0x43;
+  ellis_smc_refused = 0;
+  unsigned policy = radio_windows_request(prepare, reader);
+  // The kernel refused a call: this supervisor and the kernel disagree.
+  if (ellis_smc_refused) return 0x43;
+  for (unsigned i = 0; i < 8; ++i) diag[18+i] = radio_window_raw[i / 4][i % 4];
   diag[17] = 0x3155504d;
   diag[26] = ++wifi_memory_checks;
   return policy;
@@ -1766,7 +1923,9 @@ void root_main(seL4_BootInfo *bi) {
 #ifdef VIOLET_TEST_ISOLATION
       seL4_MessageInfo_t msg = IPC_RECV(life, &badge, root_reply);
 #else
-      seL4_MessageInfo_t msg = IPC_NBRECV(life, &badge, root_reply);
+      // Blocks until a message or the next health check when the timekeeper runs.
+      seL4_MessageInfo_t msg = timekeeper_receive(life, &badge);
+      open_faulted = badge == 16 + OPEN_RT; // a fault message, not the stall check below
 #ifdef VIOLET_MOTO
       if (usb_trial_bytes && ticks64() >= usb_deadline) {
         usb_last_failure = USB_TIMEOUT;
@@ -1819,6 +1978,7 @@ void root_main(seL4_BootInfo *bi) {
 #ifdef VIOLET_MOTO
         for (unsigned i = 0; i < 6; i++) ((volatile unsigned *)0x09202000)[40 + i] = open_fault[i];
 #endif
+        if (open_warm_restart()) continue; // contained: the runtime closes one app and goes on
         check(seL4_TCB_Suspend(procs[OPEN_RT].task.thread));
         continue;
       }
@@ -1958,7 +2118,7 @@ void root_main(seL4_BootInfo *bi) {
               // Older than a version that has already run.
             } else if (inbox->id == USB_DIAG) {
               usb_trial_bytes = uploaded;
-              memcpy(new_catalog,inbox,usb_trial_bytes);
+              memcpy(usb_scratch,inbox,usb_trial_bytes);
               break;
             }
             if (update_catalog(RADIO, false)) break;
@@ -2060,10 +2220,8 @@ void root_main(seL4_BootInfo *bi) {
         }
       } else if (badge == RADIO && key == 0x405c && op == GET &&
           seL4_MessageInfo_get_length(msg) == 14) {
-        seL4_MessageInfo_t entropy = seL4_Call(seL4_CapSMC, seL4_MessageInfo_new(3,0,0,0));
-        if (!seL4_MessageInfo_get_label(entropy) && seL4_MessageInfo_get_length(entropy) == 4) {
-          unsigned words[4];
-          for (unsigned i=0;i<4;i++) words[i]=seL4_GetMR(i);
+        unsigned words[4];
+        if (ellis_random(words)) {
           for (unsigned i=0;i<4;i++) seL4_SetMR(4+i,words[i]);
           result = 16;
           error = 0;
@@ -2139,6 +2297,8 @@ void root_main(seL4_BootInfo *bi) {
           result |= 1u << OPEN_RT;
         if (procs[CAMERA].package)
           result |= 1u << CAMERA;
+        if (procs[SENTINEL].package)
+          result |= 1u << SENTINEL;
       } else if (badge == PACKAGES && op == GET && key == 9 && val < COUNT) {
         error = 0;
         if (procs[val].package && val != PACKAGES) {

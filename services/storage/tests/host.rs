@@ -21,6 +21,32 @@ mod writeback;
 mod writeback_tests;
 mod testdisk;
 mod violetfs_tests;
+#[path = "../extent.rs"]
+mod extent;
+#[path = "../vfsproto.rs"]
+mod vfsproto;
+#[path = "../volume.rs"]
+mod volume;
+#[path = "../legacy.rs"]
+mod legacy;
+#[path = "../vfs.rs"]
+mod vfs;
+mod vfs_tests;
+#[path = "../mount.rs"]
+mod mount;
+mod mount_tests;
+// The Open Runtime's own file layer, to run it against the server.
+#[path = "../../../runtime/open/fs.rs"]
+mod fs;
+/// The errors fs.rs names (runtime/open/syscall.rs).
+mod syscall {
+    pub const ENOENT: i32 = -2;
+    pub const EEXIST: i32 = -17;
+    pub const ENOTDIR: i32 = -20;
+    pub const EISDIR: i32 = -21;
+    pub const ENOTEMPTY: i32 = -39;
+}
+mod fs_tests;
 
 // protocol.rs declares the IPC calls of the target; nothing here makes them.
 #[no_mangle]

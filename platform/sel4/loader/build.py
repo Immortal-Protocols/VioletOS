@@ -57,7 +57,7 @@ for source in [repo/"services/touch/events.c", repo/"services/storage/storage_ip
     run(common+incs+defines+["-DVIOLET_COMPONENT","-I",out,"-I",platform_include,"-std=gnu11","-c",source,"-o",obj])
     shims.append(obj)
 only=os.environ.get("VIOLET_COMPONENT_ONLY")
-selected=None if variant=="qemu" else {"launcher","runtime","touch","display","storage","power","radio","usb-diagnostics","audio","open","camera"}
+selected=None if variant=="qemu" else {"launcher","runtime","touch","display","storage","power","radio","usb-diagnostics","audio","open","camera","sentinel"}
 storage_backend=repo/"targets/moto-g-pure/emmc.rs" if variant=="moto" else None
 components(repo,out,cc,common,incs,rustc,shims,only,selected,storage_backend,variant)
 if only or (variant=="qemu" and os.environ.get("VIOLET_APP_DIR")): sys.exit(0)
@@ -136,6 +136,33 @@ if variant == "moto":
     prepare_wifi(Path(stock_path).parent, out/"wifi-firmware.bin")
     with (out/"payload.S").open("a") as payload:
         payload.write('.balign 4\n.global radio_firmware,radio_firmware_end\nradio_firmware: .incbin "wifi-firmware.bin"\nradio_firmware_end:\n')
+verified_boot = []
+if variant == "qemu":
+    # Verified boot (boot/loader/verified.rs, docs/verified-boot.md): the loader
+    # starts the kernel and the root task only if they match a manifest signed
+    # by a key this image pins. The /apps image is bound too in a release, or
+    # with VIOLET_BOOT_BIND_APPS=1; a developer image leaves it unbound because
+    # the local tests swap it without relinking the loader. The handset loader
+    # carries no manifest: its bootloader is unlocked and verifies nothing.
+    from boot_manifest import build as boot_manifest, verify as check_boot_manifest, system_version, check_loader
+    bind_apps = package_signer.release or os.environ.get("VIOLET_BOOT_BIND_APPS") == "1"
+    boot_images = [(out/"kernel.bin").read_bytes(), (out/"root.bin").read_bytes(),
+                   (out/"initfs.cpio").read_bytes() if bind_apps else None]
+    # The signed version is the root task's own (its VIOLETSYSVER note), never a re-read of the environment.
+    try:
+        boot_version = system_version(boot_images[1], os.environ.get("VIOLET_SYSTEM_VERSION"), package_signer.release)
+    except ValueError as e:
+        sys.exit(f"verified boot: {e}")
+    signed_manifest = boot_manifest(package_signer, boot_version, *boot_images)
+    check_boot_manifest(signed_manifest, package_signer.keys, variant, *boot_images, require_apps=package_signer.release)
+    (out/"boot-manifest.bin").write_bytes(signed_manifest)
+    with (out/"payload.S").open("a") as payload:
+        payload.write('.balign 4\n.global boot_manifest,boot_manifest_end\nboot_manifest: .incbin "boot-manifest.bin"\nboot_manifest_end:\n')
+    run([rustc, "--edition=2021", "--target=armv7a-none-eabi", "--crate-type=staticlib", "-Cpanic=abort",
+         "-Copt-level=s", "-Ccodegen-units=1", repo/"boot/loader/verified_lib.rs", "-o", "loader-verified.a"])
+    defines.append("-DVIOLET_VERIFIED_BOOT")
+    verified_boot = ["loader-verified.a", *signing_objects[1:]]
+    print("Verified boot: the loader checks the kernel and the root task" + (" and the /apps image." if bind_apps else "; the /apps image is NOT bound (developer image)."))
 fdt = build/"dtc-1.7.2/libfdt"
 ndk = cc.parent.parent/"sysroot/usr/include"
 headers = ["-I"+str(fdt),"-isystem",ndk/"arm-linux-androideabi","-isystem",ndk]
@@ -145,11 +172,17 @@ for source in [repo/"boot/loader/loader.S", repo/"boot/loader/loader.c", here/"s
     run(common+defines+headers+["-c",source,"-o",obj])
     objects.append(obj)
 if variant == "moto": objects.append("loader-history.a")
+objects.extend(verified_boot)
 run([ld,"--gc-sections","-T",repo/"boot/loader/loader.ld",*objects,"-o","loader.elf"])
 run([objcopy,"-O","binary","loader.elf","zImage"])
 z=(out/"zImage").read_bytes()
 assert struct.unpack_from("<3I",z,36)==(0x016f2818,0,len(z))
 if variant=="qemu":
+    # A QEMU loader that dropped the check (no VIOLET_VERIFIED_BOOT, or no call) fails the build.
+    try:
+        check_loader(z, signed_manifest)
+    except ValueError as e:
+        sys.exit(f"verified boot: {e}")
     run(common+["-DIMAGE_BYTES="+str(len(z)),"-c",here/"qemu-entry.S","-o","qemu-entry.o"])
     run([objcopy,"-O","binary","-j",".text","qemu-entry.o","entry.bin"])
 if variant=="moto":
@@ -165,7 +198,12 @@ if variant=="moto":
     marker=b"VioletOS XT2163DL boot_b storage v1\n".ljust(512,b"\0")
     image=image.ljust(marker_offset,b"\0")+marker+bytes(1024**2)
     image += b"VioletOS boot history v1\n".ljust(512,b"\0") + bytes(1024)
-    image += b"VioletOS catalog banks v1\n".ljust(512,b"\0") + bytes(4098*512)
+    # Two catalog banks (catalog_volume.rs BANK sectors each, 1.25 MiB of
+    # catalog), all before the installed apps' extent at 20 MiB.
+    import package_format
+    banks = 2 * (1 + package_format.HANDSET_LIMIT // 512)
+    image += b"VioletOS catalog banks v1\n".ljust(512,b"\0") + bytes(banks*512)
+    if len(image) > 20*1024**2:raise ValueError("catalog banks overlap the installed apps (storage_volume.rs APPS)")
     (out/"boot.img").write_bytes(image)
     page, = struct.unpack_from("<I", stock, 36)
     assert image[page:page+len(z)]==z

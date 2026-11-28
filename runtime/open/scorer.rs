@@ -404,6 +404,66 @@ pub struct Local {
     pub margin: i32,
 }
 
+/// What the scorer acts through. In the Sentinel (system/sentinel/scoring.rs)
+/// it is the reply to the Open Runtime, which carries the result out; in the
+/// host replay it is the policy itself.
+pub trait Enforcer {
+    /// The Shield's mode (`shield::Mode as u8`).
+    fn mode(&self) -> u8;
+    fn eligible(&self, who: &Subject) -> bool;
+    /// Contain `who` if the mode and its role allow it; true if contained.
+    fn trip(&mut self, now_ns: u64, who: &Subject, shield_id: u32) -> bool;
+    fn emit(&mut self, ev: TelemetryEvent);
+}
+
+impl Enforcer for ShieldPolicy {
+    fn mode(&self) -> u8 {
+        self.mode as u8
+    }
+    fn eligible(&self, who: &Subject) -> bool {
+        ShieldPolicy::eligible(self, who)
+    }
+    fn trip(&mut self, now_ns: u64, who: &Subject, shield_id: u32) -> bool {
+        ShieldPolicy::trip(self, now_ns, who, shield_id)
+    }
+    fn emit(&mut self, ev: TelemetryEvent) {
+        self.ring.emit(ev);
+    }
+}
+
+/// "quarantine v=2 m=17 model=55fedf7e": the LocalScore record's text.
+/// (Written out by hand: the Sentinel carries no formatting code.)
+pub fn score_text(action: u8, verdict: u8, margin: i32) -> alloc::string::String {
+    let mut s = alloc::string::String::from(["", "warn", "quarantine", "freeze"][(action as usize).min(3)]);
+    let dec = |s: &mut alloc::string::String, v: i64| {
+        if v < 0 {
+            s.push('-');
+        }
+        let (mut digits, mut n, mut v) = ([0u8; 12], 0, v.unsigned_abs());
+        loop {
+            digits[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        while n > 0 {
+            n -= 1;
+            s.push(digits[n] as char);
+        }
+    };
+    s.push_str(" v=");
+    dec(&mut s, i64::from(verdict));
+    s.push_str(" m=");
+    dec(&mut s, i64::from(margin));
+    s.push_str(" model=");
+    for shift in (0..8).rev() {
+        s.push(b"0123456789abcdef"[(model::MODEL_ID >> (shift * 4)) as usize & 15] as char);
+    }
+    s
+}
+
 pub struct Scorer {
     pub windows: Vec<Window>,
     clock: u64,
@@ -452,7 +512,7 @@ impl Scorer {
     /// once an app was actually contained the deterministic signs start
     /// over (`spend`), so doing it again after the quarantine ends is a new
     /// offence (30 s, 5 min, until released).
-    pub fn step(&mut self, policy: &mut ShieldPolicy, events: &[TelemetryEvent], idle_s: u32, now_ns: u64, subjects: &[Subject]) -> Vec<Local> {
+    pub fn step<E: Enforcer>(&mut self, policy: &mut E, events: &[TelemetryEvent], idle_s: u32, now_ns: u64, subjects: &[Subject]) -> Vec<Local> {
         for ev in events {
             self.ingest(ev, idle_s);
         }
@@ -468,9 +528,9 @@ impl Scorer {
             let l = logits(&f);
             self.scored = self.scored.wrapping_add(1);
             let action = decide(&l, &f, &w.facts, policy.eligible(who));
-            if w.acted_mode != policy.mode as u8 {
+            if w.acted_mode != policy.mode() {
                 w.acted = NONE;
-                w.acted_mode = policy.mode as u8;
+                w.acted_mode = policy.mode();
             }
             if action <= w.acted {
                 if action == NONE {
@@ -484,10 +544,10 @@ impl Scorer {
             if enforced {
                 w.spend();
             }
-            let text = alloc::format!("{} v={} m={} model={:08x}", ["", "warn", "quarantine", "freeze"][action as usize], verdict(&l), margin(&l), model::MODEL_ID);
+            let text = score_text(action, verdict(&l), margin(&l));
             let mut ev = TelemetryEvent::new(now_ns, AppId(w.pid), EventKind::LocalScore, who.flags | shield::FLAG_HIGH_PRIORITY, text.as_bytes());
             ev.aux_u32 = model::MODEL_ID;
-            policy.ring.emit(ev);
+            policy.emit(ev);
             out.push(Local { pid: w.pid, action, enforced, verdict: verdict(&l), margin: margin(&l) });
         }
         out

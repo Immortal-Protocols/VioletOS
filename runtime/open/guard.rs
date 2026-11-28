@@ -1,10 +1,11 @@
 //! Violet Shield at the Open Runtime's choke point: the check every guarded
 //! system call goes through, quarantine, freezing and thawing apps, bytes-sent
-//! telemetry, the on-device scorer's turn and the Sentinel's
-//! (docs/violet-shield-poc.md). The decisions themselves are in shield.rs and
-//! scorer.rs, which the host tests run; this file carries them out.
-use super::policy::{AccessMode, Action, AppId};
-use super::scorer;
+//! telemetry, the on-device scorer's turn and the companion link's
+//! (docs/violet-shield-poc.md). The per-call rules and limits are decided in
+//! shield.rs, which the host tests run. The on-device scorer runs in the
+//! Sentinel (system/sentinel/scoring.rs): this file sends it what was
+//! recorded and carries out what it decides.
+use super::policy::{self, wire, AccessMode, Action, AppId};
 use super::sentinel::Command;
 use super::shield::{self, EventKind, Mode, ShieldVerdict, Subject, TelemetryEvent};
 use super::{sys, Frozen, Gate, Runtime, TxStat, Wait, MAX_APPS};
@@ -17,6 +18,18 @@ const TX_REPORT_NS: u64 = 500_000_000;
 /// Where the Shield's mode is kept across restarts. Apps cannot write it
 /// (shield.rs `STATE_PREFIX`); only the runtime does, for Settings.
 const MODE_FILE: &str = "/data/.shield-mode";
+/// The label the Sentinel seals the mode under (system/sentinel/engine.rs).
+const MODE_LABEL: &str = "shield-mode";
+
+/// What the Open Runtime knows of the Sentinel's scorer: its counts, its
+/// model, and whether a window still waits for its turn.
+#[derive(Default)]
+pub struct ScoreLink {
+    pub scored: u32,
+    pub warned: u32,
+    pub model: u32,
+    pending: bool,
+}
 
 const fn same(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -331,18 +344,29 @@ impl Runtime {
     }
 
     /// The Shield's mode at start: the build's, or the saved one if that is
-    /// stricter (`Mode::at_boot`: the saved file is not authenticated, so it
-    /// cannot switch enforcement off). The mode goes into the measurement
-    /// chain on every start.
+    /// stricter (`Mode::at_boot`). The saved file is sealed by the Sentinel,
+    /// so an edited file is not read back. Sealing does not say when or by
+    /// whom: an older file this phone sealed opens too, on the handset (a
+    /// build key) so does one from another phone of the same build, and a
+    /// compromised runtime can have any mode sealed. So a saved mode can
+    /// only make the Shield stricter, never switch enforcement off
+    /// (system/sentinel/README.md). The mode goes into the measurement chain
+    /// on every start.
     fn load_shield_mode(&mut self) {
-        let saved = self.fs.contents(MODE_FILE).and_then(|d| core::str::from_utf8(d).ok()).and_then(Mode::parse);
+        let saved = self.fs.contents(MODE_FILE).and_then(|d| policy::unseal_state(MODE_LABEL, d));
+        let saved = saved.as_deref().and_then(|d| core::str::from_utf8(d).ok()).and_then(Mode::parse);
+        if saved.is_none() && self.fs.contents(MODE_FILE).is_some() {
+            crate::log!("shield: .shield-mode not opened");
+        }
         let mode = Mode::at_boot(self.shield.mode, saved);
         if saved.is_some() && saved != Some(mode) {
             crate::log!("shield: saved mode {} is weaker than this build's and is ignored", saved.map_or("", Mode::name));
         }
         self.shield.mode = mode;
         self.sentinel.note_mode(mode as u8);
-        crate::log!("shield: mode {} (scorer {:08x})", self.shield.mode.name(), super::scorer_model::MODEL_ID);
+        // Nothing to score yet: the Sentinel's scorer says which model it runs.
+        self.score_request(1, &[], &[], 0, 0);
+        crate::log!("shield: mode {} (scorer {:08x})", self.shield.mode.name(), self.scorer.model);
     }
 
     /// "shield-mode [monitor|enforce|strict]", "shield-release NAME" and
@@ -360,17 +384,19 @@ impl Runtime {
                 self.shield.shadow_hits,
                 self.scorer.scored,
                 self.scorer.warned,
-                super::scorer_model::MODEL_ID
+                self.scorer.model
             ),
             _ if !settings => String::from("error only Settings changes Violet Shield\n"),
             ("shield-mode", Some(text)) => match Mode::parse(text) {
                 Some(mode) => {
-                    if let Some(f) = self.fs.writable(MODE_FILE, true, true, 0) {
-                        f.extend_from_slice(mode.name().as_bytes());
+                    // Sealed by the Sentinel; without its seal nothing is saved.
+                    let sealed = policy::seal_state(MODE_LABEL, mode.name().as_bytes());
+                    if let (Some(text), Some(f)) = (sealed.as_ref(), self.fs.writable(MODE_FILE, true, true, 0)) {
+                        f.extend_from_slice(text.as_bytes());
                     }
                     // Saved means Storage holds it now, not that it was queued.
                     super::data::sync(&mut self.fs);
-                    let saved = self.fs.stored.get(MODE_FILE).map_or(false, |d| d.as_slice() == mode.name().as_bytes());
+                    let saved = sealed.is_some_and(|text| self.fs.stored.get(MODE_FILE).map_or(false, |d| d.as_slice() == text.as_bytes()));
                     self.shield.set_mode(now, mode);
                     if mode == Mode::Monitor {
                         // Monitoring blocks nothing: what was frozen runs again.
@@ -396,26 +422,53 @@ impl Runtime {
         }
     }
 
-    /// The on-device scorer's turn: score the windows that changed and carry
-    /// out what the policy decided (scorer.rs `step`).
+    /// One request to the Sentinel's scorer (system/sentinel/scoring.rs): the
+    /// reply's results, or None with no valid answer (nothing is scored then;
+    /// the per-call rules and limits in shield.rs go on, and the capability
+    /// policy refuses everything, policy.rs).
+    fn score_request(&mut self, more: u8, subjects: &[u8], events: &[u8], idle: u32, now: u64) -> Option<Vec<u8>> {
+        let head = wire::score_request_head(self.shield.mode as u8, more, idle, now);
+        let reply = match policy::call_out(wire::OP_SCORE, 0, 0, &[&head, subjects, events]) {
+            Some((wire::V_ALLOW, _, out)) => wire::score_head(&out).map(|h| (h, out)),
+            _ => None,
+        };
+        let Some(((scored, warned, model, pending), out)) = reply else {
+            self.scorer.pending = false;
+            return None;
+        };
+        self.scorer = ScoreLink { scored, warned, model, pending };
+        Some(out)
+    }
+
+    /// The on-device scorer's turn: the Sentinel scores the windows that
+    /// changed and decides (scorer.rs `step`, there); this carries it out.
     fn score_tick(&mut self, events: &[TelemetryEvent], idle: u32, now: u64) {
-        if events.is_empty() && !self.scorer.windows.iter().any(|w| w.pending()) {
+        if events.is_empty() && !self.scorer.pending {
             return;
         }
-        let subjects: Vec<Subject> = (0..MAX_APPS).filter(|&i| self.apps[i].is_some()).map(|i| self.subject(i)).collect();
-        for local in self.scorer.step(&mut self.shield, events, idle, now, &subjects) {
-            let Some(i) = self.index_of(local.pid) else { continue };
+        let subjects: Vec<u8> = (0..MAX_APPS).filter(|&i| self.apps[i].is_some()).flat_map(|i| self.subject(i).to_wire()).collect();
+        // The window holds a hundred records: the rest go ahead, unscored
+        // (common.rs `score_turn`, which the host tests run).
+        let bytes: Vec<u8> = events.iter().flat_map(|e| e.to_wire()).collect();
+        let Some(out) = wire::score_turn(&bytes, |more, chunk| self.score_request(more, &subjects, chunk, idle, now)) else { return };
+        for wire::ScoreResult { pid, action, verdict, margin, record } in wire::score_results(&out) {
+            let Some(i) = self.index_of(pid) else { continue };
             let who = self.subject(i);
+            // The policy contains (or, monitoring, reports) what the scorer called for.
+            let enforced = action >= wire::SCORE_QUARANTINE && self.shield.trip(now, &who, shield::ID_SCORER);
+            if let Some(ev) = TelemetryEvent::from_wire(record) {
+                self.shield.ring.emit(ev);
+            }
             crate::log!("shield {}: scorer says {} for pid {} (verdict {}, margin {}){}", shield::ID_SCORER,
-                ["", "warn", "quarantine", "freeze"][local.action as usize], local.pid, local.verdict, local.margin,
-                if local.action >= scorer::QUARANTINE && !local.enforced { ", reported only" } else { "" });
+                ["", "warn", "quarantine", "freeze"][action as usize], pid, verdict, margin,
+                if action >= wire::SCORE_QUARANTINE && !enforced { ", reported only" } else { "" });
             // Home's warning count: only for programs the phone may contain.
             if self.shield.eligible(&who) {
                 self.sentinel.warnings = self.sentinel.warnings.saturating_add(1);
                 self.shell.dirty = true;
             }
-            if local.enforced && local.action == scorer::FREEZE {
-                self.freeze(i, now + u64::from(scorer::FREEZE_SECS) * 1_000_000_000, shield::ID_SCORER);
+            if enforced && action == wire::SCORE_FREEZE {
+                self.freeze(i, now + u64::from(wire::SCORE_FREEZE_SECS) * 1_000_000_000, shield::ID_SCORER);
             }
         }
         self.shield_notice();
