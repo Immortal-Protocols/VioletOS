@@ -160,6 +160,42 @@ On the physical XT2163DL, slot B image `4be2ac63c17e` with signed Radio `ca18deb
 
 The boot image carries the 1 MiB storage volume (app files, the Wi-Fi app's saved networks, checkpoints) as zeros. `moto-flash` therefore sends it as an Android sparse image whose storage window is a "don't care" chunk, so the bootloader writes everything except that window and the handset keeps its data across flashes; `--wipe-storage` sends the plain image instead. If the bootloader refuses the sparse image, `moto-flash` says so and falls back to the plain one. On November 24, 2026 the XT2163DL's bootloader accepted the sparse image, and `/data/networks` survived the flash.
 
+### Flashing a slot-A-only handset (empty slot B)
+
+A factory-flashed XT2163DL that has never taken an Android OTA only has bootloader images in slot A (`preloader_a`, `lk_a`, `tee_a`, `sspm_a`, `dtbo_a`). Running `moto-flash` on such a unit fails at `fastboot set_active b` with:
+
+```text
+(bootloader) WARNING: Bootloader images on target slot b are not valid!!
+(bootloader) There is risk of bricking HW. Please flash valid bootloader
+(bootloader) into slot b before activating it.
+```
+
+Do **not** force `set_active b` past that warning. Also do **not** populate slot B with the older May 2023 `S3RHS32.20-42-13-2-3-2` factory package's `lk.img` (`MBM-2.1-ellis_trac-c971cb77e7-230529`) on a handset whose slot A runs `MBM-2.1-ellis_vzw-4a0a80aa68-231214`: that older `lk_b` treats the unit as locked, blocks `fastboot set_active` and unsigned boot images, and halts VioletOS at Red State (`No valid os could be found`). If you do end up stuck in `lk_b`, flashing that same package's signed stock `boot.img` to `boot_b` and rebooting until `slot-retry-count:_b` reaches 0 falls back automatically to Android on slot A.
+
+Note also that `fastboot getvar securestate` may still report `oem_locked` on an unlocked XT2163DL. Check the real unlock state with `fastboot flashing get_unlock_ability` (must return `Flashing Android images permitted`) or in Android via `adb shell getprop` (`ro.boot.flash.locked=0`, `ro.boot.verifiedbootstate=orange`, `ro.boot.vbmeta.device_state=unlocked`).
+
+When Android is not needed, flash VioletOS straight into slot A using the working `MBM-2.1-ellis_vzw-4a0a80aa68-231214` bootloader already there:
+
+1. **Enter fastboot on slot A** (`adb reboot bootloader`, or hold Power + Volume Down) and verify `current-slot: a`, `running-slot: _a`, `version-bootloader: MBM-2.1-ellis_vzw-4a0a80aa68-231214`, and `fastboot flashing get_unlock_ability` → `Flashing Android images permitted`. If `slot-successful:_a` is already `yes`, do **not** call `fastboot set_active a` — keeping slot A marked successful avoids burning retries across VioletOS reboots.
+2. **Initialize `boot_b`, claim `userdata`, flash `boot_a`, and reboot.** Even when VioletOS boots from `boot_a`, [storage_volume.rs](storage_volume.rs) still verifies the Android v2 header and the `VioletOS XT2163DL boot_b storage v1` marker at 16 MiB in `boot_b`. Claiming `userdata` before the first boot puts VioletFS `/data` (1 GiB) and the app store on `userdata` instead of the small 464 KiB volume in `boot_b` (this erases Android's data):
+   ```sh
+   python3 -c 'from pathlib import Path; t=b"VioletOS XT2163DL userdata v1\n"; Path("build/moto-userdata-claim.img").write_bytes(t + bytes(4096 - len(t)))'
+   fastboot flash boot_b build/sel4/moto/boot.img
+   fastboot flash userdata build/moto-userdata-claim.img
+   fastboot flash boot_a build/sel4/moto/boot.img
+   fastboot reboot
+   ```
+3. **Verify over USB Diagnostics.** First boot takes about 2–3 minutes while `userdata` is initialized at single-sector eMMC speed. Run `build/moto-debug` and confirm `runtime_ready: 1`, `disk_ready: 1`, `startup_status: "TOUCH READY"` and `last_fault_id: 0`. If you have a saved Wi-Fi profile, run `services/usb-diagnostics/host/moto-wifi-profile --saved`.
+4. **Subsequent updates on a slot-A-only unit.** Reach fastboot hands-free with `build/moto-package reboot-bootloader`, then flash only `boot_a` so `boot_b`'s storage volume and `userdata` stay intact (do not run `moto-flash`, which activates slot B):
+   ```sh
+   build/moto-package reboot-bootloader
+   fastboot flash boot_a build/sel4/moto/boot.img
+   fastboot reboot
+   ```
+   To return to stock Android later, enter fastboot (Power + Volume Down) and flash the stock `boot.img` back to `boot_a` (and erase `userdata` if it was claimed).
+
+On November 27, 2026, unit `ZY22HM97MT` (running `MBM-2.1-ellis_vzw-4a0a80aa68-231214` on slot A with an empty slot B) was flashed this way with the Sentinel / VioletFS image (`3f48ee4`). On first boot it answered `build/moto-debug` at `counter_ms` 158,273 with `generation: 1`, `runtime_ready: 1`, `disk_ready: 1`, `startup_status: "TOUCH READY"`, `last_fault_id: 0`, `battery_mv: 4100`, `rf_profile: 2` and `wifi_memory_checks: 1`.
+
 ## Wi-Fi reliability
 
 [docs/wifi-reliability-rfc.md](../../docs/wifi-reliability-rfc.md) lists what keeps the station link up. In short: a rejoin after a link failure starts with no pairwise key, so the new handshake's message 2 goes out in the clear (it used to go out encrypted with the old key, and the access point dropped every rejoin); status polls no longer end a link that is being rejoined, and the event loop keeps rejoining (500 ms apart three times, then 2 s doubling up to a minute) for as long as the network stays joined; a single failed transmit no longer ends the link (32 in a row do); the supplicant's timers keep running inside every blocking network wait; a scan keeps 32 access points instead of 8; and open networks join without a handshake.
