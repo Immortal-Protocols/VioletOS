@@ -1,8 +1,8 @@
-# seL4 as an AArch64 kernel (QEMU bring-up)
+# seL4 as an AArch64 kernel (QEMU and the handset)
 
-[build.py](build.py) builds the same pinned seL4 17.0.0 archive as the 32-bit kernels, as an AArch64 kernel for QEMU's `virt` machine, for the [qemu64 target](../../../targets/qemu64/README.md). The 32-bit build ([../build.py](../build.py)) is the default and is not changed by anything here: its platform file, patch, options and [delta.json](../delta.json) are untouched, and its script only forwards the `qemu64` target name.
+[build.py](build.py) builds the same pinned seL4 17.0.0 archive as the 32-bit kernels, as an AArch64 kernel for QEMU's `virt` machine, for the [qemu64 target](../../../targets/qemu64/README.md), and with `--target moto` for the XT2163DL handset ([targets/moto-g-pure](../../../targets/moto-g-pure/README.md#aarch64-boot-path), `make moto64`). The 32-bit build ([../build.py](../build.py)) is the default and is not changed by anything here: its platform file, patch, options and [delta.json](../delta.json) are untouched, and its script only forwards the `qemu64` target name.
 
-Like the 32-bit kernels, this is seL4's code and **not a verified seL4 configuration**: the `ellis` platform is a VioletOS board port, the compiler is the NDK's clang, and the source is changed as listed below. It has no handset variant: the secure-monitor extension of the 32-bit handset kernel is not ported, and this kernel contains no SMC instruction (the build checks).
+Like the 32-bit kernels, this is seL4's code and **not a verified seL4 configuration**: the `ellis` platform is a VioletOS board port, the compiler is the NDK's clang, and the source is changed as listed below. Its handset variant differs from the QEMU one in its base device tree (decompiled from the factory boot image, pinned by that image's SHA-256, as the 32-bit handset kernel's), its 13 MHz timer and the Wi-Fi secure-monitor extension's stubs: both kernels carry the 32-bit handset kernel's extension ([ellis-wifi.patch](ellis-wifi.patch), the same `table.h` and `invoke.h`: four secure-monitor calls with fixed arguments behind one root capability in the `seL4_CapSMC` slot), but only the handset's assembles the A64 stubs ([monitor.S](monitor.S)); QEMU's gets C stubs that fail, as the 32-bit QEMU kernel does. The build checks that the only SMC instructions are those four stubs on the handset and that there are none on QEMU.
 
 ## Every difference from upstream, checked by the build
 
@@ -16,15 +16,22 @@ Like the 32-bit kernels, this is seL4's code and **not a verified seL4 configura
 | `libsel4/sel4_arch_include/aarch64/sel4/sel4_arch/syscalls.h` | [linux-svc.patch](linux-svc.patch) | libsel4's seven system call stubs issue `svc #1`. |
 | `src/arch/arm/machine/gic_v3.c` | [gic-single-core.py](../../../platform/sel4/board/gic-single-core.py) | As the 32-bit kernels: one redistributor frame per booted core. |
 | `tools/hardware.yml` | [gic-single-core.py](../../../platform/sel4/board/gic-single-core.py) | As the 32-bit kernels: the `violet,ellis-boot-gic` device rule. |
+| `include/arch/arm/arch/64/mode/object/structures.bf` | [ellis-wifi.patch](ellis-wifi.patch) | Adds `ellis_wifi_cap` (arch cap tag 29) on ellis. |
+| `include/arch/arm/arch/64/mode/object/structures.h` | [ellis-wifi.patch](ellis-wifi.patch) | The cap has no size, object or region, like the ASID control cap. |
+| `src/arch/arm/kernel/boot.c` | [ellis-wifi.patch](ellis-wifi.patch) | Puts it in the root task's `seL4_CapSMC` slot (`KernelAllowSMCCalls` stays OFF). |
+| `src/arch/arm/64/object/objecttype.c` | [ellis-wifi.patch](ellis-wifi.patch) | Deriving it gives a null cap; invoking it runs `ellisWifiInvocation`. |
 
 ### Files added
 
 | File | From | What it is |
 | --- | --- | --- |
-| `src/plat/ellis/config.cmake` | [config.cmake](config.cmake) | The ellis platform as an AArch64 kernel, QEMU timing only. |
+| `src/plat/ellis/config.cmake` | [config.cmake](config.cmake) | The ellis platform as an AArch64 kernel: QEMU's 62.5 MHz timer, or the handset's 13 MHz with `VioletHandsetBoard`. |
 | `src/plat/ellis/kernel-overlay.dts` | [kernel-overlay.dts](../../../platform/sel4/board/kernel-overlay.dts) | The same overlay as the 32-bit kernels. |
 | `src/plat/ellis/moto-radio-memory.dts` | [moto-radio-memory.dts](../../../platform/sel4/board/moto-radio-memory.dts) | The same memory reservations, so one memory map serves both. |
-| `src/plat/ellis/factory-base.dts` | [qemu.dts](../../../platform/sel4/board/qemu.dts) | The base device tree for QEMU virt. |
+| `src/plat/ellis/factory-base.dts` | [qemu.dts](../../../platform/sel4/board/qemu.dts) | The base device tree for QEMU virt; for the handset, the factory boot image's, decompiled at build time and pinned by that image's SHA-256. |
+| `src/plat/ellis/wifi/monitor.S` | [monitor.S](monitor.S) | The four MediaTek SiP call stubs in A64, assembled for the handset only. |
+| `include/arch/arm/arch/object/ellis_wifi/invoke.h` | [invoke.h](../../../platform/sel4/board/wifi/invoke.h) | The 32-bit kernel's `ellisWifiInvocation`. |
+| `include/arch/arm/arch/object/ellis_wifi/table.h` | [table.h](../../../platform/sel4/board/wifi/table.h) | The four permitted operations and their fixed monitor arguments. |
 | `libsel4/sel4_plat_include/ellis/sel4/plat/api/constants.h` | upstream | A copy of upstream's imx8mm-evk constants. |
 
 ### Build options
@@ -43,7 +50,8 @@ Like the 32-bit kernels, this is seL4's code and **not a verified seL4 configura
 | `KernelMaxNumNodes` | 1 | One core. |
 | `KernelArmExportVCNTUser` | ON | User level reads the virtual counter. |
 | `KernelArmExportPTMRUser` | OFF | No user thread may program the EL0 physical timer (it is not switched between threads). |
-| `KernelArmHypervisorSupport` | OFF | The kernel runs at EL1. |
+| `KernelArmHypervisorSupport` | OFF | The kernel runs at EL1 (on the handset the 64-bit loader drops from EL2 to EL1 first). |
+| `VioletHandsetBoard` | ON for the handset, OFF for QEMU | Selects the handset's 13 MHz timer. |
 | `KernelRootCNodeSizeBits` | 16 | The supervisor's root CNode: 65536 slots, for its device windows in 4 KiB frames (AArch64 has no 64 KiB or 1 MiB pages). |
 
 ## Why the system call entry is patched

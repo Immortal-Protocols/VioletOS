@@ -60,6 +60,21 @@ int main(void) {
         int history_len = libusb_control_transfer(h, 0xc0, 0x56, 0, 0, history, sizeof history, 1000);
         if (history_len == sizeof history && !memcmp(history, "VBH1", 4))
           printf(",\"previous_boot_stage\":%u", word(history + 4));
+        // Newer images: word size, the AArch64 loader's entry level, the last fault.
+        unsigned char arch[52];
+        int arch_len = libusb_control_transfer(h, 0xc0, 0x59, 0, 0, arch, sizeof arch, 1000);
+        if (arch_len == sizeof arch && !memcmp(arch, "VAR1", 4)) {
+          printf(",\"word_bits\":%u,\"entry_el\":%u", word(arch + 4),
+                 (word(arch + 8) >> 16) == 0x454c ? word(arch + 8) & 0xff : 0);
+          printf(",\"last_fault\":[%u,%u,%u,%u,%u,%u]", word(arch + 12), word(arch + 16), word(arch + 20),
+                 word(arch + 24), word(arch + 28), word(arch + 32));
+          if (arch[36]) {
+            printf(",\"boot_disk\":\"");
+            for (unsigned j = 36; j < sizeof arch && arch[j]; j++)
+              putchar(arch[j] >= 32 && arch[j] < 127 && arch[j] != '"' && arch[j] != '\\' ? arch[j] : '?');
+            putchar('"');
+          }
+        }
         unsigned char radio[52];
         count = libusb_control_transfer(h, 0xc0, 0x53, 0, 0, radio,
                                         sizeof radio, 1000);

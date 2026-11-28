@@ -3,12 +3,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 
+
+def android_target(common):
+    """The NDK target whose libc headers these sources compile against, for the
+    architecture `common` builds (AArch32 unless it says aarch64)."""
+    if "--target=aarch64-none-elf" in map(str, common):
+        return "--target=aarch64-linux-android21"
+    return "--target=armv7a-linux-androideabi21"
+
 def objects(repo, out, common):
     root = repo / "build/sel4/lwip-STABLE-2_2_1_RELEASE/src"
     port = Path(__file__).with_name("ip")
     dest = out / "lwip"
     dest.mkdir(exist_ok=True)
-    flags = [*common, "--target=armv7a-linux-androideabi21", "-I", port, "-I", root / "include"]
+    flags = [*common, android_target(common), "-I", port, "-I", root / "include"]
     files = sources(root, port)
     def compile(src):
         obj = dest / (src.stem + ".o")

@@ -27,8 +27,29 @@ static unsigned window_count, window_bits;
 #define WINDOW_COUNT 1u
 #define WINDOW_STEP 0u
 #endif
+#if VM_AARCH64
+// Where the supervisor stopped (the caller of stop), for the same readers.
+volatile unsigned long stop_caller;
+__attribute__((noinline)) static void stop(void) {
+    if(!stop_caller) stop_caller=(unsigned long)__builtin_return_address(0);
+    for (;;) seL4_Yield();
+}
+#else
 static void stop(void) { for (;;) seL4_Yield(); }
+#endif
+#if VM_AARCH64
+// The line of the first failed check() and its error, for a debugger or a
+// test reading the supervisor's memory (the AArch64 port's bring-up aid).
+volatile unsigned check_failed[2];
+static void check_at(int error, unsigned line) {
+    if(!error) return;
+    if(!check_failed[0]) check_failed[0]=line, check_failed[1]=(unsigned)error;
+    stop();
+}
+#define check(error) check_at((error), __LINE__)
+#else
 static void check(int error) { if(error) stop(); }
+#endif
 static seL4_CPtr allocate(seL4_CPtr source,unsigned type,unsigned bits) {
     if(next_slot>=boot->empty.end) stop();
     check(seL4_Untyped_Retype(source,type,bits,seL4_CapInitThreadCNode,0,0,next_slot,1));

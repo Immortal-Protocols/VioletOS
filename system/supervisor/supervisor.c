@@ -6,12 +6,13 @@
 #include <stddef.h>
 
 #if VM_AARCH64 && defined(VIOLET_MOTO)
-// The handset supervisor is AArch32 only: its board windows are 1 MiB
-// sections and 64 KiB frames at fixed slots (Camera's four sections, the
-// loader's handoff section, the radio relay), and its secure-monitor calls
-// (ellis_smc) need the 32-bit kernel's extension. Only the QEMU supervisor
-// is ported (platform/sel4/include/vm.h).
-#error "the handset supervisor has no AArch64 port yet"
+// The handset supervisor on AArch64 (targets/moto-g-pure/build64.py): its
+// 1 MiB windows are SECTION_PAGES consecutive 4 KiB frames (AArch64 has no
+// 1 MiB or 64 KiB frame) and the loader's handoff page is mapped at the same
+// address it has on AArch32. The secure-monitor calls (ellis_smc) go to the
+// same kernel extension (kernel/sel4/aarch64/ellis-wifi.patch). Not there yet,
+// and skipped rather than guessed: Camera (it keeps its four frame sections
+// in slots 8-11 for cache maintenance).
 #endif
 
 seL4_IPCBuffer *__sel4_ipc_buffer;
@@ -463,6 +464,9 @@ static void surface(unsigned id) {
     }
   }
 }
+// The last frame the last map_device call made. On AArch32 that is the last
+// capability made; on AArch64 a mapping may make page tables after its frames.
+#define LAST_FRAME (VM_AARCH64 ? WINDOW_FIRST + WINDOW_COUNT - 1 : next_slot - 1)
 static void *device(unsigned id, unsigned pa, unsigned va, unsigned bits) {
   mapping = id ? &procs[id].task : &bootstrap;
   return map_device(pa, va, bits);
@@ -472,7 +476,7 @@ static void *device(unsigned id, unsigned pa, unsigned va, unsigned bits) {
 // allocating the same physical address from its untyped a second time.
 static void board_device(unsigned id, unsigned pa, unsigned va, unsigned root_va) {
   device(id, pa, va, 12);
-  unsigned frame = next_slot - 1;
+  unsigned frame = LAST_FRAME;
   ensure_table(&bootstrap, root_va);
   unsigned copy = next_slot++;
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, SEL4_DEPTH,
@@ -515,7 +519,8 @@ static void build_group(void) {
   reset_allocator();
 #ifdef VIOLET_MOTO
   device(0, 0x79450000, 0x07900000, 16);
-  boot_display_frame = next_slot - 1;
+  // On AArch64 the 64 KiB are WINDOW_COUNT pages from WINDOW_FIRST.
+  boot_display_frame = VM_AARCH64 ? WINDOW_FIRST : next_slot - 1;
   boot_stage(0);
 #endif
   const struct archive *factory = (const void *)builtin_catalog;
@@ -827,11 +832,51 @@ static seL4_CPtr spare_ram(unsigned type, unsigned bits) {
   return spare_ram_in(type, bits, true);
 }
 #ifdef VIOLET_MOTO
+#if VM_AARCH64
+// 1 MiB is no frame size on AArch64: a section is 256 pages in consecutive
+// slots, all made from one 1 MiB untyped.
+enum { SECTION_PAGES = 256 };
+static seL4_CPtr section_pages(seL4_CPtr untyped) {
+  if (boot->empty.end - next_slot < SECTION_PAGES) stop();
+  seL4_CPtr first = next_slot;
+  check(seL4_Untyped_Retype(untyped, seL4_ARM_SmallPageObject, 0, seL4_CapInitThreadCNode, 0, 0, next_slot, SECTION_PAGES));
+  next_slot += SECTION_PAGES;
+  return first;
+}
+// Map a section's pages at `va`: copies of them when `copy` (the originals stay where they are).
+static void map_section(seL4_CPtr first, struct task *t, seL4_Word va, seL4_CapRights_t rights,
+                        seL4_ARM_VMAttributes attrs, bool copy) {
+  for (unsigned k = 0; k < SECTION_PAGES; k++) {
+    seL4_CPtr frame = first + k;
+    if (copy) {
+      frame = next_slot++;
+      check(seL4_CNode_Copy(seL4_CapInitThreadCNode, frame, SEL4_DEPTH, seL4_CapInitThreadCNode, first + k, SEL4_DEPTH,
+                            seL4_AllRights));
+    }
+    // Never executable, whatever the caller asks (runtime/open/tests/test_page_rights.py).
+    check(seL4_ARM_Page_Map(frame, t->pd, va + (seL4_Word)k * PAGE, rights, attrs | seL4_ARM_ExecuteNever));
+  }
+}
+#endif
 // A 1 MiB section from a spare untyped of exactly that size first (several
 // are left around the reserved windows), so neither the shared untyped (8 MiB
 // on the handset, which the supervisor allocates from to the end) nor a larger
 // spare one the Open Runtime asks for is cut into.
 static seL4_CPtr spare_section(void) {
+#if VM_AARCH64
+  for (unsigned i = 0; i < boot->untyped.end - boot->untyped.start; i++) {
+    seL4_CPtr u = boot->untyped.start + i;
+    if (boot->untypedList[i].isDevice || u == ram || boot->untypedList[i].sizeBits != 20) continue;
+    if (boot->empty.end - next_slot < SECTION_PAGES) stop();
+    if (!seL4_Untyped_Retype(u, seL4_ARM_SmallPageObject, 0, seL4_CapInitThreadCNode, 0, 0, next_slot, SECTION_PAGES)) {
+      seL4_CPtr first = next_slot;
+      next_slot += SECTION_PAGES;
+      return first;
+    }
+  }
+  seL4_CPtr untyped = spare_ram(seL4_UntypedObject, 20);
+  return section_pages(untyped ? untyped : allocate(ram, seL4_UntypedObject, 20));
+#else
   for (unsigned i = 0; i < boot->untyped.end - boot->untyped.start; i++) {
     seL4_CPtr u = boot->untyped.start + i;
     if (boot->untypedList[i].isDevice || u == ram || boot->untypedList[i].sizeBits != 20) continue;
@@ -841,10 +886,14 @@ static seL4_CPtr spare_section(void) {
   }
   seL4_CPtr section = spare_ram(seL4_ARM_SectionObject, 20);
   return section ? section : create(ram, seL4_ARM_SectionObject);
+#endif
 }
 #endif
 // How far Open Runtime setup got, and the root CNode's use, for the boot harness.
 volatile unsigned open_setup[4], open_fault[6];
+#if VM_AARCH64
+volatile unsigned last_fault[6];
+#endif
 static void give_open(unsigned slot, seL4_CPtr cap) {
   check(seL4_CNode_Copy(procs[OPEN_RT].task.caps, slot, OPEN_BITS, seL4_CapInitThreadCNode, cap, SEL4_DEPTH,
                         seL4_AllRights));
@@ -958,6 +1007,11 @@ static void open_runtime(void) {
   ((volatile unsigned *)0x09202000)[51] = ((volatile unsigned *)0x09f00000)[0xfffe0 / 4];
   ((volatile unsigned *)0x09202000)[52] = ((volatile unsigned *)0x09f00000)[0xfffdc / 4];
   ((volatile unsigned *)0x09202000)[53] = ((volatile unsigned *)0x09f00000)[0xfffd8 / 4];
+  // The AArch64 loader's "EL" word: the level LK entered at (word 54, USB request 0x59).
+  ((volatile unsigned *)0x09202000)[54] = VM_AARCH64 ? ((volatile unsigned *)0x09f00000)[0xfffd0 / 4] : 0;
+  // And why it could not open the boot history, if it could not (words 61-64).
+  for (unsigned i = 0; i < 4; i++)
+    ((volatile unsigned *)0x09202000)[61 + i] = VM_AARCH64 ? ((volatile unsigned *)0x09f00000)[0xfffc0 / 4 + i] : 0;
 #endif
   if (((volatile unsigned *)0x09f00000)[0xfffec / 4] == 0x4e45504f) {
     open_setup[0] = 4;
@@ -978,7 +1032,8 @@ static void open_runtime(void) {
   static const unsigned net_mapped[6] = {0, 0, 0, 0, 0, 0xd0000};
   for (unsigned off = 0; off < 0xd0000;) {
     if (off == 0x40000) off = 0x43000;
-    unsigned large = off >= 0x10000 && !(off & 0xffff);
+    // (AArch64 has no 64 KiB frame, its large page is 2 MiB: pages throughout.)
+    unsigned large = !VM_AARCH64 && off >= 0x10000 && !(off & 0xffff);
     unsigned frame = create(ram, large ? seL4_ARM_LargePageObject : seL4_ARM_SmallPageObject);
     if (!off) fill_frame(frame, (const unsigned char *)net_mapped, sizeof net_mapped);
     map_shared(frame, &procs[RADIO].task, 0x0b000000 + off, seL4_AllRights);
@@ -1039,6 +1094,9 @@ static void camera_frames(void) {
   for (unsigned off = 0; off < 0x400000; off += 0x100000) {
     seL4_CPtr frame;
 #ifdef VIOLET_MOTO
+    // Camera keeps its four sections in slots 8-11 for cache maintenance;
+    // on AArch64 a section is 256 pages, which it does not handle yet.
+    if (VM_AARCH64) return;
     if (((volatile unsigned *)0x09f00000)[0xfffd4 / 4] != 0x4d4d4143) return;
     device(CAMERA, 0xe0000000 + off, 0x0b000000 + off, 20);
     frame = next_slot - 1;
@@ -1129,16 +1187,26 @@ static void wire(void) {
   // the inbox is, from spare untypeds (spare_section).
   for (unsigned i = 0; i < 2; i++) {
     catalog_candidate_frame[i] = spare_section();
+#if VM_AARCH64
+    map_section(catalog_candidate_frame[i], &bootstrap, 0x0d400000 + i * 0x100000, seL4_AllRights,
+                seL4_ARM_Default_VMAttributes|seL4_ARM_ExecuteNever, false);
+#else
     check(seL4_ARM_Page_Map(catalog_candidate_frame[i], bootstrap.pd, 0x0d400000 + i * 0x100000, seL4_AllRights,
                             seL4_ARM_Default_VMAttributes|seL4_ARM_ExecuteNever));
+#endif
   }
   new_catalog = (void *)0x0d400000;
   if (!generation) volume_bank = *(volatile unsigned *)0x0d1ffffc;
   source = volume_bank>=1 && volume_bank<=2 && parse(local_catalog,CATALOG_LIMIT) ? 3 : 0;
   if (!source) volume_bank=0;
+#if VM_AARCH64
+  map_section(section_pages(allocate(ram, seL4_UntypedObject, 20)), &bootstrap, 0x0d200000, seL4_AllRights,
+              seL4_ARM_Default_VMAttributes|seL4_ARM_ExecuteNever, false);
+#else
   unsigned upload_frame = create(ram,seL4_ARM_SectionObject);
   check(seL4_ARM_Page_Map(upload_frame,bootstrap.pd,0x0d200000,seL4_AllRights,
                           seL4_ARM_Default_VMAttributes|seL4_ARM_ExecuteNever));
+#endif
   inbox = (const void *)0x0d200000;
   upload_size = uploaded = 0;
   package_authorized = signature_started = false;
@@ -1267,11 +1335,16 @@ static void wire(void) {
 #else
   boot_stage(1);
   for (unsigned i = 0; i < 2; i++) {
+#if VM_AARCH64
+    map_section(catalog_candidate_frame[i], &procs[STORAGE].task, 0x0d100000 + i * 0x100000, seL4_CanRead,
+                seL4_ARM_ExecuteNever, true);
+#else
     unsigned copy_catalog=next_slot++;
     check(seL4_CNode_Copy(seL4_CapInitThreadCNode,copy_catalog,SEL4_DEPTH,seL4_CapInitThreadCNode,
                           catalog_candidate_frame[i],SEL4_DEPTH,seL4_CanRead));
     check(seL4_ARM_Page_Map(copy_catalog,procs[STORAGE].task.pd,0x0d100000 + i * 0x100000,seL4_CanRead,
                             seL4_ARM_ExecuteNever));
+#endif
   }
   if (usb_factory_only) procs[USB_DIAG].package = factory_usb;
   if (usb_trial_bytes) {
@@ -1329,7 +1402,7 @@ static void wire(void) {
   device(TOUCH, 0x10002000, 0x09004000, 12);
   board_device(TOUCH, 0x10005000, 0x09002000, 0x09702000);
   device(0, 0x10006000, 0x09700000, 12);
-  unsigned spm_frame = next_slot - 1;
+  unsigned spm_frame = LAST_FRAME;
   ensure_table(&procs[RADIO].task, 0x09000000);
   unsigned spm_copy = next_slot++;
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode, spm_copy, SEL4_DEPTH, seL4_CapInitThreadCNode,
@@ -1409,15 +1482,19 @@ static void wire(void) {
     map_device(0x42000000 + off, 0x09800000 + off, 20);
   for (unsigned off = 0; off < 0x200000; off += 0x100000)
     map_device_rights(0x43e00000 + off, 0x09400000 + off, 20, seL4_CanRead);
-  unsigned policy_cap=next_slot++;
+  // The loader's handoff words sit in the last page of 0x43f00000-0x44000000,
+  // read at 0x09ffffxx: the whole section on AArch32, its last page (the
+  // last frame made) on AArch64, at the same address.
+  enum { HANDOFF_VA = VM_AARCH64 ? 0x09fff000 : 0x09f00000 };
+  unsigned handoff_frame=LAST_FRAME, policy_cap=next_slot++;
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode,policy_cap,SEL4_DEPTH,seL4_CapInitThreadCNode,
-                        policy_cap-1,SEL4_DEPTH,seL4_CanRead));
-  check(seL4_ARM_Page_Map(policy_cap,bootstrap.pd,0x09f00000,seL4_CanRead,seL4_ARM_ExecuteNever));
+                        handoff_frame,SEL4_DEPTH,seL4_CanRead));
+  check(seL4_ARM_Page_Map(policy_cap,bootstrap.pd,HANDOFF_VA,seL4_CanRead,seL4_ARM_ExecuteNever));
   // Touch reads the loader's panel word at 0x43fffff0 to pick its firmware.
   unsigned touch_boot=next_slot++;
   check(seL4_CNode_Copy(seL4_CapInitThreadCNode,touch_boot,SEL4_DEPTH,seL4_CapInitThreadCNode,
                         policy_cap,SEL4_DEPTH,seL4_CanRead));
-  check(seL4_ARM_Page_Map(touch_boot,procs[TOUCH].task.pd,0x09f00000,seL4_CanRead,seL4_ARM_ExecuteNever));
+  check(seL4_ARM_Page_Map(touch_boot,procs[TOUCH].task.pd,HANDOFF_VA,seL4_CanRead,seL4_ARM_ExecuteNever));
 #endif
   workers();
 #ifdef VIOLET_MOTO
@@ -1435,11 +1512,13 @@ static void wire(void) {
 #ifdef VIOLET_MOTO
   struct task *display = &procs[DISPLAY].task;
   ensure_table(display, 0x08000000);
-  unsigned copy = next_slot++;
-  check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, SEL4_DEPTH, seL4_CapInitThreadCNode,
-                        boot_display_frame, SEL4_DEPTH, seL4_AllRights));
-  check(seL4_ARM_Page_Map(copy, display->pd, 0x08000000, seL4_AllRights, seL4_ARM_ExecuteNever));
-  share_scanout_with_open(boot_display_frame, 0x08000000);
+  for (unsigned k = 0; k < 65536 / VM_64K_STEP; k++) {
+    unsigned copy = next_slot++;
+    check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, SEL4_DEPTH, seL4_CapInitThreadCNode,
+                          boot_display_frame + k, SEL4_DEPTH, seL4_AllRights));
+    check(seL4_ARM_Page_Map(copy, display->pd, 0x08000000 + k * VM_64K_STEP, seL4_AllRights, seL4_ARM_ExecuteNever));
+    share_scanout_with_open(boot_display_frame + k, 0x08000000 + k * VM_64K_STEP);
+  }
   first = 65536;
 #endif
   for (unsigned off = first; off < 720 * 1600 * 4; off += 65536) {
@@ -1538,7 +1617,7 @@ static struct conn_backup conn_saved;
 static volatile unsigned wifi_memory_policy;
 static bool wifi_memory_prepared;
 static volatile unsigned wifi_memory_checks;
-// The Ellis AArch32 kernel installs its board-only cap in the reserved SMC
+// The Ellis kernel extension (AArch32 and AArch64) installs its board-only cap in the reserved SMC
 // slot. No child owns this cap. The kernel makes only the four fixed monitor
 // calls of wifi/table.h; the window policy (wifi/windows.h) runs here.
 static int ellis_smc(unsigned label, unsigned length, unsigned a, unsigned b, unsigned reply[4]) {
@@ -2047,6 +2126,17 @@ void root_main(seL4_BootInfo *bi) {
         continue;
       }
       if (badge >= 16) {
+#if VM_AARCH64
+        // The last fault: who, the fault's label and its first message words
+        // (on AArch64 a VM fault is pc, address, prefetch, status).
+        last_fault[0] = (unsigned)badge - 16;
+        last_fault[1] = seL4_MessageInfo_get_label(msg);
+        for (unsigned i = 0; i < 4; i++) last_fault[2 + i] = (unsigned)seL4_GetMR(i);
+#ifdef VIOLET_MOTO
+        // For USB Diagnostics (request 0x59, "VAR1"), words 55-60.
+        for (unsigned i = 0; i < 6; i++) ((volatile unsigned *)0x09202000)[55 + i] = last_fault[i];
+#endif
+#endif
 #ifdef VIOLET_TEST_ISOLATION
         if (seL4_MessageInfo_get_label(msg) == seL4_Fault_VMFault &&
             seL4_GetMR(1) == report[0])

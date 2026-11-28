@@ -27,6 +27,15 @@ fn interrupted_boot_recovered_after_reopening_disk() {
     assert_eq!(checkpoint(1,512),Ok(2));
     assert_eq!(checkpoint(4,512),Ok(2));
     assert_eq!(checkpoint(1,512),Ok(4));
+    // The AArch64 loader's stages: its first keeps the last stage before it,
+    // and the next boot (either loader) reports how far it got.
+    assert_eq!(checkpoint(21,512),Ok(1));
+    assert_eq!(checkpoint(22,512),Ok(1));
+    assert_eq!(checkpoint(23,512),Ok(1));
+    assert_eq!(checkpoint(5,512),Ok(1));
+    assert_eq!(checkpoint(1,512),Ok(5));
+    assert_eq!(checkpoint(7,512),Err(()));
+    assert_eq!(checkpoint(20,512),Err(()));
     std::fs::remove_file(path).unwrap();
 }
 #[test]

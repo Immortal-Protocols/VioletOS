@@ -33,6 +33,7 @@ The look is dark layered paper with cream icons pressed into it ([paper.rs](apps
 | `make test-locomo` | Generates a Cool Jazz track in the signed Locomo Music release, transfers it over the paired connection and checks audio in QEMU. See [Locomo Music](companion/mac/README.md#locomo-music). |
 | `make test-ladybird` | Drives the Ladybird browser by touch: links, a linked style sheet, Back, scrolling and a typed address against a local web server, and HTTPS when the Mac is online. |
 | `make` or `make moto` | The handset image at `build/sel4/moto/boot.img`. This command builds locally; installing it is a separate step (see [Handset](#handset)). |
+| `make moto64` | The handset image in AArch64 at `build/sel4/moto-aarch64/boot.img` (same factory inputs; see [AArch64 on the handset](targets/moto-g-pure/README.md#aarch64-boot-path)). |
 | `make moto-debug` | Reads handset status over USB. See [USB Diagnostics](services/usb-diagnostics/README.md). |
 | `make bitchat-peer` | A Mac bitchat peer for testing the handset's [bitchat](apps/open/bitchat/README.md) app over Bluetooth. |
 
@@ -181,13 +182,13 @@ For example, change a label in `apps/open/settings/src/pages.rs` to update both 
 
 Open apps keep files in `/data`, which the Open Runtime writes back to Storage and loads on the next boot: Settings' saved networks and Phone Internet code, the shared settings, and so on. QEMU keeps them on a 1 MiB raw disk in `build/sel4/qemu`; the handset uses the same code with an MSDC0 block driver (see the [handset storage layout](targets/moto-g-pure/README.md#handset-storage)). Apps Violet Agent installs live in their own extent of the disk and survive restarts too.
 
-### AArch64 (QEMU only, not the default)
+### AArch64 (QEMU and the handset, not the default)
 
 Everything above is AArch32, and AArch32 stays the default for every build and test. On QEMU `virt` (Cortex-A53) the real system also runs as AArch64: the same pinned seL4 built as a 64-bit kernel, the Supervisor, the Rust and C services, Storage's `/data`, the Sentinel and the Open Runtime with its policy and Shield, and Home, Settings, Music and Ladybird as 64-bit Linux programs. Build and check it with `make qemu64 QEMU64_STACK=1` (see [targets/qemu64](targets/qemu64/README.md) for the layer table and each check); `python3 targets/qemu/test_ladybird.py --arch aarch64` drives the browser. CI and `make test-local` do not build or boot it.
 
 What is not there on AArch64: verified boot (the entry stub checks no manifest; package signatures are still checked), a user timer (the kernel does not export the EL0 physical timer, so the timekeeper is off and the Open Runtime polls), fork without `CLONE_VM` (vfork, posix_spawn and threads work), the 47-bit address layout (apps are placed below 4 GiB with the AArch32 layout's randomization), a few calls whose structures are not converted, an end-to-end check of the trusted UI's lock, and the W^X, policy and C/Go ABI probes `make test-system` runs on AArch32. `test_system.py --arch aarch64` prints the first two as absent layers, never as passes.
 
-The handset stays AArch32: its bootloader starts every kernel in AArch32, an arm64 Image included ([measured](targets/moto-g-pure/README.md#aarch64-boot-path)), and the Supervisor's handset build stops at an `#error` on AArch64.
+The handset runs it too: `make moto64` builds a boot image whose header asks MediaTek's LK for a 64-bit kernel, with a 64-bit loader ([loader64.S](boot/loader/loader64.S) and the shared [loader.c](boot/loader/loader.c)), the AArch64 kernel built for the handset, and the handset's Supervisor, services (display, touch, eMMC storage, power, USB Diagnostics, Radio with Wi-Fi), Sentinel, Open Runtime and open apps for AArch64. On the XT2163DL it boots in about 8 s to the Open Runtime's screen (Home, behind the lock screen when a passcode is saved), answers on USB Diagnostics, keeps the saved `/data`, scans Wi-Fi and fetches a UUID over verified HTTPS ([the record](targets/moto-g-pure/README.md#aarch64-boot-path)). Not there on the handset in AArch64: Camera, and the user timer (as on QEMU). AArch32 stays the default handset build.
 
 ## Handset
 

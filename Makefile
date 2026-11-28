@@ -7,6 +7,11 @@ moto: setup
 	$(PYTHON) tools/build_sel4.py moto
 qemu-image: setup
 	$(PYTHON) tools/build_sel4.py qemu
+# The handset in AArch64 (targets/moto-g-pure/build64.py, README "AArch64 boot
+# path"): build/sel4/moto-aarch64/boot.img for boot_b. Local only, like moto.
+.PHONY: moto64
+moto64: setup
+	$(PYTHON) tools/build_sel4.py moto-aarch64
 # The AArch64 bring-up image (targets/qemu64/README.md). Local only: CI neither builds nor boots it.
 # QEMU64_STACK=1 also builds the VioletOS system for AArch64 (targets/qemu64/stack.py,
 # build/sel4/qemu-aarch64) and `make qemu64` then checks the layers it reaches
@@ -215,6 +220,9 @@ test-unit:
 	@mkdir -p build/tests/bootchain
 	HOST_RUSTC="$(HOST_RUSTC)" boot/loader/test_verified.sh
 	python3 tools/test_phone_image.py
+	@# The boot history's stages, the AArch64 loader's 21-23 included (a second).
+	"$(HOST_RUSTC)" --edition=2021 --test targets/moto-g-pure/test_history.rs -o build/tests/test-history
+	build/tests/test-history
 	$(CC) -std=gnu11 -O1 -Wall -Wextra -Werror targets/moto-g-pure/test_ellis_smc.c targets/moto-g-pure/test_ellis_reference.c -o build/tests/bootchain/ellis-smc
 	build/tests/bootchain/ellis-smc
 	$(CC) -std=c11 -Wall -Wextra -Werror targets/moto-g-pure/test_radio_memory.c -o build/tests/bootchain/radio-memory

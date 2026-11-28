@@ -83,7 +83,7 @@ Security differences from AArch32, written by `stack.py` to `differences.json` a
 - Randomness: before the first program, the bootstrap task seeds the Open Runtime's HMAC_DRBG ([runtime/open/entropy.rs](../../runtime/open/entropy.rs), with Storage's SHA-256) from timer jitter, credited as conservatively as the Open Runtime does. Each program then gets its own 16 AT_RANDOM bytes (musl's stack-protector canary and pointer guard), a stack top at a random page in the 128 MiB below 2 GiB, and anonymous mappings from a random page in a 1 GiB window. Unseeded: no program starts. Static programs (ET_EXEC) still load at their link address; there is no hardware entropy source on this machine model, so the seed is only as good as the jitter.
 - A program's only capability is a badged endpoint through which the kernel delivers its faults; with a native `svc #1` it can send its own messages there. The bootstrap task trusts the fault label of what arrives; a real runtime must not.
 - Executable pages are cache-synchronised (`seL4_ARM_Page_Unify_Instruction`) after loading, when made executable by mprotect, and when mapped executable. Plain QEMU does not model caches, so the boot test cannot show this is needed or sufficient; it is unverified on hardware.
-- No device tree is passed to the kernel, and no handset image exists: the handset's loader, its secure-monitor kernel extension and its drivers are 32-bit only.
+- No device tree is passed to the kernel. The handset has its own AArch64 image now (`make moto64`, [targets/moto-g-pure](../moto-g-pure/README.md#aarch64-boot-path)): it reuses this target's boot page tables and the same kernel source built for the handset, with a 64-bit loader of its own.
 
 ## Tests
 

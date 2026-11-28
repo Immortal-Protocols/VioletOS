@@ -192,18 +192,11 @@ if variant=="moto":
     assert hashlib.sha256(stock).hexdigest()=="36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a"
     # The bootloader loads the ramdisk; VioletOS's loader copies it to the open apps' window.
     image=rebuild_v2(stock,(out/"initfs.cpio").read_bytes(),kernel=z)
-    # Only the 1 MiB after this explicit slot-B marker belongs to the filesystem.
-    marker_offset=16*1024**2
-    if len(image)>marker_offset:raise ValueError("boot payload overlaps the storage window")
-    marker=b"VioletOS XT2163DL boot_b storage v1\n".ljust(512,b"\0")
-    image=image.ljust(marker_offset,b"\0")+marker+bytes(1024**2)
-    image += b"VioletOS boot history v1\n".ljust(512,b"\0") + bytes(1024)
-    # Two catalog banks (catalog_volume.rs BANK sectors each, 1.25 MiB of
-    # catalog), all before the installed apps' extent at 20 MiB.
+    # The storage marker, volume, boot history and catalog banks (1.25 MiB of
+    # catalog each) after it, as the AArch64 build lays them out too.
+    from phone_image import handset_storage
     import package_format
-    banks = 2 * (1 + package_format.HANDSET_LIMIT // 512)
-    image += b"VioletOS catalog banks v1\n".ljust(512,b"\0") + bytes(banks*512)
-    if len(image) > 20*1024**2:raise ValueError("catalog banks overlap the installed apps (storage_volume.rs APPS)")
+    image=handset_storage(image, package_format.HANDSET_LIMIT)
     (out/"boot.img").write_bytes(image)
     page, = struct.unpack_from("<I", stock, 36)
     assert image[page:page+len(z)]==z

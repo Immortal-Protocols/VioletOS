@@ -18,6 +18,19 @@ pub extern "C" fn record_boot_stage(stage: u8) -> u32 {
         None => u32::MAX,
     }
 }
+/// Why the boot history could not be opened ("OK" if it could): up to 16
+/// bytes of emmc.rs's reason into `out`. The AArch64 loader leaves it for USB.
+#[cfg(loader_trace)]
+#[no_mangle]
+pub extern "C" fn boot_disk_status(out: *mut u8) {
+    let why: &[u8] = match emmc::Disk::open_checked() {
+        Ok(_) => b"OK",
+        Err(why) => why,
+    };
+    for i in 0..16 {
+        unsafe { out.add(i).write_volatile(*why.get(i).unwrap_or(&0)) };
+    }
+}
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe { core::arch::asm!("udf #1", options(noreturn)) }

@@ -172,6 +172,8 @@ These came before the waves, or are host-only, and stay as separate local target
 
 ## The AArch64 build (`--arch aarch64`)
 
+The AArch64 handset build (`make moto64`) has one QEMU check, in the existing handset script: `python3 targets/moto-g-pure/test_boot.py --arch aarch64` (local, about 5 s: the 64-bit loader entered at EL2, the supervisor's four stages, Home, Radio's memory IPC). Its host side is in `make test-unit`: `tools/test_phone_image.py` (the 64-bit boot header and storage layout), `targets/moto-g-pure/test_history.rs` (stages 21-23), `kernel/sel4/aarch64/test_delta64.py` (the Wi-Fi extension and handset options in the manifest) and the board check (the handset kernels' timer).
+
 No QEMU assertion moved or was dropped for the AArch64 port: the AArch32 rows above are unchanged, and `make test-system`, `make test-ci` and `make test-local` still boot only the AArch32 image. The AArch64 system has its checks in the same scripts, run by `make qemu64 QEMU64_STACK=1` and by hand, outside the loop and CI ([targets/qemu64](../targets/qemu64/README.md#the-violetos-system-on-aarch64)): `test_system.py --arch aarch64` (one boot: the layers in order, then a 64-bit program's signal handlers and posix_spawn), `test_open_apps.py --arch aarch64` and `test_ladybird.py --arch aarch64`. The host side is in `make test-unit`: `runtime/arch/tests/host.rs` (`enter64`, `widen`, `memory_args`, `signal64`, `compat`), `runtime/open/tests/abi_host.rs` (AArch64 programs below 4 GiB or refused, sigreturn's alternate stack) and the integration scenario `an_aarch64_program_meets_the_same_policy_through_its_own_numbers` (through the shipped `enter64::translate` and `widen`).
 
 What `test_system.py` checks on AArch32 and has **no AArch64 counterpart yet**:

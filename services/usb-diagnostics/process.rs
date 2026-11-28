@@ -414,6 +414,19 @@ pub fn run() -> ! {
                 }
                 send(&out, len);
             }
+            // The architecture this VioletOS runs in (its word size), the level the
+            // AArch64 loader was entered at, and the supervisor's last fault record
+            // (who, label, four message words), then why the loader could not open the
+            // boot history (16 bytes of text): diagnostic words 54-64.
+            (0xc0, 0x59, 0, 0) => {
+                let mut out = [0; 52];
+                out[..4].copy_from_slice(b"VAR1");
+                out[4..8].copy_from_slice(&(usize::BITS).to_le_bytes());
+                for (i, dest) in out[8..].chunks_exact_mut(4).enumerate() {
+                    dest.copy_from_slice(&unsafe { (0x09202000 as *const u32).add(54 + i).read_volatile() }.to_le_bytes());
+                }
+                send(&out, len);
+            }
             (0xc0, 0x56, 0, 0) => {
                 let previous = unsafe { (0x09202040 as *const u32).read_volatile() };
                 let mut out = *b"VBH1....";

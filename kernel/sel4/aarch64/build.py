@@ -1,4 +1,5 @@
-"""Build the pinned seL4 as an AArch64 kernel for QEMU virt (the `qemu64` target).
+"""Build the pinned seL4 as an AArch64 kernel: for QEMU virt (the `qemu64`
+target), or with --target moto for the XT2163DL handset (targets/moto-g-pure/build64.py).
 
 The same upstream archive as the AArch32 kernels (../build.py), the same
 `ellis` device trees, a 64-bit platform file and one patch. Nothing here is
@@ -9,6 +10,8 @@ option, and the effective configuration (CMakeCache.txt) against the nearest
 verified one.
 
     python3 kernel/sel4/aarch64/build.py [--out DIR]   build kernel.elf and the libsel4 headers
+    python3 kernel/sel4/aarch64/build.py --target moto --stock BOOT.IMG [--out DIR]
+                                                       the handset kernel: the factory device tree, 13 MHz
     python3 kernel/sel4/aarch64/build.py --check       compare the repository with delta.json (host, no build)
     python3 kernel/sel4/aarch64/build.py --update      record the current source hashes
 """
@@ -98,8 +101,20 @@ def source_errors(manifest, repo=ROOT, script=None):
     return errors
 
 
-def prepare(src):
-    """Turn a pristine upstream tree into the AArch64 kernel tree. Idempotent."""
+def handset_tree(stock):
+    """The handset's base device tree: decompiled from the factory boot image, as the 32-bit build does."""
+    parent = _module("violet_kernel_build", HERE.parent / "build.py")
+    sys.path.insert(0, str(ROOT / "tools"))
+    from phone_image import factory_dtb
+    with __import__("tempfile").TemporaryDirectory() as scratch:
+        dtb = Path(scratch) / "base.dtb"
+        dtb.write_bytes(factory_dtb(Path(stock).read_bytes()))
+        return subprocess.check_output(["dtc", "-q", "-I", "dtb", "-O", "dts", dtb])
+
+
+def prepare(src, base=None):
+    """Turn a pristine upstream tree into the AArch64 kernel tree. Idempotent.
+    `base`: the handset's base device tree (handset_tree); QEMU's otherwise."""
     plat = src / "src/plat/ellis"
     plat.mkdir(exist_ok=True)
     subprocess.run([sys.executable, BOARD / "gic-single-core.py", src], check=True)
@@ -107,24 +122,47 @@ def prepare(src):
     parent.update(plat / "config.cmake", (HERE / "config.cmake").read_bytes())
     for name in ("kernel-overlay.dts", "moto-radio-memory.dts"):
         parent.update(plat / name, (BOARD / name).read_bytes())
-    parent.update(plat / "factory-base.dts", (BOARD / "qemu.dts").read_bytes())
+    parent.update(plat / "factory-base.dts", base if base is not None else (BOARD / "qemu.dts").read_bytes())
     constants = Path("sel4/plat/api/constants.h")
     headers = src / "libsel4/sel4_plat_include"
     (headers / "ellis" / constants).parent.mkdir(parents=True, exist_ok=True)
     parent.update(headers / "ellis" / constants, (headers / "imx8mm-evk" / constants).read_bytes())
-    patch = HERE / "linux-svc.patch"
-    if subprocess.run(["git", "apply", "--reverse", "--check", patch], cwd=src,
-                      stderr=subprocess.DEVNULL, env={**os.environ, "GIT_CEILING_DIRECTORIES": str(src.parent)}).returncode:
-        subprocess.run(["git", "apply", patch], cwd=src, check=True,
-                       env={**os.environ, "GIT_CEILING_DIRECTORIES": str(src.parent)})
+    # The Wi-Fi secure-monitor extension: the 32-bit kernel's operations
+    # (platform/sel4/board/wifi table.h, invoke.h) behind the same root cap in
+    # the seL4_CapSMC slot, with A64 stubs (monitor.S, assembled for the handset only).
+    wifi = plat / "wifi"
+    wifi.mkdir(exist_ok=True)
+    parent.update(wifi / "monitor.S", (HERE / "monitor.S").read_bytes())
+    includes = src / "include/arch/arm/arch/object/ellis_wifi"
+    includes.mkdir(parents=True, exist_ok=True)
+    for name in ("table.h", "invoke.h"):
+        parent.update(includes / name, (BOARD / "wifi" / name).read_bytes())
+    for patch in (HERE / "linux-svc.patch", HERE / "ellis-wifi.patch"):
+        if subprocess.run(["git", "apply", "--reverse", "--check", patch], cwd=src,
+                          stderr=subprocess.DEVNULL, env={**os.environ, "GIT_CEILING_DIRECTORIES": str(src.parent)}).returncode:
+            subprocess.run(["git", "apply", patch], cwd=src, check=True,
+                           env={**os.environ, "GIT_CEILING_DIRECTORIES": str(src.parent)})
 
 
-def enforce_tree(src, archive):
+def handset_base(stock, device_tree):
+    """The `derived` entry for the handset's base device tree, pinned through the factory image's SHA-256."""
+    manifest = load()
+    digest = hashlib.sha256(Path(stock).read_bytes()).hexdigest()
+    for path, entry in manifest["added"].items():
+        pin = entry.get("handset", {}).get("factory_boot_sha256")
+        if pin:
+            if digest != pin:
+                sys.exit(f"Kernel delta check failed: the factory boot image is not the one kernel/sel4/aarch64/delta.json pins for {path}")
+            return {path: hashlib.sha256(device_tree).hexdigest()}
+    sys.exit("Kernel delta check failed: kernel/sel4/aarch64/delta.json pins no factory boot image")
+
+
+def enforce_tree(src, archive, derived=None):
     manifest = load()
     if hashlib.sha256(archive.read_bytes()).hexdigest() != manifest["upstream"]["sha256"]:
         sys.exit(f"{archive} is not the upstream archive kernel/sel4/aarch64/delta.json pins")
     errors = source_errors(manifest) + delta.tree_errors(
-        manifest, delta.archive_hashes(archive), delta.tree_hashes(src), delta.expected_hashes(manifest, archive))
+        manifest, delta.archive_hashes(archive), delta.tree_hashes(src), delta.expected_hashes(manifest, archive, derived=derived))
     if errors:
         sys.exit("Kernel delta check failed (kernel/sel4/aarch64/delta.json):\n  " + "\n  ".join(errors)
                  + f"\n  (a stale tree? delete {src} and build again)")
@@ -147,8 +185,11 @@ def enforce_configuration(cache_text, archive):
         sys.exit("Kernel delta check failed (kernel/sel4/aarch64/delta.json):\n  " + "\n  ".join(errors))
 
 
-def build(out):
-    """Build into `out`; returns the CMake build directory (kernel.elf and libsel4 headers)."""
+def build(out, target="qemu", stock=None):
+    """Build into `out`; returns the CMake build directory (kernel.elf and libsel4 headers).
+    `target` "moto" builds the handset kernel from the factory boot image `stock`."""
+    if target not in ("qemu", "moto") or (target == "moto") != (stock is not None):
+        sys.exit("kernel/sel4/aarch64: target qemu, or moto with the factory boot image")
     parent = _module("violet_kernel_build", HERE.parent / "build.py")
     ndk = Path(os.environ.get("ANDROID_NDK_HOME", Path.home() / "Library/Android/sdk/ndk/28.2.13676358"))
     bins = list(ndk.glob("toolchains/llvm/prebuilt/*/bin/clang"))
@@ -165,8 +206,10 @@ def build(out):
         fcntl.flock(lock, fcntl.LOCK_EX)
         src = out / "upstream"
         parent.source(parent.KERNEL, src)
-        prepare(src)
-        enforce_tree(src, parent.BUILD / "downloads" / (parent.KERNEL[0] + ".tar.gz"))
+        base = handset_tree(stock) if target == "moto" else None
+        prepare(src, base)
+        enforce_tree(src, parent.BUILD / "downloads" / (parent.KERNEL[0] + ".tar.gz"),
+                     handset_base(stock, base) if target == "moto" else None)
         kernel = out / "kernel"
         subprocess.run([
             "cmake", "-GNinja", "-S", src, "-B", kernel, "-DCMAKE_TOOLCHAIN_FILE=" + str(src / "llvm.cmake"),
@@ -182,8 +225,11 @@ def build(out):
             # 2 MiB frames (AArch64 has no 64 KiB or 1 MiB pages), about 6000
             # capabilities on QEMU: a 2^16-slot root CNode (2 MiB) holds them.
             "-DKernelRootCNodeSizeBits=16",
-            # EL1 kernel: QEMU virt without virtualization starts there.
-            "-DKernelArmHypervisorSupport=OFF"], env=env, check=True)
+            # EL1 kernel: QEMU virt without virtualization starts there; on
+            # the handset the loader drops from EL2 to EL1 (boot/loader/loader64.S).
+            "-DKernelArmHypervisorSupport=OFF",
+            # The handset: the 13 MHz timer (src/plat/ellis/config.cmake).
+            "-DVioletHandsetBoard=" + ("ON" if target == "moto" else "OFF")], env=env, check=True)
         # The effective configuration, defaults included, differs from the
         # nearest verified one exactly as delta.json says.
         enforce_configuration((kernel / "CMakeCache.txt").read_text(), parent.BUILD / "downloads" / (parent.KERNEL[0] + ".tar.gz"))
@@ -192,17 +238,20 @@ def build(out):
                       "sel4_arch_include/aarch64/sel4/sel4_arch/invocation.h",
                       "sel4_arch_include/aarch64/sel4/sel4_arch/types_gen.h"]
         subprocess.run(["ninja", "-C", kernel, "kernel.elf", *["libsel4/" + f for f in generated]], env=env, check=True)
-        # No secure-monitor call anywhere in this kernel.
+        # Secure-monitor calls only in the handset's listed stubs; none on QEMU.
         listing = subprocess.check_output([bins[0].with_name("llvm-objdump"), "-d", kernel / "kernel.elf"], text=True)
-        sites = delta.smc_sites(listing)
+        allowed = set(load()["smc"]["functions"]) if target == "moto" else set()
+        sites = set(map(str, delta.smc_sites(listing))) - allowed
         if sites:
-            sys.exit("Kernel delta check failed: SMC instruction in " + ", ".join(sorted(map(str, sites))))
+            sys.exit("Kernel delta check failed: SMC instruction in " + ", ".join(sorted(sites)))
         return kernel
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", type=Path, default=ROOT / "build/sel4/qemu64")
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--target", choices=("qemu", "moto"), default="qemu")
+    parser.add_argument("--stock", type=Path, help="the XT2163DL factory boot.img (--target moto)")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--update", action="store_true")
     args = parser.parse_args()
@@ -218,7 +267,8 @@ def main():
             sys.exit("Kernel delta check failed (kernel/sel4/aarch64/delta.json):\n  " + "\n  ".join(errors))
         print("kernel/sel4/aarch64/delta.json matches the repository")
         return
-    print(build(args.out.resolve()))
+    out = args.out or ROOT / ("build/sel4/moto-aarch64" if args.target == "moto" else "build/sel4/qemu64")
+    print(build(out.resolve(), args.target, args.stock))
 
 
 if __name__ == "__main__":

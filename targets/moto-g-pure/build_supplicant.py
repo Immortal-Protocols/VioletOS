@@ -3,6 +3,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 
+
+def android_target(common):
+    """The NDK target whose libc headers these sources compile against, for the
+    architecture `common` builds (AArch32 unless it says aarch64)."""
+    if "--target=aarch64-none-elf" in map(str, common):
+        return "--target=aarch64-linux-android21"
+    return "--target=armv7a-linux-androideabi21"
+
 FILES = """
 rsn_supp/wpa rsn_supp/wpa_ie rsn_supp/pmksa_cache
 common/wpa_common common/ieee802_11_common utils/common utils/wpabuf
@@ -15,7 +23,7 @@ def objects(repo, out, common):
     src = repo / "build/sel4/wpa_supplicant-2.11/src"
     target = out / "wpa2"
     target.mkdir(exist_ok=True)
-    flags = [*common, "--target=armv7a-linux-androideabi21", "-I", src,
+    flags = [*common, android_target(common), "-I", src,
              "-I", src / "utils", "-Dos_snprintf=station_format_disabled", "-include", Path(__file__).with_name("supplicant_port.h"), "-DCONFIG_NO_STDOUT_DEBUG", "-DCONFIG_NO_RANDOM_POOL",
              "-DCONFIG_CRYPTO_INTERNAL", "-DCONFIG_NO_RC4", "-DCONFIG_INTERNAL_AES", "-DCONFIG_INTERNAL_SHA1", "-DCONFIG_INTERNAL_SHA256",
              "-DCONFIG_INTERNAL_MD5", "-DCONFIG_NO_WPA_MSG", "-DCONFIG_NO_WPA_TRACE"]

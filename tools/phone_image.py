@@ -85,6 +85,59 @@ def v2_payload_length(image):
     return cursor
 
 
+# MediaTek LK reads `bootopt=` in the command line; its last field is the
+# kernel's execution state. The stock image asks for 32-bit (64S3,32S1,32S1);
+# this asks for a 64-bit kernel at EL2, the layout 64-bit MediaTek phones ship
+# (targets/moto-g-pure/README.md, "AArch64 boot path": measured on the XT2163DL,
+# with an arm64 Image.gz at kernel_addr 0x40080000).
+AARCH64_BOOTOPT = b"64S3,32N2,64N2"
+AARCH64_KERNEL_ADDR = 0x40080000
+
+
+def set_bootopt(image, bootopt):
+    """The v2 image with its command line's bootopt= replaced (put first). The
+    header's id does not cover the command line, and LK does not check it."""
+    image = bytearray(image)
+    line = bytes(image[64:64 + 512]).split(b"\0")[0]
+    words = [w for w in line.split(b" ") if w and not w.startswith(b"bootopt=")]
+    line = b" ".join([b"bootopt=" + bootopt] + words)
+    if len(line) >= 512:
+        raise ValueError("command line too long")
+    image[64:64 + 512] = line + bytes(512 - len(line))
+    return bytes(image)
+
+
+def aarch64_v2(stock, ramdisk, image):
+    """A v2 boot image whose kernel LK starts in AArch64: `image` (an arm64
+    Image: "ARM\\x64" at 0x38) gzip-compressed, loaded at 0x40080000, with
+    the 64-bit bootopt. Everything else is the stock header's."""
+    if len(image) < 64 or image[0x38:0x3c] != b"ARM\x64":
+        raise ValueError("expected an arm64 Image")
+    import gzip
+    boot = bytearray(rebuild_v2(stock, ramdisk, kernel=gzip.compress(image, 9, mtime=0)))
+    struct.pack_into("<I", boot, 12, AARCH64_KERNEL_ADDR)
+    return set_bootopt(bytes(boot), AARCH64_BOOTOPT)
+
+
+def handset_storage(image, catalog_limit=0x140000):
+    """The rest of boot_b after the boot image (both handset builds): the
+    storage marker at 16 MiB, the 1 MiB volume, the boot history and the two
+    catalog banks (catalog_volume.rs BANK sectors each), all before the
+    installed apps' extent at 20 MiB (storage_volume.rs)."""
+    marker_offset = 16 * 1024 ** 2
+    if len(image) > marker_offset:
+        raise ValueError("boot payload overlaps the storage window")
+    # Only the 1 MiB after this explicit slot-B marker belongs to the filesystem.
+    marker = b"VioletOS XT2163DL boot_b storage v1\n".ljust(512, b"\0")
+    image = image.ljust(marker_offset, b"\0") + marker + bytes(1024 ** 2)
+    image += b"VioletOS boot history v1\n".ljust(512, b"\0") + bytes(1024)
+    banks = 2 * (1 + catalog_limit // 512)
+    image += b"VioletOS catalog banks v1\n".ljust(512, b"\0") + bytes(banks * 512)
+    if len(image) > 20 * 1024 ** 2:
+        raise ValueError("catalog banks overlap the installed apps (storage_volume.rs APPS)")
+    return image
+
+
 def factory_dtb(stock):
     """Extract the single MT6765 base tree from the pinned Motorola image."""
     if hashlib.sha256(stock).hexdigest() != "36adc5df15662da6140e14b81dbd2de4b0701164c2198f99608bee710d4dac0a":
