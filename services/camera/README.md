@@ -22,7 +22,7 @@ On the handset Camera has no direct access to the PMIC, the shared clocks or the
 
 - **The supervisor** (`camera_platform`) switches the CAM power domain (with its bus protection and SMI clamp), the `seninf_sel`, `camtm_sel` and `camtg_sel` clocks, the camera's MM bus bridge (`mm_smi_cam_ck`), the MIPI 26 MHz gates, I2C2's clocks and pins, MCLK0 and the sensor's AVDD, reset and torch pins.
 - **Power** switches the MT6357 camera LDOs and nothing else: VCAMIO (1.8 V), VCAMD (1.1 V for the Hi-1336) and VCAMA, with the last two's voltage selectors.
-- **Mapped into Camera:** camsys (clock gates), SMI larb3, the four sensor interfaces, CAMSV1, the six MIPI receiver halves and I2C2. Camera also holds the frame window's four 1 MiB section capabilities, to invalidate each slot's cache lines once CAMSV has written it.
+- **Mapped into Camera:** camsys (clock gates), SMI larb3, the four sensor interfaces, CAMSV1, the six MIPI receiver halves and I2C2. Camera also holds the frame window's frame capabilities (from its slot 8), to invalidate each slot's cache lines once CAMSV has written it: four 1 MiB sections on AArch32, two 2 MiB frames on AArch64, which has no 1 MiB frame (`camera_frames` in the supervisor, `FRAME_BITS` in the backend).
 
 The Hi-1336's register tables come from Motorola's GPL kernel. The build downloads the pinned file, checks its SHA-256 and turns the tables into a Rust module ([tools/sensor_tables.py](../../tools/sensor_tables.py)), so they are not kept in this repository. Without them Camera reports error 2.
 

@@ -50,6 +50,42 @@ class Manifest(unittest.TestCase):
         self.assertEqual(code, ["tst     x25, #0xffff", "b.ne    1f", "mov     x2, x8", "lsr     x9, x8, #31", "cbz     x9, 2f",
                                 "mov     x2, #0x10000", "2:", "b       c_handle_syscall", "1:"])
 
+    def test_the_timer_patch_gives_the_physical_timer_to_flagged_threads_only(self):
+        # ellis-timer.patch: CNTKCTL_EL1.EL0PTEN follows the running thread's
+        # seL4_TCBFlag_ellisTimer on every switch (the slow path and the IPC
+        # fastpath), the root task starts with it, and only a thread that has
+        # it may change it. The kernel's own tick is the virtual timer.
+        patch = (HERE / "ellis-timer.patch").read_text()
+        self.assertEqual(build.delta.patch_targets(patch), [
+            "include/arch/arm/arch/64/mode/fastpath/fastpath.h", "libsel4/include/sel4/constants.h",
+            "src/arch/arm/64/kernel/thread.c", "src/kernel/boot.c", "src/object/tcb.c"])
+        self.assertNotIn("-", [l[0] for l in patch.splitlines() if l and not l.startswith("---")])
+        files = {}
+        for chunk in patch.split("--- a/")[1:]:
+            name = chunk.split("\n", 1)[0]
+            files[name] = [l[1:] for l in chunk.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        calls = {name: sum("ellisTimerAccess(" in l for l in lines) for name, lines in files.items()}
+        self.assertEqual(calls, {"include/arch/arm/arch/64/mode/fastpath/fastpath.h": 1, "libsel4/include/sel4/constants.h": 0,
+                                 "src/arch/arm/64/kernel/thread.c": 1, "src/kernel/boot.c": 1, "src/object/tcb.c": 1})
+        # Every added line outside comments is inside CONFIG_ELLIS_TIMER_GRANT, except the flag's own value.
+        self.assertIn("seL4_TCBFlag_ellisTimer = 0x2,", [l.strip() for l in files["libsel4/include/sel4/constants.h"]])
+        self.assertIn("tcb->tcbFlags |= seL4_TCBFlag_ellisTimer;", [l.strip() for l in files["src/kernel/boot.c"]])
+        tcb = "\n".join(files["src/object/tcb.c"])
+        self.assertIn("!(NODE_STATE(ksCurThread)->tcbFlags & seL4_TCBFlag_ellisTimer)", tcb)
+        self.assertIn("seL4_IllegalOperation", tcb)
+        header = (HERE / "ellis_timer.h").read_text()
+        code = [l for l in header.splitlines() if "MSR(" in l or "MRS(" in l]
+        self.assertEqual([l.strip() for l in code], ['MRS("CNTKCTL_EL1", was);', 'MSR("CNTKCTL_EL1", want);'])
+        self.assertIn("#define ELLIS_CNTKCTL_EL0PTEN BIT(9)", header)
+        self.assertNotIn("MSR(", patch)
+        self.assertIn("config_set(KernelEllisTimerGrant ELLIS_TIMER_GRANT ON)", (HERE / "config.cmake").read_text())
+        archive = HERE.parents[2] / "build/sel4/downloads/seL4-17.0.0.tar.gz"
+        if archive.is_file():
+            text = build.delta.archive_texts(archive, ["include/arch/arm/arch/64/mode/machine.h"])[0]
+            # Without hypervisor support the kernel's tick is CNTV (PPI 27), never CNTP.
+            self.assertIn('#define CNT_TVAL "cntv_tval_el0"', text)
+            self.assertNotIn("cntp_", text)
+
     def test_a_changed_source_patch_or_option_is_reported(self):
         manifest = build.load()
         with tempfile.TemporaryDirectory() as directory:

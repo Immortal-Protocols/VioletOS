@@ -28,7 +28,7 @@ The table this section held measured, by compiling alone, how far the 32-bit sou
 | Layer | On AArch64 |
 | --- | --- |
 | Component crates, Power, `runtime/transport.c`, the C shims | Built and run. The counter reads (`transport.c` `ticks`, Power) use the system registers on AArch64. |
-| `system/supervisor/supervisor.c` with `platform/sel4/board/memory.h` and `platform/sel4/include/vm.h` | Built and run as the root task on QEMU and on the handset (entered at `platform/sel4/loader/root64.S`; the handset's build is `targets/moto-g-pure/build64.py`, `make moto64`). On the handset a 1 MiB window is 256 pages and Camera is left out ([targets/moto-g-pure](../../targets/moto-g-pure/README.md#aarch64-boot-path)). |
+| `system/supervisor/supervisor.c` with `platform/sel4/board/memory.h` and `platform/sel4/include/vm.h` | Built and run as the root task on QEMU and on the handset (entered at `platform/sel4/loader/root64.S`; the handset's build is `targets/moto-g-pure/build64.py`, `make moto64`). On the handset a 1 MiB window is 256 pages, and Camera's 4 MiB frame window is two 2 MiB frames ([targets/moto-g-pure](../../targets/moto-g-pure/README.md#aarch64-boot-path)). |
 | Open Runtime | Built and run; 64-bit programs go through `enter64`, `signal64` and `compat` into the one AArch32 dispatcher. Apps stay below 4 GiB, so its `u32` app addresses hold; `vma::Layout64` is not used yet. |
 
 What still holds: `seL4_ARM_LargePageObject` is 64 KiB on AArch32 and 2 MiB on AArch64, so on AArch64 `memory.h` maps each window as consecutive frames of the largest size its length and alignment allow (`frame_size`), never one 64 KiB frame, and every `u32` that holds an address is correct only while all mappings stay below 4 GiB (the board descriptions keep that rule).

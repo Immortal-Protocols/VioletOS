@@ -20,12 +20,10 @@ volume, the boot history and the two catalog banks. What differs:
   build's sources for VIOLET_ARCH=aarch64 (image/packages/build.py), and the
   open apps are aarch64 Linux programs (tools/build_initfs.py).
 
-Not in this image, and why: Camera (its four frame sections in slots 8-11 are
-AArch32 frames; supervisor.c skips it on AArch64), and anything needing the
-32-bit kernel's secure-monitor extension (Wi-Fi's memory windows and the
-random number call: refused, so Wi-Fi does not start). The user timer is off
-as on qemu64 (KernelArmExportPTMRUser=OFF): no timekeeper, the Open Runtime
-polls. --probe-stage N makes the loader set the RTC fast-boot flag and reset at
+Camera's 4 MiB frame window is two 2 MiB frames here (slots 8-9; four 1 MiB
+sections on AArch32). The timekeeper runs as on qemu64: the kernel gives the
+EL0 physical timer to the supervisor's threads only (kernel/sel4/aarch64
+ellis-timer.patch), so services and the Open Runtime sleep. --probe-stage N makes the loader set the RTC fast-boot flag and reset at
 its stage N (1 entered C, 2 handoff checked, 3 boot history open, 4 about to
 enter the kernel), for bring-up without a console.
 """
@@ -54,9 +52,9 @@ TRAMPOLINE = 0x43000000
 TABLES_PA = 0x43001000          # five pages of boot page tables
 ROOT_PA = 0x42800000            # kernel RAM 0x42700000-0x43c00000, clear of the loader image
 ROOT_BYTES = 0x200000           # the supervisor with its built-in catalog, then its stack
-# The handset's packages (platform/sel4/loader/build.py) less Camera.
+# The handset's packages (platform/sel4/loader/build.py).
 SELECTED = {"launcher", "runtime", "touch", "display", "storage", "power", "radio", "usb-diagnostics", "audio",
-            "open", "sentinel"}
+            "open", "camera", "sentinel"}
 
 sys.path.insert(0, str(REPO / "targets/board"))
 sys.path.insert(0, str(REPO / "image/packages"))

@@ -175,7 +175,13 @@ What the image is:
 | Kernel | [kernel/sel4/aarch64](../../kernel/sel4/aarch64/README.md) `--target moto`: the factory device tree (pinned by the factory image's hash), the 13 MHz timer, EL1, and the Wi-Fi secure-monitor extension with A64 stubs. |
 | Supervisor and packages | `supervisor.c` with `VIOLET_MOTO` for AArch64: 1 MiB windows are 256 pages, the handoff page is mapped where AArch32 has it, a window's frames are named by `WINDOW_FIRST` (a mapping may make page tables after them). Display, Touch, Storage (eMMC), Power, USB Diagnostics, Radio (Wi-Fi, lwIP, hostap, BearSSL), Audio, Runtime, the Sentinel and the Open Runtime for `aarch64-unknown-none`; the open apps for `aarch64-unknown-linux-musl`. |
 
-Not in the AArch64 handset image yet: **Camera** (it keeps its four frame sections in capability slots for cache maintenance; on AArch64 a section is 256 pages, which it does not handle, so the build leaves it out and the supervisor skips its frames) and **the user timer** (as on qemu64, `KernelArmExportPTMRUser=OFF`: no timekeeper, and the Open Runtime polls at a fixed priority, so the CPU never idles: `asleep 0%` in its log). The handset has no verified boot in either architecture (its bootloader is unlocked).
+Since November 28, 2026 the image also has **Camera** and **the user timer**, built and checked on QEMU but **not yet run on the handset** (see the session record below):
+
+- Camera's 4 MiB frame window (physical 0xe0000000, 0x0b000000 in Camera and, read-only, in the Open Runtime) is two 2 MiB frames, both addresses being 2 MiB aligned; Camera holds them in slots 8-9 and invalidates a slot's lines through them (`FRAME_BITS` 21 in [camera.rs](camera.rs); four 1 MiB sections in slots 8-11 on AArch32).
+- The timekeeper runs: the kernel enables the EL0 physical timer only while the supervisor's root thread or its timekeeper runs ([kernel/sel4/aarch64](../../kernel/sel4/aarch64/README.md#why-the-physical-timer-is-given-per-thread)), so services and the Open Runtime block instead of polling (on the 64-bit image without it the phone's open-log read about 21,700 loops/s at `asleep 0%`; on QEMU the same change took the Open Runtime from about 21,000 loops/s to 96 at `asleep 98%`). The loader already gives EL1 the physical timer (`CNTHCTL_EL2` = 3) before dropping from EL2.
+- When an image has no Camera, the supervisor now maps blank pages where USB Diagnostics reads Camera's status, requests and preview. Before, `moto-package camera-status` on the Camera-less 64-bit image faulted USB Diagnostics, which the supervisor then suspends for the rest of the boot (it happened on November 28; the phone stopped answering USB until it was restarted by hand).
+
+The handset has no verified boot in either architecture (its bootloader is unlocked).
 
 Every image flashed, all to `boot_b` with `moto-flash` (sparse, saved data kept); the full log with each `moto-debug` reply is `build/moto64/run.log` (not committed):
 

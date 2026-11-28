@@ -10,9 +10,8 @@
 // 1 MiB windows are SECTION_PAGES consecutive 4 KiB frames (AArch64 has no
 // 1 MiB or 64 KiB frame) and the loader's handoff page is mapped at the same
 // address it has on AArch32. The secure-monitor calls (ellis_smc) go to the
-// same kernel extension (kernel/sel4/aarch64/ellis-wifi.patch). Not there yet,
-// and skipped rather than guessed: Camera (it keeps its four frame sections
-// in slots 8-11 for cache maintenance).
+// same kernel extension (kernel/sel4/aarch64/ellis-wifi.patch). Camera's 4 MiB
+// frame window is two 2 MiB frames there, in its slots 8-9 (camera_frames).
 #endif
 
 seL4_IPCBuffer *__sel4_ipc_buffer;
@@ -933,10 +932,11 @@ static void open_runtime(void) {
   check(seL4_CNode_Mint(seL4_CapInitThreadCNode, badged, SEL4_DEPTH, seL4_CapInitThreadCNode, wake, SEL4_DEPTH,
                         seL4_AllRights, OPEN_TIMER_BADGE));
   // With the timekeeper running, it owns the timer and signals `badged`.
-  // A kernel that keeps the timer from user level (vm.h) gives it no timer.
+  // A kernel that keeps the timer from user level, or gives it only to
+  // flagged threads (vm.h VM_TIMER_EVERYONE), gives it no timer: it polls.
   if (timekeeper_open(t, wake, badged)) {
   } else
-  if (VM_USER_TIMER && !seL4_IRQControl_Get(seL4_CapIRQControl, OPEN_TIMER_IRQ, seL4_CapInitThreadCNode, handler, SEL4_DEPTH)) {
+  if (VM_TIMER_EVERYONE && !seL4_IRQControl_Get(seL4_CapIRQControl, OPEN_TIMER_IRQ, seL4_CapInitThreadCNode, handler, SEL4_DEPTH)) {
     open_timer_handler = handler;
     if (!seL4_IRQHandler_SetNotification(handler, badged) && !seL4_TCB_BindNotification(t->thread, wake)) {
       give_open(OPEN_SLOT_TIMER, handler);
@@ -1083,36 +1083,54 @@ static void open_runtime(void) {
 // Camera's frame memory, 4 MiB at 0x0b000000 in Camera and, read-only, at
 // 0x0b000000 in the Open Runtime. On the handset it is physical 0xe0000000,
 // which CAMSV writes; the loader leaves "CAMM" at 0x43ffffd4 when no
-// reservation touches it. Both map it cacheable: Camera holds the four
-// (mapped) section capabilities in its slots 8-11 and invalidates each slot's
-// lines once CAMSV has written a frame there, before publishing it. In QEMU
-// Camera draws its frames itself, into guest RAM at 0x78000000.
-enum { CAMERA_FRAME_SLOT = 8 };
+// reservation touches it. Both map it cacheable: Camera holds the (mapped)
+// frame capabilities in its slots from 8 and invalidates each slot's lines
+// once CAMSV has written a frame there, before publishing it. On AArch32 those
+// are four 1 MiB sections (slots 8-11); on AArch64, which has no 1 MiB frame,
+// two 2 MiB frames (slots 8-9): both addresses are 2 MiB aligned
+// (targets/moto-g-pure/camera.rs FRAME_BITS). In QEMU Camera draws its frames
+// itself, into guest RAM at 0x78000000.
+// (The windows as the AArch32 board files describe them are the literal
+// 1 MiB calls below, which targets/board checks; on AArch64 each even
+// section's call maps that section and the next as one frame.)
+enum { CAMERA_FRAME_SLOT = 8, CAMERA_FRAME_BITS = VM_AARCH64 ? 21 : 20 };
 static void camera_frames(void) {
   if (!procs[CAMERA].package) return;
   seL4_ARM_VMAttributes attrs = seL4_ARM_ExecuteNever;
   for (unsigned off = 0; off < 0x400000; off += 0x100000) {
     seL4_CPtr frame;
+    if (off & ((1u << CAMERA_FRAME_BITS) - 1)) continue;
+#if VM_AARCH64
+    seL4_Word frame_va = 0x0b000000 + off;
+#endif
 #ifdef VIOLET_MOTO
-    // Camera keeps its four sections in slots 8-11 for cache maintenance;
-    // on AArch64 a section is 256 pages, which it does not handle yet.
-    if (VM_AARCH64) return;
     if (((volatile unsigned *)0x09f00000)[0xfffd4 / 4] != 0x4d4d4143) return;
+#if VM_AARCH64
+    seL4_Word frame_pa = 0xe0000000u + off;
+    device(CAMERA, frame_pa, frame_va, CAMERA_FRAME_BITS);
+#else
     device(CAMERA, 0xe0000000 + off, 0x0b000000 + off, 20);
-    frame = next_slot - 1;
+#endif
+    // One frame either way (a section, or a 2 MiB frame on AArch64).
+    if (WINDOW_COUNT != 1) stop();
+    frame = WINDOW_FIRST;
     attrs = seL4_ARM_PageCacheable | seL4_ARM_ExecuteNever;
     check(seL4_ARM_Page_Unmap(frame));
     check(seL4_ARM_Page_Map(frame, procs[CAMERA].task.pd, 0x0b000000 + off, seL4_AllRights, attrs));
 #else
     // Guest RAM the kernel does not manage, after the open-app pool (and
     // below the framebuffer), so the 64 MiB the kernel has stay for objects.
+#if VM_AARCH64
+    seL4_Word frame_pa = 0x78000000u + off;
+    device(CAMERA, frame_pa, frame_va, CAMERA_FRAME_BITS);
+#else
     device(CAMERA, 0x78000000 + off, 0x0b000000 + off, 20);
-    frame = next_slot - 1;
+#endif
+    frame = WINDOW_FIRST;
 #endif
     struct task *t = &procs[OPEN_RT].task;
 #if VM_AARCH64
-    // 1 MiB is no frame size there: the section is WINDOW_COUNT pages.
-    frame = WINDOW_FIRST;
+    // The window's frames (WINDOW_COUNT of WINDOW_STEP bytes).
     for (unsigned k = 0; t->pd && k < WINDOW_COUNT; k++) {
       unsigned copy = next_slot++;
       check(seL4_CNode_Copy(seL4_CapInitThreadCNode, copy, SEL4_DEPTH, seL4_CapInitThreadCNode, frame + k, SEL4_DEPTH,
@@ -1128,7 +1146,7 @@ static void camera_frames(void) {
     }
 #endif
 #ifdef VIOLET_MOTO
-    check(seL4_CNode_Move(procs[CAMERA].task.caps, CAMERA_FRAME_SLOT + off / 0x100000, CAP_BITS,
+    check(seL4_CNode_Move(procs[CAMERA].task.caps, CAMERA_FRAME_SLOT + (off >> CAMERA_FRAME_BITS), CAP_BITS,
                           seL4_CapInitThreadCNode, frame, SEL4_DEPTH));
 #endif
   }
@@ -1387,6 +1405,14 @@ static void wire(void) {
       map_shared(frame, &procs[USB_DIAG].task, 0x09230000 + i * PAGE, seL4_CanRead);
     }
     grant(&procs[CAMERA].task, 7, life, CAMERA_LIFE_BADGE, false);
+  } else {
+    // No Camera in this image: USB Diagnostics still reads these addresses
+    // for camera-status and camera-shot, and a fault there suspends it for
+    // the boot. Blank pages answer zeros and take requests nobody reads.
+    unsigned blank = create(ram, seL4_ARM_SmallPageObject);
+    map_shared(blank, &procs[USB_DIAG].task, 0x09207000, seL4_CanRead);
+    for (unsigned i = 0; i < 16; i++) map_shared(blank, &procs[USB_DIAG].task, 0x09230000 + i * PAGE, seL4_CanRead);
+    map_shared(create(ram, seL4_ARM_SmallPageObject), &procs[USB_DIAG].task, 0x09208000, seL4_AllRights);
   }
   unsigned diagnostic_frame = create(ram, seL4_ARM_SmallPageObject);
   map_lane(diagnostic_frame, &bootstrap, 0x09202000);

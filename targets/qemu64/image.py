@@ -114,28 +114,38 @@ def assemble(regions, base):
 # boot that passes every layer cannot read as one with these protections.
 NO_VERIFIED_BOOT = ("verified boot: absent (the qemu64 entry stub checks no signed manifest; the kernel and the "
                     "supervisor load unverified, packages are still signature-checked by the supervisor)")
-NO_USER_TIMER = ("no user timer (KernelArmExportPTMRUser=OFF): the supervisor's timekeeper and its stuck-WFI guard are "
-                 "compiled out, and the Open Runtime polls at a fixed priority instead of taking IRQ 30")
+NO_USER_TIMER = ("no user timer (KernelArmExportPTMRUser=OFF and no KernelEllisTimerGrant): the supervisor's timekeeper "
+                 "and its stuck-WFI guard are compiled out, and the Open Runtime polls at a fixed priority instead of taking IRQ 30")
+
+
+def _flag(pattern, text):
+    import re
+    found = re.search(pattern, text, re.M)
+    return None if not found else found.group(1).upper() in ("ON", "1", "TRUE", "YES")
 
 
 def user_timer(cache, headers):
-    """Whether the kernel exports the EL0 physical timer, from its CMakeCache.txt text, checked against every
+    """Who may program the EL0 physical timer, from the kernel's CMakeCache.txt text: "exported" (every
+    thread, KernelArmExportPTMRUser, as on AArch32), "granted" (only threads with seL4_TCBFlag_ellisTimer,
+    KernelEllisTimerGrant: kernel/sel4/aarch64/ellis-timer.patch) or "" (nobody). Checked against every
     gen_config.h text the supervisor compiles against (`headers`): those decide vm.h VM_USER_TIMER, and one
     that says otherwise (a stale build tree) would build a supervisor whose timer writes trap. Raises
     ValueError on a mismatch or a cache that does not say."""
     import re
-    found = re.search(r"^KernelArmExportPTMRUser:BOOL=(\w+)$", cache, re.M)
-    if not found:
+    exported = _flag(r"^KernelArmExportPTMRUser:BOOL=(\w+)$", cache)
+    if exported is None:
         raise ValueError("the kernel's CMakeCache.txt does not set KernelArmExportPTMRUser")
-    kernel = found.group(1).upper() in ("ON", "1", "TRUE", "YES")
+    granted = bool(_flag(r"^KernelEllisTimerGrant:\w+=(\w+)$", cache))
     for text in headers:
-        if "CONFIG_EXPORT_PTMR_USER" not in text:
-            continue
-        compiled = re.search(r"^#define CONFIG_EXPORT_PTMR_USER\s+1", text, re.M) is not None
-        if compiled != kernel:
-            raise ValueError(f"the supervisor's headers say CONFIG_EXPORT_PTMR_USER={int(compiled)}, the kernel "
-                             f"KernelArmExportPTMRUser={'ON' if kernel else 'OFF'}: a stale build tree")
-    return kernel
+        for config, kernel, option in (("CONFIG_EXPORT_PTMR_USER", exported, "KernelArmExportPTMRUser"),
+                                       ("CONFIG_ELLIS_TIMER_GRANT", granted, "KernelEllisTimerGrant")):
+            if config not in text and not re.search(r"^#define CONFIG_PLAT_ELLIS\s+1", text, re.M):
+                continue
+            compiled = re.search(rf"^#define {config}\s+1", text, re.M) is not None
+            if compiled != kernel:
+                raise ValueError(f"the supervisor's headers say {config}={int(compiled)}, the kernel "
+                                 f"{option}={'ON' if kernel else 'OFF'}: a stale build tree")
+    return "exported" if exported else "granted" if granted else ""
 
 
 def differences(timer):

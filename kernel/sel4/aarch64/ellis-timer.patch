@@ -1,0 +1,124 @@
+--- a/include/arch/arm/arch/64/mode/fastpath/fastpath.h
++++ b/include/arch/arm/arch/64/mode/fastpath/fastpath.h
+@@ -16,6 +16,7 @@
+ #include <arch/object/vcpu.h>
+ #include <machine/fpu.h>
+ #include <smp/lock.h>
++#include <arch/object/ellis_timer.h>
+ 
+ /* When building the fastpath the assembler in traps.S makes these
+  * assumptions. Because compile_asserts are hard to do in assembler,
+@@ -37,6 +38,9 @@
+     }
+     asid = (asid_t)(stored_hw_asid.words[0] & 0xffff);
+     armv_contextSwitch_HWASID(vroot, asid);
++#ifdef CONFIG_ELLIS_TIMER_GRANT
++    ellisTimerAccess(thread);
++#endif
+ 
+ #ifdef CONFIG_BENCHMARK_TRACK_UTILISATION
+     benchmark_utilisation_switch(NODE_STATE(ksCurThread), thread);
+--- a/libsel4/include/sel4/constants.h
++++ b/libsel4/include/sel4/constants.h
+@@ -73,11 +73,16 @@
+ typedef enum {
+     seL4_TCBFlag_NoFlag = 0x0,
+     seL4_TCBFlag_fpuDisabled = 0x1,
++    /* VioletOS (ellis, AArch64): the thread may program the EL0 physical timer. */
++    seL4_TCBFlag_ellisTimer = 0x2,
+ 
+     SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
+     seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag
+ #ifdef CONFIG_HAVE_FPU
+                         | seL4_TCBFlag_fpuDisabled
++#endif
++#ifdef CONFIG_ELLIS_TIMER_GRANT
++                        | seL4_TCBFlag_ellisTimer
+ #endif
+ } seL4_TCBFlag;
+ 
+--- a/src/arch/arm/64/kernel/thread.c
++++ b/src/arch/arm/64/kernel/thread.c
+@@ -10,6 +10,7 @@
+ #include <arch/kernel/vspace.h>
+ #include <arch/kernel/thread.h>
+ #include <linker.h>
++#include <arch/object/ellis_timer.h>
+ 
+ void Arch_switchToThread(tcb_t *tcb)
+ {
+@@ -17,6 +18,9 @@
+         vcpu_switch(tcb->tcbArch.tcbVCPU);
+     }
+     setVMRoot(tcb);
++#ifdef CONFIG_ELLIS_TIMER_GRANT
++    ellisTimerAccess(tcb);
++#endif
+ }
+ 
+ BOOT_CODE void Arch_configureIdleThread(tcb_t *tcb)
+--- a/src/kernel/boot.c
++++ b/src/kernel/boot.c
+@@ -17,6 +17,7 @@
+ #include <linker.h>
+ #include <hardware.h>
+ #include <util.h>
++#include <arch/object/ellis_timer.h>
+ 
+ /* (node-local) state accessed only during bootstrapping */
+ BOOT_BSS ndks_boot_t ndks_boot;
+@@ -536,6 +537,13 @@
+     tcb->tcbPriority = seL4_MaxPrio;
+     tcb->tcbMCP = seL4_MaxPrio;
+     tcb->tcbDomain = 0;
++#ifdef CONFIG_ELLIS_TIMER_GRANT
++    /* VioletOS: the root task (the supervisor) starts as the one thread
++     * that may program the EL0 physical timer; it gives that to threads it
++     * makes with TCB SetFlags. */
++    tcb->tcbFlags |= seL4_TCBFlag_ellisTimer;
++    ellisTimerAccess(tcb);
++#endif
+ #ifndef CONFIG_KERNEL_MCS
+     setupReplyMaster(tcb);
+ #endif
+--- a/src/object/tcb.c
++++ b/src/object/tcb.c
+@@ -18,6 +18,7 @@
+ #include <object/schedcontext.h>
+ #endif
+ #include <object/tcb.h>
++#include <arch/object/ellis_timer.h>
+ #include <kernel/cspace.h>
+ #include <kernel/thread.h>
+ #include <kernel/vspace.h>
+@@ -816,6 +817,11 @@
+         lazyFPURestore(thread);
+     }
+ #endif
++#ifdef CONFIG_ELLIS_TIMER_GRANT
++    if (thread == cur_thread) {
++        ellisTimerAccess(thread);
++    }
++#endif
+     if (call) {
+         word_t *ipcBuffer = lookupIPCBuffer(true, cur_thread);
+         setRegister(cur_thread, badgeRegister, 0);
+@@ -838,6 +844,18 @@
+ 
+     word_t clear = getSyscallArg(0, buffer);
+     word_t set   = getSyscallArg(1, buffer);
++
++#ifdef CONFIG_ELLIS_TIMER_GRANT
++    /* VioletOS: only a thread that may program the EL0 physical timer may
++     * give that right to a thread or take it away. */
++    word_t flags = (thread->tcbFlags & ~clear) | (set & seL4_TCBFlag_MASK);
++    if (((flags ^ thread->tcbFlags) & seL4_TCBFlag_ellisTimer) &&
++        !(NODE_STATE(ksCurThread)->tcbFlags & seL4_TCBFlag_ellisTimer)) {
++        userError("TCB SetFlags: the timer flag is changed only by a thread that has it.");
++        current_syscall_error.type = seL4_IllegalOperation;
++        return EXCEPTION_SYSCALL_ERROR;
++    }
++#endif
+ 
+     setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+     invokeSetFlags(thread, clear, set, call);

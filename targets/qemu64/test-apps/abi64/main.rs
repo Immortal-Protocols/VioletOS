@@ -4,6 +4,10 @@
 //! handler that makes the faulting page writable and returns so the write runs
 //! again with the SIMD registers intact, and std::process::Command (musl's
 //! posix_spawn: clone with CLONE_VM|CLONE_VFORK, execve, pipes, wait4).
+//! It also tries the supervisor's timer (the EL0 physical timer, which the
+//! AArch64 kernel gives only to the timekeeper: kernel/sel4/aarch64
+//! ellis-timer.patch): a read and two writes must each trap (SIGILL, skipped
+//! by its handler), and a sleep afterwards must still end on time.
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,6 +31,7 @@ static HITS: AtomicU64 = AtomicU64::new(0);
 static INFO: AtomicU64 = AtomicU64::new(0);
 static FAULT: AtomicU64 = AtomicU64::new(0);
 static PAGE: AtomicU64 = AtomicU64::new(0);
+static ILL: AtomicU64 = AtomicU64::new(0);
 
 extern "C" fn on_usr1(_: i32) {
     HITS.fetch_add(1, Ordering::SeqCst);
@@ -40,6 +45,11 @@ extern "C" fn on_segv(_: i32, info: *const u8, _uc: *const u8) {
     // si_addr: a 64-bit pointer at 16.
     FAULT.store(unsafe { *(info.add(16) as *const u64) }, Ordering::SeqCst);
     unsafe { mprotect(PAGE.load(Ordering::SeqCst) as usize, 4096, 3) };
+}
+extern "C" fn on_ill(_: i32, _info: *const u8, uc: *mut u8) {
+    ILL.fetch_add(1, Ordering::SeqCst);
+    // ucontext_t: uc_mcontext (struct sigcontext) at 176: fault_address, regs[31], sp, then pc.
+    unsafe { *(uc.add(176 + 8 + 31 * 8 + 8) as *mut u64) += 4 };
 }
 fn handler(f: usize) -> SigAction {
     SigAction { handler: f, mask: [0; 16], flags: SA_SIGINFO, restorer: 0 }
@@ -69,6 +79,19 @@ fn main() {
         let wrote = std::ptr::read_volatile((page + 8) as *const u64);
         println!("abi64: fault at page+{:#x}, then wrote {:#x}, fp {}", FAULT.load(Ordering::SeqCst).wrapping_sub(page as u64), wrote, y);
     }
+    unsafe {
+        // The supervisor's timer: each access traps unless the kernel lets this thread program it.
+        sigaction(4, &handler(on_ill as *const () as usize), std::ptr::null_mut());
+        let mut ctl: u64 = 0x5a;
+        core::arch::asm!("mrs {0}, cntp_ctl_el0", inout(reg) ctl);
+        core::arch::asm!("msr cntp_tval_el0, {0}", in(reg) 1u64);
+        core::arch::asm!("msr cntp_ctl_el0, {0}", in(reg) 0u64);
+        println!("abi64: physical timer refused {} of 3, read {:#x}", ILL.load(Ordering::SeqCst), ctl);
+    }
+    let start = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let slept = start.elapsed().as_millis();
+    println!("abi64: a 100 ms sleep took 100 to 1000 ms {}", (100..1000).contains(&slept));
     let status = Command::new("/apps/abi64").arg("child").stdout(Stdio::null()).status();
     println!("abi64: child exit {:?}", status.ok().and_then(|s| s.code()));
     let out = Command::new("/apps/abi64").arg("child").output();

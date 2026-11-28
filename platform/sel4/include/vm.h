@@ -123,10 +123,27 @@ static inline void vm_wait_for_interrupt(void) { __asm__ volatile("dsb; wfi" :::
 
 #endif
 
-/* Whether user level may program the physical timer (PPI 30) the timekeeper
-   and the Open Runtime use. Both 32-bit kernels export it. */
+/* Whether the supervisor's threads may program the physical timer (PPI 30)
+   the timekeeper uses (VM_USER_TIMER), and whether every user thread may
+   (VM_TIMER_EVERYONE). Both 32-bit kernels export it to every thread
+   (KernelArmExportPTMRUser), so an app can stop it: the timekeeper runs with
+   its guard, and without the timekeeper the Open Runtime programs it itself.
+   The AArch64 kernels give it only to threads with seL4_TCBFlag_ellisTimer
+   (kernel/sel4/aarch64/ellis-timer.patch): the root thread from boot, the
+   timekeeper by vm_timer_grant; an app's access traps. */
 #if defined(CONFIG_EXPORT_PTMR_USER)
 #define VM_USER_TIMER 1
+#define VM_TIMER_EVERYONE 1
+static inline int vm_timer_grant(seL4_CPtr tcb) { (void)tcb; return 0; }
+#elif defined(CONFIG_ELLIS_TIMER_GRANT)
+#define VM_USER_TIMER 1
+#define VM_TIMER_EVERYONE 0
+static inline int vm_timer_grant(seL4_CPtr tcb) {
+  seL4_TCB_SetFlags_t set = seL4_TCB_SetFlags(tcb, 0, seL4_TCBFlag_ellisTimer);
+  return set.error || !(set.flags & seL4_TCBFlag_ellisTimer);
+}
 #else
 #define VM_USER_TIMER 0
+#define VM_TIMER_EVERYONE 0
+static inline int vm_timer_grant(seL4_CPtr tcb) { (void)tcb; return 1; }
 #endif

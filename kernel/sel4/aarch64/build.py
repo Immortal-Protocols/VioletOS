@@ -137,7 +137,10 @@ def prepare(src, base=None):
     includes.mkdir(parents=True, exist_ok=True)
     for name in ("table.h", "invoke.h"):
         parent.update(includes / name, (BOARD / "wifi" / name).read_bytes())
-    for patch in (HERE / "linux-svc.patch", HERE / "ellis-wifi.patch"):
+    # The EL0 physical timer for flagged threads only (ellis-timer.patch,
+    # ellis_timer.h): CNTKCTL_EL1.EL0PTEN follows the running thread's TCB flag.
+    parent.update(src / "include/arch/arm/arch/object/ellis_timer.h", (HERE / "ellis_timer.h").read_bytes())
+    for patch in (HERE / "linux-svc.patch", HERE / "ellis-wifi.patch", HERE / "ellis-timer.patch"):
         if subprocess.run(["git", "apply", "--reverse", "--check", patch], cwd=src,
                           stderr=subprocess.DEVNULL, env={**os.environ, "GIT_CEILING_DIRECTORIES": str(src.parent)}).returncode:
             subprocess.run(["git", "apply", patch], cwd=src, check=True,
@@ -216,9 +219,9 @@ def build(out, target="qemu", stock=None):
             "-DTRIPLE=aarch64-none-elf", "-DPYTHON3=" + str(py), "-DKernelPlatform=ellis",
             "-DKernelSel4Arch=aarch64", "-DKernelIsMCS=OFF", "-DKernelPrinting=OFF",
             "-DKernelDebugBuild=OFF", "-DKernelVerificationBuild=OFF",
-            # User level reads the virtual counter. It may not program the
-            # EL0 physical timer: the kernel does not switch it between
-            # threads, so any app could cancel or move another's wake-up.
+            # User level reads the virtual counter. The EL0 physical timer is
+            # not exported to every thread (any app could cancel or move
+            # another's wake-up): ellis-timer.patch gives it to flagged threads only.
             "-DKernelArmExportVCNTUser=ON", "-DKernelArmExportPTMRUser=OFF",
             "-DKernelMaxNumNodes=1",
             # The VioletOS supervisor maps every device window in 4 KiB or

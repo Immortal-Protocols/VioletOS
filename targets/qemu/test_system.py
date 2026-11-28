@@ -530,8 +530,10 @@ def main():
 # Home opens targets/qemu64/test-apps/abi64, which needs the real kernel:
 # signal handlers through the A64 gate (a fault's handler returning to the
 # faulting write, the SIMD registers intact), the 64-bit siginfo, and
-# posix_spawn (clone with CLONE_VM|CLONE_VFORK, execve, pipes, wait4).
-# targets/qemu/test_open_apps.py --arch aarch64 then drives Settings, Music
+# posix_spawn (clone with CLONE_VM|CLONE_VFORK, execve, pipes, wait4), and
+# that the app cannot read or program the supervisor's timer (the EL0
+# physical timer, kernel/sel4/aarch64/ellis-timer.patch) while a sleep still
+# ends on time. targets/qemu/test_open_apps.py --arch aarch64 then drives Settings, Music
 # and a setting kept across a restart, and test_ladybird.py --arch aarch64 the browser.
 AARCH64_LAYERS = [
     ("Storage serves /data to the Open Runtime", "[open] /data: "),
@@ -548,6 +550,8 @@ AARCH64_ABI = [
     "abi64: fault at page+0x8, then wrote 0x5eed, fp 3",
     "abi64: child exit Some(7)",
     'abi64: child said "from the child"',
+    "abi64: physical timer refused 3 of 3, read 0x5a",
+    "abi64: a 100 ms sleep took 100 to 1000 ms true",
     "abi64: missing program refused true",
     "abi64 done",
 ]
@@ -619,6 +623,7 @@ for line in ABI:
         fail(f"abi64 did not print {line!r}")
 until("abi64 exits", lambda: "exited with status 0" in everything()[start:], 15)
 print("AArch64 layer: signals (handler, siginfo, a fault's handler) and posix_spawn in a 64-bit program: ok", file=sys.stderr)
+print("AArch64 layer: an app's reads and writes of the timekeeper's timer trap, and its sleep still ends on time: ok", file=sys.stderr)
 notes = sorted({l.strip() for l in everything().splitlines() if "unsupported AArch64 system call" in l})
 if notes:
     print("AArch64: note: " + "; ".join(notes), file=sys.stderr)

@@ -83,6 +83,26 @@
     "src/arch/arm/64/object/objecttype.c": {
       "from": "kernel/sel4/aarch64/ellis-wifi.patch",
       "why": "Derivation gives a null cap (no copies), and an invocation goes to ellisWifiInvocation (invoke.h)."
+    },
+    "libsel4/include/sel4/constants.h": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "Adds seL4_TCBFlag_ellisTimer (0x2) and, with CONFIG_ELLIS_TIMER_GRANT, puts it in seL4_TCBFlag_MASK so TCB SetFlags accepts it."
+    },
+    "src/object/tcb.c": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "TCB SetFlags refuses (IllegalOperation) to set or clear seL4_TCBFlag_ellisTimer unless the invoking thread has it; on the running thread the change takes effect at once."
+    },
+    "src/arch/arm/64/kernel/thread.c": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "Arch_switchToThread sets CNTKCTL_EL1.EL0PTEN for a thread with seL4_TCBFlag_ellisTimer and clears it for any other."
+    },
+    "include/arch/arm/arch/64/mode/fastpath/fastpath.h": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "The IPC fastpath's thread switch (switchToThread_fp) does the same, so no switch leaves the previous thread's timer access in place."
+    },
+    "src/kernel/boot.c": {
+      "from": "kernel/sel4/aarch64/ellis-timer.patch",
+      "why": "The root task (the supervisor) starts with seL4_TCBFlag_ellisTimer and EL0PTEN set: it is the only thread that may hand the flag on."
     }
   },
   "added": {
@@ -121,10 +141,14 @@
     "include/arch/arm/arch/object/ellis_wifi/table.h": {
       "from": "platform/sel4/board/wifi/table.h",
       "why": "The four permitted operations and their fixed monitor arguments, the 32-bit kernel's."
+    },
+    "include/arch/arm/arch/object/ellis_timer.h": {
+      "from": "kernel/sel4/aarch64/ellis_timer.h",
+      "why": "ellisTimerAccess: CNTKCTL_EL1.EL0PTEN from the TCB's seL4_TCBFlag_ellisTimer (the EL0 physical timer, PPI 30; the kernel's tick is the virtual timer, PPI 27)."
     }
   },
   "sources": {
-    "kernel/sel4/aarch64/config.cmake": "55141a2a3c103a9d892705a55e772166bfe2f98661c40336cb927c85c9a20418",
+    "kernel/sel4/aarch64/config.cmake": "72536b1fb95c4f81fca465a1f31b956e9a3332f9a563ada3bbdf9313de59d7c4",
     "kernel/sel4/aarch64/linux-svc.patch": "0e8fc3de8d2fc133d482fbb9e276804532f5bd7413bdcd99566d068cccaa4f6d",
     "platform/sel4/board/kernel-overlay.dts": "shared",
     "platform/sel4/board/moto-radio-memory.dts": "shared",
@@ -133,7 +157,9 @@
     "kernel/sel4/aarch64/ellis-wifi.patch": "679a0fe0ff378764a3ba5257b3e39ea71068c4e6ef01b458d4d15137145df73e",
     "kernel/sel4/aarch64/monitor.S": "14407163fd43ab87db5bae7631dbb0a862dec0874ec68d9769a486b5298446e5",
     "platform/sel4/board/wifi/invoke.h": "shared",
-    "platform/sel4/board/wifi/table.h": "shared"
+    "platform/sel4/board/wifi/table.h": "shared",
+    "kernel/sel4/aarch64/ellis-timer.patch": "0600b277fd245c44c15259f7bf46a3ff405be67ce60e1ac9abd8e68ca7795358",
+    "kernel/sel4/aarch64/ellis_timer.h": "610e579765c072164aa08edee1ec602507b6325a0d578071c62f7ff63d964358"
   },
   "options": {
     "CMAKE_TOOLCHAIN_FILE": {
@@ -184,7 +210,7 @@
     },
     "KernelArmExportPTMRUser": {
       "value": "OFF",
-      "why": "No user thread may program the EL0 physical timer: the kernel does not switch it between threads, so any app could cancel or move another thread's wake-up."
+      "why": "Not exported to every user thread: the kernel does not switch the EL0 physical timer between threads, so any app could cancel or move another thread's wake-up. ellis-timer.patch instead enables it (CNTKCTL_EL1.EL0PTEN) only while a thread with seL4_TCBFlag_ellisTimer runs: the supervisor and its timekeeper."
     },
     "KernelArmHypervisorSupport": {
       "value": "OFF",

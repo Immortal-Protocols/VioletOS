@@ -15,6 +15,9 @@ if(KernelPlatformEllis)
     # The generic timer: QEMU virt's runs at 62.5 MHz, the MT6765's at 13 MHz
     # (as the 32-bit handset kernel). MCS (off here) would convert ticks to
     # microseconds as (ticks * CLK_MAGIC) >> CLK_SHIFT.
+    # The EL0 physical timer only for threads with seL4_TCBFlag_ellisTimer
+    # (kernel/sel4/aarch64/ellis-timer.patch): the supervisor's timekeeper.
+    config_set(KernelEllisTimerGrant ELLIS_TIMER_GRANT ON)
     # The Wi-Fi secure-monitor extension (kernel/sel4/aarch64/ellis-wifi.patch):
     # the four SiP calls on the handset, failing C stubs on QEMU.
     if(VioletHandsetBoard)

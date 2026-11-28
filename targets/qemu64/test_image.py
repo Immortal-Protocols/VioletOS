@@ -202,9 +202,12 @@ class AppBuild(unittest.TestCase):
 class Differences(unittest.TestCase):
     def test_the_supervisor_compiles_against_the_kernels_timer_setting(self):
         off, on = "KernelArmExportPTMRUser:BOOL=OFF\n", "x\nKernelArmExportPTMRUser:BOOL=ON\n"
+        grant = off + "KernelEllisTimerGrant:INTERNAL=ON\n"
         disabled, enabled = "/* disabled: CONFIG_EXPORT_PTMR_USER */\n", "#define CONFIG_EXPORT_PTMR_USER  1\n"
-        self.assertFalse(image.user_timer(off, [disabled, "#define CONFIG_OTHER 1\n"]))
-        self.assertTrue(image.user_timer(on, [enabled]))
+        ellis = "#define CONFIG_PLAT_ELLIS  1\n"
+        self.assertEqual(image.user_timer(off, [disabled, "#define CONFIG_OTHER 1\n"]), "")
+        self.assertEqual(image.user_timer(on, [enabled]), "exported")
+        self.assertEqual(image.user_timer(grant, [disabled + ellis + "#define CONFIG_ELLIS_TIMER_GRANT  1\n"]), "granted")
         # A stale tree's headers against this kernel: refused either way.
         with self.assertRaises(ValueError):
             image.user_timer(off, [enabled])
@@ -212,10 +215,15 @@ class Differences(unittest.TestCase):
             image.user_timer(on, [disabled])
         with self.assertRaises(ValueError):
             image.user_timer("", [])
+        # Headers from a kernel without the grant against one with it, and the reverse.
+        with self.assertRaises(ValueError):
+            image.user_timer(grant, [disabled + ellis])
+        with self.assertRaises(ValueError):
+            image.user_timer(off, [disabled + ellis + "#define CONFIG_ELLIS_TIMER_GRANT  1\n"])
 
     def test_the_lost_protections_are_named(self):
-        self.assertEqual(image.differences(True), [image.NO_VERIFIED_BOOT])
-        self.assertEqual(image.differences(False), [image.NO_VERIFIED_BOOT, image.NO_USER_TIMER])
+        self.assertEqual(image.differences("granted"), [image.NO_VERIFIED_BOOT])
+        self.assertEqual(image.differences(""), [image.NO_VERIFIED_BOOT, image.NO_USER_TIMER])
 
 
 if __name__ == "__main__":

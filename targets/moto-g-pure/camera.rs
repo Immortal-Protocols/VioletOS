@@ -739,9 +739,15 @@ pub fn stop() {
 extern "C" {
     fn page_invalidate(cap: u32, start: u32, end: u32) -> i32;
 }
-/// The frame window's four 1 MiB sections, in Camera's slots 8 to 11.
+/// The frame window's frames from Camera's slot 8 (system/supervisor
+/// camera_frames): four 1 MiB sections (slots 8 to 11) on AArch32, two 2 MiB
+/// frames (slots 8 and 9) on AArch64, which has no 1 MiB frame.
 const FRAME_SLOT: u32 = 8;
-const SECTION: usize = 0x10_0000;
+#[cfg(not(target_arch = "aarch64"))]
+const FRAME_BITS: u32 = 20;
+#[cfg(target_arch = "aarch64")]
+const FRAME_BITS: u32 = 21;
+const SECTION: usize = 1 << FRAME_BITS;
 /// Drop cached lines of [offset, offset + len) that CAMSV has just written.
 pub fn invalidate(offset: usize, len: usize) {
     let end = offset + len;

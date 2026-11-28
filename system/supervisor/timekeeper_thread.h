@@ -14,14 +14,20 @@
 //
 // VIOLET_TIMEKEEPER=0 at build time turns it off the same way.
 //
-// The kernel exports this timer to every user thread, open apps included,
-// so an app can stop or move it. A guard thread (timekeeper.h, tk_watch)
+// The AArch32 kernels export this timer to every user thread, open apps
+// included, so an app can stop or move it. A guard thread (timekeeper.h, tk_watch)
 // notices when the timer is overdue and kicks the timekeeper, so that costs
 // sleepers a time slice, not a hang. The timekeeper runs only with its
 // guard. What the guard cannot undo: an app that keeps re-arming the timer
 // to fire at once makes the timekeeper scan more often, within the app's own
 // share of the CPU. The fix that removes the exposure is in the kernel
 // (export the timer to the supervisor's threads only); see services/power/README.md.
+//
+// The AArch64 kernels make that change (kernel/sel4/aarch64/ellis-timer.patch,
+// vm.h VM_TIMER_EVERYONE 0): the timer is programmable only while a thread
+// with seL4_TCBFlag_ellisTimer runs, which the root thread has from boot and
+// the timekeeper is given (vm_timer_grant). No app can touch it, so there is
+// no guard; with nothing to run the kernel's idle thread waits for interrupts.
 #pragma once
 #include "timekeeper.h"
 
@@ -124,6 +130,8 @@ static seL4_CPtr tk_mint(seL4_CPtr source, seL4_CapRights_t rights, unsigned bad
 // no timekeeper (a timer any app can stop must not be the one every
 // process waits on).
 static bool tk_guard_start(void) {
+  // A timer only the supervisor's threads can program needs no guard.
+  if (!VM_TIMER_EVERYONE) return true;
   seL4_CPtr tcb = tk_make(seL4_TCBObject);
   tk_guard_kick = tk_ntfn ? tk_mint(tk_ntfn, seL4_AllRights, 0) : 0;
   if (!tcb || !tk_guard_kick) return false;
@@ -239,6 +247,8 @@ static void timekeeper_start(void) {
   ok = ok && !seL4_TCB_Configure(tcb, 0, seL4_CapInitThreadCNode, 0, seL4_CapInitThreadVSpace, 0, 0, 0) &&
        !seL4_TCB_SetPriority(tcb, seL4_CapInitThreadTCB, seL4_MaxPrio);
 #endif
+  // Where only flagged threads may program the timer, the timekeeper is one.
+  ok = ok && !vm_timer_grant(tcb);
   seL4_UserContext regs = {.pc = (seL4_Word)tk_main, .sp = (seL4_Word)(tk_stack + sizeof(tk_stack))};
   tk.c[0].page = &tk_root_page;
   tk_notify[0] = root_badged;
